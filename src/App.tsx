@@ -113,16 +113,26 @@ export default function App() {
   return (
     <div className="flex h-full bg-surface text-ink">
       {!bare && <Sidebar />}
-      <main className="h-full min-w-0 flex-1 overflow-y-auto">
-        <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/live" element={<Live />} />
-          <Route path="/meeting/:id" element={<MeetingDetail />} />
-          <Route path="/search" element={<Search />} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="/onboarding" element={<Onboarding />} />
-          <Route path="*" element={<NotFound />} />
-        </Routes>
+      <main className="flex h-full min-w-0 flex-1 flex-col">
+        {/* Nothing draws the window's title bar any more, so the page runs all
+            the way to the top edge: this empty strip gives every screen the
+            same breathing room up there and is what you grab to move the
+            window, matched to the identical strip at the top of the rail so
+            the two read as one band. Kept empty on purpose — dragging only
+            works on the element carrying the attribute, never on a container
+            with buttons inside it. */}
+        <div data-tauri-drag-region className="h-9 shrink-0 select-none" />
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <Routes>
+            <Route path="/" element={<Home />} />
+            <Route path="/live" element={<Live />} />
+            <Route path="/meeting/:id" element={<MeetingDetail />} />
+            <Route path="/search" element={<Search />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="/onboarding" element={<Onboarding />} />
+            <Route path="*" element={<NotFound />} />
+          </Routes>
+        </div>
       </main>
       <SetupProgress />
       <ToastViewport />

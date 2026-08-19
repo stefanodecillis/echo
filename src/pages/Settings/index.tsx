@@ -6,14 +6,13 @@ import { useEvent } from "../../hooks/useEvent";
 import { EVENTS, getSettings, updateSettings } from "../../lib/ipc";
 import { common, settings as copy } from "../../lib/copy";
 import type { Settings, SettingsPatch } from "../../lib/types";
-import { Advanced } from "./sections/Advanced";
 import { Data } from "./sections/Data";
 import { General } from "./sections/General";
 import { Recaps } from "./sections/Recaps";
 import { Speech } from "./sections/Speech";
 import { Templates } from "./sections/Templates";
 
-type SectionId = "general" | "speech" | "recaps" | "templates" | "data" | "advanced";
+type SectionId = "general" | "speech" | "recaps" | "templates" | "data";
 
 const sections: { id: SectionId; label: string }[] = [
   { id: "general", label: copy.sectionGeneral },
@@ -21,11 +20,10 @@ const sections: { id: SectionId; label: string }[] = [
   { id: "recaps", label: copy.sectionSummaries },
   { id: "templates", label: copy.sectionTemplates },
   { id: "data", label: copy.sectionData },
-  { id: "advanced", label: copy.sectionAdvanced },
 ];
 
 /**
- * Settings: General, Speech, Recaps, Recap styles, Data, Advanced.
+ * Settings: General, Speech, Recaps, Recap styles, Data.
  *
  * One shared `Settings` object is fetched here and handed down; every section
  * that changes a setting goes through `patch`, which optimistically merges the
@@ -87,7 +85,6 @@ export default function SettingsPage() {
           {active === "recaps" && <Recaps settings={settings} patch={patch} />}
           {active === "templates" && <Templates settings={settings} patch={patch} />}
           {active === "data" && <Data />}
-          {active === "advanced" && <Advanced />}
         </div>
       )}
     </section>

@@ -11,6 +11,12 @@ import { SidebarNavItem } from "./SidebarNavItem";
  * The left rail: wordmark, a "New meeting" pill, the three destinations, and
  * — instead of the privacy note — a live card while a meeting is recording.
  *
+ * The window has no title bar of its own, so the rail opens with an empty
+ * strip: the close/minimise/zoom buttons float over that space, and the strip
+ * itself is what you grab to move the window. It has to stay empty — the
+ * drag only works on the element that carries the attribute, never on a
+ * parent wrapped around buttons.
+ *
  * "New meeting" links to `/?start=1` rather than calling `startRecording`
  * itself: the Home screen owns the actual Start button and its confirmation
  * flow (title prompt, device picker), this just gets the person there with
@@ -23,8 +29,10 @@ export function Sidebar() {
   return (
     <nav
       aria-label={nav.wordmark}
-      className="flex h-full w-56 shrink-0 flex-col gap-1 border-r border-hairline bg-surface px-3 py-4"
+      className="flex h-full w-56 shrink-0 flex-col gap-1 border-r border-hairline bg-surface px-3 pb-4"
     >
+      <div data-tauri-drag-region className="h-9 shrink-0 select-none" />
+
       <div className="mb-4 flex items-center gap-2 px-3">
         <EchoMark className="h-5 w-5 text-ink" />
         <span className="text-sm font-semibold tracking-tight text-ink">{nav.wordmark}</span>

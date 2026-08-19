@@ -149,7 +149,7 @@ export const home = {
   openLiveButton: "View live",
   startButton: "Start",
   stopButton: "Stop",
-  searchPlaceholder: "What would you like to do?",
+  searchPlaceholder: "Search your meetings",
   recentTitle: "Recent meetings",
   viewAll: "View all",
   emptyTitle: "No meetings yet",

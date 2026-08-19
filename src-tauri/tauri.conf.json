@@ -25,7 +25,8 @@
         "decorations": true,
         "theme": "Light",
         "backgroundColor": "#FFFFFF",
-        "titleBarStyle": "Visible"
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {

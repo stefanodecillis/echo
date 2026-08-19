@@ -56,24 +56,33 @@ export function HomeIcon(props: IconProps) {
 }
 
 export function MeetingsIcon(props: IconProps) {
+  // A page of notes, not a calendar: this list is what was said, not what is
+  // coming up.
   return (
     <svg {...base(props)}>
-      <rect x="3.5" y="4.5" width="13" height="12" rx="2" stroke="currentColor" strokeWidth="1.4" />
-      <path d="M3.5 8h13M7 3v3M13 3v3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      <rect x="4.5" y="3" width="11" height="14" rx="2" stroke="currentColor" strokeWidth="1.4" />
+      <path
+        d="M7.3 7.2h5.4M7.3 10h5.4M7.3 12.8h3.2"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+      />
     </svg>
   );
 }
 
 export function SettingsIcon(props: IconProps) {
+  // Sliders: unmistakably "adjust things", unlike a gear whose spokes read as a
+  // sun at this size.
   return (
     <svg {...base(props)}>
-      <circle cx="10" cy="10" r="2.6" stroke="currentColor" strokeWidth="1.4" />
-      <path
-        d="M10 3.5v1.7M10 14.8v1.7M16.5 10h-1.7M5.2 10H3.5M14.6 5.4l-1.2 1.2M6.6 13.4l-1.2 1.2M14.6 14.6l-1.2-1.2M6.6 6.6L5.4 5.4"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-      />
+      <path d="M3.5 7h13M3.5 13h13" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      {/* Two rails, not three: at the 16px this actually renders at, three sit
+          close enough that the strokes and the knobs merge into one smudge. The
+          knobs have to hide the rail behind them, so they are filled with the
+          page's own white rather than left hollow. */}
+      <circle cx="12.5" cy="7" r="1.9" className="fill-surface" stroke="currentColor" strokeWidth="1.4" />
+      <circle cx="7.5" cy="13" r="1.9" className="fill-surface" stroke="currentColor" strokeWidth="1.4" />
     </svg>
   );
 }

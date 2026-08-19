@@ -80,6 +80,10 @@ pub fn set_tray_state(app: &AppHandle, state: TrayState) {
     if let Some(tray) = app.tray_by_id("echo-tray") {
         if let Ok(image) = Image::from_bytes(bytes) {
             let _ = tray.set_icon(Some(image));
+            // set_icon drops the template flag, and a non-template icon renders
+            // as a black blob in a dark menu bar. Re-assert it every swap.
+            #[cfg(target_os = "macos")]
+            let _ = tray.set_icon_as_template(true);
         }
     }
     let _ = app.emit(events::TRAY_STATE, events::TrayStatePayload { state });
