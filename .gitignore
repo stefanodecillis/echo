@@ -1,0 +1,53 @@
+# Node
+node_modules/
+.npm/
+npm-debug.log*
+
+# Frontend build output
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# Rust
+src-tauri/target/
+src-tauri/gen/
+
+# Recordings and anything derived from them. Never commit audio.
+*.flac
+*.wav
+*.m4a
+recordings/
+# ...except the tiny generated test fixtures, which the audio tests read.
+!src-tauri/tests/fixtures/*.wav
+
+# Downloaded speech assets
+models/
+speech/
+*.gguf
+*.bin
+*.mlmodelc/
+*.onnx
+
+# Local databases and logs
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+# Secrets. Keys belong in the OS keychain, never in a file.
+.env
+.env.*
+!.env.example
+*.p12
+*.pem

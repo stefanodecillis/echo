@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Both jobs compile the whole thing and run the unit and fixture tests.
+  # Audio capture, permission prompts and tray behaviour cannot be checked on a
+  # headless runner (review finding 29); those live on the manual hardware
+  # matrix in docs/DESIGN.md.
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Apple Silicon)
+            os: macos-14
+            target: aarch64-apple-darwin
+          - name: Linux (x86_64)
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # WebKitGTK and the tray library for Tauri; ALSA and PipeWire for capture.
+      # Pinned to the oldest base we support, so the .deb declares honest deps.
+      - name: Install Linux system libraries
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            curl \
+            file \
+            wget \
+            pkg-config \
+            libssl-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            libasound2-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libclang-dev \
+            cmake
+          # The Linux speech build compiles GPU shaders, which needs the Vulkan
+          # headers and the shader compiler.
+          sudo apt-get install --no-install-recommends -y libvulkan-dev glslc \
+            || sudo apt-get install --no-install-recommends -y libvulkan-dev glslang-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type-check the frontend
+        run: npx tsc --noEmit
+
+      # cargo needs `dist/` to exist, and this proves the bundle builds.
+      - name: Build the frontend
+        run: npx vite build
+
+      - name: Check the Rust core
+        working-directory: src-tauri
+        run: cargo check --all-targets --locked
+
+      - name: Test the Rust core
+        working-directory: src-tauri
+        run: cargo test --locked
+
+  lint:
+    name: Formatting and lints
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config libssl-dev libglib2.0-dev libgtk-3-dev \
+            librsvg2-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev libayatana-appindicator3-dev libxdo-dev \
+            libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev cmake \
+            libvulkan-dev glslc || true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: lint
+
+      - name: Check formatting
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # Zero jargon is a product requirement, so it gets a check rather than a
+      # code review (mantra 2). The three files under src/lib are the contract
+      # layer: they carry machine enum values and the tone rules themselves, and
+      # nothing in them is rendered. Everything else is read by a person.
+      - name: No jargon in user-facing strings
+        run: |
+          set -uo pipefail
+          hits=$(grep -rniE '"[^"]*(whisper|onnx|diariz|screencapturekit|pipewire|ggml|coreml|silero|pyannote)' \
+                   src --include='*.tsx' --include='*.ts' \
+                   | grep -vE 'src/lib/(copy|types|ipc)\.ts' || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            echo "::error::A user-facing string names the machinery. Say what the person sees instead."
+            exit 1
+          fi
