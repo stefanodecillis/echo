@@ -992,21 +992,46 @@ pub async fn list_input_devices() -> CmdResult<Vec<AudioDevice>> {
 // Permissions and onboarding
 // ---------------------------------------------------------------------------
 
+/// The notification plugin's answer, in our vocabulary. On desktop the plugin
+/// reports Granted (the operating system runs its own banner prompt the first
+/// time Echo posts a notification), so this mostly keeps the onboarding card
+/// truthful rather than stuck on an "Allow" button that does nothing.
+fn notification_permission(app: &AppHandle) -> PermissionState {
+    use tauri_plugin_notification::{NotificationExt, PermissionState as Np};
+    match app.notification().permission_state() {
+        Ok(Np::Granted) => PermissionState::Granted,
+        Ok(Np::Denied) => PermissionState::Denied,
+        Ok(_) => PermissionState::Unknown,
+        Err(_) => PermissionState::Unknown,
+    }
+}
+
 #[tauri::command]
-pub async fn get_permission_status() -> CmdResult<PermissionStatus> {
+pub async fn get_permission_status(app: AppHandle) -> CmdResult<PermissionStatus> {
     Ok(PermissionStatus {
         microphone: audio::microphone_permission().await,
         system_audio: audio::system_audio_permission().await,
-        notifications: PermissionState::Unknown,
+        notifications: notification_permission(&app),
     })
 }
 
 #[tauri::command]
-pub async fn request_permission(target: PermissionTarget) -> CmdResult<PermissionState> {
+pub async fn request_permission(
+    app: AppHandle,
+    target: PermissionTarget,
+) -> CmdResult<PermissionState> {
     Ok(match target {
         PermissionTarget::Microphone => audio::request_microphone_permission().await,
         PermissionTarget::SystemAudio => audio::request_system_audio_permission().await,
-        PermissionTarget::Notifications => PermissionState::NotApplicable,
+        PermissionTarget::Notifications => {
+            use tauri_plugin_notification::{NotificationExt, PermissionState as Np};
+            match app.notification().request_permission() {
+                Ok(Np::Granted) => PermissionState::Granted,
+                Ok(Np::Denied) => PermissionState::Denied,
+                Ok(_) => PermissionState::Unknown,
+                Err(_) => PermissionState::Unknown,
+            }
+        }
     })
 }
 
@@ -1016,7 +1041,10 @@ pub async fn open_privacy_settings(target: PermissionTarget) -> CmdResult<()> {
 }
 
 #[tauri::command]
-pub async fn get_onboarding_state(state: State<'_, AppState>) -> CmdResult<OnboardingState> {
+pub async fn get_onboarding_state(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<OnboardingState> {
     let s = settings::load(&state.db).await?;
     Ok(OnboardingState {
         complete: s.onboarding_complete,
@@ -1024,7 +1052,7 @@ pub async fn get_onboarding_state(state: State<'_, AppState>) -> CmdResult<Onboa
         permissions: PermissionStatus {
             microphone: audio::microphone_permission().await,
             system_audio: audio::system_audio_permission().await,
-            notifications: PermissionState::Unknown,
+            notifications: notification_permission(&app),
         },
         speech: asr::models::readiness(&state.db, &state.paths)
             .await
