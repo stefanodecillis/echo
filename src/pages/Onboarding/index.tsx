@@ -14,6 +14,29 @@ import { WelcomeStep } from "./steps/Welcome";
 const STEP_IDS = ["welcome", "permissions", "download", "summaries"] as const;
 type StepId = (typeof STEP_IDS)[number];
 
+/** Where setup left off, surviving a relaunch — macOS forces one when the
+ * screen-recording switch is flipped, and coming back to the Welcome page
+ * after that reads as starting over. */
+const RESUME_KEY = "echo.onboarding.step";
+
+function savedStep(): StepId {
+  try {
+    const saved = window.localStorage.getItem(RESUME_KEY);
+    return STEP_IDS.includes(saved as StepId) ? (saved as StepId) : "welcome";
+  } catch {
+    return "welcome";
+  }
+}
+
+function rememberStep(step: StepId | null) {
+  try {
+    if (step === null) window.localStorage.removeItem(RESUME_KEY);
+    else window.localStorage.setItem(RESUME_KEY, step);
+  } catch {
+    // Being unable to remember the step only costs a relaunch its bookmark.
+  }
+}
+
 const STEP_LABELS: Record<StepId, string> = {
   welcome: copy.stepLabelWelcome,
   permissions: copy.stepLabelPermissions,
@@ -30,7 +53,7 @@ const STEP_LABELS: Record<StepId, string> = {
  * first run — then leaves for Home the same way a notification click would.
  */
 export default function OnboardingPage() {
-  const [step, setStep] = useState<StepId>("welcome");
+  const [step, setStep] = useState<StepId>(savedStep);
   const navigate = useNavigate();
   const { run: finish } = useCommand(completeOnboarding);
 
@@ -38,6 +61,7 @@ export default function OnboardingPage() {
 
   function goTo(next: StepId) {
     setStep(next);
+    rememberStep(next);
   }
 
   async function handleFinish(_chosen: Provider | null) {
@@ -46,6 +70,7 @@ export default function OnboardingPage() {
     } finally {
       // Onboarding is done either way — a failed write to settings shouldn't
       // trap someone who clicked through four screens on a fresh install.
+      rememberStep(null);
       navigate("/");
     }
   }
