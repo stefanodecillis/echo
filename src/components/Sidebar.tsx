@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { useCaptureState } from "../hooks/useCaptureState";
 import { nav } from "../lib/copy";
 import { formatElapsed } from "./lib/format";
-import { HomeIcon, MeetingsIcon, PlusIcon, SettingsIcon } from "./icons";
+import { EchoMark, HomeIcon, MeetingsIcon, PlusIcon, SettingsIcon } from "./icons";
 import { RecordingDot } from "./RecordingDot";
 import { SidebarNavItem } from "./SidebarNavItem";
 
@@ -26,7 +26,7 @@ export function Sidebar() {
       className="flex h-full w-56 shrink-0 flex-col gap-1 border-r border-hairline bg-surface px-3 py-4"
     >
       <div className="mb-4 flex items-center gap-2 px-3">
-        <span aria-hidden className="h-2.5 w-2.5 rounded-full border-2 border-ink" />
+        <EchoMark className="h-5 w-5 text-ink" />
         <span className="text-sm font-semibold tracking-tight text-ink">{nav.wordmark}</span>
       </div>
 

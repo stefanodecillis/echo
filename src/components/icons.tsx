@@ -139,3 +139,27 @@ export function DownloadIcon(props: IconProps) {
     </svg>
   );
 }
+
+/** The Echo mark: a sound and its fading repetitions. Same drawing as the app
+ * icon (src-tauri/icons/source/app-icon.svg), sized for chrome. */
+export function EchoMark(props: IconProps) {
+  return (
+    <svg viewBox="0 0 44 44" fill="none" aria-hidden {...props}>
+      <circle cx="13" cy="22" r="4.5" fill="currentColor" />
+      <path
+        d="M 19.43 14.34 A 10 10 0 0 1 19.43 29.66"
+        stroke="currentColor"
+        strokeWidth="4"
+        strokeLinecap="round"
+        opacity="0.55"
+      />
+      <path
+        d="M 23.93 8.98 A 17 17 0 0 1 23.93 35.02"
+        stroke="currentColor"
+        strokeWidth="4"
+        strokeLinecap="round"
+        opacity="0.28"
+      />
+    </svg>
+  );
+}
