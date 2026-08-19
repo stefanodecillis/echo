@@ -854,6 +854,20 @@ pub async fn request_permission() -> PermissionState {
         return PermissionState::Granted;
     }
     let granted = unsafe { CGRequestScreenCaptureAccess() };
+
+    // CGRequestScreenCaptureAccess only shows its dialog once per launch (and
+    // on newer macOS sometimes not at all), and an app that never *attempted*
+    // capture is not even listed in System Settings — the person would have to
+    // find it with the "+" button by hand. Actually asking ScreenCaptureKit
+    // for content registers Echo in that list, so the person only has to flip
+    // the switch. The call is expected to fail while permission is missing;
+    // registration is the point. Bounded by OPEN_TIMEOUT, off the async
+    // runtime's threads.
+    let _ = tokio::task::spawn_blocking(|| {
+        let _ = shareable_content();
+    })
+    .await;
+
     if granted {
         PermissionState::Granted
     } else {

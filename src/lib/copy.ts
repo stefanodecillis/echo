@@ -382,6 +382,12 @@ export const onboarding = {
   welcomeSubtitle:
     "A few things to set up once: permission to listen, a one-time download, and where your recaps come from.",
   getStartedButton: "Get started",
+  welcomeStepListenTitle: "It listens",
+  welcomeStepListenCaption: "During your meetings, on this computer only.",
+  welcomeStepTranscriptTitle: "Writes it down",
+  welcomeStepTranscriptCaption: "Who said what, in any language.",
+  welcomeStepRecapTitle: "Hands you the recap",
+  welcomeStepRecapCaption: "Key points and to-dos, ready to share.",
   stepPermissionsTitle: "Let Echo listen",
   microphoneTitle: "Your microphone",
   microphoneDescription: "So Echo can hear you.",
