@@ -1,0 +1,13 @@
+-- A job needs to remember what it was asked for.
+--
+-- "Write this recap again with a different model" and "download the smaller
+-- preset" are both requests with parameters, and until now the handlers had to
+-- re-read whatever the settings happened to say by the time they ran. That is
+-- wrong twice over: a regenerate could silently use the wrong style, and
+-- queueing a download had to overwrite the person's saved quality preset as a
+-- side effect.
+--
+-- One nullable JSON column fixes both. Nullable because most jobs (catch-up, the
+-- speaker pass, the mixdown) have nothing to remember beyond their meeting id,
+-- and because every row that already exists has to stay valid.
+ALTER TABLE jobs ADD COLUMN payload TEXT;

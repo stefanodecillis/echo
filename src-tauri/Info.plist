@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.dev/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- User-facing permission copy. Zero jargon (mantra 2): describe the outcome,
+       not the mechanism. These strings are shown by macOS itself. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Echo needs your microphone so it can write down what you say in meetings.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Echo does not use your camera.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Echo checks whether a meeting app is running so it can offer to start recording.</string>
+  <!-- Screen &amp; System Audio Recording is requested at runtime by ScreenCaptureKit;
+       macOS shows the app name plus this string in the prompt. -->
+  <key>NSSystemAdministrationUsageDescription</key>
+  <string>Echo needs permission to record what your computer plays so it can include the other people in the meeting.</string>
+  <key>LSUIElement</key>
+  <false/>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+</dict>
+</plist>

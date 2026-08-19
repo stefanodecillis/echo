@@ -1,0 +1,74 @@
+[package]
+name = "echo"
+version = "0.1.0"
+description = "Echo — local-first meeting transcription and recaps"
+authors = ["Echo"]
+edition = "2021"
+rust-version = "1.90"
+
+[lib]
+name = "echo_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[workspace]
+
+[build-dependencies]
+tauri-build = "2.6.3"
+
+[dependencies]
+ammonia = "4.1.4"
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", features = ["serde"] }
+cpal = "0.18.2"
+dirs = "6.0.0"
+docx-rs = "0.4.22"
+ebur128 = "0.1.10"
+flacenc = "0.5.1"
+futures = "0.3.34"
+hound = "3.5.1"
+keyring = { version = "3.6.3", features = ["apple-native", "sync-secret-service", "vendored"] }
+log = "0.4.33"
+notify-rust = "4.18"
+ort = { version = "2.0.0-rc.13", features = ["ndarray"] }
+pulldown-cmark = "0.13.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "json", "gzip", "http2", "charset"] }
+ringbuf = "0.5.1"
+rubato = "5.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "chrono", "uuid", "macros", "migrate", "json"] }
+sysinfo = "0.38.4"
+tauri = { version = "2.11.5", features = ["tray-icon", "image-png", "protocol-asset"] }
+tauri-plugin-autostart = "2.5.1"
+tauri-plugin-dialog = "2.7.2"
+tauri-plugin-log = "2.9.0"
+tauri-plugin-notification = "2.3.3"
+tauri-plugin-opener = "2.5.4"
+tauri-plugin-single-instance = "2.4.3"
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = "0.3.23"
+uuid = { version = "1.20.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+wiremock = "0.6.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+coreaudio-sys = "0.2.18"
+objc2 = "0.6.4"
+objc2-core-audio-types = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-screen-capture-kit = "0.3.2"
+whisper-rs = { version = "0.16.0", features = ["metal", "coreml"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libspa = "0.10.1"
+pipewire = "0.10.1"
+whisper-rs = { version = "0.16.0", features = ["vulkan"] }

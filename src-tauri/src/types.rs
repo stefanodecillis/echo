@@ -1,0 +1,1357 @@
+//! Shared serde types crossing the IPC boundary.
+//!
+//! Contract rules (see `docs/DESIGN.md`):
+//! * Every struct is `camelCase` on the wire so the TypeScript mirror in
+//!   `src/lib/types.ts` needs no adapters. Keep the two files in lockstep.
+//! * Ids are UUID v4 strings (SQLite stores them as TEXT).
+//! * Times are milliseconds. Wall-clock timestamps are RFC3339 UTC strings;
+//!   in-meeting offsets are `i64` milliseconds on the monotonic meeting clock.
+//! * **Zero jargon** (mantra 2): anything a user reads is a sentence, not a
+//!   symbol. Enum variants are machine-facing; the UI maps them through
+//!   `src/lib/copy.ts`. Never put "Whisper", "VAD", "ONNX", "model",
+//!   "connector" or "token" in a string that reaches the UI outside
+//!   Settings → Advanced.
+
+use serde::{Deserialize, Serialize};
+
+/// UUID v4, lowercase hyphenated.
+pub type Id = String;
+/// RFC3339 UTC timestamp.
+pub type Timestamp = String;
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// The only error shape a command may return.
+///
+/// `message` is user-facing and must say what the person can *do*; `detail` is
+/// the technical cause and is only rendered under Settings → Advanced or
+/// written to the redacted log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiError {
+    pub kind: UiErrorKind,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Optional suggested next step the UI can render as a button.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<UiErrorAction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UiErrorKind {
+    /// A permission the person has to grant in system settings.
+    PermissionNeeded,
+    /// Something Echo still has to download before it can work.
+    NotReady,
+    /// Disk full / storage unavailable.
+    Storage,
+    /// Network or remote service problem.
+    Network,
+    /// Credential missing, keychain locked, or the person cancelled the prompt.
+    Credential,
+    /// Bad input from the UI (validated in Rust, never trusted).
+    InvalidInput,
+    /// Requested thing does not exist.
+    NotFound,
+    /// The operation was cancelled on purpose.
+    Cancelled,
+    /// Anything else; message stays generic and calm.
+    Unexpected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UiErrorAction {
+    OpenMicrophoneSettings,
+    OpenScreenRecordingSettings,
+    OpenSpeechSettings,
+    OpenSummarySettings,
+    OpenStorageSettings,
+    Retry,
+    RestartApp,
+}
+
+impl UiError {
+    pub fn new(kind: UiErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            detail: None,
+            action: None,
+        }
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    pub fn with_action(mut self, action: UiErrorAction) -> Self {
+        self.action = Some(action);
+        self
+    }
+
+    pub fn not_found(what: impl Into<String>) -> Self {
+        Self::new(UiErrorKind::NotFound, what)
+    }
+
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self::new(UiErrorKind::InvalidInput, message)
+    }
+
+    pub fn unexpected(detail: impl Into<String>) -> Self {
+        Self::new(
+            UiErrorKind::Unexpected,
+            "Something went wrong. Nothing was lost, your recording is safe on this computer.",
+        )
+        .with_detail(detail)
+    }
+}
+
+impl std::fmt::Display for UiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)?;
+        if let Some(d) = &self.detail {
+            write!(f, " ({d})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UiError {}
+
+/// Every command returns this.
+pub type CmdResult<T> = Result<T, UiError>;
+
+// ---------------------------------------------------------------------------
+// Capture state machine
+// ---------------------------------------------------------------------------
+
+/// Orthogonal to jobs and to detection (DESIGN §3 "State model").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CaptureState {
+    #[default]
+    Idle,
+    Starting,
+    Recording,
+    Paused,
+    Stopping,
+    Stopped,
+    /// Capture could not start or died unrecoverably.
+    Failed,
+    /// Still recording, but with less than we wanted (e.g. system audio lost).
+    Degraded,
+    /// An interrupted meeting was found at launch and awaits a user choice.
+    Recovering,
+}
+
+/// Which channels are actually flowing right now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Channel {
+    /// Microphone, labelled "You" in the UI.
+    #[default]
+    Mic,
+    /// Everything the computer plays.
+    System,
+    /// Derived mixdown used for playback only.
+    Mixed,
+}
+
+impl Channel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Channel::Mic => "mic",
+            Channel::System => "system",
+            Channel::Mixed => "mixed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "mic" => Some(Channel::Mic),
+            "system" => Some(Channel::System),
+            "mixed" => Some(Channel::Mixed),
+            _ => None,
+        }
+    }
+}
+
+/// Why capture is degraded, mapped to a calm banner by the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DegradedReason {
+    /// No permission / device gone: we keep the microphone only.
+    SystemAudioUnavailable,
+    /// Microphone gone, we keep what the computer plays.
+    MicrophoneUnavailable,
+    /// Live text is behind; audio on disk is complete and will catch up.
+    TranscriptBehind,
+    /// Disk is nearly full.
+    StorageLow,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureStatus {
+    pub state: CaptureState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meeting_id: Option<Id>,
+    /// Elapsed time on the monotonic meeting clock.
+    pub elapsed_ms: i64,
+    /// Channels currently producing audio.
+    pub active_channels: Vec<Channel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<DegradedReason>,
+    /// How many utterances are waiting for text. UI shows this only as
+    /// "catching up", never as a number of jobs.
+    pub pending_utterances: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Timestamp>,
+}
+
+/// Options for `start_recording`. All fields optional so the UI can call it
+/// with `{}` from the big Start button.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StartRecordingOptions {
+    /// Title the person typed; otherwise Echo names it from date + detected app.
+    pub title: Option<String>,
+    /// Capture what the computer plays as well as the microphone.
+    pub capture_system_audio: Option<bool>,
+    /// Override the input device (Settings → General).
+    pub input_device_id: Option<String>,
+    /// App name that triggered detection, stored for provenance.
+    pub detected_app: Option<String>,
+}
+
+/// What to do with a meeting that was interrupted by a crash or power loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RecoveryAction {
+    /// Finish transcribing from the audio already on disk.
+    Finish,
+    /// Throw the interrupted meeting away.
+    Discard,
+}
+
+// ---------------------------------------------------------------------------
+// Meetings
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MeetingStatus {
+    /// Row exists, capture has not started (created before capture, §3).
+    #[default]
+    Created,
+    Recording,
+    /// Capture ended, background work still running.
+    Processing,
+    /// Everything the user asked for is done.
+    Complete,
+    /// Capture ended abnormally; audio on disk is still authoritative.
+    Interrupted,
+    Failed,
+}
+
+impl MeetingStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MeetingStatus::Created => "created",
+            MeetingStatus::Recording => "recording",
+            MeetingStatus::Processing => "processing",
+            MeetingStatus::Complete => "complete",
+            MeetingStatus::Interrupted => "interrupted",
+            MeetingStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "created" => Some(MeetingStatus::Created),
+            "recording" => Some(MeetingStatus::Recording),
+            "processing" => Some(MeetingStatus::Processing),
+            "complete" => Some(MeetingStatus::Complete),
+            "interrupted" => Some(MeetingStatus::Interrupted),
+            "failed" => Some(MeetingStatus::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Row of `meetings`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Meeting {
+    pub id: Id,
+    pub title: String,
+    pub started_at: Timestamp,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<Timestamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_app: Option<String>,
+    /// BCP-47-ish dominant language, detected not configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub status: MeetingStatus,
+    pub audio_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mixed_path: Option<String>,
+    pub duration_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<Timestamp>,
+}
+
+/// What the Home and History lists render.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingSummary {
+    pub id: Id,
+    pub title: String,
+    pub started_at: Timestamp,
+    pub duration_ms: i64,
+    pub status: MeetingStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// First useful line of the recap, or of the transcript if there is no recap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    pub has_recap: bool,
+    pub has_audio: bool,
+    pub speaker_count: u32,
+    pub action_item_count: u32,
+}
+
+/// Everything the meeting detail route needs in one round-trip.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingDetail {
+    pub meeting: Meeting,
+    pub speakers: Vec<Speaker>,
+    pub markers: Vec<Marker>,
+    pub summaries: Vec<Summary>,
+    pub action_items: Vec<ActionItem>,
+    pub jobs: Vec<Job>,
+    /// Bytes on disk for this meeting's audio.
+    pub audio_bytes: u64,
+    pub segment_count: u32,
+    /// Which channels were actually captured.
+    pub captured_channels: Vec<Channel>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MeetingQuery {
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+    /// Free-text title filter (not FTS; use `search_transcripts` for that).
+    pub title_contains: Option<String>,
+    pub include_deleted: Option<bool>,
+    pub status: Option<MeetingStatus>,
+}
+
+/// Deleting is a first-class, explainable operation (DESIGN §3 Provenance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeleteMode {
+    /// Remove the recording but keep the transcript and recap.
+    AudioOnly,
+    /// Remove everything about this meeting.
+    Everything,
+}
+
+// ---------------------------------------------------------------------------
+// Audio chunks (crash-recovery journal)
+// ---------------------------------------------------------------------------
+
+/// Row of `audio_chunks`. Raw per-channel audio is the source of truth
+/// (mantra 3); a chunk only counts once `committed` is true.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioChunk {
+    pub id: Id,
+    pub meeting_id: Id,
+    pub channel: Channel,
+    pub seq: i64,
+    pub path: String,
+    pub t_start_ms: i64,
+    pub t_end_ms: i64,
+    pub committed: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Segments
+// ---------------------------------------------------------------------------
+
+/// Row of `segments`. `revision` increases when a later, better pass replaces
+/// the text or the speaker (live partial → final → diarization-refined).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Segment {
+    pub id: Id,
+    pub meeting_id: Id,
+    pub t_start_ms: i64,
+    pub t_end_ms: i64,
+    pub channel: Channel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_id: Option<Id>,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_confidence: Option<f32>,
+    pub revision: i64,
+    pub is_final: bool,
+    /// Which speech engine + revision produced this (provenance, §3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_revision: Option<String>,
+}
+
+/// A segment as it is being written, before it lands in the database.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentDraft {
+    pub meeting_id: Id,
+    pub t_start_ms: i64,
+    pub t_end_ms: i64,
+    pub channel: Channel,
+    pub speaker_id: Option<Id>,
+    pub text: String,
+    pub language: Option<String>,
+    pub avg_confidence: Option<f32>,
+    pub revision: i64,
+    pub is_final: bool,
+    pub model_name: Option<String>,
+    pub model_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TranscriptQuery {
+    pub meeting_id: Id,
+    /// Window on the meeting clock, for the virtualized transcript view.
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
+    pub limit: Option<u32>,
+    /// Include not-yet-final live text.
+    pub include_partial: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Speakers
+// ---------------------------------------------------------------------------
+
+/// Row of `speakers`. Merging is non-destructive: the merged speaker keeps its
+/// row and points at the survivor via `alias_of`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Speaker {
+    pub id: Id,
+    pub meeting_id: Id,
+    /// Stable key from channel attribution or from clustering.
+    pub cluster_key: String,
+    /// "You", "Speaker 1", or whatever the person renamed it to.
+    pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias_of: Option<Id>,
+    /// True for the microphone channel, always "You" until renamed.
+    pub is_self: bool,
+    /// Total speaking time, for the Info tab.
+    pub speaking_ms: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Markers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MarkerKind {
+    /// "Flag action item" button during a live meeting.
+    #[default]
+    ActionItem,
+    /// Generic "remember this".
+    Highlight,
+    /// Automatic note (capture degraded here, device changed, etc).
+    System,
+}
+
+impl MarkerKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MarkerKind::ActionItem => "action_item",
+            MarkerKind::Highlight => "highlight",
+            MarkerKind::System => "system",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "action_item" => Some(MarkerKind::ActionItem),
+            "highlight" => Some(MarkerKind::Highlight),
+            "system" => Some(MarkerKind::System),
+            _ => None,
+        }
+    }
+}
+
+/// Row of `markers`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Marker {
+    pub id: Id,
+    pub meeting_id: Id,
+    pub t_ms: i64,
+    pub kind: MarkerKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Summaries, action items, templates
+// ---------------------------------------------------------------------------
+
+/// Where recaps are written. User-facing names live in `copy.ts`
+/// ("On this computer" / "Google Gemini").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Provider {
+    /// Local generation, nothing leaves the machine.
+    #[default]
+    OnThisComputer,
+    /// Google Gemini via an AI Studio key; text leaves the machine.
+    Gemini,
+}
+
+impl Provider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Provider::OnThisComputer => "onThisComputer",
+            Provider::Gemini => "gemini",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "onThisComputer" | "ollama" => Some(Provider::OnThisComputer),
+            "gemini" => Some(Provider::Gemini),
+            _ => None,
+        }
+    }
+}
+
+/// What a summary backend can do. Drives chunk sizing and streaming
+/// (DESIGN §3 Connectors).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Caps {
+    /// Backend can be asked for strict JSON.
+    pub json_mode: bool,
+    /// Backend can stream partial text.
+    pub streaming: bool,
+    /// Usable input size in characters (not tokens, the UI never sees tokens).
+    pub context_chars: u32,
+    /// Backend can list the choices available to the person.
+    pub can_list_models: bool,
+    /// Text is sent off this machine.
+    pub leaves_machine: bool,
+}
+
+impl Default for Caps {
+    fn default() -> Self {
+        Self {
+            json_mode: false,
+            streaming: false,
+            context_chars: 8_000,
+            can_list_models: false,
+            leaves_machine: false,
+        }
+    }
+}
+
+/// Row of `templates`, 6 built-ins plus custom ones.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Template {
+    pub id: Id,
+    pub name: String,
+    pub prompt_md: String,
+    pub builtin: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TemplateDraft {
+    /// Absent = create, present = update.
+    pub id: Option<Id>,
+    pub name: String,
+    pub prompt_md: String,
+}
+
+/// What language the recap is written in (DESIGN §1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "value")]
+pub enum SummaryLanguage {
+    /// Same language as the meeting.
+    #[default]
+    SameAsMeeting,
+    English,
+    /// A language the person picked.
+    Fixed(String),
+}
+
+/// Request for a recap. Named `SummaryReq` in DESIGN §3.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SummaryReq {
+    pub meeting_id: Id,
+    /// Which template to use; defaults to the general recap.
+    pub template_id: Option<Id>,
+    /// Override the configured backend (the "write it again with something
+    /// else" button).
+    pub provider: Option<Provider>,
+    /// Backend-specific choice, e.g. a local model name. Advanced only.
+    pub model: Option<String>,
+    pub language: Option<SummaryLanguage>,
+    /// Regenerate even if a recap for this transcript revision exists.
+    pub force: Option<bool>,
+}
+
+/// Row of `summaries`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Summary {
+    pub id: Id,
+    pub meeting_id: Id,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<Id>,
+    /// The prompt exactly as used, so an old recap stays explainable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_snapshot: Option<String>,
+    pub provider: Provider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Transcript revision this recap was written from.
+    pub transcript_revision: i64,
+    /// Markdown, already sanitized for render (no raw HTML, no remote assets).
+    pub content_md: String,
+    pub created_at: Timestamp,
+}
+
+/// Row of `action_items`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionItem {
+    pub id: Id,
+    pub meeting_id: Id,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_id: Option<Id>,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Free text as spoken ("before Friday"), never a parsed date.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_hint: Option<String>,
+    pub done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ActionItemPatch {
+    pub id: Id,
+    pub description: Option<String>,
+    pub owner: Option<String>,
+    pub due_hint: Option<String>,
+    pub done: Option<bool>,
+    pub external_url: Option<String>,
+}
+
+/// Configuration for a summary backend, minus the secret (which lives in the
+/// keychain and never crosses IPC).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProviderConfig {
+    pub provider: Provider,
+    /// Local backend address. Loopback by default; anything else gets a
+    /// "this leaves your machine" warning first.
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    /// Only meaningful for backends that need a key. `true` if one is stored.
+    pub has_key: bool,
+    pub enabled: bool,
+    /// The person has been shown, and agreed to, "this address is not on your
+    /// computer, so what was said leaves it". Required before a non-loopback
+    /// address is accepted (DESIGN §3 Connectors); ignored otherwise.
+    #[serde(default)]
+    pub leaves_machine_acknowledged: bool,
+}
+
+/// Result of the "check this works" button on the Summaries settings screen.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderTestResult {
+    pub ok: bool,
+    /// Plain sentence: "Ready to write recaps." / "Couldn't reach it."
+    pub message: String,
+    pub caps: Caps,
+    pub models: Vec<String>,
+    /// True when the address is not loopback, so the UI can warn.
+    pub leaves_machine: bool,
+}
+
+/// One row of the Summaries settings screen.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderInfo {
+    pub provider: Provider,
+    pub config: ProviderConfig,
+    pub caps: Caps,
+    /// Detected as usable right now without any setup.
+    pub available: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Jobs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JobKind {
+    /// Transcribe the parts that live capture could not keep up with.
+    #[default]
+    TranscribeCatchup,
+    /// The canonical offline speaker pass.
+    Diarize,
+    Summarize,
+    Export,
+    /// Fetch what Echo needs to understand speech.
+    Download,
+    /// Build the mixed file used for playback.
+    Mixdown,
+}
+
+impl JobKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobKind::TranscribeCatchup => "transcribe_catchup",
+            JobKind::Diarize => "diarize",
+            JobKind::Summarize => "summarize",
+            JobKind::Export => "export",
+            JobKind::Download => "download",
+            JobKind::Mixdown => "mixdown",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "transcribe_catchup" => Some(JobKind::TranscribeCatchup),
+            "diarize" => Some(JobKind::Diarize),
+            "summarize" => Some(JobKind::Summarize),
+            "export" => Some(JobKind::Export),
+            "download" => Some(JobKind::Download),
+            "mixdown" => Some(JobKind::Mixdown),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JobStatus {
+    #[default]
+    Queued,
+    Running,
+    /// Yielded because a recording started (recording preempts everything).
+    Paused,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl JobStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobStatus::Queued => "queued",
+            JobStatus::Running => "running",
+            JobStatus::Paused => "paused",
+            JobStatus::Done => "done",
+            JobStatus::Failed => "failed",
+            JobStatus::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "queued" => Some(JobStatus::Queued),
+            "running" => Some(JobStatus::Running),
+            "paused" => Some(JobStatus::Paused),
+            "done" => Some(JobStatus::Done),
+            "failed" => Some(JobStatus::Failed),
+            "cancelled" => Some(JobStatus::Cancelled),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled
+        )
+    }
+}
+
+/// Row of `jobs`. Persisted so work survives a restart.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Job {
+    pub id: Id,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meeting_id: Option<Id>,
+    pub kind: JobKind,
+    pub status: JobStatus,
+    /// 0.0..=1.0, or None when the total is genuinely unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct JobQuery {
+    pub meeting_id: Option<Id>,
+    pub kind: Option<JobKind>,
+    pub status: Option<JobStatus>,
+    pub limit: Option<u32>,
+    /// Only jobs that are not finished.
+    pub active_only: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Speech assets ("what Echo needs to understand speech")
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AssetKind {
+    /// Main speech-to-text weights.
+    #[default]
+    Speech,
+    /// Apple-specific encoder companion for the speech asset.
+    SpeechAccelerator,
+    /// Speech/silence detector.
+    SpeechDetector,
+    /// Speaker segmentation.
+    SpeakerSegmenter,
+    /// Speaker fingerprints.
+    SpeakerEmbedder,
+}
+
+impl AssetKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AssetKind::Speech => "speech",
+            AssetKind::SpeechAccelerator => "speech_accelerator",
+            AssetKind::SpeechDetector => "speech_detector",
+            AssetKind::SpeakerSegmenter => "speaker_segmenter",
+            AssetKind::SpeakerEmbedder => "speaker_embedder",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "speech" => Some(AssetKind::Speech),
+            "speech_accelerator" => Some(AssetKind::SpeechAccelerator),
+            "speech_detector" => Some(AssetKind::SpeechDetector),
+            "speaker_segmenter" => Some(AssetKind::SpeakerSegmenter),
+            "speaker_embedder" => Some(AssetKind::SpeakerEmbedder),
+            _ => None,
+        }
+    }
+}
+
+/// Row of `models`. Technical detail: only Settings → Advanced renders the
+/// name, url or revision.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub id: Id,
+    pub kind: AssetKind,
+    pub name: String,
+    pub url: String,
+    pub sha256: String,
+    pub bytes: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// A quality preset as the person sees it: "Everyday", "Careful", "Fastest".
+/// Never a model name outside Advanced.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccuracyLevel {
+    /// Stable machine id, e.g. "everyday".
+    pub id: String,
+    /// "Everyday accuracy"
+    pub name: String,
+    /// "Good for most meetings. Uses about 1.6 GB of space."
+    pub description: String,
+    pub download_bytes: i64,
+    pub installed: bool,
+    /// Currently selected.
+    pub selected: bool,
+    /// Recommended for this computer.
+    pub recommended: bool,
+    /// Model ids this level needs (Advanced / internal).
+    pub asset_ids: Vec<Id>,
+}
+
+/// Answer to "can Echo understand speech right now?".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechReadiness {
+    /// Everything needed to record and get text is on disk.
+    pub ready: bool,
+    /// A download is in flight.
+    pub downloading: bool,
+    /// Bytes still to fetch, for the onboarding progress copy.
+    pub remaining_bytes: i64,
+    /// Currently selected accuracy level id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level_id: Option<String>,
+    /// Loaded in memory right now (mantra 1, normally false when idle).
+    pub loaded: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Detection
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DetectionState {
+    #[default]
+    Idle,
+    /// Signals say a meeting is happening.
+    Detected,
+    /// Muted by the person for a while.
+    Snoozed,
+    /// Turned off in Settings.
+    Off,
+}
+
+/// One reason the watcher thinks a meeting is happening.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectionSignal {
+    pub source: DetectionSource,
+    /// e.g. "zoom.us", shown as "Zoom looks like it's running".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    pub since: Timestamp,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DetectionSource {
+    /// A known meeting app is running.
+    #[default]
+    MeetingApp,
+    /// Something else is using the microphone.
+    InputDeviceInUse,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectionStatus {
+    pub state: DetectionState,
+    pub enabled: bool,
+    pub signals: Vec<DetectionSignal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snoozed_until: Option<Timestamp>,
+    /// Signals have been clear long enough that we suggest stopping.
+    pub suggest_stop: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Permissions & capabilities
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionState {
+    #[default]
+    Unknown,
+    Granted,
+    Denied,
+    /// Asked but the person has not answered yet.
+    Prompting,
+    /// Granted, but this platform needs a restart before it takes effect.
+    RestartRequired,
+    /// Not a thing on this platform.
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionStatus {
+    pub microphone: PermissionState,
+    /// macOS Screen & System Audio Recording; on Linux, PipeWire availability.
+    pub system_audio: PermissionState,
+    pub notifications: PermissionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionTarget {
+    Microphone,
+    SystemAudio,
+    Notifications,
+}
+
+/// Settings → Advanced only. Every string here may be technical.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemCapabilities {
+    pub os: String,
+    pub arch: String,
+    /// Compiled-in speech backend, e.g. "metal+coreml".
+    pub speech_backend: String,
+    /// What actually initialised at runtime, e.g. "metal" or "cpu".
+    pub speech_backend_active: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_fallback_reason: Option<String>,
+    pub cpu_threads: u32,
+    pub total_memory_bytes: u64,
+    pub system_audio_supported: bool,
+    pub tray_supported: bool,
+    pub app_version: String,
+}
+
+// ---------------------------------------------------------------------------
+// Devices & playback
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u16>,
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SearchQuery {
+    /// Raw user input. Escaped before it reaches FTS5 MATCH.
+    pub text: String,
+    pub meeting_id: Option<Id>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub meeting_id: Id,
+    pub meeting_title: String,
+    pub started_at: Timestamp,
+    pub segment_id: Id,
+    pub t_start_ms: i64,
+    /// Snippet with `<mark>`…`</mark>` around matches, HTML-escaped elsewhere.
+    pub snippet_html: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_name: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportFormat {
+    #[default]
+    Markdown,
+    Pdf,
+    Docx,
+    /// Plain text transcript.
+    Text,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExportRequest {
+    pub meeting_id: Id,
+    pub format: ExportFormat,
+    /// Where to write. If absent the caller must have already picked a path.
+    pub destination: Option<String>,
+    pub include_recap: Option<bool>,
+    pub include_transcript: Option<bool>,
+    pub include_action_items: Option<bool>,
+    /// Use a specific recap rather than the latest.
+    pub summary_id: Option<Id>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportResult {
+    pub path: String,
+    pub bytes: u64,
+    pub format: ExportFormat,
+}
+
+// ---------------------------------------------------------------------------
+// Storage & settings
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageReport {
+    pub root: String,
+    pub audio_bytes: u64,
+    pub database_bytes: u64,
+    pub speech_asset_bytes: u64,
+    pub log_bytes: u64,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub meeting_count: u32,
+    /// Biggest meetings first, for the "free up space" list.
+    pub largest_meetings: Vec<MeetingSummary>,
+}
+
+/// Typed view over the `settings` key/value table. Non-secret only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    pub launch_at_login: bool,
+    pub detection_enabled: bool,
+    /// Where recordings live; configurable (DESIGN §2 Audio files).
+    pub storage_dir: String,
+    pub capture_system_audio: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_device_id: Option<String>,
+    pub summary_language: SummaryLanguage,
+    pub summary_provider: Provider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_template_id: Option<Id>,
+    /// Write a recap as soon as a meeting ends.
+    pub auto_summarize: bool,
+    /// Quality preset id.
+    pub accuracy_level_id: String,
+    /// Minutes of idleness after which speech understanding is released from
+    /// memory (mantra 1).
+    pub release_after_idle_minutes: u32,
+    /// Close the window to the tray instead of quitting.
+    pub close_to_tray: bool,
+    pub onboarding_complete: bool,
+    /// Show technical detail (engine, asset names, diagnostics).
+    pub show_advanced: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            launch_at_login: false,
+            detection_enabled: true,
+            storage_dir: String::new(),
+            capture_system_audio: true,
+            input_device_id: None,
+            summary_language: SummaryLanguage::SameAsMeeting,
+            summary_provider: Provider::OnThisComputer,
+            summary_template_id: None,
+            auto_summarize: false,
+            accuracy_level_id: "everyday".to_string(),
+            release_after_idle_minutes: 10,
+            close_to_tray: true,
+            onboarding_complete: false,
+            show_advanced: false,
+        }
+    }
+}
+
+/// Partial update. Absent field = leave alone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SettingsPatch {
+    pub launch_at_login: Option<bool>,
+    pub detection_enabled: Option<bool>,
+    pub storage_dir: Option<String>,
+    pub capture_system_audio: Option<bool>,
+    pub input_device_id: Option<String>,
+    pub summary_language: Option<SummaryLanguage>,
+    pub summary_provider: Option<Provider>,
+    pub summary_template_id: Option<Id>,
+    pub auto_summarize: Option<bool>,
+    pub accuracy_level_id: Option<String>,
+    pub release_after_idle_minutes: Option<u32>,
+    pub close_to_tray: Option<bool>,
+    pub onboarding_complete: Option<bool>,
+    pub show_advanced: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OnboardingStep {
+    Welcome,
+    Permissions,
+    Download,
+    Summaries,
+    Done,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardingState {
+    pub complete: bool,
+    pub completed_steps: Vec<String>,
+    pub permissions: PermissionStatus,
+    pub speech: SpeechReadiness,
+    /// A local summary backend was found without any setup.
+    pub local_summaries_available: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Tray
+// ---------------------------------------------------------------------------
+
+/// Tray icon appearance, driven by capture + detection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TrayState {
+    #[default]
+    Idle,
+    Detected,
+    Recording,
+}
+
+/// What the person picked in the tray menu, forwarded to the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TrayAction {
+    Start,
+    Stop,
+    Open,
+    PauseDetection,
+    Quit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enums_round_trip_through_their_string_form() {
+        for c in [Channel::Mic, Channel::System, Channel::Mixed] {
+            assert_eq!(Channel::parse(c.as_str()), Some(c));
+        }
+        for s in [
+            MeetingStatus::Created,
+            MeetingStatus::Recording,
+            MeetingStatus::Processing,
+            MeetingStatus::Complete,
+            MeetingStatus::Interrupted,
+            MeetingStatus::Failed,
+        ] {
+            assert_eq!(MeetingStatus::parse(s.as_str()), Some(s));
+        }
+        for k in [
+            JobKind::TranscribeCatchup,
+            JobKind::Diarize,
+            JobKind::Summarize,
+            JobKind::Export,
+            JobKind::Download,
+            JobKind::Mixdown,
+        ] {
+            assert_eq!(JobKind::parse(k.as_str()), Some(k));
+        }
+        for s in [
+            JobStatus::Queued,
+            JobStatus::Running,
+            JobStatus::Paused,
+            JobStatus::Done,
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+        ] {
+            assert_eq!(JobStatus::parse(s.as_str()), Some(s));
+        }
+        for k in [
+            MarkerKind::ActionItem,
+            MarkerKind::Highlight,
+            MarkerKind::System,
+        ] {
+            assert_eq!(MarkerKind::parse(k.as_str()), Some(k));
+        }
+        for a in [
+            AssetKind::Speech,
+            AssetKind::SpeechAccelerator,
+            AssetKind::SpeechDetector,
+            AssetKind::SpeakerSegmenter,
+            AssetKind::SpeakerEmbedder,
+        ] {
+            assert_eq!(AssetKind::parse(a.as_str()), Some(a));
+        }
+        for p in [Provider::OnThisComputer, Provider::Gemini] {
+            assert_eq!(Provider::parse(p.as_str()), Some(p));
+        }
+    }
+
+    #[test]
+    fn wire_format_is_camel_case() {
+        let json = serde_json::to_string(&CaptureStatus {
+            state: CaptureState::Recording,
+            elapsed_ms: 1234,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(json.contains("\"elapsedMs\":1234"), "{json}");
+        assert!(json.contains("\"state\":\"recording\""), "{json}");
+    }
+
+    #[test]
+    fn summary_language_is_tagged() {
+        let json = serde_json::to_string(&SummaryLanguage::Fixed("it".into())).unwrap();
+        assert_eq!(json, r#"{"kind":"fixed","value":"it"}"#);
+        let same = serde_json::to_string(&SummaryLanguage::SameAsMeeting).unwrap();
+        assert_eq!(same, r#"{"kind":"sameAsMeeting"}"#);
+    }
+
+    #[test]
+    fn job_status_terminality() {
+        assert!(JobStatus::Done.is_terminal());
+        assert!(!JobStatus::Running.is_terminal());
+        assert!(!JobStatus::Paused.is_terminal());
+    }
+}
