@@ -52,6 +52,12 @@ pub enum SummarizeError {
     MissingCredential,
     #[error("the service refused the request: {0}")]
     Rejected(String),
+    /// The model saved in Settings is not one this service answers for — it was
+    /// renamed, retired, or mistyped. The person fixes it by choosing another
+    /// one, so the whole sentence is written for them: this string can reach the
+    /// screen unchanged.
+    #[error("Echo can't write recaps with “{model}” any more. Open Settings and choose a different one.")]
+    ModelNotFound { model: String },
     #[error("the service took too long")]
     Timeout,
     #[error("cancelled")]
@@ -87,14 +93,16 @@ impl CancelFlag {
 }
 
 /// One request to a backend.
+///
+/// Note what is *not* here: a model. Which model writes the recap is part of the
+/// backend's saved configuration, resolved once when the connector is built, so
+/// a request cannot quietly ask for a different one (see [`Connector::model`]).
 #[derive(Debug, Clone)]
 pub struct GenerateRequest {
     /// Instructions plus transcript. Already sized to the backend's context.
     pub prompt: String,
     /// Separate system instruction, for backends that take one.
     pub system: Option<String>,
-    /// Backend-specific choice. `None` uses the configured default.
-    pub model: Option<String>,
     /// When set, ask for strict JSON matching this schema. Only honoured when
     /// [`Caps::json_mode`] is true; otherwise the prompt carries the schema and
     /// the reply is validated locally either way.
@@ -109,7 +117,6 @@ impl Default for GenerateRequest {
         Self {
             prompt: String::new(),
             system: None,
-            model: None,
             json_schema: None,
             temperature: Some(0.2),
             timeout: Duration::from_secs(180),
@@ -139,6 +146,16 @@ pub trait Connector: Send + Sync {
     /// What this backend can do. Drives chunk sizing, streaming and whether the
     /// UI offers a JSON-strict path.
     fn capabilities(&self) -> Caps;
+
+    /// The model this connector will actually use, resolved from the saved
+    /// configuration when it was built (falling back to the backend's default).
+    /// `None` only when nothing is configured and the backend has no sensible
+    /// default of its own — a local server, where the pulls are the person's own
+    /// deliberate choices.
+    ///
+    /// The recap records this, so an old recap stays explainable even after the
+    /// setting changes.
+    fn model(&self) -> Option<String>;
 
     /// Choices the person can pick from. Empty when the backend cannot list
     /// them ([`Caps::can_list_models`] is false).
@@ -277,10 +294,17 @@ pub async fn list_providers(db: &Db) -> Result<Vec<ProviderInfo>, SummarizeError
         available: ollama_available,
     });
 
-    let gemini_model = repo::get_setting(db, settings::keys::GEMINI_MODEL)
-        .await
-        .map_err(db_err)?
-        .filter(|v| !v.trim().is_empty());
+    // Report the model that would actually write a recap right now, not the raw
+    // row: with nothing saved that is the default, and the Settings screen should
+    // show the person what is in use rather than an empty box.
+    let gemini_model = Some(
+        repo::get_setting(db, settings::keys::GEMINI_MODEL)
+            .await
+            .map_err(db_err)?
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| gemini::DEFAULT_MODEL.to_string()),
+    );
     let has_key = secrets::has(secrets::accounts::GEMINI_API_KEY)
         .await
         .unwrap_or(false);
@@ -354,7 +378,6 @@ pub async fn test_provider(
 async fn run_generate(
     connector: &dyn Connector,
     prompt: String,
-    model: Option<String>,
     cancel: &CancelFlag,
 ) -> Result<String, SummarizeError> {
     if cancel.is_cancelled() {
@@ -362,7 +385,6 @@ async fn run_generate(
     }
     let req = GenerateRequest {
         prompt,
-        model,
         cancel: cancel.clone(),
         ..Default::default()
     };
@@ -484,7 +506,14 @@ pub async fn summarize_meeting(
 
     let app_settings = settings::load(db).await.map_err(db_err)?;
     let provider = req.provider.unwrap_or(app_settings.summary_provider);
+    // Provider and model are both resolved here, at run time, from what is saved
+    // for that backend — the same path for the recap that runs when a meeting
+    // ends and for "write it again" from the meeting screen. `req.model` is
+    // deliberately ignored: choosing a model is a setting for the backend, not a
+    // decision to make once per recap. (The field stays on the wire type so an
+    // older queued job still deserializes.)
     let connector = connector_for(db, provider).await?;
+    let model = connector.model();
     let context_chars = connector.capabilities().context_chars;
 
     let transcript_text = build_transcript_text(db, &req.meeting_id).await?;
@@ -531,13 +560,11 @@ pub async fn summarize_meeting(
         return Err(SummarizeError::NoTranscript);
     }
 
-    let model = req.model.clone();
-
     let content_md = if chunks.len() == 1 {
         ctx.transcript_chunk = chunks[0].clone();
         ctx.chunk_count = 1;
         let prompt = templates::render(&template, &ctx);
-        run_generate(connector.as_ref(), prompt, model.clone(), &cancel).await?
+        run_generate(connector.as_ref(), prompt, &cancel).await?
     } else {
         let mut notes = Vec::with_capacity(chunks.len());
         for (i, chunk) in chunks.iter().enumerate() {
@@ -548,14 +575,14 @@ pub async fn summarize_meeting(
             ctx.chunk_index = i as u32;
             ctx.chunk_count = chunks.len() as u32;
             let prompt = templates::render(&template, &ctx);
-            let note = run_generate(connector.as_ref(), prompt, model.clone(), &cancel).await?;
+            let note = run_generate(connector.as_ref(), prompt, &cancel).await?;
             notes.push(note);
         }
         if cancel.is_cancelled() {
             return Err(SummarizeError::Cancelled);
         }
         let reduce_prompt = templates::render_reduce(&template, &notes, &ctx);
-        run_generate(connector.as_ref(), reduce_prompt, model.clone(), &cancel).await?
+        run_generate(connector.as_ref(), reduce_prompt, &cancel).await?
     };
 
     let sanitized = sanitize_markdown(&content_md);
@@ -641,7 +668,6 @@ fn parse_action_items(text: &str) -> Result<Vec<ActionItemRaw>, SummarizeError> 
 async fn run_action_item_pass(
     connector: &dyn Connector,
     prompt: &str,
-    model: Option<String>,
     schema: &serde_json::Value,
     json_mode: bool,
     cancel: &CancelFlag,
@@ -651,7 +677,6 @@ async fn run_action_item_pass(
     }
     let req = GenerateRequest {
         prompt: prompt.to_string(),
-        model,
         json_schema: json_mode.then(|| schema.clone()),
         cancel: cancel.clone(),
         ..Default::default()
@@ -680,6 +705,10 @@ pub async fn extract_action_items(
         .map_err(db_err)?
         .ok_or_else(|| SummarizeError::Failed("that recap is gone".into()))?;
 
+    // The recap's provider, but today's model: `summary.model` says which model
+    // wrote that recap, and it may since have been changed or retired. Asking a
+    // model that no longer exists for the task list would fail for a reason that
+    // has nothing to do with the task list.
     let connector = connector_for(db, summary.provider).await?;
     let json_mode = connector.capabilities().json_mode;
 
@@ -691,15 +720,8 @@ pub async fn extract_action_items(
     let prompt = templates::render_action_items(&summary.content_md, &ctx);
     let schema = templates::action_item_schema();
 
-    let raw = match run_action_item_pass(
-        connector.as_ref(),
-        &prompt,
-        summary.model.clone(),
-        &schema,
-        json_mode,
-        &cancel,
-    )
-    .await
+    let raw = match run_action_item_pass(connector.as_ref(), &prompt, &schema, json_mode, &cancel)
+        .await
     {
         Ok(items) => items,
         Err(SummarizeError::Cancelled) => return Err(SummarizeError::Cancelled),
@@ -711,7 +733,6 @@ pub async fn extract_action_items(
             match run_action_item_pass(
                 connector.as_ref(),
                 &repair_prompt,
-                summary.model.clone(),
                 &schema,
                 json_mode,
                 &cancel,

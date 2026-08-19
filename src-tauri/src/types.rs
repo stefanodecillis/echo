@@ -618,7 +618,10 @@ pub struct SummaryReq {
     /// Override the configured backend (the "write it again with something
     /// else" button).
     pub provider: Option<Provider>,
-    /// Backend-specific choice, e.g. a local model name. Advanced only.
+    /// Ignored, and kept only so a job queued by an older build still
+    /// deserializes. Which model writes a recap is part of the chosen backend's
+    /// saved configuration ([`crate::summarize::Connector::model`]), not a
+    /// per-recap decision — nothing should send this.
     pub model: Option<String>,
     pub language: Option<SummaryLanguage>,
     /// Regenerate even if a recap for this transcript revision exists.
@@ -1163,7 +1166,8 @@ pub struct Settings {
     pub summary_provider: Provider,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_template_id: Option<Id>,
-    /// Write a recap as soon as a meeting ends.
+    /// Write a recap as soon as a meeting ends. On unless turned off — see
+    /// [`crate::settings::DEFAULT_AUTO_SUMMARIZE`].
     pub auto_summarize: bool,
     /// Quality preset id.
     pub accuracy_level_id: String,
@@ -1188,7 +1192,10 @@ impl Default for Settings {
             summary_language: SummaryLanguage::SameAsMeeting,
             summary_provider: Provider::OnThisComputer,
             summary_template_id: None,
-            auto_summarize: false,
+            // One source of truth for this default, so nothing that builds a
+            // `Settings` without going through `settings::load` can quietly
+            // decide recaps are off.
+            auto_summarize: crate::settings::DEFAULT_AUTO_SUMMARIZE,
             accuracy_level_id: "everyday".to_string(),
             release_after_idle_minutes: 10,
             close_to_tray: true,

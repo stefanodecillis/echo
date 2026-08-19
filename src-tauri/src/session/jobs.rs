@@ -22,7 +22,7 @@ use futures::future::BoxFuture;
 use tokio::sync::Notify;
 
 use crate::db::{repo, Db, DbError};
-use crate::events::JobProgressPayload;
+use crate::events::{JobProgressPayload, NoticeLevel};
 use crate::paths::AppPaths;
 use crate::session::ports::{AsrPort, EventBus, EventSink, Ports, UiEvent};
 use crate::types::{
@@ -431,6 +431,31 @@ fn diarize_failure(cancel: &Cancel, error: crate::diarize::DiarizeError) -> JobF
     }
 }
 
+/// Whether the one gentle "recaps need setting up" notice has already gone out
+/// this run. Automatic recaps happen after every meeting, and someone who
+/// skipped that step in onboarding must not be nagged after every one of them.
+static RECAP_SETUP_NOTICE_SENT: AtomicBool = AtomicBool::new(false);
+
+/// Is a backend actually set up to write recaps with?
+///
+/// Cheap and local: no network probe and no key read beyond "is one stored". The
+/// automatic recap uses this to decide between doing the work and stepping
+/// quietly aside; a recap the person explicitly asked for still runs and still
+/// reports what it needs.
+async fn recap_backend_ready(db: &Db, provider: crate::types::Provider) -> bool {
+    use crate::types::Provider;
+    match provider {
+        Provider::OnThisComputer => repo::get_setting(db, crate::settings::keys::OLLAMA_MODEL)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|model| !model.trim().is_empty()),
+        Provider::Gemini => crate::secrets::has(crate::secrets::accounts::GEMINI_API_KEY)
+            .await
+            .unwrap_or(false),
+    }
+}
+
 async fn summarize(ctx: &JobContext) -> Result<(), JobFailure> {
     let meeting_id = ctx.meeting_id()?.to_string();
     ctx.progress.set(0.0).await;
@@ -451,6 +476,9 @@ async fn summarize(ctx: &JobContext) -> Result<(), JobFailure> {
                 None
             }
         });
+    // No payload means nobody pressed anything: this is the recap that follows a
+    // meeting on its own.
+    let asked_for_by_hand = requested.is_some();
     let req = match requested {
         Some(mut req) => {
             // The meeting the job is attached to always wins over the payload.
@@ -476,10 +504,46 @@ async fn summarize(ctx: &JobContext) -> Result<(), JobFailure> {
         },
     };
 
+    // Nothing is set up to write recaps with (onboarding skipped, most likely).
+    // An automatic recap steps aside quietly: recording and transcripts work
+    // perfectly well without a recap backend (DESIGN §0.4), so this is not a
+    // failure and must not turn into a red mark after every meeting.
+    let provider = req.provider.unwrap_or(settings.summary_provider);
+    if !asked_for_by_hand && !recap_backend_ready(&ctx.db, provider).await {
+        tracing::info!(
+            meeting = %meeting_id,
+            "skipping the automatic recap: nothing is set up to write one"
+        );
+        if !RECAP_SETUP_NOTICE_SENT.swap(true, Ordering::SeqCst) {
+            ctx.events.emit(UiEvent::Notice(crate::events::NoticePayload {
+                level: NoticeLevel::Info,
+                message: "Echo can write recaps of your meetings once you pick who writes them, \
+                          in Settings."
+                    .into(),
+                persistent: false,
+                // Deliberately no meeting: the UI turns a notice that names one
+                // into a link to it, and what this one asks for is in Settings.
+                meeting_id: None,
+                tag: Some("recapNeedsSetup".into()),
+            }));
+        }
+        ctx.progress.set(1.0).await;
+        return Ok(());
+    }
+
     ctx.progress.set(0.1).await;
-    let summary = crate::summarize::summarize_meeting(&ctx.db, &req, ctx.cancel.as_flag())
-        .await
-        .map_err(|error| summarize_failure(&ctx.cancel, error))?;
+    let summary = match crate::summarize::summarize_meeting(&ctx.db, &req, ctx.cancel.as_flag()).await
+    {
+        Ok(summary) => summary,
+        // A meeting with nothing written down cannot have a recap. When nobody
+        // asked for one, that is simply the end of it.
+        Err(crate::summarize::SummarizeError::NoTranscript) if !asked_for_by_hand => {
+            tracing::info!(meeting = %meeting_id, "no words to write a recap from");
+            ctx.progress.set(1.0).await;
+            return Ok(());
+        }
+        Err(error) => return Err(summarize_failure(&ctx.cancel, error)),
+    };
 
     ctx.progress.set(0.8).await;
     match crate::summarize::extract_action_items(
@@ -510,9 +574,18 @@ async fn summarize(ctx: &JobContext) -> Result<(), JobFailure> {
 
     ctx.events
         .emit(UiEvent::SummaryReady(crate::events::SummaryReadyPayload {
-            meeting_id,
+            meeting_id: meeting_id.clone(),
             summary_id: summary.id,
         }));
+    // The recap arrives minutes after the meeting ended, when the person has
+    // moved on to something else, so it says so out loud once.
+    ctx.events.emit(UiEvent::Notice(crate::events::NoticePayload {
+        level: NoticeLevel::Info,
+        message: "Your recap is ready.".into(),
+        persistent: false,
+        meeting_id: Some(meeting_id),
+        tag: Some("recapReady".into()),
+    }));
     ctx.progress.set(1.0).await;
     Ok(())
 }
@@ -667,6 +740,10 @@ fn summarize_failure(cancel: &Cancel, error: crate::summarize::SummarizeError) -
             "Echo couldn't reach the place that writes your recaps. Check it's running.",
         ),
         S::Timeout => JobFailure::failed("That took too long. You can try writing it again."),
+        // Already a finished sentence naming the model and what to do about it,
+        // and "try again" would be a lie: the same setting would pick the same
+        // retired model. It goes on the job as written.
+        ref not_found @ S::ModelNotFound { .. } => JobFailure::failed(not_found.to_string()),
         other => {
             tracing::warn!(error = %other, "the recap stopped");
             JobFailure::failed("Echo couldn't write the recap this time. You can try again.")
@@ -1018,6 +1095,31 @@ mod tests {
         assert!(!flag.is_cancelled());
         c.preempt();
         assert!(flag.is_cancelled());
+    }
+
+    /// The automatic recap has to be able to tell "nothing is set up" from "this
+    /// went wrong", without a network call. Only the on-this-computer branch is
+    /// exercised here: the other one asks the OS keychain, which a test must not.
+    #[tokio::test]
+    async fn a_local_backend_counts_as_ready_only_once_something_is_chosen() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        assert!(
+            !recap_backend_ready(&db, crate::types::Provider::OnThisComputer).await,
+            "a skipped setup is not ready"
+        );
+
+        repo::set_setting(&db, crate::settings::keys::OLLAMA_MODEL, "   ")
+            .await
+            .unwrap();
+        assert!(
+            !recap_backend_ready(&db, crate::types::Provider::OnThisComputer).await,
+            "an empty choice is no choice"
+        );
+
+        repo::set_setting(&db, crate::settings::keys::OLLAMA_MODEL, "something-local")
+            .await
+            .unwrap();
+        assert!(recap_backend_ready(&db, crate::types::Provider::OnThisComputer).await);
     }
 
     #[test]

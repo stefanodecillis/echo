@@ -149,6 +149,22 @@ export function DownloadIcon(props: IconProps) {
   );
 }
 
+/** A quiet trash can, for the hover-only delete affordance on a meeting row. */
+export function TrashIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path
+        d="M5 6.5h10M8 6.5V5a1 1 0 011-1h2a1 1 0 011 1v1.5M6.5 6.5l.6 9.2a1 1 0 001 .8h3.8a1 1 0 001-.8l.6-9.2"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M8.5 9.5v5M11.5 9.5v5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 /** The Echo mark: a sound and its fading repetitions. Same drawing as the app
  * icon (src-tauri/icons/source/app-icon.svg), sized for chrome. */
 export function EchoMark(props: IconProps) {

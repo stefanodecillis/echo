@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { createPortal } from "react-dom";
+import { Link } from "react-router-dom";
 
 import "../styles/animations.css";
 
@@ -62,6 +63,19 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: (id: string)
     >
       <span aria-hidden className={cx("mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full", dotClasses[toast.level])} />
       <p className="flex-1 text-sm text-ink-soft">{toast.message}</p>
+      {/* A notice about a particular meeting arrives long after the person
+          moved on — "Your recap is ready." most of all, now that recaps write
+          themselves. Without this the toast is a dead end (mantra 4): it tells
+          you something is waiting and gives you no way to reach it. */}
+      {toast.meetingId && (
+        <Link
+          to={`/meeting/${toast.meetingId}`}
+          onClick={() => onDismiss(toast.id)}
+          className="shrink-0 self-center text-xs font-medium text-ink underline-offset-2 hover:underline"
+        >
+          {common.open}
+        </Link>
+      )}
       <button
         type="button"
         onClick={() => onDismiss(toast.id)}

@@ -363,9 +363,33 @@ fn apply_launch_at_login(app: &AppHandle, wanted: bool) {
     }
 }
 
+/// Whole-app events, as opposed to per-window ones.
+///
+/// The one that matters: clicking Echo in the Dock while the window is closed to
+/// the tray. macOS sends the application `applicationShouldHandleReopen`, which
+/// Tauri surfaces as [`tauri::RunEvent::Reopen`]; without handling it, a person
+/// who closed the window has no way back in except the tray, and mantra 4 says
+/// no state is a dead end. `has_visible_windows` is the system's own answer, so
+/// a click while the window is already up does nothing.
+fn on_run_event(app: &AppHandle, event: &tauri::RunEvent) {
+    #[cfg(target_os = "macos")]
+    if let tauri::RunEvent::Reopen {
+        has_visible_windows,
+        ..
+    } = event
+    {
+        if !has_visible_windows {
+            tracing::debug!("reopened from the Dock");
+            focus_main_window(app);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, event);
+}
+
 /// Entry point, called from `main.rs`.
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             // A second launch means the person wants the window, not a
             // second copy of Echo.
@@ -405,6 +429,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(echo_command_handler!())
-        .run(tauri::generate_context!())
+        // `build` rather than `run`, so the run loop's own events (the Dock
+        // click above) reach us.
+        .build(tauri::generate_context!())
         .expect("Echo could not start");
+
+    app.run(|app, event| on_run_event(app, &event));
 }

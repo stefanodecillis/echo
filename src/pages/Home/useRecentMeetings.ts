@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 
 import { useEvent } from "../../hooks";
 import { EVENTS, listMeetings } from "../../lib/ipc";
-import type { MeetingSummary, UiError } from "../../lib/types";
+import type { Id, MeetingSummary, UiError } from "../../lib/types";
 
 const RECENT_LIMIT = 6;
 
@@ -11,6 +11,10 @@ export interface RecentMeetingsState {
   loading: boolean;
   error: UiError | undefined;
   reload: () => void;
+  /** Drops a row the instant it's deleted, so it never lingers for the length
+   * of a round trip. The core also announces the delete as `meetingUpdated`,
+   * which reloads the list right behind this — this is the fast half. */
+  removeMeeting: (meetingId: Id) => void;
 }
 
 /**
@@ -48,7 +52,11 @@ export function useRecentMeetings(): RecentMeetingsState {
 
   const reload = () => setReloadToken((t) => t + 1);
 
+  const removeMeeting = (meetingId: Id) => {
+    setMeetings((list) => list.filter((m) => m.id !== meetingId));
+  };
+
   useEvent(EVENTS.meetingUpdated, reload);
 
-  return { meetings, loading, error, reload };
+  return { meetings, loading, error, reload, removeMeeting };
 }

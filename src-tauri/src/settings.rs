@@ -39,10 +39,19 @@ pub mod keys {
     pub const MODEL_CATALOG_REVISION: &str = "model_catalog_revision";
 }
 
+/// Recaps are written on their own once a meeting ends. The happy path is
+/// "notification → click → Start → recap appears" (mantra 4), which is only true
+/// if nobody has to find a switch first. Someone who turned it off has `false`
+/// stored, and a stored value always wins over this.
+pub const DEFAULT_AUTO_SUMMARIZE: bool = true;
+
 /// Read every setting, filling in defaults for anything missing.
 pub async fn load(db: &Db) -> Result<Settings, DbError> {
     let raw = repo::all_settings(db).await?;
-    let mut s = Settings::default();
+    let mut s = Settings {
+        auto_summarize: DEFAULT_AUTO_SUMMARIZE,
+        ..Settings::default()
+    };
 
     let get = |k: &str| raw.get(k).map(String::as_str);
 
@@ -196,6 +205,10 @@ mod tests {
         assert_eq!(s.summary_language, SummaryLanguage::SameAsMeeting);
         assert_eq!(s.release_after_idle_minutes, 10);
         assert!(
+            s.auto_summarize,
+            "a recap is written on its own unless someone turned that off"
+        );
+        assert!(
             !s.storage_dir.is_empty(),
             "storage location must always resolve"
         );
@@ -231,6 +244,34 @@ mod tests {
         .unwrap();
         assert!(!after2.detection_enabled, "earlier change survives");
         assert!(after2.auto_summarize);
+    }
+
+    #[tokio::test]
+    async fn turning_automatic_recaps_off_is_remembered() {
+        let db = connect_in_memory().await.unwrap();
+        let after = apply(
+            &db,
+            &SettingsPatch {
+                auto_summarize: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!after.auto_summarize, "a stored 'no' beats the default");
+        assert!(!load(&db).await.unwrap().auto_summarize);
+
+        // And it can be turned back on.
+        apply(
+            &db,
+            &SettingsPatch {
+                auto_summarize: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(load(&db).await.unwrap().auto_summarize);
     }
 
     #[tokio::test]

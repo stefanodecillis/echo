@@ -233,6 +233,14 @@ impl Connector for OllamaConnector {
         }
     }
 
+    fn model(&self) -> Option<String> {
+        self.model.clone()
+    }
+
+    /// Everything the server has pulled, unfiltered and in the order it reports
+    /// them. Someone running a local server chose each of those pulls on
+    /// purpose; second-guessing that list would only hide a model they meant to
+    /// use.
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>, SummarizeError>> {
         Box::pin(async move {
             let resp = with_one_retry(|| {
@@ -285,7 +293,9 @@ impl Connector for OllamaConnector {
     ) -> BoxStream<'a, Result<GenerateEvent, SummarizeError>> {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
-        let model = req.model.clone().or_else(|| self.model.clone());
+        // Which model to use is this backend's saved setting, not something a
+        // single recap decides.
+        let model = self.model.clone();
         let system = req.system.clone();
         let prompt = req.prompt.clone();
         let json_schema = req.json_schema.clone();

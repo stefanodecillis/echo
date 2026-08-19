@@ -252,6 +252,13 @@ export interface SummaryReq {
   meetingId: Id;
   templateId?: Id;
   provider?: Provider;
+  /**
+   * Ignored by the core, and only still here so an older queued job
+   * deserializes. Which model writes a recap belongs to the chosen backend's
+   * settings, not to one recap — don't send it.
+   *
+   * @deprecated
+   */
   model?: string;
   language?: SummaryLanguage;
   force?: boolean;

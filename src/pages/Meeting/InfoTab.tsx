@@ -56,7 +56,7 @@ export function InfoTab({ meetingId, detail }: InfoTabProps) {
         <h2 className="text-sm font-semibold text-ink">{copy.infoCapturedTitle}</h2>
         <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
           <div>
-            <dt className="text-ink-faint">{copy.infoCapturedTitle}</dt>
+            <dt className="text-ink-faint">{copy.infoCapturedLabel}</dt>
             <dd className="mt-1 flex flex-wrap gap-1.5">
               {channelOrder
                 .filter((c) => detail.capturedChannels.includes(c))

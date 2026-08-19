@@ -1,15 +1,22 @@
 import { Link } from "react-router-dom";
 
-import { Card, Chip, EmptyState, MeetingsIcon, Skeleton } from "../../components";
-import { common, home, languageLabel } from "../../lib/copy";
-import type { MeetingSummary } from "../../lib/types";
-import { formatDuration, formatRelativeDate } from "./format";
+import { Button, Card, EchoMark, EmptyState, Skeleton } from "../../components";
+import { common, home } from "../../lib/copy";
+import type { StartRecordingOptions } from "../../lib/types";
+import { MeetingRow } from "./MeetingRow";
 import { useRecentMeetings } from "./useRecentMeetings";
+
+export interface RecentMeetingsProps {
+  /** Wired to the same Start flow as the (now-gone) idle hero, so the
+   * all-empty state is never a dead end. */
+  onStart?: (options?: StartRecordingOptions) => void;
+  starting?: boolean;
+}
 
 /** The recent-meetings section: a loading skeleton, an error with a retry,
  * the first-run empty state, or the rows themselves. */
-export function RecentMeetings() {
-  const { meetings, loading, error, reload } = useRecentMeetings();
+export function RecentMeetings({ onStart, starting }: RecentMeetingsProps) {
+  const { meetings, loading, error, reload, removeMeeting } = useRecentMeetings();
 
   return (
     <section className="flex flex-col gap-3">
@@ -41,40 +48,24 @@ export function RecentMeetings() {
         </Card>
       ) : meetings.length === 0 ? (
         <EmptyState
-          icon={<MeetingsIcon className="h-8 w-8" />}
+          icon={<EchoMark className="h-8 w-8" />}
           title={home.emptyTitle}
           description={home.emptyDescription}
+          action={
+            onStart ? (
+              <Button variant="secondary" loading={starting} onClick={() => onStart()}>
+                {home.startButton}
+              </Button>
+            ) : undefined
+          }
         />
       ) : (
         <ul className="flex flex-col gap-2">
           {meetings.map((meeting) => (
-            <MeetingRow key={meeting.id} meeting={meeting} />
+            <MeetingRow key={meeting.id} meeting={meeting} onDeleted={removeMeeting} />
           ))}
         </ul>
       )}
     </section>
-  );
-}
-
-function MeetingRow({ meeting }: { meeting: MeetingSummary }) {
-  const language = languageLabel(meeting.language);
-  return (
-    <li>
-      <Link to={`/meeting/${meeting.id}`} className="block">
-        <Card interactive padding="md" className="flex flex-col gap-1.5">
-          <div className="flex items-center justify-between gap-3">
-            <h3 className="truncate text-sm font-medium text-ink">{meeting.title}</h3>
-            <span className="shrink-0 text-xs text-ink-faint">
-              {formatRelativeDate(meeting.startedAt)}
-            </span>
-          </div>
-          <div className="flex items-center gap-2 text-xs text-ink-faint">
-            <span>{formatDuration(meeting.durationMs)}</span>
-            {language && <Chip>{language}</Chip>}
-          </div>
-          {meeting.snippet && <p className="truncate text-sm text-ink-soft">{meeting.snippet}</p>}
-        </Card>
-      </Link>
-    </li>
   );
 }

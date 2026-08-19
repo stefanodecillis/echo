@@ -2,9 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { EmptyState, SearchInput, Skeleton } from "@/components";
-import { search as copy } from "@/lib/copy";
-import { listMeetings, searchTranscripts } from "@/lib/ipc";
-import type { Id, SearchHit } from "@/lib/types";
+import { useEvent } from "@/hooks";
+import { MeetingRow } from "@/pages/Home/MeetingRow";
+import { common, search as copy } from "@/lib/copy";
+import { EVENTS, listMeetings, searchTranscripts, toUiError } from "@/lib/ipc";
+import type { Id, MeetingSummary, SearchHit, UiError } from "@/lib/types";
 
 import { formatResultDate, formatTimestamp } from "./lib/date";
 
@@ -19,6 +21,10 @@ interface MeetingGroup {
  * that it still feels instant. */
 const DEBOUNCE_MS = 300;
 const MIN_QUERY_LENGTH = 2;
+
+/** Comfortably above what anyone will actually have recorded — `list_meetings`
+ * caps at this anyway, so this reads as "everything" in practice. */
+const ALL_MEETINGS_LIMIT = 500;
 
 function groupByMeeting(hits: SearchHit[]): MeetingGroup[] {
   const order: Id[] = [];
@@ -41,9 +47,12 @@ function groupByMeeting(hits: SearchHit[]): MeetingGroup[] {
 }
 
 /**
- * `/search` — full-text search across every meeting Echo has kept, grouped
- * by meeting, with the matching words underlined. Clicking a hit opens that
- * meeting's Transcript tab already scrolled to the moment it was said.
+ * `/search` — "Meetings" in the sidebar. With nothing typed it lists every
+ * meeting Echo has kept, newest first, exactly like Home's Recent meetings
+ * (same `listMeetings` call, same row). Typing switches to full-text search
+ * across every meeting, grouped by meeting with the matching words
+ * underlined. Clicking a hit opens that meeting's Transcript tab already
+ * scrolled to the moment it was said.
  */
 export default function SearchPage() {
   const navigate = useNavigate();
@@ -51,15 +60,39 @@ export default function SearchPage() {
   const [query, setQuery] = useState(() => searchParams.get("q") ?? "");
   const [hits, setHits] = useState<SearchHit[]>();
   const [searching, setSearching] = useState(false);
-  const [hasAnyMeetings, setHasAnyMeetings] = useState<boolean>();
 
-  // Whether there is anything to search at all, checked once — an empty
-  // library reads very differently from "nothing found for that word".
+  const [allMeetings, setAllMeetings] = useState<MeetingSummary[]>();
+  const [allMeetingsError, setAllMeetingsError] = useState<UiError>();
+  const [reloadToken, setReloadToken] = useState(0);
+
+  // The full list, newest first. This doubles as "is the library empty at
+  // all" (independent of whatever's typed) and as the browse view shown
+  // before a search word is typed.
   useEffect(() => {
-    listMeetings({ limit: 1 })
-      .then((list) => setHasAnyMeetings(list.length > 0))
-      .catch(() => setHasAnyMeetings(true));
-  }, []);
+    let cancelled = false;
+    listMeetings({ limit: ALL_MEETINGS_LIMIT })
+      .then((list) => {
+        if (cancelled) return;
+        setAllMeetings(list);
+        setAllMeetingsError(undefined);
+      })
+      .catch((err) => {
+        if (!cancelled) setAllMeetingsError(toUiError(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadToken]);
+
+  // A meeting finishing its recap, getting renamed, or being let go for having
+  // nothing in it all arrive as this — the same signal Home's list listens to,
+  // so both lists say the same thing at the same time.
+  useEvent(EVENTS.meetingUpdated, () => setReloadToken((t) => t + 1));
+
+  const handleDeleted = (meetingId: Id) => {
+    setAllMeetings((list) => list?.filter((m) => m.id !== meetingId));
+    setHits((list) => list?.filter((hit) => hit.meetingId !== meetingId));
+  };
 
   // Keep the query in the URL so the search survives a back-navigation or a
   // copied link, without pushing a history entry per keystroke.
@@ -96,11 +129,20 @@ export default function SearchPage() {
     navigate(`/meeting/${hit.meetingId}?tab=transcript&t=${hit.tStartMs}`);
   };
 
-  const showIdle = hasAnyMeetings !== false && query.trim().length === 0;
-  const showEmptyLibrary = hasAnyMeetings === false;
-  const showLoading = !showEmptyLibrary && !showIdle && searching;
-  const showNoResults = !showEmptyLibrary && !showIdle && !searching && hits !== undefined && groups.length === 0;
-  const showResults = !showEmptyLibrary && !showIdle && !searching && groups.length > 0;
+  const trimmed = query.trim();
+  const libraryLoaded = allMeetings !== undefined;
+  const libraryEmpty = libraryLoaded && allMeetings!.length === 0;
+
+  const showEmptyLibrary = libraryEmpty;
+  const isBrowsing = !showEmptyLibrary && trimmed.length === 0;
+  const showBrowseLoading = isBrowsing && !libraryLoaded && !allMeetingsError;
+  const showBrowseError = isBrowsing && !!allMeetingsError;
+  const showBrowseList = isBrowsing && libraryLoaded && !allMeetingsError;
+
+  const isQuerying = !showEmptyLibrary && trimmed.length > 0;
+  const showLoading = isQuerying && searching;
+  const showNoResults = isQuerying && !searching && hits !== undefined && groups.length === 0;
+  const showResults = isQuerying && !searching && groups.length > 0;
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-8 py-10">
@@ -117,7 +159,34 @@ export default function SearchPage() {
         <EmptyState title={copy.noMeetingsTitle} description={copy.noMeetingsDescription} />
       )}
 
-      {showIdle && <EmptyState title={copy.idleTitle} description={copy.idleDescription} />}
+      {showBrowseLoading && (
+        <div className="flex flex-col gap-2" aria-hidden>
+          <Skeleton className="h-16 w-full" />
+          <Skeleton className="h-16 w-full" />
+          <Skeleton className="h-16 w-full" />
+        </div>
+      )}
+
+      {showBrowseError && (
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-hairline px-4 py-3">
+          <p className="text-sm text-ink-faint">{allMeetingsError?.message}</p>
+          <button
+            type="button"
+            onClick={() => setReloadToken((t) => t + 1)}
+            className="shrink-0 text-sm font-medium text-ink underline-offset-2 hover:underline"
+          >
+            {common.retry}
+          </button>
+        </div>
+      )}
+
+      {showBrowseList && (
+        <ul className="flex flex-col gap-2">
+          {allMeetings!.map((meeting) => (
+            <MeetingRow key={meeting.id} meeting={meeting} onDeleted={handleDeleted} />
+          ))}
+        </ul>
+      )}
 
       {showLoading && (
         <div className="flex flex-col gap-3" aria-hidden>

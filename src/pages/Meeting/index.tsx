@@ -79,7 +79,7 @@ export default function MeetingPage() {
         }}
       />
 
-      <div className="border-b border-hairline px-8">
+      <div className="px-8">
         <Tabs
           items={[
             { id: "recap", label: copy.tabRecap },

@@ -154,6 +154,15 @@ impl From<summarize::SummarizeError> for UiError {
             )
             .with_action(UiErrorAction::Retry),
             S::Cancelled => UiError::new(UiErrorKind::Cancelled, "Stopped."),
+            // The message is already the whole sentence the person needs — it
+            // names the model that went away and says to choose another — so it
+            // goes on screen as written, with the button that gets them there.
+            // Left to `unexpected` it would hide behind "something went wrong"
+            // and only show up under Advanced.
+            ref not_found @ S::ModelNotFound { .. } => {
+                UiError::new(UiErrorKind::NotReady, not_found.to_string())
+                    .with_action(UiErrorAction::OpenSummarySettings)
+            }
             other => UiError::unexpected(other.to_string()),
         }
     }
@@ -382,6 +391,11 @@ pub async fn update_meeting_title(
 }
 
 /// Delete a meeting, or just its audio. Files are removed after the rows.
+///
+/// One confirmation in the UI and then it is gone: the transcript, the speakers,
+/// the markers, the recap and its tasks, the work queue, the search index and
+/// every audio file (`repo::delete_meeting` and the folder below). No second
+/// "are you really sure" — the person said so once.
 #[tauri::command]
 pub async fn delete_meeting(
     state: State<'_, AppState>,
@@ -389,8 +403,12 @@ pub async fn delete_meeting(
     mode: DeleteMode,
 ) -> CmdResult<()> {
     check_id(&meeting_id)?;
-    // Stop transcribing audio that is on its way to the bin.
-    state.session.forget_meeting(&meeting_id);
+    // Stop transcribing, and stop any background work, for audio that is on its
+    // way to the bin.
+    state.session.drop_work_for_meeting(&meeting_id).await;
+    // Read before removing: the announcement below needs the name and length,
+    // and after a full delete there is no row left to ask.
+    let before = repo::get_meeting(&state.db, &meeting_id).await.ok().flatten();
     let dir = meeting_audio_dir(&state, &meeting_id).await;
     let orphaned = match mode {
         DeleteMode::AudioOnly => repo::forget_audio(&state.db, &meeting_id).await?,
@@ -399,9 +417,33 @@ pub async fn delete_meeting(
     for path in orphaned {
         let _ = std::fs::remove_file(path);
     }
+    // Only ever the folder named after this meeting; `meeting_audio_dir` makes
+    // sure a row that recorded the storage root cannot send this at the root.
     if matches!(mode, DeleteMode::Everything) || dir.exists() {
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // Say so, once, on the one channel every list already listens to. Deleting a
+    // meeting from Home must also empty it out of the Meetings page and the
+    // meeting's own screen — a row that is gone should not need a reload to
+    // disappear. Emitted after the rows and the files, so nothing that refreshes
+    // on this can read the meeting back.
+    use crate::session::ports::EventSink;
+    state
+        .session
+        .events()
+        .emit(crate::session::ports::UiEvent::MeetingUpdated(
+            crate::events::MeetingUpdatedPayload {
+                meeting_id: meeting_id.clone(),
+                status: before
+                    .as_ref()
+                    .map(|m| m.status)
+                    .unwrap_or(MeetingStatus::Failed),
+                title: before.as_ref().map(|m| m.title.clone()),
+                duration_ms: before.as_ref().map(|m| m.duration_ms).unwrap_or(0),
+                deleted: matches!(mode, DeleteMode::Everything),
+            },
+        ));
     Ok(())
 }
 

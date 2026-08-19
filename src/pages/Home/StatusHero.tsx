@@ -93,19 +93,12 @@ export function StatusHero({
     );
   }
 
-  return (
-    <Card padding="lg" className="flex flex-col items-start gap-3">
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight text-ink">{home.heroIdleTitle}</h1>
-        <p className="mt-1 text-sm text-ink-soft">{home.heroIdleSubtitle}</p>
-      </div>
-      <Button variant="secondary" loading={starting} onClick={() => onStart()}>
-        {home.startButton}
-      </Button>
-      <p className="text-xs text-ink-ghost">{home.heroIdleTip}</p>
-      <StartError message={startErrorMessage} action={startErrorAction} />
-    </Card>
-  );
+  // Idle, with nothing detected: Start already lives in the sidebar and
+  // detection opens the app on its own, so there is nothing this card would
+  // say that isn't said better elsewhere — except a failed start attempt
+  // (e.g. the sidebar's "New meeting" hitting a permission problem), which
+  // still needs somewhere to surface so it's never a silent dead end.
+  return <StartError message={startErrorMessage} action={startErrorAction} />;
 }
 
 function RecordingHero({

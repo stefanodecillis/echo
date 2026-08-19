@@ -31,7 +31,7 @@ export function Tabs({ items, value, onChange, className }: TabsProps) {
             className={cx(
               "relative flex items-center gap-1.5 pb-3 text-sm font-medium transition-colors",
               "focus-visible:outline-none",
-              active ? "text-ink" : "text-ink-faint hover:text-ink-soft",
+              active ? "text-ink" : "text-ink-soft hover:text-ink",
             )}
           >
             {item.icon}
@@ -39,7 +39,7 @@ export function Tabs({ items, value, onChange, className }: TabsProps) {
             <span
               aria-hidden
               className={cx(
-                "absolute inset-x-0 -bottom-px h-0.5 rounded-full transition-colors",
+                "absolute inset-x-0 -bottom-px h-[2px] rounded-full transition-colors",
                 active ? "bg-ink" : "bg-transparent",
               )}
             />

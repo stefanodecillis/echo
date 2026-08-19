@@ -49,6 +49,11 @@ use crate::types::{
 /// Bounded, because a stuck engine must never stop a meeting from ending.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Less committed audio than this, with nothing written down, is not a meeting:
+/// it is a mis-click, a notification tapped by accident, or a start-then-stop
+/// while looking for the right button. See [`recovery::meeting_has_content`].
+pub const MIN_KEPT_MS: i64 = 3_000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("not implemented yet")]
@@ -321,7 +326,7 @@ impl Inner {
 
     /// Capture died. Everything already committed is safe, so this ends the
     /// recording the same way a stop would: no dead ends.
-    pub(crate) async fn note_fatal(&self, detail: &str, meeting_id: &str) {
+    pub(crate) async fn note_fatal(self: &Arc<Self>, detail: &str, meeting_id: &str) {
         tracing::error!(detail, "capture stopped unexpectedly");
         // Do not join the pipeline tasks here: this runs inside one of them.
         let handle = self.capture.lock().await.take();
@@ -332,11 +337,19 @@ impl Inner {
         let committed = jobs::committed_end_ms(&self.db, meeting_id)
             .await
             .unwrap_or(0);
+        // Literally the predicate a normal stop uses, not a copy of it: a
+        // capture that died is the *most* likely moment for the journal to be
+        // behind the files on disk, and that fallback look in the folder is the
+        // whole reason `meeting_has_content` exists (mantra 3). On any doubt it
+        // answers "there is something here", which is the answer we want.
+        let worth_keeping = recovery::meeting_has_content(self, meeting_id)
+            .await
+            .unwrap_or(true);
         let language = repo::language_histogram(&self.db, meeting_id)
             .await
             .ok()
             .and_then(|h| h.first().map(|(l, _)| l.clone()));
-        let status = if committed > 0 {
+        let status = if worth_keeping {
             MeetingStatus::Processing
         } else {
             MeetingStatus::Failed
@@ -360,23 +373,71 @@ impl Inner {
         self.emit_state();
         self.notice(NoticePayload {
             level: NoticeLevel::Problem,
-            message: "Echo had to stop listening. Everything recorded up to now is saved.".into(),
+            message: if worth_keeping {
+                "Echo had to stop listening. Everything recorded up to now is saved.".into()
+            } else {
+                "Echo had to stop listening before it recorded anything. You can start again."
+                    .to_string()
+            },
             persistent: true,
-            meeting_id: Some(meeting_id.to_string()),
+            meeting_id: worth_keeping.then(|| meeting_id.to_string()),
             tag: Some("captureFailed".into()),
         });
         self.ports.events.emit(UiEvent::TrayState(TrayState::Idle));
 
-        if committed > 0 {
-            // Turn what we have into a finished meeting.
+        if worth_keeping {
+            // Turn what we have into a finished meeting, recap included when
+            // that is what the settings say (on unless turned off).
             let _ = self
                 .jobs
                 .queue(Some(meeting_id), JobKind::TranscribeCatchup)
                 .await;
             let _ = self.jobs.queue(Some(meeting_id), JobKind::Diarize).await;
             let _ = self.jobs.queue(Some(meeting_id), JobKind::Mixdown).await;
+            let auto_summarize = crate::settings::load(&self.db)
+                .await
+                .map(|s| s.auto_summarize)
+                .unwrap_or(crate::settings::DEFAULT_AUTO_SUMMARIZE);
+            if auto_summarize {
+                let _ = self.jobs.queue(Some(meeting_id), JobKind::Summarize).await;
+            }
+        } else {
+            // Out of the way rather than in the list. The row is kept (not
+            // deleted) because a capture that fell over is worth having in the
+            // diagnostics log, and there are no files to reclaim.
+            let _ = repo::soft_delete_meeting(&self.db, meeting_id).await;
+            self.ports.events.emit(UiEvent::MeetingUpdated(
+                MeetingUpdatedPayload {
+                    meeting_id: meeting_id.to_string(),
+                    status: MeetingStatus::Failed,
+                    title: None,
+                    duration_ms: 0,
+                    deleted: true,
+                },
+            ));
         }
         let _ = self.jobs.release().await;
+    }
+
+    /// Stop anything queued or running for this meeting. Used when a meeting is
+    /// deleted or discarded: work against a row that is going away is wasted
+    /// battery at best and a confusing error at worst.
+    pub(crate) async fn cancel_jobs_for(&self, meeting_id: &str) {
+        let active = repo::list_jobs(
+            &self.db,
+            &crate::types::JobQuery {
+                meeting_id: Some(meeting_id.to_string()),
+                active_only: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_default();
+        for job in active {
+            if let Err(error) = self.jobs.cancel(&job.id).await {
+                tracing::debug!(%error, "could not stop work for a meeting that is going away");
+            }
+        }
     }
 
     /// Release the speech engine after a quiet spell (mantra 1).
@@ -684,7 +745,12 @@ impl SessionManager {
     }
 
     /// Stop recording, commit every chunk, then queue catch-up, the speaker
-    /// pass, the mixdown and (when the setting says so) the recap.
+    /// pass, the mixdown and the recap.
+    ///
+    /// A meeting that produced nothing worth keeping is deleted here rather than
+    /// left in the list as a husk ([`recovery::meeting_has_content`]), in which
+    /// case this returns `None` and the UI goes back Home instead of opening a
+    /// meeting that no longer exists.
     ///
     /// Not recording returns `None`.
     pub async fn stop(&self) -> Result<Option<Id>, SessionError> {
@@ -747,22 +813,37 @@ impl SessionManager {
         )
         .await?;
 
-        // Catch-up → speakers → playback file → (recap).
-        recovery::queue_finalization(&inner, &meeting_id).await?;
+        // Catch-up → speakers → playback file → recap. Or, when there is nothing
+        // to work on, no jobs at all and no meeting either.
+        let outcome = recovery::queue_finalization(&inner, &meeting_id).await?;
         if let Err(error) = inner.jobs.release().await {
             tracing::warn!(%error, "could not pick background work back up");
         }
 
+        let discarded = matches!(outcome, recovery::Finalized::Discarded);
         {
             let mut live = inner.live.lock().expect("capture state lock");
-            live.elapsed_ms = duration_ms;
+            live.elapsed_ms = if discarded { 0 } else { duration_ms };
             live.active_channels.clear();
             live.degraded_reason = None;
+            if discarded {
+                // Nothing left to point at.
+                live.meeting_id = None;
+                live.started_at = None;
+            }
         }
         inner.pending.store(0, Ordering::SeqCst);
         inner.transition(&CaptureEvent::Stopped);
         inner.emit_state();
         inner.ports.events.emit(UiEvent::TrayState(TrayState::Idle));
+
+        if discarded {
+            // `queue_finalization` already told the UI the row is gone.
+            inner.arm_idle_release();
+            tracing::info!(meeting = %meeting_id, duration_ms, "an empty recording was let go");
+            return Ok(None);
+        }
+
         inner
             .ports
             .events
@@ -990,6 +1071,17 @@ impl SessionManager {
     /// transcribing audio that is on its way to the bin.
     pub fn forget_meeting(&self, meeting_id: &str) {
         self.0.ports.asr.forget_meeting(meeting_id);
+    }
+
+    /// [`SessionManager::forget_meeting`], and stop the background work too.
+    ///
+    /// Deleting the row would cascade the `jobs` rows away, but a job that is
+    /// *running* holds only the id and would carry on reading files that are
+    /// about to disappear. Cancelling first means it stops at its next
+    /// checkpoint instead.
+    pub async fn drop_work_for_meeting(&self, meeting_id: &str) {
+        self.0.ports.asr.forget_meeting(meeting_id);
+        self.0.cancel_jobs_for(meeting_id).await;
     }
 
     /// On the way out: end a recording cleanly, park the queue, free memory.
@@ -1299,6 +1391,7 @@ mod tests {
         assert!(h.events.notice_tagged("systemAudioLost"));
         // Still a normal recording otherwise.
         assert_eq!(status.meeting_id.as_deref(), Some(id.as_str()));
+        h.record_a_minute(&id).await;
         assert!(h.session.stop().await.unwrap().is_some());
     }
 
@@ -1406,26 +1499,16 @@ mod tests {
     async fn stopping_queues_the_finishing_work_in_order() {
         let h = Harness::new().await;
         let id = h.session.start(Default::default()).await.unwrap();
+        h.record_a_minute(&id).await;
         h.session.stop().await.unwrap();
 
-        let queued: Vec<JobKind> = repo::list_jobs(
-            &h.db,
-            &JobQuery {
-                meeting_id: Some(id.clone()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|j| j.kind)
-        .collect();
+        let queued = h.queued_kinds(&id).await;
         assert!(queued.contains(&JobKind::TranscribeCatchup));
         assert!(queued.contains(&JobKind::Diarize));
         assert!(queued.contains(&JobKind::Mixdown));
         assert!(
-            !queued.contains(&JobKind::Summarize),
-            "recaps are opt-in unless the person asked for them automatically"
+            queued.contains(&JobKind::Summarize),
+            "the recap is written on its own by default"
         );
 
         // The queue hands them out catch-up first.
@@ -1434,12 +1517,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_recap_is_queued_too_when_the_person_asked_for_one_automatically() {
+    async fn no_recap_is_queued_when_the_person_turned_that_off() {
         let h = Harness::new().await;
         crate::settings::apply(
             &h.db,
             &crate::types::SettingsPatch {
-                auto_summarize: Some(true),
+                auto_summarize: Some(false),
                 ..Default::default()
             },
         )
@@ -1447,21 +1530,150 @@ mod tests {
         .unwrap();
 
         let id = h.session.start(Default::default()).await.unwrap();
+        h.record_a_minute(&id).await;
         h.session.stop().await.unwrap();
 
-        let kinds: Vec<JobKind> = repo::list_jobs(
-            &h.db,
-            &JobQuery {
-                meeting_id: Some(id),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|j| j.kind)
-        .collect();
-        assert!(kinds.contains(&JobKind::Summarize));
+        let kinds = h.queued_kinds(&id).await;
+        assert!(kinds.contains(&JobKind::TranscribeCatchup));
+        assert!(
+            !kinds.contains(&JobKind::Summarize),
+            "a stored 'no' is respected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Nothing recorded, nothing kept
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_start_and_an_immediate_stop_leaves_no_meeting_behind() {
+        let h = Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        let dir = h.paths.meeting_dir(&id);
+        assert!(dir.exists());
+
+        // No chunk was ever committed and nothing was said.
+        assert!(
+            h.session.stop().await.unwrap().is_none(),
+            "there is no meeting to open"
+        );
+
+        assert!(repo::get_meeting(&h.db, &id).await.unwrap().is_none());
+        assert!(repo::list_meetings(&h.db, &all_meetings())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            h.queued_kinds(&id).await.is_empty(),
+            "no work is queued for a meeting that is gone"
+        );
+        assert!(!dir.exists(), "its folder went too");
+        assert!(h.events.notice_tagged("nothingToKeep"));
+        assert_eq!(h.session.status().await.state, CaptureState::Stopped);
+        assert!(h.session.status().await.meeting_id.is_none());
+    }
+
+    /// The journal is bookkeeping; the files are the truth. A stop that could not
+    /// write its chunk rows in time must not cost someone their meeting.
+    #[tokio::test]
+    async fn audio_on_disk_with_no_journal_rows_survives_a_stop() {
+        let h = Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        let dir = h.paths.meeting_dir(&id);
+        {
+            let mut writer = crate::audio::writer::ChunkWriter::create(
+                &dir,
+                Channel::Mic,
+                crate::audio::TARGET_SAMPLE_RATE,
+            )
+            .unwrap();
+            writer
+                .write_samples(&vec![0.2f32; crate::audio::TARGET_SAMPLE_RATE as usize * 8])
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(repo::list_chunks(&h.db, &id, None).await.unwrap().is_empty());
+
+        assert_eq!(h.session.stop().await.unwrap().as_deref(), Some(id.as_str()));
+        assert!(repo::get_meeting(&h.db, &id).await.unwrap().is_some());
+        assert!(dir.exists());
+    }
+
+    #[tokio::test]
+    async fn a_couple_of_seconds_of_silence_is_not_a_meeting() {
+        let h = Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        h.commit_chunk(&id, 0, 1_200).await;
+
+        assert!(h.session.stop().await.unwrap().is_none());
+        assert!(repo::get_meeting(&h.db, &id).await.unwrap().is_none());
+    }
+
+    /// Mantra 3: audio on disk *is* content, even before anything has read it.
+    #[tokio::test]
+    async fn audio_nobody_has_transcribed_yet_is_never_thrown_away() {
+        let h = Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        h.commit_chunk(&id, 0, 45_000).await;
+
+        assert_eq!(h.session.stop().await.unwrap().as_deref(), Some(id.as_str()));
+        let kept = repo::get_meeting(&h.db, &id).await.unwrap().unwrap();
+        assert_eq!(kept.status, MeetingStatus::Processing);
+        assert!(kept.deleted_at.is_none());
+        assert!(h.queued_kinds(&id).await.contains(&JobKind::TranscribeCatchup));
+        assert_eq!(
+            repo::count_final_segments(&h.db, &id).await.unwrap(),
+            0,
+            "kept on the strength of the audio alone"
+        );
+    }
+
+    /// A very short recording that produced words is a real, if brief, meeting.
+    #[tokio::test]
+    async fn a_short_meeting_with_words_in_it_is_kept() {
+        let h = Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        h.capture
+            .send(ports::CaptureSignal::UtteranceReady(Utterance {
+                channel: Channel::Mic,
+                t_start_ms: 200,
+                t_end_ms: 1_400,
+                samples: vec![0.0; 16_000],
+                truncated: false,
+            }));
+        h.settle().await;
+        h.commit_chunk(&id, 0, 1_500).await;
+
+        assert_eq!(h.session.stop().await.unwrap().as_deref(), Some(id.as_str()));
+        assert!(repo::get_meeting(&h.db, &id).await.unwrap().is_some());
+        assert!(repo::count_final_segments(&h.db, &id).await.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn finishing_an_interrupted_meeting_with_nothing_in_it_bins_it() {
+        let h = Harness::new().await;
+        let meeting = repo::create_meeting(&h.db, "A false start", "/tmp", None)
+            .await
+            .unwrap();
+        repo::set_meeting_status(&h.db, &meeting.id, MeetingStatus::Recording)
+            .await
+            .unwrap();
+        // Just under a second of audio: enough for the scan to offer it, not
+        // enough to be worth keeping.
+        let chunk = repo::insert_chunk(&h.db, &meeting.id, Channel::Mic, 0, "/tmp/mic-0.flac", 0, 900)
+            .await
+            .unwrap();
+        repo::commit_chunk(&h.db, &chunk, 900).await.unwrap();
+
+        assert_eq!(h.session.find_interrupted().await.unwrap(), vec![meeting.id.clone()]);
+        h.session
+            .resolve_interrupted(&meeting.id, RecoveryAction::Finish)
+            .await
+            .unwrap();
+
+        assert!(repo::get_meeting(&h.db, &meeting.id).await.unwrap().is_none());
+        assert!(h.queued_kinds(&meeting.id).await.is_empty());
+        assert_eq!(h.session.status().await.state, CaptureState::Idle);
     }
 
     #[tokio::test]
@@ -1745,7 +1957,7 @@ mod tests {
         repo::set_job_progress(&h.db, &catchup, 0.4).await.unwrap();
 
         // Recording takes the machine.
-        h.session.start(Default::default()).await.unwrap();
+        let live = h.session.start(Default::default()).await.unwrap();
         h.executor.wait_for_parked().await;
         let parked = repo::get_job(&h.db, &catchup).await.unwrap().unwrap();
         assert_eq!(parked.status, JobStatus::Paused, "parked, not failed");
@@ -1760,9 +1972,11 @@ mod tests {
 
         // Recording ends: parked work carries on, catch-up first.
         h.executor.stop_blocking();
+        h.record_a_minute(&live).await;
         h.session.stop().await.unwrap();
-        // Three from the older meeting, three queued by the stop.
-        h.executor.wait_for_kinds(6).await;
+        // Three from the older meeting, four queued by the stop (the recap is
+        // automatic).
+        h.executor.wait_for_kinds(7).await;
         let order = h.executor.finished();
         assert_eq!(order[0], JobKind::TranscribeCatchup, "{order:?}");
         let last_catchup = order

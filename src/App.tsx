@@ -78,7 +78,14 @@ export default function App() {
       level: payload.level,
       message: payload.message,
       persistent: payload.persistent,
-      tag: payload.tag,
+      // A tag replaces whichever toast already carries it. That is right for a
+      // message about Echo itself ("it can't hear the other people any more"),
+      // and wrong for one about a particular meeting: recaps write themselves
+      // now, so two meetings finishing minutes apart would both say "Your recap
+      // is ready." and the second would quietly take the first one's Open link
+      // with it. Naming the meeting in the tag keeps them apart while still
+      // collapsing repeats about the same one.
+      tag: payload.tag && payload.meetingId ? `${payload.tag}:${payload.meetingId}` : payload.tag,
       meetingId: payload.meetingId,
     });
   });

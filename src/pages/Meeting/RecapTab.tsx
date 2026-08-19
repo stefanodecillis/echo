@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { Button, EmptyState, SkeletonLines } from "@/components";
+import { Button, EmptyState, ProgressBar } from "@/components";
 import { CheckIcon } from "@/components/icons";
 import { common, meeting as copy, notices } from "@/lib/copy";
 import { updateActionItem } from "@/lib/ipc";
@@ -103,8 +103,12 @@ export function RecapTab({ meetingId, meetingTitle, detail, setDetail }: RecapTa
             <RecapMarkdown content={currentSummary.contentMd} />
           </div>
         ) : activeJob ? (
-          <div className="echo-card p-6">
-            <SkeletonLines count={5} />
+          <div className="echo-card flex flex-col items-center gap-4 px-6 py-16 text-center">
+            <h3 className="text-base font-semibold text-ink">{copy.recapWritingTitle}</h3>
+            <p className="max-w-sm text-sm text-ink-faint">{copy.recapWritingDescription}</p>
+            <div className="w-full max-w-xs">
+              <ProgressBar value={activeJob.progress} />
+            </div>
           </div>
         ) : (
           <EmptyState title={copy.noRecapTitle} description={copy.noRecapDescription} />

@@ -448,4 +448,42 @@ impl Harness {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+
+    /// Journal one committed chunk, as the writer would once a piece of audio is
+    /// flushed and fsynced.
+    pub(crate) async fn commit_chunk(&self, meeting_id: &str, t_start_ms: i64, t_end_ms: i64) {
+        self.capture
+            .send(CaptureSignal::ChunkCommitted(
+                crate::audio::writer::CommittedChunk {
+                    channel: Channel::Mic,
+                    seq: 0,
+                    path: self.paths.chunk_path(meeting_id, Channel::Mic, 0),
+                    t_start_ms,
+                    t_end_ms,
+                },
+            ));
+        self.settle().await;
+    }
+
+    /// A minute of committed audio: enough that the meeting is obviously worth
+    /// keeping, for tests that are about something else.
+    pub(crate) async fn record_a_minute(&self, meeting_id: &str) {
+        self.commit_chunk(meeting_id, 0, 60_000).await;
+    }
+
+    /// The kinds of work queued for a meeting.
+    pub(crate) async fn queued_kinds(&self, meeting_id: &str) -> Vec<JobKind> {
+        crate::db::repo::list_jobs(
+            &self.db,
+            &crate::types::JobQuery {
+                meeting_id: Some(meeting_id.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the work queue")
+        .into_iter()
+        .map(|job| job.kind)
+        .collect()
+    }
 }

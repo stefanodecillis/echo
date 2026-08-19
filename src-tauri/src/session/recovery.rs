@@ -15,6 +15,11 @@
 //!
 //! Finishing queues exactly the same jobs a normal stop does, which is what makes
 //! "transcription resumes from the last committed audio offset" true for free.
+//!
+//! The other half of this module is the same question asked at the end of every
+//! recording: is there anything here worth keeping? [`meeting_has_content`] is
+//! the one answer both the stop path and the finish-after-recovery path use, and
+//! a meeting that fails it is deleted outright rather than kept as a husk.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -204,13 +209,20 @@ pub(crate) async fn resolve(
         ))));
     };
 
+    let mut discarded_as_empty = false;
     match action {
         RecoveryAction::Finish => {
             if !matches!(meeting.status, MeetingStatus::Processing) {
                 repo::set_meeting_status(&inner.db, meeting_id, MeetingStatus::Processing).await?;
             }
-            queue_finalization(inner, meeting_id).await?;
-            tracing::info!(meeting = %meeting_id, "finishing an interrupted meeting");
+            // Same rule as a normal stop: there is nothing to finish when there
+            // is nothing worth keeping, and "finish" must not conjure a husk.
+            match queue_finalization(inner, meeting_id).await? {
+                Finalized::Queued => {
+                    tracing::info!(meeting = %meeting_id, "finishing an interrupted meeting")
+                }
+                Finalized::Discarded => discarded_as_empty = true,
+            }
         }
         RecoveryAction::Discard => {
             // Out of the person's way, but the audio itself stays on disk until
@@ -221,18 +233,21 @@ pub(crate) async fn resolve(
         }
     }
 
-    inner.ports.events.emit(UiEvent::MeetingUpdated(
-        crate::events::MeetingUpdatedPayload {
-            meeting_id: meeting_id.to_string(),
-            status: match action {
-                RecoveryAction::Finish => MeetingStatus::Processing,
-                RecoveryAction::Discard => MeetingStatus::Failed,
+    // An empty meeting has already announced itself as gone.
+    if !discarded_as_empty {
+        inner.ports.events.emit(UiEvent::MeetingUpdated(
+            crate::events::MeetingUpdatedPayload {
+                meeting_id: meeting_id.to_string(),
+                status: match action {
+                    RecoveryAction::Finish => MeetingStatus::Processing,
+                    RecoveryAction::Discard => MeetingStatus::Failed,
+                },
+                title: Some(meeting.title),
+                duration_ms: meeting.duration_ms,
+                deleted: matches!(action, RecoveryAction::Discard),
             },
-            title: Some(meeting.title),
-            duration_ms: meeting.duration_ms,
-            deleted: matches!(action, RecoveryAction::Discard),
-        },
-    ));
+        ));
+    }
 
     let settled = {
         let mut state = inner.live.lock().expect("capture state lock");
@@ -246,16 +261,148 @@ pub(crate) async fn resolve(
     Ok(())
 }
 
+/// What happened to a meeting that just ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Finalized {
+    /// The finishing work is queued.
+    Queued,
+    /// There was nothing worth keeping; the meeting and its files are gone.
+    Discarded,
+}
+
+/// Is there anything in this meeting worth keeping?
+///
+/// The predicate, deliberately generous, because throwing away someone's meeting
+/// is unforgivable and keeping an empty row is merely untidy. A meeting is kept
+/// when **either**:
+///
+/// * it has at least one finished line of transcript — words are the product; or
+/// * at least [`super::MIN_KEPT_MS`] of audio is committed on disk. Audio counts
+///   as content on its own (mantra 3): a meeting whose transcription simply has
+///   not run yet is *not* empty, and the catch-up job will turn that audio into
+///   words later. Only committed chunks count, because an uncommitted one may be
+///   a half-written file; but if the journal comes up empty the folder itself
+///   gets one last look, so a row that was never written cannot cost someone
+///   audio that is right there on disk.
+///
+/// What is left is a husk: no words, and under three seconds of sound nobody
+/// will ever ask for — the shape of pressing Start and Stop while looking for
+/// the right button.
+pub(crate) async fn meeting_has_content(
+    inner: &Arc<Inner>,
+    meeting_id: &str,
+) -> Result<bool, SessionError> {
+    if repo::count_final_segments(&inner.db, meeting_id).await? > 0 {
+        return Ok(true);
+    }
+    let committed = super::jobs::committed_end_ms(&inner.db, meeting_id).await?;
+    if committed >= super::MIN_KEPT_MS {
+        return Ok(true);
+    }
+
+    // Last look before anything is deleted: the journal is bookkeeping, the files
+    // are the truth (mantra 3). A pipeline that ran out of time writing its rows,
+    // or a database write that failed while the disk was full, must never cost
+    // somebody a meeting that is sitting there on disk.
+    let dir = match repo::get_meeting(&inner.db, meeting_id).await? {
+        Some(meeting) => audio_dir_of(inner, &meeting),
+        None => inner.paths.meeting_dir(meeting_id),
+    };
+    let on_disk: i64 = match crate::audio::recover_chunks(&dir).await {
+        Ok(found) => found.iter().map(|chunk| chunk.duration_ms()).sum(),
+        Err(error) => {
+            // Cannot tell: assume there is something rather than delete blind.
+            tracing::warn!(%error, "could not look at the recording folder before tidying up");
+            return Ok(true);
+        }
+    };
+    if on_disk >= super::MIN_KEPT_MS {
+        tracing::info!(
+            meeting = %meeting_id,
+            on_disk,
+            "the journal looked empty but there is audio on disk; keeping it"
+        );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Delete a meeting nobody will ever want, with its files, and say so once.
+///
+/// Nothing is queued for it and anything already queued is cancelled, so no
+/// catch-up, speaker pass or recap runs against a row that is on its way out.
+async fn discard_empty_meeting(inner: &Arc<Inner>, meeting_id: &str) {
+    // Stop the work first: a job holding this id must not carry on reading files
+    // that are about to disappear.
+    inner.ports.asr.forget_meeting(meeting_id);
+    inner.cancel_jobs_for(meeting_id).await;
+
+    let dir = match repo::get_meeting(&inner.db, meeting_id).await {
+        Ok(Some(meeting)) => audio_dir_of(inner, &meeting),
+        _ => inner.paths.meeting_dir(meeting_id),
+    };
+    match repo::delete_meeting(&inner.db, meeting_id).await {
+        Ok(files) => {
+            for file in files {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+        Err(error) => {
+            // Could not remove it: leave it out of the way rather than in the
+            // list, and never fail a stop over tidying up.
+            tracing::warn!(%error, "could not remove an empty meeting");
+            let _ = repo::soft_delete_meeting(&inner.db, meeting_id).await;
+        }
+    }
+    // Only ever a folder named after this meeting, never the folder the person
+    // chose to keep recordings in.
+    if dir
+        .file_name()
+        .map(|name| name == std::ffi::OsStr::new(meeting_id))
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    tracing::info!(meeting = %meeting_id, "nothing was recorded, so nothing was kept");
+    inner.ports.events.emit(UiEvent::MeetingUpdated(
+        crate::events::MeetingUpdatedPayload {
+            meeting_id: meeting_id.to_string(),
+            status: MeetingStatus::Failed,
+            title: None,
+            duration_ms: 0,
+            deleted: true,
+        },
+    ));
+    inner.notice(NoticePayload {
+        level: NoticeLevel::Info,
+        message: "That one was too short to keep, so Echo let it go.".into(),
+        persistent: false,
+        meeting_id: None,
+        tag: Some("nothingToKeep".into()),
+    });
+}
+
 /// The jobs that turn committed audio into a finished meeting. The same list
 /// runs after a normal stop and after a recovery, in this order.
+///
+/// A meeting with nothing worth keeping never gets a queue: it is deleted
+/// instead ([`meeting_has_content`]).
 pub(crate) async fn queue_finalization(
     inner: &Arc<Inner>,
     meeting_id: &str,
-) -> Result<(), SessionError> {
+) -> Result<Finalized, SessionError> {
+    if !meeting_has_content(inner, meeting_id).await? {
+        discard_empty_meeting(inner, meeting_id).await;
+        return Ok(Finalized::Discarded);
+    }
+
+    // On by default (mantra 4: the happy path is Start → the recap appears).
+    // Someone who turned it off has `false` stored, and that wins.
     let auto_summarize = crate::settings::load(&inner.db)
         .await
         .map(|s| s.auto_summarize)
-        .unwrap_or(false);
+        .unwrap_or(crate::settings::DEFAULT_AUTO_SUMMARIZE);
 
     let mut wanted = vec![
         JobKind::TranscribeCatchup,
@@ -263,10 +410,13 @@ pub(crate) async fn queue_finalization(
         JobKind::Mixdown,
     ];
     if auto_summarize {
+        // Queued now, run last: `repo::next_queued_job` hands work out
+        // catch-up → speakers → playback → recap, so the recap is written from
+        // the finished transcript with its speakers already sorted out.
         wanted.push(JobKind::Summarize);
     }
     for kind in wanted {
         inner.jobs.queue(Some(meeting_id), kind).await?;
     }
-    Ok(())
+    Ok(Finalized::Queued)
 }

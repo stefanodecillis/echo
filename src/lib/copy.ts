@@ -117,6 +117,8 @@ export const common = {
   learnMore: "Learn more",
   openSettings: "Open Settings",
   backToHome: "Back to Home",
+  /** On a notice that names a meeting: takes you straight to it. */
+  open: "Open",
   /** The 404 route, which should be unreachable in a desktop app. */
   notFoundTitle: "There is nothing here",
   notFoundBody: "Echo took a wrong turn. Your meetings are safe.",
@@ -152,14 +154,20 @@ export const home = {
   searchPlaceholder: "Search your meetings",
   recentTitle: "Recent meetings",
   viewAll: "View all",
-  emptyTitle: "No meetings yet",
-  emptyDescription:
-    "Once you start one, it will show up here with its recap and transcript.",
+  emptyTitle: "Echo has nothing to echo yet",
+  emptyDescription: "Go have a meeting worth remembering, and Echo will write it all down.",
   recoveringTitle: "Echo found a meeting that didn't finish",
   recoveringDescription:
     "This can happen after a crash or a restart. Pick up where it left off, or let it go.",
   recoveringFinish: "Finish it",
   recoveringDiscard: "Let it go",
+  /** The quiet trash icon on a meeting row, and its one confirmation. */
+  deleteRowLabel: "Delete meeting",
+  deleteRowConfirmTitle: "Delete this meeting?",
+  /** Word for word the same as `meeting.deleteConfirmDescription`: it is the
+   * same action, so it says the same thing wherever it's asked. */
+  deleteRowConfirmDescription:
+    "The recording, transcript and recap all go with it. This can't be undone.",
 } as Record<string, string>;
 
 /** Live: the recording view. */
@@ -206,7 +214,8 @@ export const meeting = {
   infoDeleteAll: "Delete this meeting",
   infoDeleteAllDescription: "Removes everything about this meeting for good.",
   deleteConfirmTitle: "Delete this meeting?",
-  deleteConfirmDescription: "This can't be undone.",
+  deleteConfirmDescription:
+    "The recording, transcript and recap all go with it. This can't be undone.",
   renameTitle: "Rename meeting",
   playFromHere: "Play from here",
   languageDetecting: "Detecting…",
@@ -237,6 +246,9 @@ export const meeting = {
   actionItemMarkNotDone: "Mark not done",
   transcriptNoMatches: "Nothing matches that.",
   transcriptFilterPlaceholder: "Filter this transcript",
+  recapWritingTitle: "Writing your recap…",
+  recapWritingDescription: "This usually takes less than a minute.",
+  infoCapturedLabel: "Captured",
 } as Record<string, string>;
 
 /** History and search. */
@@ -315,6 +327,11 @@ export const settings = {
     "That download didn't finish. Check your connection and try again.",
 
   // Recaps (Summaries)
+  /** The one switch above the chooser: recaps happen on their own by default,
+   * so this is how someone turns that off. */
+  recapsAutomaticTitle: "Write a recap after every meeting",
+  recapsAutomaticDescription:
+    "Echo writes it on its own as soon as a meeting ends. Turn this off and you can still ask for one from any meeting.",
   recapsOnDeviceStatusDetected: "Ollama is running and ready",
   recapsOnDeviceStatusNotRunning:
     "Ollama isn't running. Get it from ollama.com, open it, then check again.",
@@ -328,6 +345,8 @@ export const settings = {
   recapsGeminiPrivacyParagraph:
     "Turning this on sends your transcript to Google's servers so Gemini can write the recap. Whether Google stores or otherwise uses that data depends on your Google account and billing plan.",
   recapsGeminiPrivacyLink: "Read Google's data terms",
+  recapsGeminiModelLabel: "Model",
+  recapsGeminiModelPlaceholder: "Pick one",
   recapsSelectedBadge: "Being used for recaps",
   recapsSelectButton: "Use this",
   recapsCheckAgainButton: "Check again",

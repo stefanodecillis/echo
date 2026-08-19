@@ -145,7 +145,7 @@ export default function Home() {
         />
       )}
 
-      <RecentMeetings />
+      <RecentMeetings onStart={handleStart} starting={startCmd.loading} />
     </div>
   );
 }

@@ -245,19 +245,61 @@ pub async fn soft_delete_meeting(db: &Db, id: &str) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Remove the meeting and everything derived from it. Returns the audio paths
-/// the caller must unlink.
+/// Remove the meeting and everything derived from it. Returns every audio file
+/// the caller must unlink: the per-channel chunks and the derived playback file.
+///
+/// The children are deleted explicitly, in one transaction, even though every
+/// table cascades from `meetings`:
+/// * the FTS indexes are kept in step by triggers on `segments`, and a trigger
+///   firing for a row a foreign-key action removed is a SQLite build detail
+///   ([`PRAGMA recursive_triggers`]) rather than something to bet a person's
+///   search results on. Deleting segments here makes the trigger fire for
+///   certain, so no deleted meeting can leave words behind in the index.
+/// * `jobs` rows are removed with the meeting, so nothing is left queued
+///   against something that no longer exists.
 pub async fn delete_meeting(db: &Db, id: &str) -> Result<Vec<String>, DbError> {
-    let paths: Vec<(String,)> =
-        sqlx::query_as("SELECT path FROM audio_chunks WHERE meeting_id = ?1")
+    let mut paths: Vec<String> = sqlx::query_as("SELECT path FROM audio_chunks WHERE meeting_id = ?1")
+        .bind(id)
+        .fetch_all(db)
+        .await?
+        .into_iter()
+        .map(|(p,): (String,)| p)
+        .collect();
+    let mixed: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT mixed_path FROM meetings WHERE id = ?1")
             .bind(id)
-            .fetch_all(db)
+            .fetch_optional(db)
             .await?;
+    if let Some(mixed) = mixed.and_then(|(p,)| p).filter(|p| !p.trim().is_empty()) {
+        paths.push(mixed);
+    }
+
+    let mut tx = db.begin().await?;
+    // Segments first: their delete trigger is what clears both FTS indexes.
+    // Action items before summaries, speakers after segments, so no statement
+    // depends on a cascade having run.
+    for table in [
+        "action_items",
+        "summaries",
+        "segments",
+        "speakers",
+        "markers",
+        "audio_chunks",
+        "jobs",
+    ] {
+        // `table` is one of the literals above, never user input.
+        sqlx::query(&format!("DELETE FROM {table} WHERE meeting_id = ?1"))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query("DELETE FROM meetings WHERE id = ?1")
         .bind(id)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
-    Ok(paths.into_iter().map(|p| p.0).collect())
+    tx.commit().await?;
+
+    Ok(paths.into_iter().filter(|p| !p.is_empty()).collect())
 }
 
 /// Every meeting and the folder it was recorded into, including ones already
@@ -291,12 +333,26 @@ pub async fn all_audio_file_paths(db: &Db) -> Result<Vec<String>, DbError> {
 }
 
 /// Delete-all, for Settings → Data.
+///
+/// Same reasoning as [`delete_meeting`]: the children go first and by name, so
+/// the `segments` delete trigger clears the search indexes rather than leaving
+/// that to whether this SQLite build fires triggers for cascaded rows.
 pub async fn delete_all_meetings(db: &Db) -> Result<(), DbError> {
     let mut tx = db.begin().await?;
-    sqlx::query("DELETE FROM meetings")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM jobs").execute(&mut *tx).await?;
+    for table in [
+        "action_items",
+        "summaries",
+        "segments",
+        "speakers",
+        "markers",
+        "audio_chunks",
+        "jobs",
+        "meetings",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table}"))
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -617,6 +673,21 @@ pub async fn count_segments(db: &Db, meeting_id: &str) -> Result<u32, DbError> {
         .bind(meeting_id)
         .fetch_one(db)
         .await?;
+    Ok(n as u32)
+}
+
+/// Lines of transcript that are finished, i.e. not live partials waiting to be
+/// replaced. This is "did this meeting produce any words", which is what decides
+/// whether an ended meeting is worth keeping (see `session::recovery`'s
+/// `meeting_has_content`, and [`crate::session::MIN_KEPT_MS`]).
+pub async fn count_final_segments(db: &Db, meeting_id: &str) -> Result<u32, DbError> {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM segments
+         WHERE meeting_id = ?1 AND is_final = 1 AND TRIM(text) <> ''",
+    )
+    .bind(meeting_id)
+    .fetch_one(db)
+    .await?;
     Ok(n as u32)
 }
 
@@ -2495,9 +2566,200 @@ mod tests {
         insert_chunk(&db, &m.id, Channel::System, 0, "/a/s0.flac", 0, 1_000)
             .await
             .unwrap();
+        set_meeting_mixed_path(&db, &m.id, "/a/mixed.flac").await.unwrap();
+
         let paths = delete_meeting(&db, &m.id).await.unwrap();
-        assert_eq!(paths.len(), 2);
         assert!(get_meeting(&db, &m.id).await.unwrap().is_none());
+        assert_eq!(
+            paths.len(),
+            3,
+            "both channels and the playback file: {paths:?}"
+        );
+        assert!(paths.contains(&"/a/mixed.flac".to_string()));
+    }
+
+    /// One confirmation, and then nothing is left: no rows anywhere, and no
+    /// words left in the search index either.
+    #[tokio::test]
+    async fn deleting_a_meeting_leaves_nothing_behind() {
+        let (db, m) = seeded().await;
+        let other = create_meeting(&db, "Keep me", "/tmp/audio/m2", None)
+            .await
+            .unwrap();
+
+        insert_chunk(&db, &m.id, Channel::Mic, 0, "/a/0.flac", 0, 1_000)
+            .await
+            .unwrap();
+        insert_segments(&db, &[draft(&m.id, 0, "pomegranate season")])
+            .await
+            .unwrap();
+        insert_segments(&db, &[draft(&other.id, 0, "quince season")])
+            .await
+            .unwrap();
+        let speaker = upsert_speaker(&db, &m.id, "mic", "You", true).await.unwrap();
+        let mine = get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: m.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assign_speaker(&db, &[mine[0].id.clone()], &speaker.id, 2)
+            .await
+            .unwrap();
+        insert_marker(&db, &m.id, 500, MarkerKind::ActionItem, Some("chase this"))
+            .await
+            .unwrap();
+        let summary = insert_summary(
+            &db,
+            &m.id,
+            None,
+            None,
+            Provider::OnThisComputer,
+            None,
+            Some("en"),
+            1,
+            "# Recap",
+        )
+        .await
+        .unwrap();
+        replace_action_items(
+            &db,
+            &m.id,
+            Some(&summary.id),
+            &[ActionItem {
+                id: String::new(),
+                meeting_id: m.id.clone(),
+                summary_id: Some(summary.id.clone()),
+                description: "send the notes".into(),
+                owner: None,
+                due_hint: None,
+                done: false,
+                external_url: None,
+            }],
+        )
+        .await
+        .unwrap();
+        create_job(&db, Some(&m.id), JobKind::Summarize).await.unwrap();
+
+        delete_meeting(&db, &m.id).await.unwrap();
+
+        for (table, column) in [
+            ("segments", "meeting_id"),
+            ("speakers", "meeting_id"),
+            ("markers", "meeting_id"),
+            ("summaries", "meeting_id"),
+            ("action_items", "meeting_id"),
+            ("audio_chunks", "meeting_id"),
+            ("jobs", "meeting_id"),
+        ] {
+            let (left,): (i64,) =
+                sqlx::query_as(&format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"))
+                    .bind(&m.id)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            assert_eq!(left, 0, "{table} still has rows for a deleted meeting");
+        }
+
+        // The search index is external content, so a stale entry does not show
+        // up as a row anywhere — read the index itself.
+        for index in ["segments_fts", "segments_fts_trigram"] {
+            let (terms, still_there) = index_terms(&db, index, "pomegranate").await;
+            assert_eq!(
+                still_there, 0,
+                "{index} still knows a deleted meeting's words"
+            );
+            assert!(
+                terms > 0,
+                "{index} lost the meeting that was not deleted ({terms} terms)"
+            );
+        }
+
+        // And the meeting nobody deleted is untouched.
+        assert_eq!(count_segments(&db, &other.id).await.unwrap(), 1);
+        assert_eq!(
+            search_segments(
+                &db,
+                &SearchQuery {
+                    text: "quince".into(),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_all_clears_the_search_index_too() {
+        let (db, m) = seeded().await;
+        insert_segments(&db, &[draft(&m.id, 0, "tangerine")])
+            .await
+            .unwrap();
+        delete_all_meetings(&db).await.unwrap();
+
+        let (terms, _) = index_terms(&db, "segments_fts", "tangerine").await;
+        assert_eq!(terms, 0, "delete-all left words in the search index");
+    }
+
+    /// How many terms one search index holds, and how many of them are `needle`.
+    /// The indexes are external-content FTS5 tables, so a stale entry is
+    /// invisible from the `segments` side — `fts5vocab` reads the index itself.
+    async fn index_terms(db: &Db, index: &str, needle: &str) -> (i64, i64) {
+        let view = format!("v_{index}");
+        sqlx::query(&format!("DROP TABLE IF EXISTS {view}"))
+            .execute(db)
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "CREATE VIRTUAL TABLE {view} USING fts5vocab({index}, 'row')"
+        ))
+        .execute(db)
+        .await
+        .unwrap();
+        let (terms,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {view}"))
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let (matching,): (i64,) =
+            sqlx::query_as(&format!("SELECT COUNT(*) FROM {view} WHERE term = ?1"))
+                .bind(needle)
+                .fetch_one(db)
+                .await
+                .unwrap();
+        sqlx::query(&format!("DROP TABLE {view}"))
+            .execute(db)
+            .await
+            .unwrap();
+        (terms, matching)
+    }
+
+    /// Browse-all needs every meeting the person has, including ones that have
+    /// not been given a recap (or even a transcript) yet.
+    #[tokio::test]
+    async fn listing_includes_meetings_with_no_recap_yet() {
+        let db = connect_in_memory().await.unwrap();
+        let fresh = create_meeting(&db, "Still processing", "/tmp/a", None)
+            .await
+            .unwrap();
+        set_meeting_status(&db, &fresh.id, MeetingStatus::Processing)
+            .await
+            .unwrap();
+        let gone = create_meeting(&db, "Thrown away", "/tmp/b", None)
+            .await
+            .unwrap();
+        soft_delete_meeting(&db, &gone.id).await.unwrap();
+
+        let listed = list_meetings(&db, &MeetingQuery::default()).await.unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].id, fresh.id);
+        assert!(!listed[0].has_recap);
+        assert_eq!(count_meetings(&db).await.unwrap(), 1);
     }
 
     #[tokio::test]
