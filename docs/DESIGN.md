@@ -8,6 +8,10 @@ Reviewed by codex/gpt-5.6-sol; 40 findings incorporated (see `docs/REVIEW-NOTES.
 1. **Use nothing until needed, release it when idle.** No model in RAM, no audio stream open, no ONNX session, no DB-heavy work unless a recording or an explicit user action requires it. Whisper loads at recording start (or on explicit pre-warm) and unloads after a configurable idle period. Idle app = a 5s detection poll and nothing else (<0.5% CPU target).
 2. **Zero jargon in the UI.** Never mention Whisper, models, ONNX, VAD, diarization, connectors, tokens. Onboarding: "Downloading what Echo needs to understand speech (1.6 GB, one time)". Recording: "Listening…". Processing: "Writing your recap…". Technical detail (model names, engine, GPU in use) lives only behind Settings → Advanced. Errors say what the user can do, not what failed internally.
 3. **Raw audio on disk is the source of truth.** Everything downstream (transcription, diarization, summaries) can be recomputed from it; nothing downstream may block or lose capture.
+4. **Built for a non-technical user.** The reference persona is a freelancer or manager, not an engineer. Installation, onboarding, and daily use must never require a terminal, a config file, or prior knowledge. Concretely:
+   - **Install**: signed/notarized .dmg with drag-to-Applications layout on macOS; .deb/.AppImage that declare every dependency on Linux. Double-click → it runs. No "install Ollama first" prerequisite: summaries setup offers Gemini or a clearly optional local path, and the app is fully usable for recording/transcripts before any summary provider is configured.
+   - **First run**: onboarding does everything (permissions with plain "why" copy and Open-Settings buttons, one-time download with progress, summaries choice or skip). A user who clicks "next" through it ends up with a working app.
+   - **Daily use**: the happy path is notification → click → Start → recap appears. Every error states what the user can do next in plain words; no state is a dead end; defaults are always safe so Settings never *needs* visiting.
 
 ## 1. Goals
 
