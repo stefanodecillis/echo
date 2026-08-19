@@ -66,7 +66,7 @@ export const labels = {
     storageLow: "Running low on space. Recording keeps going — free up room soon.",
   },
   provider: {
-    onThisComputer: "On this computer",
+    onThisComputer: "Ollama",
     gemini: "Google Gemini",
   },
   jobKind: {
@@ -278,7 +278,7 @@ export const settings = {
     "A more careful setting takes a little longer but hears more correctly.",
   summaryProviderOnDevice: "On this computer",
   summaryProviderOnDeviceDescription:
-    "Nothing leaves your machine. Needs a one-time setup.",
+    "Runs an AI model on this Mac through the Ollama app. Nothing leaves your computer.",
   summaryProviderGemini: "Google Gemini",
   summaryProviderGeminiDescription:
     "Your transcript is sent to Google to write the recap.",
@@ -315,10 +315,10 @@ export const settings = {
     "That download didn't finish. Check your connection and try again.",
 
   // Recaps (Summaries)
-  recapsOnDeviceStatusDetected: "Found and ready to use",
+  recapsOnDeviceStatusDetected: "Ollama is running and ready",
   recapsOnDeviceStatusNotRunning:
-    "Echo hasn't found a way to write recaps on this computer yet.",
-  recapsOnDeviceModelLabel: "Which one to use",
+    "Ollama isn't running. Get it from ollama.com, open it, then check again.",
+  recapsOnDeviceModelLabel: "Model",
   recapsOnDeviceModelPlaceholder: "Pick one",
   recapsOnDeviceAdvancedToggle: "Use a different address",
   recapsOnDeviceAddressLabel: "Address",
@@ -411,13 +411,15 @@ export const onboarding = {
     "This happens once. After that, Echo works without sending anything anywhere.",
   chooseSmallerButton: "Use a smaller, faster download instead",
   downloadRetryButton: "Try downloading again",
-  stepSummariesTitle: "Where your recaps come from",
-  summariesOnDeviceFound: "Echo found a way to write recaps on this computer.",
+  stepSummariesTitle: "Who writes your recaps?",
+  summariesIntro:
+    "Everything Echo records and writes down stays on this Mac either way. This choice is only about which assistant reads the transcript and writes the recap \u2014 you can change it anytime.",
+  summariesOnDeviceFound: "Ollama is running \u2014 recaps stay on this Mac, private and free.",
   summariesOnDeviceNotFound:
-    "Echo didn't find a way to write recaps on this computer yet.",
-  summariesGeminiTitle: "Use Google Gemini instead",
+    "Ollama isn't running. Get it from ollama.com, open it, then check again.",
+  summariesGeminiTitle: "Google Gemini",
   summariesGeminiDescription:
-    "Your transcript is sent to Google to write the recap. You can change this later.",
+    "Google's AI writes the recap. The transcript text is sent to Google for that \u2014 needs a free API key.",
   summariesSkipDescription:
     "You can record and read transcripts without this — set it up whenever you like.",
   finishButton: "Start using Echo",
@@ -428,8 +430,8 @@ export const onboarding = {
   stepLabelSummaries: "Recaps",
   quitButton: "Quit Echo",
   downloadContinueAnywayNote: "You can finish this later in Settings.",
-  summariesUseOnDevice: "Use this computer",
-  recapsChosenOnDevice: "Recaps will be written on this computer.",
+  summariesUseOnDevice: "Use Ollama",
+  recapsChosenOnDevice: "Recaps will be written by Ollama on this Mac.",
   recapsChosenGemini: "Recaps will be written using Google Gemini.",
 } as Record<string, string>;
 

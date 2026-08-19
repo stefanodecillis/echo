@@ -163,3 +163,30 @@ export function EchoMark(props: IconProps) {
     </svg>
   );
 }
+
+/** Ollama's llama face, simplified to strokes so it sits with the rest of the
+ * set. Shown wherever the Ollama connector is named. */
+export function OllamaIcon(props: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden {...props}>
+      <rect x="7" y="2.6" width="2.8" height="6" rx="1.4" stroke="currentColor" strokeWidth="1.5" />
+      <rect x="14.2" y="2.6" width="2.8" height="6" rx="1.4" stroke="currentColor" strokeWidth="1.5" />
+      <rect x="4.8" y="7" width="14.4" height="13" rx="6.2" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="9.6" cy="13" r="1.15" fill="currentColor" />
+      <circle cx="14.4" cy="13" r="1.15" fill="currentColor" />
+    </svg>
+  );
+}
+
+/** Google Gemini's four-point spark. Shown wherever the Gemini connector is
+ * named. */
+export function GeminiIcon(props: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden {...props}>
+      <path
+        d="M12 2c.55 5.5 4.5 9.45 10 10-5.5.55-9.45 4.5-10 10-.55-5.5-4.5-9.45-10-10 5.5-.55 9.45-4.5 10-10z"
+        fill="currentColor"
+      />
+    </svg>
+  );
+}

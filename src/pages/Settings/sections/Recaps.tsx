@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 
 import { Card } from "../../../components/Card";
 import { Chip } from "../../../components/Chip";
-import { CheckIcon } from "../../../components/icons";
+import { CheckIcon, GeminiIcon, OllamaIcon } from "../../../components/icons";
 import { useCommand } from "../../../hooks/useCommand";
 import {
   hasProviderKey,
@@ -13,6 +13,7 @@ import {
   testSummaryProvider,
 } from "../../../lib/ipc";
 import { common, labels, settings as copy } from "../../../lib/copy";
+import { isLoopbackAddress } from "../../../lib/net";
 import type { Provider, ProviderConfig, ProviderInfo } from "../../../lib/types";
 import { Select } from "../components/Select";
 import type { SectionProps } from "../types";
@@ -70,12 +71,14 @@ interface ProviderCardProps {
 }
 
 function ProviderCardShell({
+  icon,
   title,
   description,
   active,
   onSelect,
   children,
 }: {
+  icon?: ReactNode;
   title: string;
   description: string;
   active: boolean;
@@ -87,6 +90,11 @@ function ProviderCardShell({
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
+            {icon && (
+              <span aria-hidden className="flex h-5 w-5 items-center justify-center text-ink">
+                {icon}
+              </span>
+            )}
             <p className="text-sm font-semibold text-ink">{title}</p>
             {active && (
               <Chip variant="solid" icon={<CheckIcon className="h-full w-full" />}>
@@ -107,15 +115,31 @@ function ProviderCardShell({
   );
 }
 
+const DEFAULT_OLLAMA_ADDRESS = "http://127.0.0.1:11434";
+
 function OnDeviceCard({ info, active, onSelect, onUpdate }: ProviderCardProps) {
   const [models, setModels] = useState<string[]>([]);
   const [checking, setChecking] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [address, setAddress] = useState(info.config.baseUrl ?? DEFAULT_OLLAMA_ADDRESS);
+  const [acknowledged, setAcknowledged] = useState(false);
+
+  const remote = !isLoopbackAddress(address);
 
   async function check() {
     setChecking(true);
     setMessage(null);
     try {
+      const trimmed = address.trim() || DEFAULT_OLLAMA_ADDRESS;
+      if (trimmed !== (info.config.baseUrl ?? DEFAULT_OLLAMA_ADDRESS)) {
+        const config: ProviderConfig = {
+          ...info.config,
+          baseUrl: trimmed,
+          leavesMachineAcknowledged: remote ? acknowledged : undefined,
+        };
+        await saveSummaryProvider(config);
+        onUpdate({ ...info, config });
+      }
       const result = await testSummaryProvider("onThisComputer");
       setModels(result.models);
       setMessage(result.message);
@@ -139,11 +163,33 @@ function OnDeviceCard({ info, active, onSelect, onUpdate }: ProviderCardProps) {
 
   return (
     <ProviderCardShell
+      icon={<OllamaIcon className="h-5 w-5" />}
       title={labels.provider.onThisComputer}
       description={copy.summaryProviderOnDeviceDescription}
       active={active}
       onSelect={onSelect}
     >
+      <label className="flex flex-col gap-1.5">
+        <span className="text-xs font-medium text-ink">{copy.recapsOnDeviceAddressLabel}</span>
+        <input
+          type="text"
+          value={address}
+          onChange={(e) => setAddress(e.target.value)}
+          placeholder={copy.recapsOnDeviceAddressPlaceholder}
+          className="w-full min-w-0 rounded-xl border border-hairline bg-surface px-3 py-2 text-sm text-ink placeholder:text-ink-ghost focus:outline-none focus:ring-2 focus:ring-accent/30"
+        />
+      </label>
+      {remote && (
+        <label className="flex items-start gap-2 text-xs text-ink-soft">
+          <input
+            type="checkbox"
+            checked={acknowledged}
+            onChange={(e) => setAcknowledged(e.target.checked)}
+            className="mt-0.5"
+          />
+          {copy.recapsOnDeviceLeavesMachineWarning}
+        </label>
+      )}
       <div className="flex items-center justify-between gap-3">
         <p className="text-xs text-ink-faint">
           {checking
@@ -213,6 +259,7 @@ function GeminiCard({ info, active, onSelect, onUpdate }: ProviderCardProps) {
 
   return (
     <ProviderCardShell
+      icon={<GeminiIcon className="h-5 w-5" />}
       title={labels.provider.gemini}
       description={copy.summaryProviderGeminiDescription}
       active={active}
