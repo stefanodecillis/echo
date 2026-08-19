@@ -38,3 +38,15 @@ render(appIcon, 1024, "icon-1024.png");
 render(traySvg({ dotR: 4.5, arcAlpha: [0.55, 0.28], badge: false }), 44, "../tray-idle.png");
 render(traySvg({ dotR: 4.5, arcAlpha: [1, 1], badge: true }), 44, "../tray-detected.png");
 render(traySvg({ dotR: 7, arcAlpha: [1, 1], badge: false }), 44, "../tray-recording.png");
+
+// Recording pulse animation: the dot breathes 7 -> 5.5 -> 4.5 -> 5.5 -> (loop
+// back to 7), read at ~2fps by the tray. Arcs stay fully opaque throughout —
+// recording means a strong signal, no fading.
+const pulseRadii = [7, 5.5, 4.5, 5.5];
+pulseRadii.forEach((dotR, i) => {
+  render(
+    traySvg({ dotR, arcAlpha: [1, 1], badge: false }),
+    44,
+    `../tray-recording-${i}.png`,
+  );
+});

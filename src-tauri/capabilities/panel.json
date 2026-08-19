@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "panel",
+  "description": "What the small floating panel window may do: hear about its own state, and call Echo's own typed commands (start, stop, dismiss). It never shows, hides, moves or focuses a window itself — the Rust core does all of that — so none of those permissions are granted. No filesystem, no shell, no dialogs, no notifications.",
+  "windows": ["panel"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:app:default",
+    "log:default"
+  ]
+}

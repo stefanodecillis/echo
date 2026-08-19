@@ -493,6 +493,16 @@ export const anchors = {
     "Echo can still hear you, but not the other people. It will keep recording.",
 } as const;
 
+/**
+ * The floating panel: a compact window that appears on its own to offer
+ * Start when a meeting is detected. Its Start/Stop buttons and "Listening…"
+ * line reuse `home`/`anchors` rather than repeating them here — this only
+ * holds what's unique to the panel itself.
+ */
+export const panel = {
+  detectedTitle: "Meeting detected",
+} as const;
+
 /** Words for the two microphone-versus-computer channels. */
 export const channels = {
   mic: "You",

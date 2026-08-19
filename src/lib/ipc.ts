@@ -41,6 +41,8 @@ import type {
   NavigatePayload,
   NoticePayload,
   OnboardingState,
+  PanelState,
+  PanelStatePayload,
   PermissionState,
   PermissionStatus,
   PermissionTarget,
@@ -362,6 +364,31 @@ export const showMainWindow = () => call<void>("show_main_window");
 export const quitApp = () => call<void>("quit_app");
 
 // ---------------------------------------------------------------------------
+// The floating panel
+// ---------------------------------------------------------------------------
+
+/**
+ * The ✕ (and Escape) on the "meeting detected" panel: take it away and say
+ * nothing more about *this* meeting. Not a snooze — the next meeting gets its
+ * panel as usual.
+ */
+export const panelDismiss = () => call<void>("panel_dismiss");
+
+/**
+ * The panel is done because it worked — Start or Stop went through. Same hiding,
+ * without telling detection the meeting was unwanted.
+ */
+export const panelClose = () => call<void>("panel_close");
+
+/**
+ * What the panel should be showing right now.
+ *
+ * The panel is normally told by event, but the very first time the window is
+ * still booting and misses it; asking on mount closes that gap.
+ */
+export const getPanelState = () => call<PanelState | null>("get_panel_state");
+
+// ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 
@@ -385,6 +412,8 @@ export const EVENTS = {
   trayAction: "echo://tray-action",
   navigate: "echo://navigate",
   recoveryAvailable: "echo://recovery-available",
+  /** Only ever delivered to the floating panel window. */
+  panelState: "echo://panel-state",
 } as const;
 
 export type EventName = (typeof EVENTS)[keyof typeof EVENTS];
@@ -409,6 +438,7 @@ export interface EventPayloads {
   [EVENTS.trayAction]: TrayActionPayload;
   [EVENTS.navigate]: NavigatePayload;
   [EVENTS.recoveryAvailable]: RecoveryAvailablePayload;
+  [EVENTS.panelState]: PanelStatePayload;
 }
 
 /**

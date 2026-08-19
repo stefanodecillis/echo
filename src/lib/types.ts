@@ -708,3 +708,22 @@ export interface NavigatePayload {
 export interface RecoveryAvailablePayload {
   meetingIds: Id[];
 }
+
+/**
+ * What the small floating panel is showing. Mirror of `PanelState` in
+ * `src-tauri/src/events.rs`: a union tagged on `kind`, so the panel renders one
+ * face or the other and never guesses which fields mean anything.
+ *
+ * Both times are epoch milliseconds on the same clock as `Date.now()`, so the
+ * panel can count "3m ago" and the elapsed clock by itself instead of being fed
+ * a tick every second.
+ */
+export type PanelState =
+  | { kind: "detected"; detectedAtMs: number; appName?: string }
+  | { kind: "recording"; startedAtMs: number; paused: boolean };
+
+/**
+ * `null` means the panel has left the screen: it drops what it was drawing, and
+ * with it the once-a-second clock, instead of counting where nobody can see.
+ */
+export type PanelStatePayload = PanelState | null;

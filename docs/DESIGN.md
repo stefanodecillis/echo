@@ -18,7 +18,7 @@ Reviewed by codex/gpt-5.6-sol; 40 findings incorporated (see `docs/REVIEW-NOTES.
 - Capture meetings (microphone + system audio), transcribe locally with Whisper, automatic language detection.
 - On-device speaker attribution: live = channel-based ("You" = mic, remote = system channel with provisional labels); after recording ends, an offline diarization refinement pass distinguishes and stabilizes individual remote speakers. Rename + merge speakers (non-destructive, alias-based).
 - AI summaries + action items via a pluggable connector trait; v1 ships **Ollama** (local) and **Gemini** (AI Studio API key). Summary output language is a user setting (meeting language / English / fixed custom).
-- Automatic meeting detection with an OS notification (clicking it opens Echo with a prominent Start button; tray menu also has Start — desktop notification action buttons are not supported by Tauri's plugin).
+- Automatic meeting detection, nudged by a small floating panel near the menu bar ("Meeting detected", how long ago, a Start button, a ✕) — it appears without taking the keyboard away from whatever is on screen, and takes itself away if nobody touches it. The OS notification is the fallback for when no window can be put on screen (clicking it opens Echo with a prominent Start button); tray menu also has Start — desktop notification action buttons are not supported by Tauri's plugin.
 - History: browse, search (FTS), re-open past meetings; export Markdown/PDF/DOCX.
 - Onboarding wizard: permissions → model download → summaries setup. Non-technical copy throughout.
 - Background/tray app; window/launcher always remains a first-class route (Linux tray support is not universal).
@@ -111,7 +111,7 @@ trait Connector {
 Summarization = map-reduce over transcript chunks sized to the model's context; strict JSON schema for action items validated locally with one repair-retry; summary markdown sanitized before render (no raw HTML, no remote resources). Small-model quality mitigations: chunking, schema, "regenerate with different model" button. Gemini setup screen states plainly what leaves the machine and that Google's data handling depends on account/billing tier, with a link — an explicit choice, not a footnote. Ollama URL restricted to loopback by default; non-loopback allowed only with a "this leaves your machine" warning.
 
 ### Meeting detection
-Poll every 5s when idle: (a) running meeting apps (zoom.us, Teams, Webex, Discord, Slack); (b) input-device-in-use (macOS CoreAudio `kAudioDevicePropertyDeviceIsRunningSomewhere`; Linux PipeWire active input streams). Debounced → notification (click opens Echo, big Start button) + tray badge. Auto-stop suggestion after signals clear >2 min. Snooze 1h.
+Poll every 5s when idle: (a) running meeting apps (zoom.us, Teams, Webex, Discord, Slack); (b) input-device-in-use (macOS CoreAudio `kAudioDevicePropertyDeviceIsRunningSomewhere`; Linux PipeWire active input streams). Debounced → tray badge, plus exactly one nudge per meeting: the floating panel (Start right there; ✕ says nothing more about *that* meeting, and is not a snooze), or the notification (click opens Echo, big Start button) when no window can be put on screen — never both. Auto-stop suggestion after signals clear >2 min. Snooze 1h.
 
 ## 4. UI (Sana-style; see mantra 2)
 
@@ -124,7 +124,7 @@ Light theme, white, generous whitespace, rounded-xl cards, 1px #eee borders, nea
 5. **Settings** — General (launch at login, detection on/off, storage location, summary language), Speech (installed "accuracy levels" = quality presets; sizes shown), Summaries (On this computer [Ollama] / Google Gemini [key, masked, keychain] with plain-language privacy note), Templates (built-ins + custom CRUD), Data (storage report, delete-all), Advanced (engine, GPU in use, model identifiers, diagnostics export).
 6. **Onboarding** — Welcome → Permissions (mic; macOS screen-recording with "why" copy, handles restart-required and denied states, "Open System Settings" button) → Download (~1.6 GB one-time, resumable, can pick "smaller & faster" preset) → Summaries (auto-detect Ollama / Gemini key / skip).
 
-Tray: idle/detected/recording states; menu: Start/Stop, Open Echo, Pause detection 1h, Quit. Close-to-tray, but app is always restorable from launcher/window (Linux tray caveat). Single instance.
+Tray: idle/detected/recording states, the recording one gently pulsing (one 500ms timer, alive only while recording; paused holds a frame with no timer). Left-clicking while recording brings the same floating panel up under the icon with the elapsed time and Stop; left-clicking otherwise brings the window back. Menu: Start/Stop, Open Echo, Pause detection 1h, Quit. Close-to-tray, but app is always restorable from launcher/window (Linux tray caveat). Single instance.
 
 Local diagnostics (no telemetry): bounded, redacted rotating log — capture backend, device changes, queue overflows, timings, GPU fallback reason; never transcript text or keys; exportable from Advanced.
 

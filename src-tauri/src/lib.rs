@@ -22,6 +22,7 @@ pub mod diarize;
 pub mod events;
 pub mod export;
 pub mod logging;
+pub mod panel;
 pub mod paths;
 pub mod secrets;
 pub mod session;
@@ -30,14 +31,16 @@ pub mod summarize;
 pub mod types;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Listener, Manager, WindowEvent};
 
 use commands::AppState;
-use types::{TrayAction, TrayState};
+use events::PanelState;
+use types::{CaptureStatus, TrayAction, TrayState};
 
 /// Tray menu item ids. Also the ids the tray click handler matches on.
 mod tray_ids {
@@ -52,6 +55,15 @@ mod tray_ids {
 const TRAY_ICON_IDLE: &[u8] = include_bytes!("../icons/tray-idle.png");
 const TRAY_ICON_DETECTED: &[u8] = include_bytes!("../icons/tray-detected.png");
 const TRAY_ICON_RECORDING: &[u8] = include_bytes!("../icons/tray-recording.png");
+
+/// The recording icon's pulse: the same mark with the dot breathing. Only ever
+/// on screen while something is being recorded (see [`panel::TrayAnimation`]).
+const TRAY_ICON_RECORDING_FRAMES: [&[u8]; panel::FRAME_COUNT] = [
+    include_bytes!("../icons/tray-recording-0.png"),
+    include_bytes!("../icons/tray-recording-1.png"),
+    include_bytes!("../icons/tray-recording-2.png"),
+    include_bytes!("../icons/tray-recording-3.png"),
+];
 
 /// Flags the window handlers need synchronously, so they never await.
 pub struct UiFlags {
@@ -72,21 +84,42 @@ impl Default for UiFlags {
 
 /// Swap the tray icon. Called by the session and detection layers.
 pub fn set_tray_state(app: &AppHandle, state: TrayState) {
+    // The pulse only exists while the tray says "recording". Standing it down
+    // here as well as from the capture-state listener closes the one race worth
+    // caring about: a frame landing after the icon went back to idle would
+    // leave the menu bar claiming a recording that had finished.
+    if state != TrayState::Recording {
+        if let Some(animation) = app.try_state::<panel::TrayAnimation>() {
+            animation.stop();
+        }
+    }
     let bytes = match state {
         TrayState::Idle => TRAY_ICON_IDLE,
         TrayState::Detected => TRAY_ICON_DETECTED,
         TrayState::Recording => TRAY_ICON_RECORDING,
     };
+    paint_tray(app, bytes);
+    let _ = app.emit(events::TRAY_STATE, events::TrayStatePayload { state });
+}
+
+/// Paint one frame of the recording pulse. Deliberately quiet: the tray *state*
+/// has not changed, so no `TRAY_STATE` event goes out — twice a second of "still
+/// recording" would be noise on the bus.
+pub fn set_tray_frame(app: &AppHandle, frame: usize) {
+    paint_tray(app, TRAY_ICON_RECORDING_FRAMES[frame % panel::FRAME_COUNT]);
+}
+
+fn paint_tray(app: &AppHandle, bytes: &[u8]) {
     if let Some(tray) = app.tray_by_id("echo-tray") {
         if let Ok(image) = Image::from_bytes(bytes) {
-            let _ = tray.set_icon(Some(image));
-            // set_icon drops the template flag, and a non-template icon renders
-            // as a black blob in a dark menu bar. Re-assert it every swap.
-            #[cfg(target_os = "macos")]
-            let _ = tray.set_icon_as_template(true);
+            // Icon and template flag in one go. `set_icon` on its own drops the
+            // flag — and a non-template icon is a black blob in a dark menu bar
+            // — but setting them one after the other draws the icon twice,
+            // which the twice-a-second pulse would show as a flicker. On Linux
+            // and Windows this is `set_icon` and nothing else.
+            let _ = tray.set_icon_with_as_template(Some(image), true);
         }
     }
-    let _ = app.emit(events::TRAY_STATE, events::TrayStatePayload { state });
 }
 
 /// Show the window and focus it. The window is always a first-class way back
@@ -115,6 +148,9 @@ pub fn navigate(app: &AppHandle, payload: events::NavigatePayload) {
 pub fn quit(app: &AppHandle) {
     if let Some(flags) = app.try_state::<UiFlags>() {
         flags.quitting.store(true, Ordering::SeqCst);
+    }
+    if let Some(animation) = app.try_state::<panel::TrayAnimation>() {
+        animation.stop();
     }
     if let Some(state) = app.try_state::<AppState>() {
         tauri::async_runtime::block_on(state.session.shutdown());
@@ -191,15 +227,119 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             }
         })
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click { button, .. } = event {
-                if button == tauri::tray::MouseButton::Left {
-                    focus_main_window(tray.app_handle());
-                }
+            let TrayIconEvent::Click {
+                button,
+                button_state,
+                rect,
+                ..
+            } = event
+            else {
+                return;
+            };
+            // macOS reports both halves of the click; act on the release, so one
+            // press is one action.
+            if button != MouseButton::Left || button_state != MouseButtonState::Up {
+                return;
             }
+            on_tray_left_click(tray.app_handle(), rect);
         })
         .build(app)?;
 
     Ok(())
+}
+
+/// Left-clicking the tray. While a recording is running that means "show me the
+/// recording" — the little panel under the icon, with the clock and Stop.
+/// Otherwise it means what it has always meant: bring the window back.
+fn on_tray_left_click(app: &AppHandle, rect: tauri::Rect) {
+    let Some(state) = app.try_state::<panel::Panel>() else {
+        focus_main_window(app);
+        return;
+    };
+    if panel::motion_for(state.capture()) == panel::IconMotion::Off {
+        focus_main_window(app);
+        return;
+    }
+    let started_at_ms = state
+        .started_at_ms()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    let paused = panel::motion_for(state.capture()) == panel::IconMotion::Held;
+    panel::toggle_recording(app, Some(tray_anchor(app, &rect)), started_at_ms, paused);
+}
+
+/// The tray icon's own rectangle, in physical pixels, so the panel can sit
+/// under it. The runtime already hands us physical values; the scale factor is
+/// only there in case that ever changes.
+fn tray_anchor(app: &AppHandle, rect: &tauri::Rect) -> panel::Area {
+    let scale = app
+        .get_webview_window("main")
+        .and_then(|window| window.scale_factor().ok())
+        .unwrap_or(1.0);
+    let position = rect.position.to_physical::<f64>(scale);
+    let size = rect.size.to_physical::<f64>(scale);
+    panel::Area::new(position.x, position.y, size.width, size.height)
+}
+
+/// Keep the tray pulse and the floating panel in step with capture, by
+/// listening to the same event the UI gets. Nothing in `session` has to know
+/// either of them exists.
+fn watch_capture(app: &AppHandle) {
+    let handle = app.clone();
+    app.listen(events::CAPTURE_STATE, move |event| {
+        let Ok(status) = serde_json::from_str::<CaptureStatus>(event.payload()) else {
+            return;
+        };
+        let handle = handle.clone();
+        // Onto Tauri's runtime: the pulse spawns its timer on whatever runtime
+        // is current, and this callback arrives from wherever the session
+        // happened to be.
+        tauri::async_runtime::spawn(async move { on_capture_state(&handle, status) });
+    });
+}
+
+fn on_capture_state(app: &AppHandle, status: CaptureStatus) {
+    let motion = panel::motion_for(status.state);
+
+    if let Some(state) = app.try_state::<panel::Panel>() {
+        state.note_capture(status.state, recording_started_at_ms(&status));
+
+        // Whichever panel is on screen, take it away once it is talking about
+        // something that is no longer true: the "meeting detected" nudge the
+        // moment recording starts, the recording panel the moment it stops.
+        let stale = match state.showing() {
+            Some(PanelState::Detected { .. }) => motion != panel::IconMotion::Off,
+            Some(PanelState::Recording { .. }) => motion == panel::IconMotion::Off,
+            None => false,
+        };
+        if stale {
+            panel::hide(app);
+        } else {
+            // Still the right panel, but "Listening…" and a ticking clock would
+            // be untrue while the recording is paused.
+            panel::refresh_recording(app, motion == panel::IconMotion::Held);
+        }
+    }
+
+    if let Some(animation) = app.try_state::<panel::TrayAnimation>() {
+        animation.apply(motion, Arc::new(panel::TrayPainter::new(app.clone())));
+    }
+}
+
+/// When the running recording started, in epoch milliseconds, so the panel can
+/// count on its own instead of being fed a clock tick every second.
+fn recording_started_at_ms(status: &CaptureStatus) -> Option<i64> {
+    if panel::motion_for(status.state) == panel::IconMotion::Off {
+        return None;
+    }
+    if let Some(started) = status
+        .started_at
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+    {
+        return Some(started.timestamp_millis());
+    }
+    // No start time on the status: the elapsed clock is the next best answer.
+    Some(chrono::Utc::now().timestamp_millis() - status.elapsed_ms)
 }
 
 /// Everything that has to happen before the window is usable.
@@ -251,6 +391,12 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     // stored value is the intent and this reconciles the world to it.
     apply_launch_at_login(app, loaded.launch_at_login);
 
+    // The floating panel and the tray pulse. Both are pure state until
+    // something needs them: no window is created and no timer runs until a
+    // meeting is noticed or a recording starts (mantra 1).
+    app.manage(panel::Panel::new());
+    app.manage(panel::TrayAnimation::new());
+
     app.manage(AppState {
         session: session::SessionManager::new(
             db.clone(),
@@ -299,7 +445,9 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 6. Tray and window behaviour.
+    // 6. Tray, panel and window behaviour.
+    watch_capture(app);
+
     if let Err(error) = build_tray(app) {
         // A missing tray is survivable; the window is the primary surface.
         tracing::warn!(%error, "no tray icon on this system");

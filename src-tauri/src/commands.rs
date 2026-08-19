@@ -1166,6 +1166,41 @@ pub async fn show_main_window(app: AppHandle) -> CmdResult<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The floating panel
+// ---------------------------------------------------------------------------
+
+/// The ✕ on the "meeting detected" panel.
+///
+/// Takes the panel away and says nothing more about *this* meeting. It is not a
+/// snooze: detection keeps watching, the tray keeps showing what it sees, and
+/// the next meeting gets its panel as usual.
+#[tauri::command]
+pub async fn panel_dismiss(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    state.detect.dismiss_episode();
+    crate::panel::hide(&app);
+    Ok(())
+}
+
+/// The panel has done its job — Start or Stop went through — so take it away.
+/// Unlike [`panel_dismiss`] this says nothing about the meeting being unwanted.
+#[tauri::command]
+pub async fn panel_close(app: AppHandle) -> CmdResult<()> {
+    crate::panel::hide(&app);
+    Ok(())
+}
+
+/// What the panel should be showing right now.
+///
+/// The panel is told by event when it is put on screen, but the very first time
+/// the window is still loading and misses it. Asking on mount closes that gap.
+#[tauri::command]
+pub async fn get_panel_state(app: AppHandle) -> CmdResult<Option<crate::events::PanelState>> {
+    Ok(app
+        .try_state::<crate::panel::Panel>()
+        .and_then(|panel| panel.showing()))
+}
+
 #[tauri::command]
 pub async fn quit_app(app: AppHandle) -> CmdResult<()> {
     // Same path as the tray: close a live recording, park the queue, free the
@@ -1258,6 +1293,10 @@ macro_rules! echo_command_handler {
             // window
             $crate::commands::show_main_window,
             $crate::commands::quit_app,
+            // the floating panel
+            $crate::commands::panel_dismiss,
+            $crate::commands::panel_close,
+            $crate::commands::get_panel_state,
         ]
     };
 }

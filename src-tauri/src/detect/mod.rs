@@ -7,9 +7,15 @@
 //!    active input streams)
 //!
 //! Either signal, held for [`DEBOUNCE_POLLS`] consecutive polls, flips the
-//! watcher to [`DetectionState::Detected`]: one OS notification (Tauri's
-//! plugin has no action buttons on desktop, so this is a plain "click opens
-//! Echo" notification, review finding 7) plus a tray badge. While a meeting
+//! watcher to [`DetectionState::Detected`]: a tray badge, plus exactly one
+//! nudge. The nudge is the small floating panel near the menu bar
+//! ([`crate::panel`]) — "Meeting detected", how long ago, and a Start button
+//! right there. When a window cannot be put on screen at all, it falls back to
+//! an OS notification instead (a plain "click opens Echo" one; Tauri's plugin
+//! has no action buttons on desktop, review finding 7). Never both: one meeting
+//! noticed is one interruption. Closing the panel with ✕ mutes only that
+//! episode — see [`DebounceTracker::dismiss`] — and is emphatically not a
+//! snooze. While a meeting
 //! *is* being recorded, the same signals are watched the other way around:
 //! once they have all been clear for [`AUTO_STOP_SUGGEST_SECS`], the watcher
 //! sets `suggest_stop` on [`DetectionStatus`] so the UI can offer a gentle
@@ -181,6 +187,13 @@ struct DebounceTracker {
     absent_streak: u32,
     detected_latched: bool,
     stop_suggested: bool,
+    /// Counts detection *episodes*: one per false→true flip of the latch. A
+    /// meeting that is noticed, waved away, ends, and starts again is a new
+    /// episode and gets a fresh nudge.
+    episode: u64,
+    /// The episode the person closed the panel on. Only that one is muted —
+    /// this is not a snooze, detection keeps working exactly as before.
+    dismissed_episode: Option<u64>,
 }
 
 impl DebounceTracker {
@@ -191,14 +204,20 @@ impl DebounceTracker {
         if capture_state == CaptureState::Recording {
             // Already recording: "Detected" has nothing left to offer, only
             // auto-stop matters.
-            self.present_streak = 0;
-            self.detected_latched = false;
-
             if signals_present {
+                // The meeting is still going, so this is still the same
+                // episode: the latch stays exactly as it was. Otherwise
+                // stopping a recording while the call is still open would earn
+                // a fresh "meeting detected" nudge ten seconds later, for the
+                // meeting the person just decided to stop recording.
                 self.absent_streak = 0;
                 self.stop_suggested = false;
                 StepEvent::None
             } else {
+                // Nothing left to hear: the meeting is over as far as we can
+                // tell, and the next one is a new episode.
+                self.present_streak = 0;
+                self.detected_latched = false;
                 self.absent_streak = self.absent_streak.saturating_add(1);
                 if self.absent_streak >= auto_stop_threshold_polls() && !self.stop_suggested {
                     self.stop_suggested = true;
@@ -216,6 +235,7 @@ impl DebounceTracker {
                 self.present_streak = self.present_streak.saturating_add(1);
                 if self.present_streak >= DEBOUNCE_POLLS && !self.detected_latched {
                     self.detected_latched = true;
+                    self.episode = self.episode.wrapping_add(1);
                     StepEvent::Detected
                 } else {
                     StepEvent::None
@@ -234,6 +254,22 @@ impl DebounceTracker {
 
     fn is_suggesting_stop(&self) -> bool {
         self.stop_suggested
+    }
+
+    /// Which detection episode we are in. Starts at zero, before anything has
+    /// ever been detected.
+    fn episode(&self) -> u64 {
+        self.episode
+    }
+
+    /// The person closed the panel: say nothing more about *this* meeting.
+    fn dismiss(&mut self) {
+        self.dismissed_episode = Some(self.episode);
+    }
+
+    /// Has this episode already been waved away?
+    fn is_dismissed(&self) -> bool {
+        self.dismissed_episode == Some(self.episode)
     }
 }
 
@@ -381,6 +417,26 @@ impl Watcher {
 
     pub fn status(&self) -> DetectionStatus {
         self.inner.lock().unwrap().status.clone()
+    }
+
+    /// Which detection episode is in progress. One per meeting noticed; zero
+    /// before anything has been.
+    pub fn episode(&self) -> u64 {
+        self.debounce.lock().unwrap().episode()
+    }
+
+    /// The ✕ on the floating panel: say nothing more about *this* meeting.
+    ///
+    /// Deliberately not a snooze — detection keeps watching, the tray badge
+    /// keeps showing, and the next meeting gets nudged about as usual. All this
+    /// mutes is a second panel for the meeting the person just waved away.
+    pub fn dismiss_episode(&self) {
+        self.debounce.lock().unwrap().dismiss();
+    }
+
+    /// Has the meeting we are currently seeing already been waved away?
+    pub fn episode_dismissed(&self) -> bool {
+        self.debounce.lock().unwrap().is_dismissed()
     }
 
     /// Poll once, out of band. Used by tests and by the "check now" button in
@@ -572,14 +628,29 @@ impl Watcher {
                     .unwrap_or(false),
                 None => false,
             };
-            if speech_ready {
+            if speech_ready && !self.episode_dismissed() {
                 let detected_app = new_status
                     .signals
                     .iter()
                     .find_map(|signal| signal.app.clone());
-                self.show_meeting_notification(&app, detected_app);
+                self.nudge_about_the_meeting(&app, detected_app).await;
             }
         }
+    }
+
+    /// One nudge per meeting, and only one.
+    ///
+    /// The floating panel is the good version: it is where the person is
+    /// looking, and Start is right there. The OS notification is the fallback
+    /// for when a window cannot be put on screen at all. Doing both would be
+    /// two interruptions for one meeting.
+    async fn nudge_about_the_meeting(&self, app: &AppHandle, detected_app: Option<String>) {
+        let detected_at_ms = Utc::now().timestamp_millis();
+        if crate::panel::show_detected(app, detected_at_ms, detected_app.clone()).await {
+            return;
+        }
+        tracing::debug!("no floating panel available, falling back to a notification");
+        self.show_meeting_notification(app, detected_app);
     }
 
     fn show_meeting_notification(&self, app: &AppHandle, detected_app: Option<String>) {
@@ -828,6 +899,101 @@ mod tests {
         assert!(d.is_detected());
         d.step(CaptureState::Idle, false);
         assert!(!d.is_detected(), "clearing the signal clears Detected");
+    }
+
+    // -- episodes and the panel's ✕ ---------------------------------------
+
+    #[test]
+    fn nothing_is_dismissed_before_a_meeting_is_ever_noticed() {
+        let d = DebounceTracker::default();
+        assert_eq!(d.episode(), 0);
+        assert!(!d.is_dismissed());
+    }
+
+    #[test]
+    fn each_time_a_meeting_is_noticed_is_a_new_episode() {
+        let mut d = DebounceTracker::default();
+        d.step(CaptureState::Idle, true);
+        d.step(CaptureState::Idle, true);
+        assert_eq!(d.episode(), 1);
+
+        // Still the same meeting: more present polls do not start a new one.
+        d.step(CaptureState::Idle, true);
+        d.step(CaptureState::Idle, true);
+        assert_eq!(d.episode(), 1);
+
+        // Meeting ends, another starts.
+        d.step(CaptureState::Idle, false);
+        d.step(CaptureState::Idle, true);
+        d.step(CaptureState::Idle, true);
+        assert_eq!(d.episode(), 2);
+    }
+
+    #[test]
+    fn closing_the_panel_mutes_only_the_meeting_it_was_about() {
+        let mut d = DebounceTracker::default();
+        d.step(CaptureState::Idle, true);
+        d.step(CaptureState::Idle, true);
+        d.dismiss();
+        assert!(d.is_dismissed());
+
+        // The signal keeps holding — no second panel for the same meeting.
+        d.step(CaptureState::Idle, true);
+        assert!(d.is_dismissed());
+
+        // The next meeting is nudged about as if nothing had happened.
+        d.step(CaptureState::Idle, false);
+        d.step(CaptureState::Idle, true);
+        assert_eq!(d.step(CaptureState::Idle, true), StepEvent::Detected);
+        assert!(!d.is_dismissed(), "✕ is not a snooze");
+    }
+
+    #[test]
+    fn stopping_a_recording_mid_meeting_does_not_re_announce_it() {
+        let mut d = DebounceTracker::default();
+        d.step(CaptureState::Idle, true);
+        assert_eq!(d.step(CaptureState::Idle, true), StepEvent::Detected);
+        let episode = d.episode();
+
+        // Recording runs while the call is still going.
+        for _ in 0..5 {
+            assert_eq!(d.step(CaptureState::Recording, true), StepEvent::None);
+        }
+        // The person stops it, with the call still open.
+        assert_eq!(d.step(CaptureState::Idle, true), StepEvent::None);
+        assert_eq!(d.step(CaptureState::Idle, true), StepEvent::None);
+        assert_eq!(d.episode(), episode, "the same meeting, still");
+    }
+
+    #[test]
+    fn a_meeting_recorded_and_then_really_over_still_counts_the_next_one() {
+        let mut d = DebounceTracker::default();
+        d.step(CaptureState::Idle, true);
+        d.step(CaptureState::Idle, true);
+        d.dismiss();
+        d.step(CaptureState::Recording, true);
+        // The call ends while recording is still on.
+        d.step(CaptureState::Recording, false);
+        assert!(!d.is_detected());
+        // Later, a different meeting.
+        d.step(CaptureState::Idle, true);
+        assert_eq!(d.step(CaptureState::Idle, true), StepEvent::Detected);
+        assert!(!d.is_dismissed(), "a new meeting is never pre-dismissed");
+    }
+
+    #[tokio::test]
+    async fn the_watcher_exposes_the_episode_the_panel_dismisses() {
+        let watcher = Watcher::with_source(true, quiet_source());
+        assert_eq!(watcher.episode(), 0);
+        assert!(!watcher.episode_dismissed());
+        watcher.dismiss_episode();
+        assert!(
+            watcher.episode_dismissed(),
+            "dismissing before anything is seen still marks the current episode"
+        );
+        // And it never reaches for the snooze.
+        assert_eq!(watcher.status().state, DetectionState::Idle);
+        assert!(watcher.status().snoozed_until.is_none());
     }
 
     // -- auto-stop suggestion ---------------------------------------------

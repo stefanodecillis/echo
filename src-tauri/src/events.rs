@@ -57,6 +57,8 @@ pub const TRAY_ACTION: &str = "echo://tray-action";
 pub const NAVIGATE: &str = "echo://navigate";
 /// Interrupted meetings were found at launch; the UI offers finish or discard.
 pub const RECOVERY_AVAILABLE: &str = "echo://recovery-available";
+/// What the floating panel should be showing. Sent to the `panel` window only.
+pub const PANEL_STATE: &str = "echo://panel-state";
 
 /// Every event name, for tests that assert the TS mirror is complete.
 pub const ALL: &[&str] = &[
@@ -78,6 +80,7 @@ pub const ALL: &[&str] = &[
     TRAY_ACTION,
     NAVIGATE,
     RECOVERY_AVAILABLE,
+    PANEL_STATE,
 ];
 
 // ---------------------------------------------------------------------------
@@ -292,6 +295,43 @@ pub struct RecoveryAvailablePayload {
     pub meeting_ids: Vec<Id>,
 }
 
+/// `PANEL_STATE` — the two things the floating panel can be.
+///
+/// A discriminated union on `kind`, so the panel renders one or the other and
+/// never has to guess which fields are meaningful. Times are epoch
+/// milliseconds: the panel counts "3 minutes ago" and the elapsed clock itself,
+/// which keeps this a one-shot event instead of a per-second stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PanelState {
+    /// A meeting looks like it started and nothing is being recorded yet.
+    Detected {
+        detected_at_ms: i64,
+        /// The app that gave it away ("Zoom"), when one did.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        app_name: Option<String>,
+    },
+    /// A recording is running; the panel shows the clock and a Stop button.
+    Recording {
+        started_at_ms: i64,
+        /// The recording is paused. The panel then says so and stops counting,
+        /// rather than claiming Echo is listening when it is not (mantra 2).
+        paused: bool,
+    },
+}
+
+/// `PANEL_STATE`
+///
+/// `null` means the panel is off the screen. It is sent on the way out so the
+/// panel's webview drops what it was drawing — and with it the once-a-second
+/// clock — the moment it stops being visible, rather than trusting the platform
+/// to tell it that it is hidden (mantra 1).
+pub type PanelStatePayload = Option<PanelState>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +357,34 @@ mod tests {
         .unwrap();
         assert!(json.contains("\"persistent\":true"), "{json}");
         assert!(json.contains("\"level\":\"warning\""), "{json}");
+    }
+
+    #[test]
+    fn the_panel_payload_is_a_kind_tagged_union() {
+        let detected = serde_json::to_string(&PanelState::Detected {
+            detected_at_ms: 1_700_000_000_000,
+            app_name: Some("Zoom".into()),
+        })
+        .unwrap();
+        assert!(detected.contains("\"kind\":\"detected\""), "{detected}");
+        assert!(detected.contains("\"detectedAtMs\":"), "{detected}");
+        assert!(detected.contains("\"appName\":\"Zoom\""), "{detected}");
+
+        let recording = serde_json::to_string(&PanelState::Recording {
+            started_at_ms: 1_700_000_000_000,
+            paused: false,
+        })
+        .unwrap();
+        assert!(recording.contains("\"kind\":\"recording\""), "{recording}");
+        assert!(recording.contains("\"startedAtMs\":"), "{recording}");
+        assert!(recording.contains("\"paused\":false"), "{recording}");
+
+        // An unnamed app is absent rather than null, so the panel can use `?.`.
+        let anonymous = serde_json::to_string(&PanelState::Detected {
+            detected_at_ms: 1,
+            app_name: None,
+        })
+        .unwrap();
+        assert!(!anonymous.contains("appName"), "{anonymous}");
     }
 }
