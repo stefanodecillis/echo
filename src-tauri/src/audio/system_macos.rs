@@ -832,6 +832,13 @@ pub fn supported() -> bool {
     version.majorVersion >= 13
 }
 
+/// Whether this process has already asked macOS for screen capture. The
+/// preflight API cannot tell "never asked" from "asked and refused", and the
+/// two need different UI: an Allow button the first time, a road to System
+/// Settings after.
+static SCREEN_ACCESS_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Permission state without prompting.
 pub async fn permission() -> PermissionState {
     if !supported() {
@@ -839,13 +846,20 @@ pub async fn permission() -> PermissionState {
     }
     if unsafe { CGPreflightScreenCaptureAccess() } {
         PermissionState::Granted
+    } else if !SCREEN_ACCESS_REQUESTED.load(Ordering::SeqCst) {
+        // Not granted, but nothing has been asked yet this run: the person
+        // needs the Allow button, not a hunt through System Settings for an
+        // app that is not even listed there.
+        PermissionState::Unknown
     } else {
         PermissionState::Denied
     }
 }
 
-/// Trigger the system prompt. Grant usually needs a relaunch, so the result is
-/// often [`PermissionState::RestartRequired`].
+/// Ask macOS for screen capture. This is also what makes Echo APPEAR in
+/// System Settings → Screen & System Audio Recording: an app is only listed
+/// there once it has actually attempted capture, so both calls below are made
+/// even though they are expected to say no while permission is missing.
 pub async fn request_permission() -> PermissionState {
     if !supported() {
         return PermissionState::NotApplicable;
@@ -853,14 +867,15 @@ pub async fn request_permission() -> PermissionState {
     if unsafe { CGPreflightScreenCaptureAccess() } {
         return PermissionState::Granted;
     }
+    SCREEN_ACCESS_REQUESTED.store(true, Ordering::SeqCst);
+
+    // Shows the system dialog (once per launch at most), and registers the
+    // app with the permission system.
     let granted = unsafe { CGRequestScreenCaptureAccess() };
 
-    // CGRequestScreenCaptureAccess only shows its dialog once per launch (and
-    // on newer macOS sometimes not at all), and an app that never *attempted*
-    // capture is not even listed in System Settings — the person would have to
-    // find it with the "+" button by hand. Actually asking ScreenCaptureKit
-    // for content registers Echo in that list, so the person only has to flip
-    // the switch. The call is expected to fail while permission is missing;
+    // Belt to that braces: actually asking ScreenCaptureKit for content is
+    // the documented trigger for both the prompt and the System Settings
+    // listing on newer macOS. Expected to fail while permission is missing —
     // registration is the point. Bounded by OPEN_TIMEOUT, off the async
     // runtime's threads.
     let _ = tokio::task::spawn_blocking(|| {
@@ -871,9 +886,10 @@ pub async fn request_permission() -> PermissionState {
     if granted {
         PermissionState::Granted
     } else {
-        // macOS only starts honouring a fresh grant after a relaunch, so saying
-        // "denied" here would be a lie the person cannot act on.
-        PermissionState::RestartRequired
+        // Now Echo is listed in System Settings with its switch off; the
+        // Denied card is the one that points there. macOS itself offers to
+        // reopen Echo when the switch is flipped.
+        PermissionState::Denied
     }
 }
 
