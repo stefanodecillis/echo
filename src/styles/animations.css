@@ -1,0 +1,36 @@
+/**
+ * The handful of motions Tailwind's built-in utilities (`animate-pulse`,
+ * `animate-ping`, `animate-spin`) don't cover. Imported directly by the
+ * components that use them, so nothing here loads unless it's on screen.
+ *
+ * Kept deliberately small and quiet — see docs/DESIGN.md §4: subtle shadows
+ * and motion only, one accent, generous whitespace.
+ */
+
+@keyframes echo-progress-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(350%);
+  }
+}
+
+.animate-progress-indeterminate {
+  animation: echo-progress-indeterminate 1.1s ease-in-out infinite;
+}
+
+@keyframes echo-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-toast-in {
+  animation: echo-toast-in 0.16s ease-out;
+}

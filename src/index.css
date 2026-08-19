@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-surface text-ink font-sans antialiased;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Desktop app: no rubber-band scroll, no text selection on chrome. */
+  body {
+    overscroll-behavior: none;
+  }
+
+  ::selection {
+    background: theme("colors.accent.soft");
+  }
+}
+
+@layer components {
+  .echo-card {
+    @apply rounded-xl border border-hairline bg-surface shadow-card;
+  }
+
+  .echo-pill {
+    @apply inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-colors;
+  }
+
+  .echo-pill-primary {
+    @apply echo-pill bg-ink text-white hover:bg-ink-soft;
+  }
+
+  .echo-pill-quiet {
+    @apply echo-pill border border-hairline text-ink-soft hover:bg-surface-sunken;
+  }
+
+  .echo-chip {
+    @apply inline-flex items-center rounded-full bg-surface-sunken px-2.5 py-1 text-xs font-medium text-ink-faint;
+  }
+}
