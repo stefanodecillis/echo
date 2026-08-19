@@ -98,6 +98,7 @@ export const labels = {
 /** Words used across more than one screen: dialogs, toasts, generic buttons. */
 export const common = {
   close: "Close",
+  settingUpLabel: "Getting Echo ready",
   dismiss: "Dismiss",
   cancel: "Cancel",
   save: "Save",
@@ -140,6 +141,9 @@ export const home = {
   heroIdleTitle: "Waiting for your next meeting",
   heroIdleSubtitle: "Start any time — Echo will listen and write the recap.",
   heroIdleTip: "Echo keeps an eye out for meeting apps and lets you know when it's time.",
+  heroPreparingTitle: "Getting Echo ready",
+  heroPreparingSubtitle:
+    "Finishing the one-time download. Recording and meeting alerts switch on the moment it's done.",
   heroDetectedTitle: "Looks like your meeting is starting",
   heroDetectedSubtitle: "Echo noticed a call getting going — press Start and it'll listen.",
   openLiveButton: "View live",
@@ -432,6 +436,7 @@ export const onboarding = {
 /** Banners, toasts and confirmations. */
 export const notices = {
   somethingWentWrong: "Something went wrong. Nothing was lost.",
+  setupDone: "Echo is ready — recording and meeting alerts are on.",
   systemAudioLost:
     "Echo can hear you, but not the other people. It will keep recording.",
   storageLow:

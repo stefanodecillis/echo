@@ -282,6 +282,15 @@ pub async fn start_recording(
     state: State<'_, AppState>,
     options: Option<StartRecordingOptions>,
 ) -> CmdResult<Id> {
+    // Recording is locked until the one-time speech download is in place —
+    // the person asked for that explicitly: no half-working states.
+    let readiness = asr::models::readiness(&state.db, &state.paths).await?;
+    if !readiness.ready {
+        return Err(UiError::new(
+            UiErrorKind::NotReady,
+            "Echo is still getting ready. Recording unlocks the moment the one-time download finishes.",
+        ));
+    }
     Ok(state.session.start(options.unwrap_or_default()).await?)
 }
 

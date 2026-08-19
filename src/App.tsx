@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Route, Routes, useLocation, useNavigate } from "react-router-dom";
 
+import { SetupProgress } from "./components/SetupProgress";
 import { Sidebar } from "./components/Sidebar";
 import { ToastViewport } from "./components/Toast";
 import { useEvent } from "./hooks/useEvent";
@@ -123,6 +124,7 @@ export default function App() {
           <Route path="*" element={<NotFound />} />
         </Routes>
       </main>
+      <SetupProgress />
       <ToastViewport />
     </div>
   );

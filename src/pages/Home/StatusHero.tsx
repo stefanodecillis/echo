@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 
-import { Button, Card, Modal, RecordingDot } from "../../components";
+import { Button, Card, Modal, ProgressBar, RecordingDot } from "../../components";
 import { formatElapsed } from "../../components/lib/format";
 import { useCommand } from "../../hooks";
 import { common, home, labels, live } from "../../lib/copy";
@@ -22,6 +22,10 @@ export interface StatusHeroProps {
   startErrorAction?: "openMicrophoneSettings" | "openScreenRecordingSettings";
   /** The most recent line Echo has heard, for the live variant. */
   lastCaption?: string;
+  /** The one-time download is still running: recording is locked until then. */
+  preparing?: boolean;
+  /** 0..1 while preparing, undefined when the size isn't known yet. */
+  preparingFraction?: number;
 }
 
 const ACTIVE_STATES = new Set(["starting", "recording", "paused", "degraded", "stopping"]);
@@ -40,9 +44,32 @@ export function StatusHero({
   startErrorMessage,
   startErrorAction,
   lastCaption,
+  preparing,
+  preparingFraction,
 }: StatusHeroProps) {
   if (ACTIVE_STATES.has(capture.state)) {
     return <RecordingHero capture={capture} lastCaption={lastCaption} />;
+  }
+
+  if (preparing) {
+    return (
+      <Card padding="lg" className="flex flex-col items-start gap-3">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight text-ink">
+            {home.heroPreparingTitle}
+          </h1>
+          <p className="mt-1 text-sm text-ink-soft">{home.heroPreparingSubtitle}</p>
+        </div>
+        <ProgressBar
+          value={preparingFraction}
+          label={home.heroPreparingTitle}
+          className="w-full max-w-xs"
+        />
+        <Button variant="secondary" disabled>
+          {home.startButton}
+        </Button>
+      </Card>
+    );
   }
 
   if (detection.state === "detected") {

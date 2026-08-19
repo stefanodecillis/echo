@@ -3,6 +3,8 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { SearchInput } from "../../components";
 import { useCaptureState, useCommand, useEvent } from "../../hooks";
+import { useDownloadProgress } from "../../hooks/useDownloadProgress";
+import { useSpeechReadiness } from "../../hooks/useSpeechReadiness";
 import { home } from "../../lib/copy";
 import { EVENTS, startRecording, toUiError } from "../../lib/ipc";
 import { useEchoStore } from "../../lib/store";
@@ -34,6 +36,12 @@ export default function Home() {
   const addToast = useEchoStore((s) => s.addToast);
   const startCmd = useCommand(startRecording);
   const [lastCaption, setLastCaption] = useState<string>();
+  const readiness = useSpeechReadiness();
+  const download = useDownloadProgress();
+  // Unknown readiness counts as ready here so the hero doesn't flicker into
+  // "getting ready" on every visit; the backend still refuses a premature
+  // start with a plain sentence either way.
+  const preparing = readiness ? !readiness.ready : false;
 
   useEvent(EVENTS.transcriptPartial, (payload) => {
     if (payload.meetingId === capture.meetingId) setLastCaption(payload.text);
@@ -58,6 +66,18 @@ export default function Home() {
 
   useEffect(() => {
     if (searchParams.get("start") !== "1") return;
+    if (preparing) {
+      // Echo isn't ready to record yet; drop the request instead of firing a
+      // start that the backend would refuse.
+      setSearchParams(
+        (params) => {
+          params.delete("start");
+          return params;
+        },
+        { replace: true },
+      );
+      return;
+    }
     setSearchParams(
       (params) => {
         params.delete("start");
@@ -116,6 +136,12 @@ export default function Home() {
               : undefined
           }
           lastCaption={lastCaption}
+          preparing={preparing}
+          preparingFraction={
+            download && download.totalBytes > 0
+              ? download.receivedBytes / download.totalBytes
+              : undefined
+          }
         />
       )}
 

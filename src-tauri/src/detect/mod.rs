@@ -562,11 +562,23 @@ impl Watcher {
         }
 
         if edge == StepEvent::Detected {
-            let detected_app = new_status
-                .signals
-                .iter()
-                .find_map(|signal| signal.app.clone());
-            self.show_meeting_notification(&app, detected_app);
+            // Recording is locked until the one-time speech download is done,
+            // so a "start recording?" nudge would lead nowhere. Stay quiet
+            // until Echo can actually follow through.
+            let speech_ready = match app.try_state::<crate::AppState>() {
+                Some(state) => crate::asr::models::readiness(&state.db, &state.paths)
+                    .await
+                    .map(|r| r.ready)
+                    .unwrap_or(false),
+                None => false,
+            };
+            if speech_ready {
+                let detected_app = new_status
+                    .signals
+                    .iter()
+                    .find_map(|signal| signal.app.clone());
+                self.show_meeting_notification(&app, detected_app);
+            }
         }
     }
 
