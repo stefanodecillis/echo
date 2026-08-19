@@ -91,7 +91,7 @@ export const labels = {
     denied: "Not allowed",
     prompting: "Waiting for your answer",
     restartRequired: "Restart Echo to finish",
-    notApplicable: "Not needed on this computer",
+    notApplicable: "Nothing to set up",
   },
 } as const;
 
@@ -395,7 +395,8 @@ export const onboarding = {
   screenRecordingDescription:
     "macOS uses this permission for hearing everything your computer plays, not just your microphone.",
   notificationsTitle: "Notifications",
-  notificationsDescription: "So Echo can let you know when a meeting starts.",
+  notificationsDescription:
+    "So Echo can let you know when a meeting starts. macOS asks on its own the first time.",
   permissionAllowButton: "Allow",
   permissionRestartNote: "Restart Echo for this to take effect.",
   permissionDeniedNote:

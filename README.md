@@ -176,3 +176,14 @@ and no keys.
 
 Recording captures everything your computer plays, not only the meeting window.
 Echo says so rather than implying otherwise.
+
+## Local build signing
+
+`tauri.conf.json` signs release bundles with the "Echo Local Signing" certificate — a
+self-signed code-signing certificate in the login keychain of the machine that builds.
+It exists so macOS permission grants (microphone, screen recording) survive rebuilds:
+ad-hoc signatures are re-keyed on every build and macOS forgets the grants. On a new
+machine, either create such a certificate (Keychain Access → Certificate Assistant →
+Create a Certificate → type "Code Signing", name it "Echo Local Signing") or change
+`bundle.macOS.signingIdentity` to `"-"` and accept re-prompting during development.
+Proper Developer ID signing + notarization replaces this for distribution.

@@ -992,18 +992,13 @@ pub async fn list_input_devices() -> CmdResult<Vec<AudioDevice>> {
 // Permissions and onboarding
 // ---------------------------------------------------------------------------
 
-/// The notification plugin's answer, in our vocabulary. On desktop the plugin
-/// reports Granted (the operating system runs its own banner prompt the first
-/// time Echo posts a notification), so this mostly keeps the onboarding card
-/// truthful rather than stuck on an "Allow" button that does nothing.
-fn notification_permission(app: &AppHandle) -> PermissionState {
-    use tauri_plugin_notification::{NotificationExt, PermissionState as Np};
-    match app.notification().permission_state() {
-        Ok(Np::Granted) => PermissionState::Granted,
-        Ok(Np::Denied) => PermissionState::Denied,
-        Ok(_) => PermissionState::Unknown,
-        Err(_) => PermissionState::Unknown,
-    }
+/// Notifications need no setup step on desktop: the plugin cannot read the
+/// real state (it reports "granted" unconditionally), and macOS runs its own
+/// banner prompt the first time Echo actually posts one. Saying "Allowed"
+/// before anyone allowed anything read as a lie, so the card says "nothing to
+/// set up" instead.
+fn notification_permission(_app: &AppHandle) -> PermissionState {
+    PermissionState::NotApplicable
 }
 
 #[tauri::command]
@@ -1023,15 +1018,7 @@ pub async fn request_permission(
     Ok(match target {
         PermissionTarget::Microphone => audio::request_microphone_permission().await,
         PermissionTarget::SystemAudio => audio::request_system_audio_permission().await,
-        PermissionTarget::Notifications => {
-            use tauri_plugin_notification::{NotificationExt, PermissionState as Np};
-            match app.notification().request_permission() {
-                Ok(Np::Granted) => PermissionState::Granted,
-                Ok(Np::Denied) => PermissionState::Denied,
-                Ok(_) => PermissionState::Unknown,
-                Err(_) => PermissionState::Unknown,
-            }
-        }
+        PermissionTarget::Notifications => notification_permission(&app),
     })
 }
 

@@ -57,7 +57,7 @@
     "macOS": {
       "minimumSystemVersion": "13.0",
       "hardenedRuntime": true,
-      "signingIdentity": "-",
+      "signingIdentity": "Echo Local Signing",
       "entitlements": "entitlements.plist",
       "files": {},
       "dmg": {
