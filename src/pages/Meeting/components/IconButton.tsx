@@ -35,7 +35,14 @@ export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(functio
       )}
       {...props}
     >
-      <span aria-hidden className="flex h-4 w-4 items-center justify-center">
+      {/* Icons from the shared set carry no width/height of their own; an
+          unsized <svg> falls back to its intrinsic default and draws outside
+          this 16px slot — a visibly empty button. Force any svg child to
+          fill the slot. */}
+      <span
+        aria-hidden
+        className="flex h-4 w-4 items-center justify-center [&>svg]:h-full [&>svg]:w-full"
+      >
         {icon}
       </span>
     </button>
