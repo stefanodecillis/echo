@@ -395,6 +395,12 @@ pub async fn start_recording(
 ) -> CmdResult<Id> {
     // Recording is locked until the one-time speech download is in place —
     // the person asked for that explicitly: no half-working states.
+    //
+    // "In place" means *something* can transcribe, not that the newest model
+    // has arrived. An upgrade downloading in the background is never the reason
+    // a meeting goes unrecorded (mantra 3), so this reconciles first and then
+    // asks, and the answer counts whatever weights are actually on disk.
+    state.session.ensure_speech_current().await;
     let readiness = asr::models::readiness(&state.db, &state.paths).await?;
     if !readiness.ready {
         return Err(UiError::new(
@@ -861,6 +867,12 @@ pub async fn cancel_speech_download(state: State<'_, AppState>, asset_id: Id) ->
 
 #[tauri::command]
 pub async fn get_speech_readiness(state: State<'_, AppState>) -> CmdResult<SpeechReadiness> {
+    // Asking whether Echo can understand speech is also when Echo checks that
+    // it has the right model and puts itself right if it does not: queue a
+    // missing download, clean up weights it has stopped using. Nothing here
+    // waits on that — the reconcile only queues work and deletes what is
+    // already redundant (see `crate::asr::reconcile`).
+    state.session.ensure_speech_current().await;
     let mut readiness = asr::models::readiness(&state.db, &state.paths).await?;
     // `models` reads the catalog and the disk; only the session knows whether
     // anything is actually in memory right now.

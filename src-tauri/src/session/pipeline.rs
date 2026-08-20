@@ -92,6 +92,37 @@ const LEVELS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Most audio a caption is decoded from: the tail of what is open, never the
 /// whole thing. whisper.cpp's streaming example uses the same 10 s.
+///
+/// **Kept at 10 s after measuring the full model** (`examples/speculative_probe`,
+/// 2026-08-20, real meeting audio on Apple silicon with the encoder companion):
+///
+/// ```text
+///  window   decodes    median       p90       max   vs step
+///      6s        12     2.50s     2.76s     2.81s     0.83x
+///      8s        12     2.41s     3.06s     3.52s     0.80x
+///     10s        12     2.55s     3.16s     3.62s     0.85x
+///
+///  the same audio and the same window on the model this replaced:
+///     10s        12     0.85s     0.94s     0.98s     0.28x
+/// ```
+///
+/// So a caption costs three times what it used to, and still lands inside a
+/// step at the median. Moving to the full model was expected to force this
+/// number down and it did not, for a reason worth writing down: **whisper pads
+/// every window to 30 s of mel frames before the encoder sees it.** The encoder
+/// is a fixed cost whatever the window length, and only the decoder scales with
+/// it. Cutting 10 s to 6 s buys 0.05 s — noise — and pays for it in left
+/// context, which is the one thing a caption of a half-finished sentence
+/// actually needs.
+///
+/// The p90 sits just over a step, and that is survivable by construction rather
+/// than by luck: [`CAPTION_STEP_MS`] is measured in *audio*, not wall clock, so
+/// a decode that overruns makes the next caption cover more speech instead of
+/// building a queue of stale ones.
+///
+/// So the trade is not the one it looks like. Shorten this only if the median
+/// climbs past [`CAPTION_STEP_MS`], and re-measure before assuming a shorter
+/// window is what fixes it — on this evidence it is not.
 pub const CAPTION_WINDOW_MS: i64 = 10_000;
 
 /// New speech needed before the caption is decoded again on that channel.

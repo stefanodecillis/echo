@@ -554,8 +554,8 @@ pub fn engine_is_needed_by_capture(state: CaptureState) -> bool {
 ///
 /// Deliberately not "is the engine busy right now". A meeting with a long silence
 /// in it, or a gap between catch-up finishing and the recap starting, is still
-/// one conversation, and unloading 1.6 GB in the middle of it only buys a reload
-/// (mantra 1's amendment of 2026-08-20).
+/// one conversation, and unloading three gigabytes in the middle of it only buys
+/// a reload (mantra 1's amendment of 2026-08-20).
 pub fn engine_stays_resident(capturing: bool, outstanding_meeting_jobs: usize) -> bool {
     capturing || outstanding_meeting_jobs > 0
 }
@@ -1223,6 +1223,90 @@ impl SessionManager {
         }
         self.0.jobs.start();
         Ok(())
+    }
+
+    /// Make sure Echo has the speech model it wants, and get rid of any it does
+    /// not. The one entry point for the self-healing described in
+    /// [`crate::asr::reconcile`].
+    ///
+    /// Called at launch and every time the UI asks whether Echo can understand
+    /// speech, so it has to be cheap when there is nothing to do (a `stat` per
+    /// catalogued asset and one settings read) and safe to call at any moment.
+    ///
+    /// Three things can come out of it, at most one of them visible:
+    ///
+    /// * something wanted is missing → a download job is queued, and the
+    ///   progress pill the app already has shows it. Recording is not blocked:
+    ///   whatever is on disk keeps serving.
+    /// * every wanted file has arrived and older weights are still there → they
+    ///   are deleted and the person is told once, quietly.
+    /// * nothing to do → silence, which is the common case.
+    ///
+    /// Returns whether Echo can transcribe right now, which is the only part a
+    /// caller has ever needed.
+    pub async fn ensure_speech_current(&self) -> bool {
+        let plan = match crate::asr::models::plan_reconcile(&self.0.db, &self.0.paths).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                // A reconcile that cannot read the disk changes nothing and
+                // blocks nothing: whatever was installed a moment ago still is.
+                tracing::warn!(%error, "could not check what Echo has to understand speech with");
+                return false;
+            }
+        };
+
+        // Never take weights away from a meeting in progress. Unlinking a file
+        // the engine already has open is survivable, but the engine reloads on
+        // its own after three failed decodes, and finding the weights gone at
+        // that moment would cost the rest of the meeting's live text. The files
+        // are only redundant — they can wait until the meeting is over, which is
+        // the next time anything asks.
+        let recording = engine_is_needed_by_capture(self.0.state());
+        if recording && plan.switching() {
+            tracing::info!(
+                "leaving older speech weights in place until this meeting is finished"
+            );
+            return plan.can_serve();
+        }
+        crate::asr::models::apply_cleanup(&self.0.db, &self.0.paths, &plan).await;
+
+        if plan.switching() {
+            // The engine picks the new weights up on its next configure, which
+            // is why the old files could go: `installed_path` now resolves to
+            // the new model and the old one is not on disk to be loaded.
+            tracing::info!(
+                serving = plan.serving.unwrap_or("?"),
+                "Echo switched to the speech model it wants"
+            );
+            self.0.notice(NoticePayload {
+                level: NoticeLevel::Info,
+                message: "Echo upgraded how it understands speech.".into(),
+                persistent: false,
+                meeting_id: None,
+                // Tagged so a second launch that somehow re-observes the switch
+                // replaces the notice rather than stacking a duplicate.
+                tag: Some("speechUpgraded".into()),
+            });
+        }
+
+        if !plan.missing.is_empty() {
+            // `queue` deduplicates per kind, so a download already queued or
+            // running is joined rather than started twice — this can be called
+            // several times a second by a UI that is watching readiness.
+            match self
+                .queue_job_with_payload(None, JobKind::Download, &plan.level_id.to_string())
+                .await
+            {
+                Ok(_) => tracing::info!(
+                    missing = plan.missing.len(),
+                    bytes = plan.remaining_bytes(),
+                    "queued the download of what Echo still needs"
+                ),
+                Err(error) => tracing::warn!(%error, "could not queue the download"),
+            }
+        }
+
+        plan.can_serve()
     }
 
     /// Load speech understanding now, because the person asked. Nothing loads on
@@ -1948,6 +2032,28 @@ mod tests {
         assert!(engine_stays_resident(false, 1));
         // And only then does the grace period start.
         assert!(!engine_stays_resident(false, 0));
+    }
+
+    /// The same predicate guards the model cleanup, and for the same reason: an
+    /// upgrade must never reach into a meeting that is happening. See
+    /// `SessionManager::ensure_speech_current`.
+    #[test]
+    fn superseded_weights_are_not_deleted_out_from_under_a_live_meeting() {
+        for state in [
+            CaptureState::Starting,
+            CaptureState::Recording,
+            CaptureState::Degraded,
+            CaptureState::Paused,
+            CaptureState::Stopping,
+        ] {
+            assert!(
+                engine_is_needed_by_capture(state),
+                "{state:?} would let the cleanup run during a meeting"
+            );
+        }
+        // Once nothing is being listened to, the leftovers can go.
+        assert!(!engine_is_needed_by_capture(CaptureState::Idle));
+        assert!(!engine_is_needed_by_capture(CaptureState::Stopped));
     }
 
     #[tokio::test]

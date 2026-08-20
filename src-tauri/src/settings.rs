@@ -76,7 +76,14 @@ pub async fn load(db: &Db) -> Result<Settings, DbError> {
         s.show_advanced = parse_bool(v, s.show_advanced);
     }
     if let Some(v) = get(keys::ACCURACY_LEVEL_ID).filter(|v| !v.is_empty()) {
-        s.accuracy_level_id = v.to_string();
+        // Resolved against the catalog, never taken raw. A database written by
+        // an older build can name a level that no longer exists — the levels
+        // called "faster" and "fastest" were retired on 2026-08-20 when Echo
+        // went to one model — and everything downstream of here treats this as
+        // a level it can look up. Handing it a name the catalog does not know
+        // turns "your speech download" into a job that fails with nothing a
+        // person can do about it.
+        s.accuracy_level_id = crate::asr::catalog::preset_or_default(v).id.to_string();
     }
     s.input_device_id = get(keys::INPUT_DEVICE_ID)
         .filter(|v| !v.is_empty())
@@ -205,6 +212,28 @@ mod tests {
             "storage location must always resolve"
         );
         assert!(PathBuf::from(&s.storage_dir).is_absolute());
+    }
+
+    /// The upgrade path. Someone who had picked "Faster" before 2026-08-20 has
+    /// that name in their database, and it no longer names anything — so it has
+    /// to resolve to the level that does, not travel on to the download job as
+    /// an id nothing can look up.
+    #[tokio::test]
+    async fn a_level_from_an_older_build_resolves_to_the_one_that_exists() {
+        let db = connect_in_memory().await.unwrap();
+        for retired in ["faster", "fastest", "", "something-invented"] {
+            repo::set_setting(&db, keys::ACCURACY_LEVEL_ID, retired)
+                .await
+                .unwrap();
+            let s = load(&db).await.unwrap();
+            assert_eq!(
+                s.accuracy_level_id,
+                crate::asr::catalog::DEFAULT_PRESET_ID,
+                "{retired:?} must not reach anything that looks levels up"
+            );
+            // And the thing it reaches can in fact be looked up.
+            assert!(crate::asr::catalog::preset(&s.accuracy_level_id).is_some());
+        }
     }
 
     #[tokio::test]

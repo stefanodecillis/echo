@@ -408,11 +408,18 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
-    /// Read the selected preset and the installed files out of the database.
+    /// Read the level and the installed files out of the database.
     ///
-    /// Fails with [`AsrError::NotInstalled`] rather than loading something else:
-    /// silently transcribing with different weights than the person chose would
-    /// make the provenance on every segment a lie.
+    /// Loads whatever is **actually installed**, and names the segments after
+    /// it. There is one model in the catalog's level, but there may be an older
+    /// one still on disk while the new one downloads, and in that window this
+    /// resolves to the old one — that is how a meeting started mid-upgrade gets
+    /// transcribed at all (see [`crate::asr::reconcile`]). What it never does is
+    /// claim the new model wrote text the old one wrote: `model_name` and
+    /// `model_revision` come from the row that was loaded, so the provenance on
+    /// every segment stays true through the switch.
+    ///
+    /// Fails with [`AsrError::NotInstalled`] only when there is nothing at all.
     pub async fn from_settings(db: &Db) -> Result<Self, AsrError> {
         let level_id = repo::get_setting(db, crate::settings::keys::ACCURACY_LEVEL_ID)
             .await?
@@ -425,7 +432,20 @@ impl EngineConfig {
             .ok_or(AsrError::NotInstalled)?;
         let accelerator_path = models::installed_path(db, AssetKind::SpeechAccelerator).await?;
 
-        let row = repo::get_model(db, preset.speech_id).await?;
+        // Which catalog entry that path *is*, rather than which one we hoped
+        // for. Decoding numbers come from the level either way: they are about
+        // how hard to try, not about which weights, and the level's numbers are
+        // what shipped with the weights that are serving.
+        let loaded = model_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|name| {
+                catalog::CATALOG
+                    .iter()
+                    .find(|e| e.kind == AssetKind::Speech && e.file_name == name)
+            });
+        let asset_id = loaded.map_or(preset.speech_id, |e| e.id);
+        let row = repo::get_model(db, asset_id).await?;
         Ok(Self {
             model_path,
             accelerator_path,
@@ -433,7 +453,7 @@ impl EngineConfig {
             model_name: row
                 .as_ref()
                 .map(|r| r.name.clone())
-                .unwrap_or_else(|| preset.speech_id.to_string()),
+                .unwrap_or_else(|| asset_id.to_string()),
             model_revision: row
                 .and_then(|r| r.revision)
                 .unwrap_or_else(|| catalog::CATALOG_REVISION.to_string()),
@@ -1486,11 +1506,15 @@ impl EngineWorker {
     /// Load now, so the first utterance of a meeting is not slow. Called at
     /// recording start and by the explicit pre-warm action.
     ///
-    /// The decoding effort and the provenance come from whichever catalog entry
-    /// these weights are, so switching preset behind our back cannot leave a
-    /// segment claiming it was written by the previous one. An uncatalogued file
-    /// (a developer pointing at their own weights) falls back to the default
-    /// preset's numbers and names itself after the file.
+    /// The provenance comes from whichever catalog entry these weights are, so
+    /// weights changing behind our back cannot leave a segment claiming it was
+    /// written by the previous ones. An uncatalogued file (a developer pointing
+    /// at their own weights) names itself after the file.
+    ///
+    /// The decoding numbers come from the level, always. There is one set of
+    /// them, and they describe how hard to try rather than which weights to try
+    /// with — an older model still serving a meeting is decoded the same way the
+    /// new one will be.
     pub async fn prewarm(
         &self,
         model_path: &Path,
@@ -1504,12 +1528,11 @@ impl EngineWorker {
                     .iter()
                     .find(|e| e.kind == AssetKind::Speech && e.file_name == name)
             });
-        let preset = entry.and_then(|e| catalog::PRESETS.iter().find(|p| p.speech_id == e.id));
 
         let config = EngineConfig {
             model_path: model_path.to_path_buf(),
             accelerator_path: accelerator_path.map(Path::to_path_buf),
-            decode: preset.map_or_else(|| catalog::default_preset().decode, |p| p.decode),
+            decode: catalog::default_preset().decode,
             model_name: entry.map_or_else(
                 || {
                     model_path
@@ -2056,17 +2079,25 @@ mod tests {
         assert!((MIN_DECODE_THREADS..=MAX_DECODE_THREADS).contains(&real));
     }
 
+    /// One model, three lanes. The lane decides beam-versus-greedy; the model
+    /// never changes with it (product decision of 2026-08-20).
     #[test]
-    fn the_quality_preset_decides_beam_search_or_greedy() {
-        let everyday = catalog::preset("everyday").unwrap();
-        match sampling_strategy(&everyday.decode) {
+    fn the_lane_decides_beam_search_or_greedy_and_the_model_never_changes() {
+        let level = catalog::default_preset().decode;
+        match sampling_strategy(&level) {
             SamplingStrategy::BeamSearch { beam_size, .. } => assert_eq!(beam_size, 5),
-            other => panic!("the everyday preset should search beams, got {other:?}"),
+            other => panic!("the disk pass should search beams, got {other:?}"),
         }
-        let fastest = catalog::preset("fastest").unwrap();
-        match sampling_strategy(&fastest.decode) {
-            SamplingStrategy::Greedy { best_of } => assert!(best_of >= 1),
-            other => panic!("the quickest preset should be greedy, got {other:?}"),
+        match sampling_strategy(&level.live_final()) {
+            SamplingStrategy::BeamSearch { beam_size, .. } => assert_eq!(
+                beam_size, 5,
+                "a live final is decoded at the same width as the disk pass"
+            ),
+            other => panic!("a live final should search beams, got {other:?}"),
+        }
+        match sampling_strategy(&level.speculative()) {
+            SamplingStrategy::Greedy { best_of } => assert_eq!(best_of, 1),
+            other => panic!("a caption should be greedy, got {other:?}"),
         }
     }
 
@@ -2329,8 +2360,11 @@ mod tests {
     #[tokio::test]
     async fn prewarming_takes_the_provenance_from_whichever_weights_they_are() {
         let worker = EngineWorker::new();
-        let tiny = catalog::entry(catalog::ids::SPEECH_FASTEST).unwrap();
-        let path = PathBuf::from("/nowhere").join(tiny.file_name);
+        // Weights Echo no longer wants, which is exactly the case that matters:
+        // while the new model downloads these are what a meeting is transcribed
+        // with, and the segments have to say so.
+        let old = catalog::entry(catalog::ids::SPEECH_TURBO).unwrap();
+        let path = PathBuf::from("/nowhere").join(old.file_name);
 
         // Loading fails (the file is not there), but the configuration it chose
         // is what we are checking.
@@ -2338,12 +2372,12 @@ mod tests {
         let cfg = worker
             .configured()
             .expect("prewarm configures before loading");
-        assert_eq!(cfg.model_name, tiny.name);
-        assert_eq!(cfg.model_revision, tiny.revision);
+        assert_eq!(cfg.model_name, old.name);
+        assert_eq!(cfg.model_revision, old.revision);
         assert_eq!(
             cfg.decode,
-            catalog::preset("fastest").unwrap().decode,
-            "the quickest weights decode with the quickest preset's numbers"
+            catalog::default_preset().decode,
+            "one set of decoding numbers, whichever weights are serving"
         );
 
         // Weights nobody catalogued still get a usable name rather than nothing.
@@ -2362,7 +2396,7 @@ mod tests {
         let first = EngineConfig {
             model_path: PathBuf::from("/nowhere/ggml-tiny.bin"),
             accelerator_path: None,
-            decode: catalog::preset("fastest").unwrap().decode,
+            decode: catalog::default_preset().decode,
             model_name: "tiny".into(),
             model_revision: "r".into(),
         };
@@ -2389,7 +2423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_engine_settings_read_the_selected_preset_and_refuse_to_guess() {
+    async fn the_engine_settings_load_what_is_installed_and_refuse_to_guess() {
         let db = crate::db::connect_in_memory().await.unwrap();
         models::sync_catalog(&db).await.unwrap();
         let err = EngineConfig::from_settings(&db).await.unwrap_err();
@@ -2400,7 +2434,7 @@ mod tests {
 
         repo::set_model_installed(
             &db,
-            catalog::ids::SPEECH_EVERYDAY,
+            catalog::ids::SPEECH,
             true,
             Some("/speech/everyday.bin"),
         )
@@ -2408,16 +2442,14 @@ mod tests {
         .unwrap();
         let cfg = EngineConfig::from_settings(&db).await.unwrap();
         assert_eq!(cfg.model_path, PathBuf::from("/speech/everyday.bin"));
-        assert_eq!(cfg.decode, catalog::preset("everyday").unwrap().decode);
+        assert_eq!(cfg.decode, catalog::default_preset().decode);
         assert_eq!(
             cfg.model_name,
-            catalog::entry(catalog::ids::SPEECH_EVERYDAY).unwrap().name
+            catalog::entry(catalog::ids::SPEECH).unwrap().name
         );
         assert_eq!(
             cfg.model_revision,
-            catalog::entry(catalog::ids::SPEECH_EVERYDAY)
-                .unwrap()
-                .revision
+            catalog::entry(catalog::ids::SPEECH).unwrap().revision
         );
         assert!(
             cfg.accelerator_path.is_none(),

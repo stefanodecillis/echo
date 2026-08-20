@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::asr::catalog::{self, Archive, CatalogEntry};
+use crate::asr::reconcile::{self, Plan};
 use crate::asr::AsrError;
 use crate::db::{repo, Db};
 use crate::paths::AppPaths;
@@ -200,13 +201,15 @@ pub async fn refresh_installed(db: &Db, paths: &AppPaths) -> Result<(), AsrError
     Ok(())
 }
 
-/// The quality presets the person picks between, named in plain words.
+/// The one level, named in plain words.
 ///
-/// Never a model identifier here; those live behind Settings → Advanced.
+/// Still a list because the IPC surface is a list and the settings column is a
+/// level id; there is nothing to pick between (`catalog::PRESETS` has one
+/// member). Never a model identifier here; those live behind Settings →
+/// Advanced.
 pub async fn list_accuracy_levels(db: &Db) -> Result<Vec<AccuracyLevel>, AsrError> {
     ensure_catalogued(db).await?;
     let selected = selected_level_id(db).await?;
-    let recommended = catalog::recommended_preset_id(total_memory_bytes());
     let rows = model_rows(db).await?;
 
     let mut out = Vec::with_capacity(catalog::PRESETS.len());
@@ -222,41 +225,128 @@ pub async fn list_accuracy_levels(db: &Db) -> Result<Vec<AccuracyLevel>, AsrErro
             download_bytes: catalog::preset_total_bytes(preset.id),
             installed,
             selected: preset.id == selected,
-            recommended: preset.id == recommended,
+            // There is one level, so it is the one we recommend. No routing by
+            // installed memory any more (product decision of 2026-08-20): the
+            // transcript a person gets must not depend on their hardware.
+            recommended: preset.id == catalog::DEFAULT_PRESET_ID,
             asset_ids: asset_ids.iter().map(|s| s.to_string()).collect(),
         });
     }
     Ok(out)
 }
 
-/// Everything the selected preset needs, and whether it is on disk.
-pub async fn readiness(db: &Db, paths: &AppPaths) -> Result<SpeechReadiness, AsrError> {
+// ---------------------------------------------------------------------------
+// Self-healing model state
+//
+// See `crate::asr::reconcile` for the decision itself and why it is shaped the
+// way it is. What lives here is only the plumbing on either side of it:
+// `plan_reconcile` gathers the inputs from the disk and the table, `apply_cleanup`
+// carries out the one destructive thing a plan can ask for, and `reconcile` is
+// the two together for callers with nothing to say about the timing.
+// ---------------------------------------------------------------------------
+
+/// Look at the disk and work out what should happen. **Reads only.**
+///
+/// Safe from a getter, and that matters: [`readiness`] calls this on every
+/// question the UI asks, and a question must not delete anybody's files. The
+/// half that acts is [`reconcile`].
+pub async fn plan_reconcile(db: &Db, paths: &AppPaths) -> Result<Plan, AsrError> {
+    // The table is a cache of the disk, and the disk is the truth. Someone can
+    // always have deleted a file behind our back, and a half-finished install
+    // must not read as ready.
     refresh_installed(db, paths).await?;
     let level_id = selected_level_id(db).await?;
     let rows = model_rows(db).await?;
-
-    // Recording only waits for speech plus speech detection; the speaker files
-    // are used by a pass that runs after the meeting ends.
-    let required = catalog::preset_required_asset_ids(&level_id);
-    let ready = required
+    let installed: Vec<&'static str> = catalog::CATALOG
         .iter()
-        .all(|id| rows.get(*id).is_some_and(|m| m.installed));
+        .filter(|e| e.applies_here())
+        .filter(|e| rows.get(e.id).is_some_and(|m| m.installed))
+        .map(|e| e.id)
+        .collect();
+    Ok(reconcile::plan(&level_id, &installed))
+}
 
-    let remaining_bytes = catalog::preset_asset_ids(&level_id)
-        .iter()
-        .filter(|id| !rows.get(**id).is_some_and(|m| m.installed))
-        .filter_map(|id| catalog::entry(id))
-        .map(|e| e.bytes)
-        .sum();
+/// Reconcile, and carry out whatever the plan says can be done here.
+///
+/// "Whatever can be done here" is exactly one thing: deleting weights that have
+/// been superseded, once their replacement is verified installed. Downloading is
+/// not done here — it is a job, queued by the caller, so it survives a restart
+/// and shows up in the one progress pill the app already has.
+///
+/// Returns the plan as it was *before* the deletions, so the caller can see that
+/// a switch happened and say so. Running it again is a no-op: the plan is
+/// `Steady` once the files are gone.
+///
+/// Idempotent and crash-safe. Each deletion is independent, and the plan only
+/// offers up assets whose replacement is already on disk, so an interruption
+/// leaves redundant files rather than none.
+pub async fn reconcile(db: &Db, paths: &AppPaths) -> Result<Plan, AsrError> {
+    let plan = plan_reconcile(db, paths).await?;
+    apply_cleanup(db, paths, &plan).await;
+    if !plan.state.is_settled() {
+        tracing::info!(
+            state = ?plan.state,
+            serving = plan.serving.unwrap_or("nothing yet"),
+            missing = plan.missing.len(),
+            obsolete = plan.obsolete.len(),
+            "speech assets are not settled"
+        );
+    }
+    Ok(plan)
+}
+
+/// Delete what the plan says has been superseded. The other half of
+/// [`reconcile`], separate so a caller that knows a recording is running can
+/// reconcile without touching the disk.
+///
+/// Deleting weights out from under a live meeting is *nearly* harmless — unlink
+/// leaves an open file readable, so a decode in flight finishes — but only
+/// nearly: if the engine were to reload mid-meeting (it does, after three
+/// consecutive failures) the file it wants would be gone. So the caller gets to
+/// say no, and the cleanup happens a few minutes later instead.
+pub async fn apply_cleanup(db: &Db, paths: &AppPaths, plan: &Plan) {
+    for asset_id in plan.deletable() {
+        match remove_asset(db, paths, &asset_id.to_string()).await {
+            Ok(()) => tracing::info!(
+                asset = asset_id,
+                replaced_by = plan.serving.unwrap_or("?"),
+                "removed weights Echo has stopped using"
+            ),
+            // A file we could not delete is a file that takes up room, not a
+            // failure worth stopping for: the next reconcile tries again.
+            Err(error) => tracing::warn!(
+                %error,
+                asset = asset_id,
+                "could not remove weights Echo has stopped using; it will try again"
+            ),
+        }
+    }
+}
+
+/// Everything the level needs, and whether Echo can understand speech *now*.
+///
+/// `ready` is about what can serve, not about what is wanted: while an upgrade
+/// is downloading, the older weights still on disk make this `true` and a
+/// recording started now works on them (mantra 3 — an upgrade must never be the
+/// reason a meeting is not recorded).
+pub async fn readiness(db: &Db, paths: &AppPaths) -> Result<SpeechReadiness, AsrError> {
+    let plan = plan_reconcile(db, paths).await?;
+    let rows = model_rows(db).await?;
+    let detector_ready = rows
+        .get(catalog::ids::DETECTOR)
+        .is_some_and(|m| m.installed);
 
     Ok(SpeechReadiness {
-        ready,
+        // Speech plus speech detection. The speaker files are used by a pass
+        // that runs after the meeting ends, so recording never waits for them.
+        ready: plan.can_serve() && detector_ready,
         downloading: any_download_in_flight(),
-        remaining_bytes,
-        level_id: Some(level_id),
+        remaining_bytes: plan.remaining_bytes(),
+        level_id: Some(plan.level_id.to_string()),
         loaded: false,
     })
 }
+
 
 /// Download every asset a preset needs, in order, resuming what is partial.
 ///
@@ -445,15 +535,41 @@ pub async fn remove_asset(db: &Db, paths: &AppPaths, asset_id: &Id) -> Result<()
     Ok(())
 }
 
-/// Path of an installed asset of this kind for the selected preset.
+/// Path of the installed asset of this kind the engine should load.
+///
+/// For speech and its Apple companion this is the **serving** asset, not
+/// necessarily the level's: while a new model is still downloading, the older
+/// one on disk is what a meeting is transcribed with, and it has to be paired
+/// with its own companion (see [`crate::asr::reconcile`]). For everything else
+/// there is only ever one candidate.
+///
+/// Reads the `models` table, so it costs no disk access. Callers that need the
+/// table to agree with the disk first go through [`plan_reconcile`] or
+/// [`readiness`], which every read path already does.
 pub async fn installed_path(db: &Db, kind: AssetKind) -> Result<Option<PathBuf>, AsrError> {
     ensure_catalogued(db).await?;
     let level_id = selected_level_id(db).await?;
-    let wanted = catalog::preset_asset_ids(&level_id)
+    let rows = model_rows(db).await?;
+    let is_installed = |id: &str| rows.get(id).is_some_and(|m| m.installed);
+
+    // The speech file that is actually going to be loaded, if any.
+    let serving = catalog::speech_ids_best_first()
         .into_iter()
-        .filter_map(catalog::entry)
-        .find(|e| e.kind == kind);
-    let Some(entry) = wanted else {
+        .find(|id| is_installed(id));
+
+    let entry = match kind {
+        AssetKind::Speech => serving.and_then(catalog::entry),
+        // Pair the companion with the weights that are serving. Pointing the
+        // new model's encoder at the old model's weights would not load, and
+        // reporting the new one as present when the old one is serving would be
+        // a lie in Settings → Advanced.
+        AssetKind::SpeechAccelerator => serving.and_then(catalog::accelerator_for),
+        _ => catalog::preset_asset_ids(&level_id)
+            .into_iter()
+            .filter_map(catalog::entry)
+            .find(|e| e.kind == kind),
+    };
+    let Some(entry) = entry else {
         return Ok(None);
     };
     let Some(row) = repo::get_model(db, entry.id).await? else {
@@ -465,10 +581,17 @@ pub async fn installed_path(db: &Db, kind: AssetKind) -> Result<Option<PathBuf>,
     Ok(row.path.map(PathBuf::from))
 }
 
-/// Delete leftover `.part` files that no longer match anything in the catalog.
-/// Runs at launch.
+/// Delete leftover `.part` files that no longer lead anywhere. Runs at launch.
+///
+/// "Anywhere" is three things: the catalog does not know this id, or the asset
+/// is already installed, or the asset is one the level has stopped wanting. That
+/// last one matters as much as the others — an interrupted download of
+/// yesterday's model is a gigabyte of a file that will never be resumed, because
+/// nothing asks for those bytes any more.
 pub async fn clean_stale_partials(db: &Db, paths: &AppPaths) -> Result<u64, AsrError> {
     let mut removed = 0u64;
+    let level_id = selected_level_id(db).await?;
+    let wanted = catalog::preset_asset_ids(&level_id);
     let mut dir = match tokio::fs::read_dir(&paths.tmp_dir).await {
         Ok(d) => d,
         // No scratch directory yet is not a problem, it means nothing to clean.
@@ -492,9 +615,9 @@ pub async fn clean_stale_partials(db: &Db, paths: &AppPaths) -> Result<u64, AsrE
             Ok(Some(row)) => row.installed,
             _ => false,
         };
-        // Keep only partials that still lead somewhere: a catalogued asset we
-        // have not installed yet.
-        let dead_weight = !known || already_installed;
+        // Keep only partials that still lead somewhere: an asset this level
+        // wants and has not installed yet.
+        let dead_weight = !known || already_installed || !wanted.contains(&asset_id);
         if dead_weight && tokio::fs::remove_file(&path).await.is_ok() {
             removed += 1;
         }
@@ -937,8 +1060,12 @@ async fn selected_level_id(db: &Db) -> Result<String, AsrError> {
     Ok(catalog::preset_or_default(&id).id.to_string())
 }
 
-/// Installed memory, used only to suggest a preset. 0 when it cannot be read,
-/// which the caller must treat as "do not downgrade anybody".
+/// Installed memory, reported in Settings → Advanced and nothing else.
+///
+/// It used to pick which model to download, which meant the words in somebody's
+/// transcript depended on how much RAM they bought. It does not any more
+/// (product decision of 2026-08-20): there is one model. 0 means "could not
+/// read it", never "none".
 pub fn total_memory_bytes() -> u64 {
     let mut system = sysinfo::System::new_with_specifics(
         sysinfo::RefreshKind::nothing()
@@ -1485,38 +1612,266 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn presets_are_listed_with_their_selected_and_installed_state() {
+    async fn the_one_level_is_listed_as_selected_and_recommended() {
         let db = connect_in_memory().await.unwrap();
         sync_catalog(&db).await.unwrap();
         let levels = list_accuracy_levels(&db).await.unwrap();
-        assert_eq!(levels.len(), catalog::PRESETS.len());
+        assert_eq!(levels.len(), 1, "there is nothing to choose between");
 
-        let selected: Vec<_> = levels.iter().filter(|l| l.selected).collect();
-        assert_eq!(selected.len(), 1, "exactly one preset is selected");
-        assert_eq!(selected[0].id, catalog::DEFAULT_PRESET_ID);
-        assert!(levels.iter().all(|l| !l.installed));
-        assert!(levels.iter().all(|l| l.download_bytes > 0));
-        assert!(levels.iter().all(|l| !l.asset_ids.is_empty()));
-        assert_eq!(levels.iter().filter(|l| l.recommended).count(), 1);
+        let only = &levels[0];
+        assert_eq!(only.id, catalog::DEFAULT_PRESET_ID);
+        assert!(only.selected);
+        assert!(
+            only.recommended,
+            "the one level is the recommendation, whatever the machine"
+        );
+        assert!(!only.installed);
+        assert!(only.download_bytes > 3_000_000_000);
+        assert!(!only.asset_ids.is_empty());
 
-        // A different choice moves the flag, and an unknown one falls back.
-        repo::set_setting(&db, settings::keys::ACCURACY_LEVEL_ID, "fastest")
-            .await
-            .unwrap();
-        let levels = list_accuracy_levels(&db).await.unwrap();
-        assert!(levels.iter().find(|l| l.id == "fastest").unwrap().selected);
-
+        // A settings row naming a level from another build still resolves.
         repo::set_setting(&db, settings::keys::ACCURACY_LEVEL_ID, "banana")
             .await
             .unwrap();
         let levels = list_accuracy_levels(&db).await.unwrap();
+        assert!(levels[0].selected);
+    }
+
+    // -----------------------------------------------------------------
+    // The reconcile, against a real directory and a real table
+    //
+    // The decision itself is tested exhaustively in `crate::asr::reconcile`.
+    // These cover the wiring: that the plan sees the disk, that carrying it out
+    // actually removes files, and that it never removes the wrong ones.
+    // -----------------------------------------------------------------
+
+    /// Put an asset on disk and mark it installed, the way a finished download
+    /// would. Bundles are directories, so they get a directory.
+    async fn install(paths: &AppPaths, db: &Db, asset_id: &str) -> PathBuf {
+        let entry = catalog::entry(asset_id).expect("catalogued");
+        let path = install_path(paths, entry);
+        if entry.is_bundle() {
+            tokio::fs::create_dir_all(&path).await.unwrap();
+            tokio::fs::write(path.join("coremldata.bin"), b"x")
+                .await
+                .unwrap();
+        } else {
+            tokio::fs::write(&path, b"weights").await.unwrap();
+        }
+        repo::set_model_installed(db, asset_id, true, Some(&path_str(&path)))
+            .await
+            .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_fresh_install_is_told_to_download_and_deletes_nothing() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+
+        let plan = reconcile(&db, &fx.paths).await.unwrap();
+        assert_eq!(plan.state, reconcile::State::FirstRun);
+        assert!(!plan.can_serve());
+        assert!(!plan.switching(), "nobody is told about a first download");
+        assert_eq!(plan.missing, catalog::preset_asset_ids(plan.level_id));
+    }
+
+    /// Yesterday's install, today's build. The one journey this feature exists
+    /// for, walked from start to finish.
+    #[tokio::test]
+    async fn an_upgrade_keeps_serving_the_old_weights_and_then_switches() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+
+        // What a person who installed Echo yesterday has.
+        for id in [catalog::ids::DETECTOR, catalog::ids::SEGMENTER, catalog::ids::EMBEDDER] {
+            install(&fx.paths, &db, id).await;
+        }
+        let old_speech = install(&fx.paths, &db, catalog::ids::SPEECH_TURBO).await;
+        let old_accel = if cfg!(target_os = "macos") {
+            Some(install(&fx.paths, &db, catalog::ids::ACCEL_TURBO).await)
+        } else {
+            None
+        };
+
+        // Launch 1: the new model is missing, the old one carries the load.
+        let plan = reconcile(&db, &fx.paths).await.unwrap();
+        assert_eq!(plan.state, reconcile::State::Upgrading);
         assert!(
-            levels
-                .iter()
-                .find(|l| l.id == catalog::DEFAULT_PRESET_ID)
-                .unwrap()
-                .selected
+            plan.can_serve(),
+            "recording is not blocked by an upgrade in flight"
         );
+        assert!(!plan.switching(), "and nothing is said yet");
+        assert!(old_speech.exists(), "the old weights are still there");
+        assert!(
+            readiness(&db, &fx.paths).await.unwrap().ready,
+            "and readiness says so: a meeting started now is recorded"
+        );
+        assert_eq!(
+            installed_path(&db, AssetKind::Speech).await.unwrap(),
+            Some(old_speech.clone()),
+            "on the old weights"
+        );
+
+        // Repeated launches change nothing while the download is unfinished.
+        let again = reconcile(&db, &fx.paths).await.unwrap();
+        assert_eq!(again.state, reconcile::State::Upgrading);
+        assert!(old_speech.exists());
+
+        // The download finishes.
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            install(&fx.paths, &db, id).await;
+        }
+
+        // Launch 2: the switch. The old files go, and only now.
+        let switched = reconcile(&db, &fx.paths).await.unwrap();
+        assert!(switched.switching(), "this is the one notice");
+        assert_eq!(switched.serving, Some(catalog::ids::SPEECH));
+        assert!(!old_speech.exists(), "yesterday's weights are gone");
+        if let Some(accel) = &old_accel {
+            assert!(!accel.exists(), "and so is yesterday's companion");
+        }
+        assert!(
+            !repo::get_model(&db, catalog::ids::SPEECH_TURBO)
+                .await
+                .unwrap()
+                .unwrap()
+                .installed,
+            "the row stops claiming it is installed"
+        );
+
+        // What the level wants survived it.
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            let entry = catalog::entry(id).unwrap();
+            assert!(
+                install_path(&fx.paths, entry).exists(),
+                "{id} was swept up by mistake"
+            );
+        }
+
+        // Launch 3: settled, and silent.
+        let settled = reconcile(&db, &fx.paths).await.unwrap();
+        assert_eq!(settled.state, reconcile::State::Steady);
+        assert!(!settled.switching(), "the person is told once, not every launch");
+    }
+
+    /// Running the reconcile twice from the switch state must not say it twice —
+    /// the second run has nothing left to find.
+    #[tokio::test]
+    async fn the_switch_is_announced_once_because_the_second_run_sees_nothing() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            install(&fx.paths, &db, id).await;
+        }
+        install(&fx.paths, &db, catalog::ids::SPEECH_TINY).await;
+
+        assert!(reconcile(&db, &fx.paths).await.unwrap().switching());
+        assert!(!reconcile(&db, &fx.paths).await.unwrap().switching());
+        assert!(!reconcile(&db, &fx.paths).await.unwrap().switching());
+    }
+
+    /// A crash between two deletions leaves files that waste room. It must never
+    /// leave a person unable to record.
+    #[tokio::test]
+    async fn a_cleanup_that_stops_halfway_never_leaves_zero_models() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            install(&fx.paths, &db, id).await;
+        }
+        for id in [catalog::ids::SPEECH_TURBO, catalog::ids::SPEECH_TINY] {
+            install(&fx.paths, &db, id).await;
+        }
+
+        // Simulate the crash: take the plan, carry out one deletion by hand,
+        // then start over as a fresh launch would.
+        let plan = plan_reconcile(&db, &fx.paths).await.unwrap();
+        let doomed = plan.deletable();
+        assert!(doomed.len() >= 2);
+        remove_asset(&db, &fx.paths, &doomed[0].to_string())
+            .await
+            .unwrap();
+
+        // At the moment of the crash, recording still works.
+        assert!(readiness(&db, &fx.paths).await.unwrap().ready);
+
+        // And the next launch finishes the job.
+        let after = reconcile(&db, &fx.paths).await.unwrap();
+        assert!(readiness(&db, &fx.paths).await.unwrap().ready);
+        assert!(after.state.is_settled() || after.switching());
+        let settled = reconcile(&db, &fx.paths).await.unwrap();
+        assert_eq!(settled.state, reconcile::State::Steady);
+        for id in doomed {
+            let entry = catalog::entry(id).unwrap();
+            assert!(!install_path(&fx.paths, entry).exists(), "{id} is still here");
+        }
+    }
+
+    /// A file somebody put in the folder themselves is not Echo's to delete.
+    #[tokio::test]
+    async fn a_file_echo_did_not_put_there_is_left_alone() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            install(&fx.paths, &db, id).await;
+        }
+        let theirs = fx.paths.assets_dir.join("my-own-weights.bin");
+        tokio::fs::write(&theirs, b"mine").await.unwrap();
+
+        let plan = reconcile(&db, &fx.paths).await.unwrap();
+        assert_eq!(plan.state, reconcile::State::Steady);
+        assert!(theirs.exists(), "Echo does not tidy up after other people");
+    }
+
+    /// The shared files are used by every level and must survive any switch.
+    #[tokio::test]
+    async fn a_switch_never_touches_speech_detection_or_the_speaker_files() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            install(&fx.paths, &db, id).await;
+        }
+        install(&fx.paths, &db, catalog::ids::SPEECH_TURBO).await;
+
+        assert!(reconcile(&db, &fx.paths).await.unwrap().switching());
+        for id in catalog::SHARED_ASSET_IDS {
+            let entry = catalog::entry(id).unwrap();
+            assert!(
+                install_path(&fx.paths, entry).exists(),
+                "{id} was deleted, which would stop Echo hearing anybody"
+            );
+        }
+    }
+
+    /// Someone deleted the weights in Finder. The plan notices from the disk,
+    /// not from the table, and asks for them again.
+    #[tokio::test]
+    async fn weights_deleted_behind_our_back_are_asked_for_again() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            install(&fx.paths, &db, id).await;
+        }
+        assert_eq!(
+            reconcile(&db, &fx.paths).await.unwrap().state,
+            reconcile::State::Steady
+        );
+
+        let speech = install_path(&fx.paths, catalog::entry(catalog::ids::SPEECH).unwrap());
+        tokio::fs::remove_file(&speech).await.unwrap();
+
+        let plan = reconcile(&db, &fx.paths).await.unwrap();
+        assert_eq!(plan.state, reconcile::State::FirstRun);
+        assert!(plan.missing.contains(&catalog::ids::SPEECH));
+        assert!(!readiness(&db, &fx.paths).await.unwrap().ready);
     }
 
     #[tokio::test]
@@ -1584,7 +1939,11 @@ mod tests {
         let live = fx.paths.asset_partial_path(catalog::ids::DETECTOR);
         let orphan = fx.paths.asset_partial_path("speech-from-a-past-release");
         let installed = fx.paths.asset_partial_path(catalog::ids::SEGMENTER);
-        for p in [&live, &orphan, &installed] {
+        // Half of yesterday's model, interrupted. Nothing will ever ask for the
+        // rest of those bytes, so keeping them for a resume is keeping a
+        // gigabyte for nothing.
+        let superseded = fx.paths.asset_partial_path(catalog::ids::SPEECH_TURBO);
+        for p in [&live, &orphan, &installed, &superseded] {
             tokio::fs::write(p, b"half a file").await.unwrap();
             tokio::fs::write(meta_path(p), b"{}").await.unwrap();
         }
@@ -1595,17 +1954,21 @@ mod tests {
 
         let removed = clean_stale_partials(&db, &fx.paths).await.unwrap();
         assert_eq!(
-            removed, 4,
-            "the orphan and the installed one, file + sidecar"
+            removed, 6,
+            "the orphan, the installed one and the superseded one, file + sidecar"
         );
         assert!(live.exists(), "a resumable download is left alone");
         assert!(meta_path(&live).exists());
         assert!(!orphan.exists());
         assert!(!installed.exists());
+        assert!(
+            !superseded.exists(),
+            "a half-downloaded model nobody wants any more is not resumable"
+        );
     }
 
     #[tokio::test]
-    async fn installed_path_answers_for_the_selected_preset_only() {
+    async fn installed_path_answers_with_whatever_can_actually_be_loaded() {
         let db = connect_in_memory().await.unwrap();
         sync_catalog(&db).await.unwrap();
         assert!(installed_path(&db, AssetKind::Speech)
@@ -1613,27 +1976,65 @@ mod tests {
             .unwrap()
             .is_none());
 
-        repo::set_model_installed(
-            &db,
-            catalog::ids::SPEECH_EVERYDAY,
-            true,
-            Some("/speech/everyday.bin"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            installed_path(&db, AssetKind::Speech).await.unwrap(),
-            Some(PathBuf::from("/speech/everyday.bin"))
-        );
-
-        // Switching preset points at a different file, which is not there.
-        repo::set_setting(&db, settings::keys::ACCURACY_LEVEL_ID, "fastest")
+        repo::set_model_installed(&db, catalog::ids::SPEECH, true, Some("/speech/best.bin"))
             .await
             .unwrap();
-        assert!(installed_path(&db, AssetKind::Speech)
+        assert_eq!(
+            installed_path(&db, AssetKind::Speech).await.unwrap(),
+            Some(PathBuf::from("/speech/best.bin"))
+        );
+    }
+
+    /// The upgrade case. The level wants large-v3; only yesterday's weights are
+    /// installed; the engine has to be handed those, with *their* companion.
+    #[tokio::test]
+    async fn mid_upgrade_the_engine_is_handed_the_weights_that_are_there() {
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+        repo::set_model_installed(&db, catalog::ids::SPEECH_TURBO, true, Some("/s/turbo.bin"))
             .await
-            .unwrap()
-            .is_none());
+            .unwrap();
+        assert_eq!(
+            installed_path(&db, AssetKind::Speech).await.unwrap(),
+            Some(PathBuf::from("/s/turbo.bin")),
+            "an upgrade in flight must not leave the engine with nothing"
+        );
+
+        if cfg!(target_os = "macos") {
+            repo::set_model_installed(
+                &db,
+                catalog::ids::ACCEL_TURBO,
+                true,
+                Some("/s/turbo-encoder.mlmodelc"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                installed_path(&db, AssetKind::SpeechAccelerator)
+                    .await
+                    .unwrap(),
+                Some(PathBuf::from("/s/turbo-encoder.mlmodelc")),
+                "the old weights load their own companion, not the new model's"
+            );
+        }
+
+        // The new weights arrive: everything moves over in one step.
+        repo::set_model_installed(&db, catalog::ids::SPEECH, true, Some("/s/best.bin"))
+            .await
+            .unwrap();
+        assert_eq!(
+            installed_path(&db, AssetKind::Speech).await.unwrap(),
+            Some(PathBuf::from("/s/best.bin"))
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                installed_path(&db, AssetKind::SpeechAccelerator)
+                    .await
+                    .unwrap(),
+                None,
+                "and it does not borrow the old companion, which would not load"
+            );
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1764,7 +2165,7 @@ mod tests {
         sync_catalog(&db).await.unwrap();
 
         let server = MockServer::start().await;
-        let level = "fastest";
+        let level = catalog::DEFAULT_PRESET_ID;
         let ids = catalog::preset_asset_ids(level);
         // The Apple companion is a zip bundle needing a real archive; the rest
         // of the preset is plain files. Cover the plain path here.

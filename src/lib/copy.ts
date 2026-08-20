@@ -340,6 +340,17 @@ export const settings = {
   speechNotReadyTitle: "Not set up yet",
   speechNotReadyDescription:
     "Echo needs a one-time download before it can understand speech.",
+  /** Appended to the line above with the real total for this computer, so the
+   * size a person reads here is the same one onboarding quoted. */
+  speechDownloadSizeNote: "It takes about",
+  /** Ready *and* still downloading. Two situations reach this, and the sentence
+   * has to be true of both: the first download is finishing its last pieces, or
+   * a better way to understand speech is arriving to replace what is already
+   * here. Either way the only thing the person needs to know is that recording
+   * works meanwhile — so that is all it says. Without this line, "Ready to use"
+   * next to a progress bar reads as a bug. */
+  speechImprovingDescription:
+    "Echo is still downloading part of this. Recording works as usual while it finishes — nothing to do.",
   speechStorageLabel: "Storage used",
   speechDownloadButton: "Download",
   speechResumeButton: "Resume download",
@@ -447,7 +458,6 @@ export const onboarding = {
   permissionDeniedNote:
     "Turned off in System Settings. Turn it on there, then come back.",
   stepDownloadTitle: "Downloading what Echo needs to understand speech",
-  stepDownloadSize: "1.6 GB, one time",
   stepDownloadDescription:
     "This happens once. After that, Echo works without sending anything anywhere.",
   downloadRetryButton: "Try downloading again",
@@ -464,6 +474,15 @@ export const onboarding = {
     "You can record and read transcripts without this — set it up whenever you like.",
   finishButton: "Start using Echo",
 
+  /** "4.3 GB, one time", from the number the core reports for this platform.
+   * A function rather than a constant because the total differs between macOS
+   * and Linux (the speed-up file is Apple-only) and because it moves whenever
+   * the catalog does — a hardcoded size here went stale the first time the
+   * speech model changed. `anchors.downloadingSpeechSize` is the fallback for
+   * the moment before the number has arrived. */
+  downloadSize: (formatted?: string) =>
+    formatted ? `${formatted}, one time` : anchors.downloadingSpeechSize,
+
   stepLabelWelcome: "Welcome",
   stepLabelPermissions: "Permissions",
   stepLabelDownload: "Download",
@@ -473,7 +492,7 @@ export const onboarding = {
   summariesUseOnDevice: "Use Ollama",
   recapsChosenOnDevice: "Recaps will be written by Ollama on this Mac.",
   recapsChosenGemini: "Recaps will be written using Google Gemini.",
-} as Record<string, string>;
+} as const;
 
 /** Banners, toasts and confirmations. */
 export const notices = {
@@ -495,6 +514,10 @@ export const notices = {
   providerUnreachable:
     "Echo couldn't reach the place that writes your recaps. Check it's running.",
   actionItemUpdated: "Updated.",
+  /** Echo replaced the speech model with a better one, on its own. Said once,
+   * quietly, and only after the new one is in place and working — matches the
+   * `speechUpgraded` notice the core emits. */
+  speechUpgraded: "Echo upgraded how it understands speech.",
 } as Record<string, string>;
 
 /**
@@ -503,7 +526,10 @@ export const notices = {
  */
 export const anchors = {
   downloadingSpeech: "Downloading what Echo needs to understand speech",
-  downloadingSpeechSize: "1.6 GB, one time",
+  /** The size DESIGN quotes. macOS, where the speed-up file is part of it; the
+   * screens all render `downloadSize(bytes)` with the real number instead, and
+   * this is only the fallback for the moment before it has loaded. */
+  downloadingSpeechSize: "4.3 GB, one time",
   listening: "Listening…",
   writingRecap: "Writing your recap…",
   waitingForMeeting: "Waiting for your next meeting",

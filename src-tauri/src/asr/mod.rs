@@ -2,9 +2,12 @@
 //!
 //! IMPLEMENTED-BY: asr agent (M3).
 //!
-//! * [`catalog`] is the data: which files Echo fetches, from where, under what
-//!   licence, and which quality preset needs which.
+//! * [`catalog`] is the data: which files Echo fetches, from where and under
+//!   what licence — including the ones it has stopped wanting, which stay
+//!   catalogued so they can be recognised and removed.
 //! * [`models`] fetches and verifies what Echo needs to understand speech.
+//! * [`reconcile`] keeps the weights on disk in step with the weights Echo
+//!   wants, without ever leaving a person with nothing to record with.
 //! * [`engine`] runs it: one loaded engine, one job at a time.
 //! * [`language`] decides when the meeting's language is settled.
 //! * [`catchup`] transcribes from disk whatever the live pass missed.
@@ -22,6 +25,7 @@ pub mod catchup;
 pub mod engine;
 pub mod language;
 pub mod models;
+pub mod reconcile;
 
 use crate::types::{Channel, Id};
 
@@ -203,6 +207,9 @@ mod tests {
             language: Some("en".into()),
             language_confidence: Some(0.98),
             avg_confidence: Some(0.87),
+            // Deliberately the weights Echo has retired: a segment written
+            // while an older model was still serving has to keep saying so
+            // (see `crate::asr::reconcile`), so this is the case worth pinning.
             model_name: Some("whisper large-v3-turbo (ggml)".into()),
             model_revision: Some("abc123".into()),
         };

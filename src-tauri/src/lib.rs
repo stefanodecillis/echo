@@ -431,6 +431,14 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             if let Err(error) = state.session.start_job_runner().await {
                 tracing::warn!(%error, "background work is not being picked up");
             }
+            // Does Echo have the speech model it wants? This is the launch that
+            // notices a new release wants different weights: it queues the
+            // download (the job runner above is already draining), keeps
+            // serving whatever is on disk meanwhile, and removes the old files
+            // once the new ones are verified. After the job runner, so the
+            // download it queues is picked up on this launch rather than the
+            // next one.
+            state.session.ensure_speech_current().await;
             match state.session.find_interrupted().await {
                 Ok(ids) if !ids.is_empty() => {
                     tracing::info!(count = ids.len(), "found meetings to offer finishing");

@@ -18,14 +18,21 @@ import type { AccuracyLevel, Id } from "../../../lib/types";
 import type { SectionProps } from "../types";
 
 /**
- * Speech: a status card, nothing to choose. Echo always downloads and uses
- * the best fit for this computer (docs/DESIGN.md mantra 1's 2026-08-20
- * amendment) — this screen just says whether that's done, the one-time
- * download's state, and how much room it takes. Model names stay in
- * Settings > Advanced, never here.
+ * Speech: a status card, nothing to choose.
  *
- * `listAccuracyLevels` is only consulted internally for the one asset id to
- * download or remove; there is nothing here for the person to pick between.
+ * Echo downloads and uses one way of understanding speech, the best there is,
+ * the same on every computer (docs/DESIGN.md mantra 1 and its 2026-08-20
+ * amendments). It also keeps that current on its own: if a newer release wants
+ * different weights, the core fetches them in the background and swaps them in
+ * once they are ready, without ever leaving the person unable to record. So
+ * this screen has no decision on it. It says three things — whether Echo can
+ * understand speech, whether anything is still arriving, and how much room it
+ * all takes.
+ *
+ * Model names stay in Settings > Advanced, never here.
+ *
+ * `listAccuracyLevels` returns exactly one level; it is consulted only for the
+ * honest download size and the asset ids behind Remove.
  */
 export function Speech(_props: SectionProps) {
   const readiness = useSpeechReadiness();
@@ -85,6 +92,14 @@ export function Speech(_props: SectionProps) {
 
   const ready = readiness?.ready ?? level?.installed ?? false;
   const downloading = readiness?.downloading ?? false;
+  /**
+   * Echo can already understand speech *and* there is still more to fetch.
+   * Either the first download is finishing its last pieces, or the core is
+   * replacing what is here with something better (an upgrade never blocks
+   * recording — see the reconcile in the core). Worth a sentence either way,
+   * because "Ready to use" next to a progress bar otherwise reads as a bug.
+   */
+  const improving = ready && (downloading || (readiness?.remainingBytes ?? 0) > 0);
   const resuming =
     !ready && !downloading && level !== null && (readiness?.remainingBytes ?? 0) > 0 &&
     (readiness?.remainingBytes ?? 0) < level.downloadBytes;
@@ -103,7 +118,18 @@ export function Speech(_props: SectionProps) {
               {ready && <Chip variant="solid">{copy.speechReadyBadge}</Chip>}
             </div>
             <p className="mt-1 text-sm text-ink-soft">
-              {ready ? copy.speechReadyDescription : copy.speechNotReadyDescription}
+              {!ready
+                ? // The honest total for this computer, from the core, rather
+                  // than a size typed into the copy that goes stale the next
+                  // time what Echo downloads changes.
+                  level
+                  ? `${copy.speechNotReadyDescription} ${copy.speechDownloadSizeNote} ${formatBytes(
+                      level.downloadBytes,
+                    )}.`
+                  : copy.speechNotReadyDescription
+                : improving
+                  ? copy.speechImprovingDescription
+                  : copy.speechReadyDescription}
             </p>
             {ready && storageBytes !== null && (
               <p className="mt-1 text-xs text-ink-faint">
@@ -122,7 +148,9 @@ export function Speech(_props: SectionProps) {
                 {copy.speechCancelButton}
               </button>
             )}
-            {ready && (
+            {/* Never next to a download in flight: "Remove" would delete files
+                that are still arriving, and the one to offer then is Cancel. */}
+            {ready && !downloading && (
               <button type="button" onClick={remove} className="echo-pill-quiet">
                 {copy.speechRemoveButton}
               </button>

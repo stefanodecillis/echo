@@ -63,7 +63,11 @@ export function DownloadStep({ onNext, onBack }: DownloadStepProps) {
           {anchors.downloadingSpeech}
         </h2>
         <p className="text-sm text-ink-faint">
-          {copy.stepDownloadSize} · {copy.stepDownloadDescription}
+          {/* The real total for this computer, not a number typed into the copy:
+              it differs by platform and it moves whenever what Echo downloads
+              does. `downloadSize` falls back to the anchor until it arrives. */}
+          {copy.downloadSize(level ? formatBytes(level.downloadBytes) : undefined)} ·{" "}
+          {copy.stepDownloadDescription}
         </p>
       </div>
 

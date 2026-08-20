@@ -163,7 +163,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let support = app_support();
     let source = support.join("recordings").join(&meeting);
-    let speech = support.join("speech");
+    // Where the weights are. `ECHO_PROBE_SPEECH_DIR` lets a probe run against
+    // assets in a scratch directory — the app's own folder is read-only while a
+    // model change is being proved, and a 3 GB download does not belong in it.
+    let speech = std::env::var_os("ECHO_PROBE_SPEECH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| support.join("speech"));
 
     let tmp = tempfile::tempdir()?;
     let audio_dir = tmp.path().join("audio");
@@ -195,20 +200,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = db::connect(&tmp.path().join("echo.db")).await?;
     models::sync_catalog(&db).await?;
     repo::set_setting(&db, echo_lib::settings::keys::ACCURACY_LEVEL_ID, "everyday").await?;
-    for (id, path) in [
-        (
-            "speech-large-v3-turbo",
-            speech.join("ggml-large-v3-turbo.bin"),
-        ),
-        (
-            "speech-accelerator-large-v3-turbo",
-            speech.join("ggml-large-v3-turbo-encoder.mlmodelc"),
-        ),
-        (
-            "speech-detector-silero-v5",
-            speech.join("silero-vad-v5.1.2.onnx"),
-        ),
-    ] {
+    // Point the throwaway table at whatever weights are in `speech`.
+    //
+    // `ECHO_PROBE_SPEECH_ID` picks which catalogued speech entry to run — the
+    // whole point of a model-change probe is running the same audio through two
+    // of them and reading the two transcripts side by side. Its Apple companion
+    // comes from the catalog's own pairing, so it can never be mismatched.
+    let speech_id = std::env::var("ECHO_PROBE_SPEECH_ID")
+        .unwrap_or_else(|_| echo_lib::asr::catalog::ids::SPEECH.to_string());
+    let speech_entry = echo_lib::asr::catalog::entry(&speech_id)
+        .ok_or_else(|| format!("{speech_id} is not in the catalog"))?;
+    let mut wanted: Vec<(&str, PathBuf)> = vec![(
+        speech_entry.id,
+        speech.join(speech_entry.installed_name()),
+    )];
+    if let Some(accel) = echo_lib::asr::catalog::accelerator_for(speech_entry.id) {
+        wanted.push((accel.id, speech.join(accel.installed_name())));
+    }
+    let detector = echo_lib::asr::catalog::entry(echo_lib::asr::catalog::ids::DETECTOR).unwrap();
+    wanted.push((detector.id, speech.join(detector.installed_name())));
+
+    for (id, path) in &wanted {
         if !path.exists() {
             return Err(format!("{} is not installed at {}", id, path.display()).into());
         }

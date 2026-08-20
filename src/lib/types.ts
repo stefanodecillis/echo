@@ -399,7 +399,14 @@ export interface ModelInfo {
   path?: string;
 }
 
-/** A quality preset as the person sees it. Plain words only. */
+/**
+ * The speech level as the person sees it. Plain words only.
+ *
+ * There is exactly one, and the core sends exactly one — Echo ships a single
+ * model rather than a choice (see the core's `asr::catalog::PRESETS`). The shape
+ * is still a list because `downloadBytes`, `installed` and `assetIds` are what
+ * the download screens read, and because the next change of model wants it.
+ */
 export interface AccuracyLevel {
   id: string;
   name: string;

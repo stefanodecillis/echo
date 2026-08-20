@@ -115,20 +115,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ok("speech detector: real download, hash verify, ONNX load, inference");
 
     // 9. The speech engine's first load — the seam a first recording hits.
-    //    Uses the smallest preset (~75 MB + Apple encoder companion) so this
-    //    stays cheap; proves the download bundle path, whisper.cpp linking,
-    //    Metal/Core ML init on this machine, and the CPU-fallback report.
-    //    Opt in with PROBE_ENGINE=1.
+    //    Uses the smallest weights the catalog still knows (~75 MB + Apple
+    //    encoder companion) so this stays cheap; proves the download bundle
+    //    path, whisper.cpp linking, Metal/Core ML init on this machine, and the
+    //    CPU-fallback report. Opt in with PROBE_ENGINE=1.
+    //
+    //    Deliberately fetched as individual assets rather than as a level: Echo
+    //    has one level and it is the full model, which is four gigabytes and
+    //    not what a plumbing check should pull down. The tiny entries are still
+    //    catalogued (they have to be, so the cleanup can recognise them), and
+    //    the engine loads whatever speech file is actually installed — so
+    //    installing only these is enough to exercise the load path.
     if std::env::var("PROBE_ENGINE").as_deref() == Ok("1") {
-        models::download_level(&db, &app_paths, "fastest", Box::new(|_| {})).await?;
-        settings::apply(
-            &db,
-            &echo_lib::types::SettingsPatch {
-                accuracy_level_id: Some("fastest".into()),
-                ..Default::default()
-            },
-        )
-        .await?;
+        for asset in [
+            echo_lib::asr::catalog::ids::SPEECH_TINY,
+            echo_lib::asr::catalog::ids::ACCEL_TINY,
+        ] {
+            let entry = echo_lib::asr::catalog::entry(asset).expect("catalogued");
+            if !entry.applies_here() {
+                continue;
+            }
+            models::download_asset(&db, &app_paths, &asset.to_string(), Box::new(|_| {})).await?;
+        }
         let worker = echo_lib::asr::engine::EngineWorker::new();
         worker.configure_from_settings(&db).await?;
         let report = worker.load_now().await?;

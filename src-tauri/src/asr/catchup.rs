@@ -1083,7 +1083,7 @@ mod tests {
                 text: "allora, direi che possiamo procedere".into(),
                 language: job.language_hint.clone().or(Some("it".into())),
                 avg_confidence: Some(0.9),
-                model_name: Some("large-v3-turbo".into()),
+                model_name: Some("probe weights".into()),
                 model_revision: Some("rev1".into()),
                 ..Default::default()
             })

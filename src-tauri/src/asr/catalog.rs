@@ -20,6 +20,10 @@
 //! * The presets are **user-facing**, so their names and descriptions contain
 //!   no jargon at all (mantra 2). Model identifiers live in
 //!   [`CatalogEntry::name`], which only Settings → Advanced renders.
+//! * An entry is **never removed** when it stops being wanted. A release that
+//!   changes which weights Echo uses leaves the old ones catalogued, because
+//!   that is the only way [`crate::asr::models::plan_reconcile`] can recognise
+//!   what is on a person's disk and clean it up. See [`OBSOLETE_ASSET_IDS`].
 //!
 //! "Signed catalog" (DESIGN §3) is satisfied by construction rather than by a
 //! detached signature: the catalog is compiled into the binary, and the binary is
@@ -32,7 +36,7 @@ use crate::types::AssetKind;
 
 /// Bumped whenever this file changes. Stored in settings so a newer build can
 /// notice it has a newer catalog than the database.
-pub const CATALOG_REVISION: &str = "2026-08-19.1";
+pub const CATALOG_REVISION: &str = "2026-08-20.1";
 
 /// Which platforms need an entry at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +85,13 @@ pub struct CatalogEntry {
     pub provenance: &'static str,
     pub archive: Archive,
     pub platform: Platform,
+    /// For an Apple encoder companion: the speech entry it belongs to.
+    ///
+    /// Explicit rather than derived from whichever level happens to use them,
+    /// because a companion outlives the level: once large-v3 replaced turbo,
+    /// turbo's companion still has to be recognised as *turbo's* so it can be
+    /// cleaned up with it. `None` for everything that is not a companion.
+    pub pairs_with: Option<&'static str>,
 }
 
 impl CatalogEntry {
@@ -108,6 +119,18 @@ impl CatalogEntry {
     }
 }
 
+/// The Apple encoder companion that belongs to a speech entry, if there is one
+/// and this platform uses it.
+///
+/// Pairing matters to the reconcile: while an upgrade is still downloading, the
+/// engine keeps serving the *old* weights, and it must load the old weights'
+/// companion, not the new one's.
+pub fn accelerator_for(speech_id: &str) -> Option<&'static CatalogEntry> {
+    CATALOG
+        .iter()
+        .find(|e| e.pairs_with == Some(speech_id) && e.applies_here())
+}
+
 // ---------------------------------------------------------------------------
 // Speech files. whisper.cpp GGML conversions, published by the whisper.cpp
 // project on Hugging Face and pinned to one commit of that repository.
@@ -129,29 +152,84 @@ const COREML_PROVENANCE: &str = concat!(
 
 /// Asset ids, so the presets and the rest of the module never spell a string
 /// twice.
+///
+/// **These strings are permanent.** They are the primary key of the `models`
+/// table on every installed copy of Echo, so the id of a retired asset has to
+/// keep naming the same bytes for the cleanup to find them.
 pub mod ids {
-    pub const SPEECH_EVERYDAY: &str = "speech-large-v3-turbo";
-    pub const SPEECH_FASTER: &str = "speech-small";
-    pub const SPEECH_FASTEST: &str = "speech-tiny";
-
-    pub const ACCEL_EVERYDAY: &str = "speech-accelerator-large-v3-turbo";
-    pub const ACCEL_FASTER: &str = "speech-accelerator-small";
-    pub const ACCEL_FASTEST: &str = "speech-accelerator-tiny";
+    /// The speech model Echo uses: full large-v3, and its Apple companion.
+    pub const SPEECH: &str = "speech-large-v3";
+    pub const ACCEL: &str = "speech-accelerator-large-v3";
 
     pub const DETECTOR: &str = "speech-detector-silero-v5";
     pub const SEGMENTER: &str = "speaker-segmenter-pyannote-3";
     pub const EMBEDDER: &str = "speaker-embedder-wespeaker-campplus";
+
+    // --- retired: catalogued so they can be recognised and removed ---------
+    /// What Echo used before 2026-08-20. Still on many disks.
+    pub const SPEECH_TURBO: &str = "speech-large-v3-turbo";
+    pub const ACCEL_TURBO: &str = "speech-accelerator-large-v3-turbo";
+    pub const SPEECH_SMALL: &str = "speech-small";
+    pub const ACCEL_SMALL: &str = "speech-accelerator-small";
+    pub const SPEECH_TINY: &str = "speech-tiny";
+    pub const ACCEL_TINY: &str = "speech-accelerator-tiny";
 }
 
-/// Everything every preset needs: speech detection and the two speaker files.
-/// Small enough that we never make the person choose.
+/// Everything the level needs beyond speech itself: speech detection and the
+/// two speaker files. Small enough that we never make the person choose.
 pub const SHARED_ASSET_IDS: &[&str] = &[ids::DETECTOR, ids::SEGMENTER, ids::EMBEDDER];
 
-/// The catalog. Order matters only for display.
+/// Weights Echo has shipped in the past and no longer wants.
+///
+/// They stay in [`CATALOG`] and they stay listed here for exactly one reason:
+/// the reconcile has to be able to look at a person's disk, recognise a file as
+/// something *Echo* put there, and delete it. An unrecognised file is left
+/// alone — we do not delete things we cannot account for.
+///
+/// Nothing reads this to decide what to download. It is derived from the
+/// catalog and the level in [`obsolete_asset_ids`]; the constant only exists so
+/// a test can assert the two agree.
+pub const OBSOLETE_ASSET_IDS: &[&str] = &[
+    ids::SPEECH_TURBO,
+    ids::ACCEL_TURBO,
+    ids::SPEECH_SMALL,
+    ids::ACCEL_SMALL,
+    ids::SPEECH_TINY,
+    ids::ACCEL_TINY,
+];
+
+/// The catalog. Order matters in one place only: the speech entries are listed
+/// best-first, which is the order [`crate::asr::models::plan_reconcile`] falls
+/// back through when it has to keep serving something older.
 pub const CATALOG: &[CatalogEntry] = &[
     // --- speech -----------------------------------------------------------
+    //
+    // Full large-v3. Every lane uses it: live captions, live finals, the
+    // catch-up pass and Listen again (product decision of 2026-08-20). The
+    // lengths and hashes below were taken by downloading both files from the
+    // pinned revision and hashing what arrived — that download *is* the
+    // provenance record for these two lines.
     CatalogEntry {
-        id: ids::SPEECH_EVERYDAY,
+        id: ids::SPEECH,
+        kind: AssetKind::Speech,
+        name: "whisper large-v3 (ggml)",
+        file_name: "ggml-large-v3.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3.bin",
+        sha256: Some("64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2"),
+        bytes: 3_095_033_483,
+        license: WHISPER_LICENSE,
+        revision: WHISPER_REPO_REV,
+        provenance: WHISPER_PROVENANCE,
+        archive: Archive::None,
+        platform: Platform::Any,
+        pairs_with: None,
+    },
+    // --- speech Echo no longer wants -------------------------------------
+    //
+    // Kept so the reconcile can find them on disk and remove them. Nothing
+    // downloads these any more; see `OBSOLETE_ASSET_IDS`.
+    CatalogEntry {
+        id: ids::SPEECH_TURBO,
         kind: AssetKind::Speech,
         name: "whisper large-v3-turbo (ggml)",
         file_name: "ggml-large-v3-turbo.bin",
@@ -163,9 +241,10 @@ pub const CATALOG: &[CatalogEntry] = &[
         provenance: WHISPER_PROVENANCE,
         archive: Archive::None,
         platform: Platform::Any,
+        pairs_with: None,
     },
     CatalogEntry {
-        id: ids::SPEECH_FASTER,
+        id: ids::SPEECH_SMALL,
         kind: AssetKind::Speech,
         name: "whisper small (ggml)",
         file_name: "ggml-small.bin",
@@ -177,9 +256,10 @@ pub const CATALOG: &[CatalogEntry] = &[
         provenance: WHISPER_PROVENANCE,
         archive: Archive::None,
         platform: Platform::Any,
+        pairs_with: None,
     },
     CatalogEntry {
-        id: ids::SPEECH_FASTEST,
+        id: ids::SPEECH_TINY,
         kind: AssetKind::Speech,
         name: "whisper tiny (ggml)",
         file_name: "ggml-tiny.bin",
@@ -191,10 +271,28 @@ pub const CATALOG: &[CatalogEntry] = &[
         provenance: WHISPER_PROVENANCE,
         archive: Archive::None,
         platform: Platform::Any,
+        pairs_with: None,
     },
     // --- Apple encoder companions ----------------------------------------
     CatalogEntry {
-        id: ids::ACCEL_EVERYDAY,
+        id: ids::ACCEL,
+        kind: AssetKind::SpeechAccelerator,
+        name: "whisper large-v3 Core ML encoder",
+        file_name: "ggml-large-v3-encoder.mlmodelc.zip",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-encoder.mlmodelc.zip",
+        sha256: Some("47837be7594a29429ec08620043390c4d6d467f8bd362df09e9390ace76a55a4"),
+        bytes: 1_175_711_232,
+        license: WHISPER_LICENSE,
+        revision: WHISPER_REPO_REV,
+        provenance: COREML_PROVENANCE,
+        archive: Archive::ZipBundle {
+            dir_name: "ggml-large-v3-encoder.mlmodelc",
+        },
+        platform: Platform::MacOs,
+        pairs_with: Some(ids::SPEECH),
+    },
+    CatalogEntry {
+        id: ids::ACCEL_TURBO,
         kind: AssetKind::SpeechAccelerator,
         name: "whisper large-v3-turbo Core ML encoder",
         file_name: "ggml-large-v3-turbo-encoder.mlmodelc.zip",
@@ -208,9 +306,10 @@ pub const CATALOG: &[CatalogEntry] = &[
             dir_name: "ggml-large-v3-turbo-encoder.mlmodelc",
         },
         platform: Platform::MacOs,
+        pairs_with: Some(ids::SPEECH_TURBO),
     },
     CatalogEntry {
-        id: ids::ACCEL_FASTER,
+        id: ids::ACCEL_SMALL,
         kind: AssetKind::SpeechAccelerator,
         name: "whisper small Core ML encoder",
         file_name: "ggml-small-encoder.mlmodelc.zip",
@@ -224,9 +323,10 @@ pub const CATALOG: &[CatalogEntry] = &[
             dir_name: "ggml-small-encoder.mlmodelc",
         },
         platform: Platform::MacOs,
+        pairs_with: Some(ids::SPEECH_SMALL),
     },
     CatalogEntry {
-        id: ids::ACCEL_FASTEST,
+        id: ids::ACCEL_TINY,
         kind: AssetKind::SpeechAccelerator,
         name: "whisper tiny Core ML encoder",
         file_name: "ggml-tiny-encoder.mlmodelc.zip",
@@ -240,6 +340,7 @@ pub const CATALOG: &[CatalogEntry] = &[
             dir_name: "ggml-tiny-encoder.mlmodelc",
         },
         platform: Platform::MacOs,
+        pairs_with: Some(ids::SPEECH_TINY),
     },
     // --- speech detection -------------------------------------------------
     CatalogEntry {
@@ -255,6 +356,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         provenance: "github.com/snakers4/silero-vad, tag v5.1.2, ONNX export shipped by upstream",
         archive: Archive::None,
         platform: Platform::Any,
+        pairs_with: None,
     },
     // --- speakers ---------------------------------------------------------
     CatalogEntry {
@@ -274,6 +376,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         ),
         archive: Archive::None,
         platform: Platform::Any,
+        pairs_with: None,
     },
     CatalogEntry {
         id: ids::EMBEDDER,
@@ -292,6 +395,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         ),
         archive: Archive::None,
         platform: Platform::Any,
+        pairs_with: None,
     },
 ];
 
@@ -410,8 +514,15 @@ impl DecodeParams {
     }
 }
 
-/// A quality preset. `name` and `description` are read by people, so they say
-/// nothing about models, beams or temperatures (mantra 2).
+/// The level: which weights, and how hard to decode with them.
+///
+/// `name` and `blurb` are read by people, so they say nothing about models,
+/// beams or temperatures (mantra 2).
+///
+/// There is exactly one of these (see [`PRESETS`]). The type is still a list of
+/// named levels rather than a bare constant because the settings column, the
+/// `models` rows and the IPC surface are all keyed by a level id, and because
+/// the *next* change of weights wants the same shape this one had.
 #[derive(Debug, Clone, Copy)]
 pub struct AccuracyPreset {
     /// Stable machine id, stored in settings.
@@ -421,70 +532,44 @@ pub struct AccuracyPreset {
     /// differs per platform.
     pub blurb: &'static str,
     pub speech_id: &'static str,
-    /// Apple encoder companion, or `None` for presets that have none.
+    /// Apple encoder companion, or `None` on a platform with none.
     pub accelerator_id: Option<&'static str>,
     pub decode: DecodeParams,
-    /// Recommended only on a computer with at least this much memory.
-    pub min_memory_bytes: u64,
 }
 
-/// The preset a fresh install starts on. Matches `Settings::default()`.
+/// The only level there is. Matches `Settings::default()`.
 pub const DEFAULT_PRESET_ID: &str = "everyday";
 
-pub const PRESETS: &[AccuracyPreset] = &[
-    AccuracyPreset {
-        id: DEFAULT_PRESET_ID,
-        name: "Everyday accuracy",
-        blurb: "Good for most meetings, and understands almost any language.",
-        speech_id: ids::SPEECH_EVERYDAY,
-        accelerator_id: Some(ids::ACCEL_EVERYDAY),
-        decode: DecodeParams {
-            beam_size: 5,
-            best_of: 5,
-            temperature: 0.0,
-            temperature_inc: 0.2,
-            entropy_thold: 2.4,
-            logprob_thold: -1.0,
-            no_speech_thold: 0.6,
-        },
-        // Below roughly 8 GB the everyday level is a stretch alongside a call.
-        min_memory_bytes: 8 * 1024 * 1024 * 1024,
+/// One level, one model, everywhere (product decision of 2026-08-20).
+///
+/// Echo used to carry three levels and pick between them by installed memory.
+/// Two things were wrong with that. It was a choice nobody could make well —
+/// the honest answer does not depend on the person (mantra 1's amendment) — and
+/// it meant the transcript a person got depended on how much RAM they happened
+/// to have, which is not a promise anybody would agree to if it were stated out
+/// loud. So: full large-v3 for live captions, live finals, the catch-up pass and
+/// Listen again alike. Nothing routes by lane, by machine or by plan.
+///
+/// The decoding numbers still differ *by lane* — a caption is greedy, a final
+/// keeps the beam, the disk pass keeps the whole ladder — and that is the
+/// business of [`DecodeParams::speculative`], [`DecodeParams::live_final`] and
+/// this one struct they all start from.
+pub const PRESETS: &[AccuracyPreset] = &[AccuracyPreset {
+    id: DEFAULT_PRESET_ID,
+    name: "Everyday accuracy",
+    blurb: "Good for most meetings, and understands almost any language.",
+    speech_id: ids::SPEECH,
+    accelerator_id: Some(ids::ACCEL),
+    decode: DecodeParams {
+        beam_size: 5,
+        best_of: 5,
+        temperature: 0.0,
+        temperature_inc: 0.2,
+        entropy_thold: 2.4,
+        logprob_thold: -1.0,
+        no_speech_thold: 0.6,
     },
-    AccuracyPreset {
-        id: "faster",
-        name: "Faster",
-        blurb: "Keeps up more easily and takes far less room. Good when speech is clear.",
-        speech_id: ids::SPEECH_FASTER,
-        accelerator_id: Some(ids::ACCEL_FASTER),
-        decode: DecodeParams {
-            beam_size: 2,
-            best_of: 2,
-            temperature: 0.0,
-            temperature_inc: 0.2,
-            entropy_thold: 2.4,
-            logprob_thold: -1.0,
-            no_speech_thold: 0.6,
-        },
-        min_memory_bytes: 4 * 1024 * 1024 * 1024,
-    },
-    AccuracyPreset {
-        id: "fastest",
-        name: "Quickest",
-        blurb: "The lightest choice. Expect more mistakes, especially with accents.",
-        speech_id: ids::SPEECH_FASTEST,
-        accelerator_id: Some(ids::ACCEL_FASTEST),
-        decode: DecodeParams {
-            beam_size: 0,
-            best_of: 1,
-            temperature: 0.0,
-            temperature_inc: 0.4,
-            entropy_thold: 2.8,
-            logprob_thold: -1.0,
-            no_speech_thold: 0.6,
-        },
-        min_memory_bytes: 0,
-    },
-];
+}];
 
 // ---------------------------------------------------------------------------
 // Lookups
@@ -541,16 +626,34 @@ pub fn preset_total_bytes(level_id: &str) -> i64 {
         .sum()
 }
 
-/// Which preset we suggest on this computer, from installed memory alone.
-pub fn recommended_preset_id(total_memory_bytes: u64) -> &'static str {
-    // Presets are ordered best-first, so the first one this computer can carry
-    // is the one to suggest.
-    for p in PRESETS {
-        if total_memory_bytes == 0 || total_memory_bytes >= p.min_memory_bytes {
-            return p.id;
-        }
-    }
-    DEFAULT_PRESET_ID
+/// Catalogued assets this platform uses that the level does **not** want.
+///
+/// This is the cleanup's whole idea of "old": derived from the level, so adding
+/// a level's replacement weights to the catalog is the only edit a future change
+/// of model needs. Order follows [`CATALOG`], which keeps it stable for logs.
+///
+/// Speech-adjacent only by construction — the detector and the two speaker files
+/// are shared by every level, so they never appear here.
+pub fn obsolete_asset_ids(level_id: &str) -> Vec<&'static str> {
+    let wanted = preset_asset_ids(level_id);
+    CATALOG
+        .iter()
+        .filter(|e| e.applies_here() && !wanted.contains(&e.id))
+        .map(|e| e.id)
+        .collect()
+}
+
+/// Speech entries this platform could load, best first.
+///
+/// [`CATALOG`] lists speech best-first, and this is the one place that ordering
+/// is load-bearing: it is the order the reconcile falls back through when the
+/// wanted weights are not on disk yet and something has to serve the meeting.
+pub fn speech_ids_best_first() -> Vec<&'static str> {
+    CATALOG
+        .iter()
+        .filter(|e| e.kind == AssetKind::Speech && e.applies_here())
+        .map(|e| e.id)
+        .collect()
 }
 
 /// "1.6 GB", "488 MB". Used in the sentence a person reads, so it is short and
@@ -585,6 +688,7 @@ pub fn preset_description(level_id: &str) -> String {
         human_bytes(preset_total_bytes(p.id))
     )
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -640,6 +744,30 @@ mod tests {
         }
     }
 
+    /// The bytes the level downloads were fetched and hashed by hand before
+    /// these lines were written. Pinning the numbers here is what makes a later
+    /// edit to them a deliberate act rather than a typo.
+    #[test]
+    fn the_speech_model_is_the_one_that_was_downloaded_and_hashed() {
+        let speech = entry(ids::SPEECH).unwrap();
+        assert_eq!(speech.file_name, "ggml-large-v3.bin");
+        assert_eq!(speech.bytes, 3_095_033_483);
+        assert_eq!(
+            speech.sha256,
+            Some("64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2")
+        );
+        let accel = entry(ids::ACCEL).unwrap();
+        assert_eq!(accel.bytes, 1_175_711_232);
+        assert_eq!(
+            accel.sha256,
+            Some("47837be7594a29429ec08620043390c4d6d467f8bd362df09e9390ace76a55a4")
+        );
+        // Both come from the same pinned upstream commit.
+        assert_eq!(speech.revision, accel.revision);
+        assert!(speech.url.contains(WHISPER_REPO_REV));
+        assert!(accel.url.contains(WHISPER_REPO_REV));
+    }
+
     #[test]
     fn accelerators_are_apple_only_bundles_named_the_way_whisper_expects() {
         for e in CATALOG {
@@ -654,14 +782,31 @@ mod tests {
                 "{dir} is not the name whisper.cpp looks for"
             );
             // whisper.cpp derives "<speech file without .bin>-encoder.mlmodelc",
-            // so the bundle name has to match its preset's speech file.
-            let preset = PRESETS
-                .iter()
-                .find(|p| p.accelerator_id == Some(e.id))
-                .expect("every accelerator belongs to a preset");
-            let speech = entry(preset.speech_id).unwrap();
+            // so the bundle name has to match the speech file it is paired with.
+            let speech_id = e
+                .pairs_with
+                .expect("every companion names the speech file it belongs to");
+            let speech = entry(speech_id).expect("and that speech file is catalogued");
+            assert_eq!(speech.kind, AssetKind::Speech);
             let stem = speech.file_name.trim_end_matches(".bin");
             assert_eq!(dir, format!("{stem}-encoder.mlmodelc"));
+        }
+        // And every speech file has one, wanted or not: an old model that is
+        // still serving a meeting needs its own companion, not the new one's.
+        for e in CATALOG.iter().filter(|e| e.kind == AssetKind::Speech) {
+            let paired = CATALOG.iter().find(|a| a.pairs_with == Some(e.id));
+            assert!(paired.is_some(), "{} has no Apple companion", e.id);
+        }
+    }
+
+    #[test]
+    fn only_companions_pair_with_anything() {
+        for e in CATALOG {
+            if e.kind == AssetKind::SpeechAccelerator {
+                assert!(e.pairs_with.is_some(), "{} pairs with nothing", e.id);
+            } else {
+                assert!(e.pairs_with.is_none(), "{} should pair with nothing", e.id);
+            }
         }
     }
 
@@ -673,6 +818,11 @@ mod tests {
             if let Some(a) = p.accelerator_id {
                 let accel = entry(a).expect("preset accelerator is catalogued");
                 assert_eq!(accel.kind, AssetKind::SpeechAccelerator);
+                assert_eq!(
+                    accel.pairs_with,
+                    Some(p.speech_id),
+                    "the level's companion belongs to the level's speech file"
+                );
             }
         }
         for id in SHARED_ASSET_IDS {
@@ -690,54 +840,164 @@ mod tests {
         assert_eq!(preset_or_default("no-such-level").id, DEFAULT_PRESET_ID);
     }
 
+    /// One model, everywhere. This is the test that would fail if somebody
+    /// reintroduced a second level, a per-machine choice or a cheaper model for
+    /// some lane (product decision of 2026-08-20).
+    #[test]
+    fn there_is_exactly_one_level_and_it_uses_the_full_model() {
+        assert_eq!(PRESETS.len(), 1, "Echo offers no model choice");
+        let only = &PRESETS[0];
+        assert_eq!(only.id, DEFAULT_PRESET_ID);
+        assert_eq!(only.speech_id, ids::SPEECH);
+        assert_eq!(entry(ids::SPEECH).unwrap().file_name, "ggml-large-v3.bin");
+        // Nothing anywhere may quietly reach for the smaller weights.
+        assert!(
+            !preset_asset_ids(DEFAULT_PRESET_ID).contains(&ids::SPEECH_TURBO),
+            "the level must not want yesterday's weights"
+        );
+    }
+
     #[test]
     fn a_preset_needs_speech_detection_and_the_speaker_files() {
         let all = preset_asset_ids(DEFAULT_PRESET_ID);
-        assert_eq!(
-            all.first(),
-            Some(&ids::SPEECH_EVERYDAY),
-            "speech comes first"
-        );
+        assert_eq!(all.first(), Some(&ids::SPEECH), "speech comes first");
         assert!(all.contains(&ids::DETECTOR));
         assert!(all.contains(&ids::SEGMENTER));
         assert!(all.contains(&ids::EMBEDDER));
         assert_eq!(
-            all.contains(&ids::ACCEL_EVERYDAY),
+            all.contains(&ids::ACCEL),
             cfg!(target_os = "macos"),
             "the Apple companion is only fetched on Apple hardware"
         );
 
         // Recording only waits for speech plus detection.
         let required = preset_required_asset_ids(DEFAULT_PRESET_ID);
-        assert_eq!(required, vec![ids::SPEECH_EVERYDAY, ids::DETECTOR]);
+        assert_eq!(required, vec![ids::SPEECH, ids::DETECTOR]);
     }
 
     #[test]
-    fn preset_totals_add_up_and_get_smaller_as_the_preset_gets_faster() {
-        let everyday = preset_total_bytes("everyday");
-        let faster = preset_total_bytes("faster");
-        let fastest = preset_total_bytes("fastest");
-        assert!(everyday > faster && faster > fastest);
-        // The total is exactly the sum of what we would fetch here.
-        let manual: i64 = preset_asset_ids("faster")
+    fn the_total_is_exactly_what_would_be_fetched_here() {
+        let manual: i64 = preset_asset_ids(DEFAULT_PRESET_ID)
             .into_iter()
             .map(|id| entry(id).unwrap().bytes)
             .sum();
-        assert_eq!(manual, faster);
+        assert_eq!(manual, preset_total_bytes(DEFAULT_PRESET_ID));
+        // Big enough that the sentence has to say so honestly.
+        assert!(preset_total_bytes(DEFAULT_PRESET_ID) > 3_000_000_000);
+    }
+
+    /// The honest number the UI quotes. If the catalog changes, this test is
+    /// where the copy is reminded to change with it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_download_is_the_size_the_copy_says_it_is() {
+        assert_eq!(preset_total_bytes(DEFAULT_PRESET_ID), 4_308_357_836);
+        assert_eq!(
+            human_bytes(preset_total_bytes(DEFAULT_PRESET_ID)),
+            "4.3 GB",
+            "src/lib/copy.ts quotes this number; both have to move together"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // What "old" means
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn yesterdays_weights_are_still_catalogued_so_they_can_be_found() {
+        // Not a nicety: an id that vanished from the catalog is a file on
+        // somebody's disk that nothing can account for or delete.
+        for id in OBSOLETE_ASSET_IDS {
+            let e = entry(id).unwrap_or_else(|| panic!("{id} left the catalog"));
+            assert!(
+                matches!(
+                    e.kind,
+                    AssetKind::Speech | AssetKind::SpeechAccelerator
+                ),
+                "{id} is not speech, so it cannot be superseded by a model"
+            );
+        }
     }
 
     #[test]
-    fn quality_presets_differ_only_in_speech_file_and_decoding_effort() {
-        let everyday = preset("everyday").unwrap();
-        let faster = preset("faster").unwrap();
-        let fastest = preset("fastest").unwrap();
-        assert!(everyday.decode.beam_size > faster.decode.beam_size);
-        assert!(faster.decode.uses_beam_search());
-        assert!(
-            !fastest.decode.uses_beam_search(),
-            "the quickest preset samples greedily"
+    fn the_obsolete_set_is_derived_from_the_level_and_agrees_with_the_list() {
+        // Compared as sets: the derivation follows catalog layout, the constant
+        // is grouped by generation, and neither ordering is the other's
+        // business.
+        let derived: HashSet<&str> = obsolete_asset_ids(DEFAULT_PRESET_ID).into_iter().collect();
+        let expected: HashSet<&str> = OBSOLETE_ASSET_IDS
+            .iter()
+            .copied()
+            .filter(|id| entry(id).is_some_and(CatalogEntry::applies_here))
+            .collect();
+        assert_eq!(derived, expected);
+        let derived: Vec<&str> = obsolete_asset_ids(DEFAULT_PRESET_ID);
+
+        // Nothing the level wants is ever obsolete, and nothing shared is.
+        for id in preset_asset_ids(DEFAULT_PRESET_ID) {
+            assert!(!derived.contains(&id), "{id} is both wanted and obsolete");
+        }
+        for id in SHARED_ASSET_IDS {
+            assert!(
+                !derived.contains(id),
+                "{id} is shared by every level and must never be swept up"
+            );
+        }
+    }
+
+    #[test]
+    fn every_catalogued_asset_is_either_wanted_or_obsolete() {
+        let wanted = preset_asset_ids(DEFAULT_PRESET_ID);
+        let obsolete = obsolete_asset_ids(DEFAULT_PRESET_ID);
+        for e in CATALOG.iter().filter(|e| e.applies_here()) {
+            let counted = wanted.contains(&e.id) as usize + obsolete.contains(&e.id) as usize;
+            assert_eq!(counted, 1, "{} is in neither camp or in both", e.id);
+        }
+    }
+
+    #[test]
+    fn speech_is_listed_best_first_so_a_fallback_picks_the_best_thing_there() {
+        let order = speech_ids_best_first();
+        assert_eq!(
+            order.first(),
+            Some(&ids::SPEECH),
+            "the wanted model has to come first, or a fallback would prefer an older one"
         );
+        assert_eq!(
+            order,
+            vec![
+                ids::SPEECH,
+                ids::SPEECH_TURBO,
+                ids::SPEECH_SMALL,
+                ids::SPEECH_TINY
+            ],
+            "biggest first: turbo beats small beats tiny"
+        );
+    }
+
+    #[test]
+    fn a_companion_is_found_for_the_model_that_is_actually_serving() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(accelerator_for(ids::SPEECH).map(|e| e.id), Some(ids::ACCEL));
+            assert_eq!(
+                accelerator_for(ids::SPEECH_TURBO).map(|e| e.id),
+                Some(ids::ACCEL_TURBO),
+                "an old model that is still serving loads its own companion"
+            );
+        } else {
+            assert!(accelerator_for(ids::SPEECH).is_none());
+        }
+        assert!(accelerator_for("not-a-model").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Decoding
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_level_searches_beams_from_disk_and_falls_back_when_it_has_to() {
         for p in PRESETS {
+            assert!(p.decode.uses_beam_search());
             assert_eq!(p.decode.temperature, 0.0, "decoding starts deterministic");
             assert!(p.decode.temperature_inc > 0.0, "fallbacks must be possible");
             assert!(p.decode.best_of >= 1);
@@ -797,8 +1057,7 @@ mod tests {
                 p.id
             );
         }
-        // The everyday preset is the one with a wide beam to keep or give up.
-        let everyday = preset("everyday").unwrap().decode;
+        let everyday = default_preset().decode;
         assert_eq!(everyday.beam_size, 5, "catch-up keeps the wide beam");
         assert_eq!(
             everyday.live_final().beam_size,
@@ -809,14 +1068,9 @@ mod tests {
         assert_eq!(everyday.max_attempts(), 6, "0.0, 0.2, … 1.0 on disk");
     }
 
-    #[test]
-    fn a_small_computer_is_pointed_at_a_smaller_preset() {
-        assert_eq!(recommended_preset_id(32 * 1024 * 1024 * 1024), "everyday");
-        assert_eq!(recommended_preset_id(6 * 1024 * 1024 * 1024), "faster");
-        assert_eq!(recommended_preset_id(2 * 1024 * 1024 * 1024), "fastest");
-        // Unknown memory must not downgrade anybody.
-        assert_eq!(recommended_preset_id(0), "everyday");
-    }
+    // -----------------------------------------------------------------
+    // Words a person reads
+    // -----------------------------------------------------------------
 
     #[test]
     fn nothing_a_person_reads_contains_jargon() {
@@ -857,7 +1111,8 @@ mod tests {
 
     #[test]
     fn sizes_read_the_way_a_download_is_described() {
-        assert_eq!(human_bytes(1_624_555_275), "1.6 GB");
+        assert_eq!(human_bytes(4_308_357_836), "4.3 GB");
+        assert_eq!(human_bytes(3_095_033_483), "3.1 GB");
         assert_eq!(human_bytes(487_601_967), "488 MB");
         assert_eq!(human_bytes(2_327_524), "2.3 MB");
         assert_eq!(human_bytes(512), "512 bytes");

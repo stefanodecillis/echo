@@ -107,7 +107,7 @@ Everything below compiles, `cargo test` is green (420 unit tests, one ignored),
 `cargo clippy --all-targets -- -D warnings` is clean, and the debug binary links
 against whisper.cpp and ONNX Runtime. **None of it has been exercised against
 real audio hardware or a real download**, because that needs a machine with a
-microphone, a permission dialog to click, and 1.6 GB of weights.
+microphone, a permission dialog to click, and 4.3 GB of weights.
 
 ### Works, and has been tested
 
@@ -153,11 +153,14 @@ microphone, a permission dialog to click, and 1.6 GB of weights.
   writes sample-by-sample, so a crash costs milliseconds instead of a whole 30 s
   window. Cost is space: roughly 115 MB per hour per channel.
 - **Model licenses need an audit.** The catalog records a license and revision
-  for all nine assets and the URLs were verified by HTTP HEAD, but the speaker
+  for every asset and the URLs were verified by HTTP HEAD, but the speaker
   assets in particular need a human to confirm the terms before shipping.
-- **No downloads have been run end to end.** Range + If-Range resume was
-  confirmed against Hugging Face's CDN and Silero VAD (2.3 MB) was fetched once
-  to compute its hash, but no whisper weights have ever been downloaded.
+- **The speech weights have been downloaded and hashed** (2026-08-20): both
+  files of the current model were fetched from the pinned upstream commit and
+  their SHA-256s computed from the bytes that arrived, which is what the catalog
+  now records. Note that Hugging Face's ETag on these is *not* the SHA-256, so a
+  hash has to come from the download rather than from a HEAD.
+  Range + If-Range resume was confirmed separately against the same CDN.
 - Click-to-play in the transcript, live speaker clustering (deliberately out of
   scope for v1), and installer signing/notarization are not done.
 

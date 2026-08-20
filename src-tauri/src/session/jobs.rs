@@ -144,7 +144,11 @@ pub fn label_for(kind: JobKind) -> &'static str {
         JobKind::Diarize => "Working out who said what…",
         JobKind::Summarize => "Writing your recap…",
         JobKind::Export => "Saving your file…",
-        JobKind::Download => "Downloading what Echo needs to understand speech…",
+        // Two phases, one job: the bytes arrive, then they are made ready to
+        // use on this particular machine (which on Apple silicon is not
+        // instant — see `download`). "Setting up" is true of both; "downloading"
+        // would stop being true halfway through.
+        JobKind::Download => "Setting up what Echo needs to understand speech…",
         JobKind::Mixdown => "Getting the recording ready to play back…",
     }
 }
@@ -732,6 +736,59 @@ async fn download(ctx: &JobContext) -> Result<(), JobFailure> {
         .set(permille.load(Ordering::Relaxed) as f32 / 1000.0)
         .await;
     result.map_err(|error| asr_failure(&ctx.cancel, error))?;
+
+    // The download that just finished may have been the last file an upgrade
+    // was waiting for. Reconciling here is what makes the switch happen at the
+    // moment it becomes safe, rather than on the next launch or the next time
+    // the UI happens to ask (see `crate::asr::reconcile`).
+    //
+    // Deliberately after the download succeeded and before progress reaches 1:
+    // the old weights are gone by the time anything reads "done".
+    //
+    // No "is a recording running" guard here, unlike
+    // `SessionManager::ensure_speech_current`: a recording parks this job
+    // (recording has absolute priority — see `JobRuntime::preempt`), so
+    // reaching this line at all means nothing is being listened to.
+    match crate::asr::models::reconcile(&ctx.db, &ctx.paths).await {
+        Ok(plan) if plan.switching() => {
+            tracing::info!(
+                serving = plan.serving.unwrap_or("?"),
+                "Echo switched to the speech model it wants"
+            );
+            ctx.events.emit(UiEvent::Notice(crate::events::NoticePayload {
+                level: crate::events::NoticeLevel::Info,
+                message: "Echo upgraded how it understands speech.".into(),
+                persistent: false,
+                meeting_id: None,
+                tag: Some("speechUpgraded".into()),
+            }));
+        }
+        Ok(_) => {}
+        // Not a download failure: the bytes arrived and are installed. The
+        // tidying up is retried at the next launch or readiness check.
+        Err(error) => tracing::warn!(%error, "could not tidy up older speech weights"),
+    }
+
+    // Load the weights once, here, while the person is already waiting on a
+    // download that says it happens once.
+    //
+    // This is not a warm cache for its own sake. On Apple silicon the encoder
+    // companion is compiled *for this machine* the first time it is loaded, and
+    // for the full model that took eighteen minutes on the machine this was
+    // measured on, against three seconds once the OS had cached the result — a
+    // genuine one-off, and a big one. Paid here it is part
+    // of "Downloading what Echo needs to understand speech". Paid on first use
+    // it is a meeting whose captions do not appear until it is over. The audio
+    // would still be on disk and the transcript would still arrive from the
+    // catch-up pass (mantra 3), but "no captions for the first meeting after an
+    // update" is not something to leave in.
+    //
+    // Failing here is not a failed download: the bytes are installed and
+    // verified, and the next load will try again.
+    if let Err(error) = ctx.asr.prewarm().await {
+        tracing::warn!(%error, "the new weights did not load on the first attempt");
+    }
+
     ctx.progress.set(1.0).await;
     Ok(())
 }
