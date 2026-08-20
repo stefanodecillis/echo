@@ -190,6 +190,12 @@ export const live = {
   nothingRecordingDescription: "Start a meeting from Home to see it here.",
   goHomeButton: "Go to Home",
   copyTranscriptButton: "Copy transcript",
+  /** The small row that sits at the bottom of the transcript with a pulsing
+   * dot, for as long as Echo is actively listening. */
+  listeningNow: "Listening…",
+  /** The pill that appears once someone has scrolled up to read and new
+   * speech has come in since — clicking it returns to following along live. */
+  jumpToNow: "Jump to now",
 } as Record<string, string>;
 
 /** Meeting detail: Recap, Transcript, Info tabs. */
@@ -270,6 +276,20 @@ export const meeting = {
   peopleCountBackToAutomatic: "Back to automatic",
   peopleCountConfirmDescription: "Names you gave speakers may need redoing.",
   peopleCountRedoButton: "Redo",
+
+  // "Name your speakers" dialog (Transcript tab): the participants stepper,
+  // the redo it triggers, and one row per speaker with a sample and a name.
+  speakersDialogTitle: "Name your speakers",
+  speakersDialogDescription: "Play a sample, then type who it is.",
+  speakersDialogParticipantsLabel: "Participants",
+  /** "Redo", not "Re-run": the question this button answers is worded
+   * "Redo who said what…?" (`peopleCount.confirmTitle`), and a button that
+   * disagrees with its own question reads as a different action. */
+  speakersDialogRerunButton: "Redo",
+  speakersDialogListenLabel: "Listen",
+  speakersDialogStopLabel: "Stop",
+  speakersDialogSampleError: "Echo couldn't play a sample for this voice.",
+  speakersDialogEmpty: "Echo hasn't worked out who's speaking yet.",
 } as Record<string, string>;
 
 /** History and search. */

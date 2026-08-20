@@ -347,7 +347,6 @@ pub async fn readiness(db: &Db, paths: &AppPaths) -> Result<SpeechReadiness, Asr
     })
 }
 
-
 /// Download every asset a preset needs, in order, resuming what is partial.
 ///
 /// Idempotent: calling it while a download is running attaches to that
@@ -1686,7 +1685,11 @@ mod tests {
         sync_catalog(&db).await.unwrap();
 
         // What a person who installed Echo yesterday has.
-        for id in [catalog::ids::DETECTOR, catalog::ids::SEGMENTER, catalog::ids::EMBEDDER] {
+        for id in [
+            catalog::ids::DETECTOR,
+            catalog::ids::SEGMENTER,
+            catalog::ids::EMBEDDER,
+        ] {
             install(&fx.paths, &db, id).await;
         }
         let old_speech = install(&fx.paths, &db, catalog::ids::SPEECH_TURBO).await;
@@ -1754,7 +1757,10 @@ mod tests {
         // Launch 3: settled, and silent.
         let settled = reconcile(&db, &fx.paths).await.unwrap();
         assert_eq!(settled.state, reconcile::State::Steady);
-        assert!(!settled.switching(), "the person is told once, not every launch");
+        assert!(
+            !settled.switching(),
+            "the person is told once, not every launch"
+        );
     }
 
     /// The same journey for the **voice-print network**, which changed for the
@@ -1787,7 +1793,9 @@ mod tests {
         );
         // And nothing pretends the new network is loadable yet.
         assert_eq!(
-            installed_path(&db, AssetKind::SpeakerEmbedder).await.unwrap(),
+            installed_path(&db, AssetKind::SpeakerEmbedder)
+                .await
+                .unwrap(),
             None
         );
 
@@ -1798,7 +1806,9 @@ mod tests {
         assert!(!old.exists(), "yesterday's voice prints are gone");
         assert!(new.exists(), "today's are not");
         assert_eq!(
-            installed_path(&db, AssetKind::SpeakerEmbedder).await.unwrap(),
+            installed_path(&db, AssetKind::SpeakerEmbedder)
+                .await
+                .unwrap(),
             Some(new),
             "and the pass loads the network the threshold was measured against"
         );
@@ -1871,7 +1881,10 @@ mod tests {
         assert_eq!(settled.state, reconcile::State::Steady);
         for id in doomed {
             let entry = catalog::entry(id).unwrap();
-            assert!(!install_path(&fx.paths, entry).exists(), "{id} is still here");
+            assert!(
+                !install_path(&fx.paths, entry).exists(),
+                "{id} is still here"
+            );
         }
     }
 

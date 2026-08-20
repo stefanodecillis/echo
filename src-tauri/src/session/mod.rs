@@ -1263,9 +1263,7 @@ impl SessionManager {
         // the next time anything asks.
         let recording = engine_is_needed_by_capture(self.0.state());
         if recording && plan.switching() {
-            tracing::info!(
-                "leaving older speech weights in place until this meeting is finished"
-            );
+            tracing::info!("leaving older speech weights in place until this meeting is finished");
             return plan.can_serve();
         }
         crate::asr::models::apply_cleanup(&self.0.db, &self.0.paths, &plan).await;

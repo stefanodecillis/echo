@@ -70,7 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--lengths" => {
                 if let Some(list) = args.next() {
-                    lengths = list.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+                    lengths = list
+                        .split(',')
+                        .filter_map(|v| v.trim().parse().ok())
+                        .collect();
                 }
             }
             other => positional.push(other.to_string()),
@@ -133,7 +136,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if path.exists() {
             repo::set_model_installed(&db, accel.id, true, Some(&path.to_string_lossy())).await?;
         } else {
-            println!("note:     no encoder companion in {} — measuring without it", speech.display());
+            println!(
+                "note:     no encoder companion in {} — measuring without it",
+                speech.display()
+            );
         }
     }
 
@@ -206,8 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for n in 0..windows {
             // Spread the samples across the copied audio, leaving room for a
             // whole window before each end point.
-            let end_ms =
-                window_ms + ((total_ms - window_ms) * n as i64) / windows.max(1) as i64;
+            let end_ms = window_ms + ((total_ms - window_ms) * n as i64) / windows.max(1) as i64;
             let samples = echo_lib::audio::read_window(&chunks, end_ms - window_ms, end_ms).await?;
             if samples.len() < (window_ms * i64::from(TARGET_SAMPLE_RATE) / 1_000) as usize / 2 {
                 continue;

@@ -369,7 +369,10 @@ mod tests {
             p.deletable().is_empty(),
             "deleting turbo now would leave the person with nothing"
         );
-        assert!(!p.switching(), "nothing has switched yet, so nothing is said");
+        assert!(
+            !p.switching(),
+            "nothing has switched yet, so nothing is said"
+        );
     }
 
     #[test]
@@ -601,7 +604,10 @@ mod tests {
 
         assert_eq!(p.state, State::FirstRun);
         assert_eq!(p.serving, None, "an encoder alone cannot transcribe");
-        assert!(p.obsolete.contains(&ids::ACCEL_TURBO), "but it is recognised");
+        assert!(
+            p.obsolete.contains(&ids::ACCEL_TURBO),
+            "but it is recognised"
+        );
         assert!(
             p.deletable().is_empty(),
             "and left alone until the new set is complete"

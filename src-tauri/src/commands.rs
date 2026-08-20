@@ -119,6 +119,14 @@ impl From<diarize::DiarizeError> for UiError {
                 UiErrorKind::Cancelled,
                 "Echo will finish working out who said what once your recording is done.",
             ),
+            // Both of these are ordinary states of a meeting, not faults, so
+            // they say what is true and ask for nothing.
+            D::NoVoiceSample => UiError::not_found(
+                "Echo hasn't got a clear moment of this person speaking on their own.",
+            ),
+            D::AudioForgotten => {
+                UiError::not_found("This meeting's recording is gone, so there's nothing to play.")
+            }
             other => UiError::unexpected(other.to_string()),
         }
     }
@@ -760,6 +768,28 @@ pub async fn merge_speakers(state: State<'_, AppState>, from_id: Id, into_id: Id
 pub async fn unmerge_speaker(state: State<'_, AppState>, speaker_id: Id) -> CmdResult<()> {
     check_id(&speaker_id)?;
     Ok(diarize::unmerge(&state.db, &speaker_id).await?)
+}
+
+/// A few seconds of one speaker's voice, so a name can be put to it.
+///
+/// Comes back as base64 for the UI to play from a data URL — the clip is built
+/// in memory and never written to disk, because it exists for as long as it
+/// takes to listen to it. Capped at a few seconds ([`diarize::sample::CLIP_MS`]):
+/// this answers "who is this?", it is not a second way to replay the meeting.
+///
+/// Turned down, in plain words, when this person never talks on their own for
+/// long enough to be recognisable, and when the recording has been deleted.
+/// Neither is a fault — a meeting keeps its transcript and its speakers either
+/// way.
+#[tauri::command]
+pub async fn speaker_sample(
+    state: State<'_, AppState>,
+    meeting_id: Id,
+    speaker_id: Id,
+) -> CmdResult<String> {
+    check_id(&meeting_id)?;
+    check_id(&speaker_id)?;
+    Ok(diarize::sample::speaker_sample(&state.db, &meeting_id, &speaker_id).await?)
 }
 
 /// Queue the offline speaker pass. The result replaces the provisional labels.
@@ -1492,6 +1522,7 @@ macro_rules! echo_command_handler {
             $crate::commands::rename_speaker,
             $crate::commands::merge_speakers,
             $crate::commands::unmerge_speaker,
+            $crate::commands::speaker_sample,
             $crate::commands::refine_speakers,
             $crate::commands::set_speaker_count,
             // speech assets

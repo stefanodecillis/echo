@@ -214,6 +214,32 @@ export const mergeSpeakers = (fromId: Id, intoId: Id) =>
 export const unmergeSpeaker = (speakerId: Id) =>
   call<void>("unmerge_speaker", { speakerId });
 
+/**
+ * A few seconds of this person talking on their own, so a name can be put to
+ * the voice.
+ *
+ * Resolves to **base64 WAV** — no prefix. Play it from a `blob:` URL, not a
+ * `data:` one: the app's CSP allows `blob:` under `media-src` and deliberately
+ * does not allow `data:` there, so a data URL is silently refused by the
+ * webview. `Meeting/lib/audio.ts`'s `base64ToBlobUrl` does the decode:
+ *
+ * ```ts
+ * const clip = await speakerSample(meetingId, speakerId);
+ * const url = base64ToBlobUrl(clip); // revoke it when nothing can play it
+ * new Audio(url).play();
+ * ```
+ *
+ * Echo picks the longest stretch where only this person is talking, skips the
+ * throat-clearing at the start of it, and caps the clip at a few seconds. The
+ * same meeting always gives back the same clip, and nothing is written to disk.
+ *
+ * Rejects with a `notFound` UiError in two ordinary cases — this person never
+ * talks on their own for long enough to recognise, and the recording has been
+ * deleted — so show `error.message` as an explanation, not as a failure.
+ */
+export const speakerSample = (meetingId: Id, speakerId: Id) =>
+  call<string>("speaker_sample", { meetingId, speakerId });
+
 /** Queues the offline pass. Progress arrives on the job-progress event. */
 export const refineSpeakers = (meetingId: Id) =>
   call<Id>("refine_speakers", { meetingId });

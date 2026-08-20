@@ -320,7 +320,10 @@ impl Scan {
 /// microphone recording and every voice in it has to be separated out (module
 /// docs). `None` means there is no committed audio on either channel, and
 /// therefore nothing to load a model for (mantra 1).
-async fn voice_channel(db: &Db, meeting_id: &str) -> Result<Option<(Source, ChunkPcm)>, DiarizeError> {
+async fn voice_channel(
+    db: &Db,
+    meeting_id: &str,
+) -> Result<Option<(Source, ChunkPcm)>, DiarizeError> {
     let system = ChunkPcm::new(
         repo::list_chunks(db, meeting_id, Some(Channel::System))
             .await
@@ -1318,7 +1321,9 @@ mod tests {
             .await
             .unwrap();
 
-        let speakers = persist(&db, &meeting.id, &[], Source::System).await.unwrap();
+        let speakers = persist(&db, &meeting.id, &[], Source::System)
+            .await
+            .unwrap();
         assert_eq!(speakers.len(), 1);
         assert_eq!(speakers[0].cluster_key, SELF_CLUSTER_KEY);
         assert!(speakers[0].is_self);
@@ -1520,9 +1525,14 @@ mod tests {
         .await
         .unwrap();
 
-        let speakers = persist(&db, &meeting.id, &[vec![(5_000i64, 9_000i64)]], Source::System)
-            .await
-            .unwrap();
+        let speakers = persist(
+            &db,
+            &meeting.id,
+            &[vec![(5_000i64, 9_000i64)]],
+            Source::System,
+        )
+        .await
+        .unwrap();
         assert_eq!(speakers.len(), 2);
         let me = speakers.iter().find(|s| s.is_self).expect("You");
         assert_eq!(me.display_name, SELF_DISPLAY_NAME);

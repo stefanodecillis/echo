@@ -210,10 +210,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| echo_lib::asr::catalog::ids::SPEECH.to_string());
     let speech_entry = echo_lib::asr::catalog::entry(&speech_id)
         .ok_or_else(|| format!("{speech_id} is not in the catalog"))?;
-    let mut wanted: Vec<(&str, PathBuf)> = vec![(
-        speech_entry.id,
-        speech.join(speech_entry.installed_name()),
-    )];
+    let mut wanted: Vec<(&str, PathBuf)> =
+        vec![(speech_entry.id, speech.join(speech_entry.installed_name()))];
     if let Some(accel) = echo_lib::asr::catalog::accelerator_for(speech_entry.id) {
         wanted.push((accel.id, speech.join(accel.installed_name())));
     }
@@ -349,7 +347,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("=== coverage ===");
-    println!("meeting length            {:>8.1} s", meeting_ms as f64 / 1_000.0);
+    println!(
+        "meeting length            {:>8.1} s",
+        meeting_ms as f64 / 1_000.0
+    );
     println!(
         "speech stretches found    {attempts:>8}   ({:.1} s, {:.1}% of the meeting)",
         stretch_ms as f64 / 1_000.0,
@@ -379,7 +380,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== {SAMPLES} lines across the meeting (first {SAMPLE_WORDS} words) ===");
     for i in 0..SAMPLES.min(written.len()) {
         let last = written.len() - 1;
-        let at = if SAMPLES > 1 { i * last / (SAMPLES - 1) } else { 0 };
+        let at = if SAMPLES > 1 {
+            i * last / (SAMPLES - 1)
+        } else {
+            0
+        };
         let s = &written[at];
         println!(
             "  [{:>3}:{:02}] {}",

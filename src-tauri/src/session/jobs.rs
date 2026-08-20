@@ -755,13 +755,14 @@ async fn download(ctx: &JobContext) -> Result<(), JobFailure> {
                 serving = plan.serving.unwrap_or("?"),
                 "Echo switched to the speech model it wants"
             );
-            ctx.events.emit(UiEvent::Notice(crate::events::NoticePayload {
-                level: crate::events::NoticeLevel::Info,
-                message: "Echo upgraded how it understands speech.".into(),
-                persistent: false,
-                meeting_id: None,
-                tag: Some("speechUpgraded".into()),
-            }));
+            ctx.events
+                .emit(UiEvent::Notice(crate::events::NoticePayload {
+                    level: crate::events::NoticeLevel::Info,
+                    message: "Echo upgraded how it understands speech.".into(),
+                    persistent: false,
+                    meeting_id: None,
+                    tag: Some("speechUpgraded".into()),
+                }));
         }
         Ok(_) => {}
         // Not a download failure: the bytes arrived and are installed. The

@@ -1,34 +1,55 @@
 //! Noticing that a meeting is happening.
 //!
-//! Two things are visible from outside a meeting, polled every
+//! Three things are visible from outside a meeting, polled every
 //! [`POLL_INTERVAL_SECS`] (DESIGN §3) — and they are emphatically **not worth
 //! the same**:
 //!
-//! 1. **A known meeting app is running** (zoom.us, Teams, Webex, Discord,
-//!    Slack, Meet). Corroborating evidence only. On its own it means nothing:
-//!    Slack and Discord sit open from breakfast to bedtime, and Zoom lives in
-//!    the tray between calls. "Zoom is running" is not "you are in a meeting",
-//!    and treating it as one is how Echo used to interrupt people who were
-//!    doing nothing at all.
-//! 2. **Something other than Echo is holding an input device** (macOS
+//! 1. **A known call app is running** (Zoom, Teams, Webex, FaceTime, Discord,
+//!    Slack, Meet, and the other names in [`MEETING_APPS`]). Corroborating
+//!    evidence only. On its own it means nothing: Slack and Discord sit open
+//!    from breakfast to bedtime, and Zoom lives in the tray between calls.
+//!    "Zoom is running" is not "you are in a meeting", and treating it as one is
+//!    how Echo used to interrupt people who were doing nothing at all.
+//! 2. **A browser is running** ([`BROWSERS`]). Weaker still — a browser is
+//!    always open — and it is here for one job: a meeting in a tab has no
+//!    process name of its own, so a browser is the only thing that makes
+//!    "somebody is using the microphone" *possibly* a meeting rather than
+//!    certainly not one.
+//! 3. **Something other than Echo is holding an input device** (macOS
 //!    CoreAudio, Linux PipeWire). This is the signal that means *someone is
 //!    talking right now* — but it also trips on dictation, Siri, a voice
 //!    message, any app that grabs the mic for a moment.
 //!
-//! So the microphone is necessary, and a running meeting app only buys speed:
+//! So the microphone is necessary and never sufficient. Something has to make
+//! the shape of the evidence *call-shaped* before Echo says a word:
 //!
 //! | what a poll sees | what the watcher does |
 //! |---|---|
-//! | meeting app, mic quiet | nothing. Not detected, no badge, no nudge, ever. |
-//! | meeting app **and** mic | nudge after [`DEBOUNCE_POLLS`] polls ([`DEBOUNCE_SECS`]s) |
-//! | mic alone | nudge after [`MIC_ONLY_DEBOUNCE_POLLS`] polls ([`MIC_ONLY_DEBOUNCE_SECS`]s) |
+//! | call app, mic quiet | nothing. Not detected, no badge, no nudge, ever. |
+//! | browser, mic quiet | nothing, obviously. |
+//! | call app **and** mic | nudge after [`DEBOUNCE_POLLS`] polls ([`DEBOUNCE_SECS`]s) |
+//! | browser **and** mic, no call app | nudge after [`MIC_ONLY_DEBOUNCE_POLLS`] polls ([`MIC_ONLY_DEBOUNCE_SECS`]s) |
+//! | mic alone, nothing that can make a call | **nothing, however long it holds** |
 //! | neither | nothing |
 //!
-//! The mic-alone wait is picked to sit above dictation and Siri (a few
+//! That last row is the difference between Echo and a nuisance. A microphone
+//! held with no browser and no call app anywhere on the machine is a dictation
+//! utility, a voice memo, a transcription tool, a game — the person is not in a
+//! meeting, and no amount of patience makes them in one. Echo used to nudge
+//! about it anyway; people reported it as "it thinks every sound is a meeting",
+//! and they were right to.
+//!
+//! The browser-and-mic wait is picked to sit above dictation and Siri (a few
 //! seconds, and never half a minute) and below a meeting anyone would mind
 //! missing the top of. It has to exist: Google Meet in a browser tab has no
-//! process name Echo can match, so the microphone alone is the *only* way that
-//! meeting is ever noticed.
+//! process name Echo can match, so the microphone plus an open browser is the
+//! *only* way that meeting is ever noticed.
+//!
+//! None of this can work if the microphone signal itself lies, and it used to:
+//! a headset is one duplex device, and asking that device whether it is "running"
+//! says yes while music plays out of it. The `macos` module beside this one
+//! carries that fix and its reasoning; this file's job is to be un-fooled by
+//! anything that gets past it.
 //!
 //! Crossing the threshold latches [`DetectionState::Detected`]: a tray badge,
 //! plus exactly one nudge. The nudge is the small floating panel near the menu
@@ -43,12 +64,12 @@
 //! Once latched, the latch is generous on purpose (hysteresis): a mic that
 //! drops out for a moment — a headset swap, a mute button that really does
 //! release the device — keeps the meeting alive for up to
-//! [`LATCH_GRACE_POLLS`] polls ([`LATCH_GRACE_SECS`]s) as long as a meeting app
-//! is still running, so a flickering signal cannot manufacture a second
-//! episode and a second nudge for one meeting. It is *bounded* rather than
-//! open-ended because of rule 1 above: if the mic never comes back, all that is
-//! left is an idle app, and an idle app must never leave the UI or the tray
-//! claiming a meeting is happening.
+//! [`LATCH_GRACE_POLLS`] polls ([`LATCH_GRACE_SECS`]s) as long as something that
+//! could be carrying the call is still running, so a flickering signal cannot
+//! manufacture a second episode and a second nudge for one meeting. It is
+//! *bounded* rather than open-ended because of rule 1 above: if the mic never
+//! comes back, all that is left is an idle app, and an idle app must never leave
+//! the UI or the tray claiming a meeting is happening.
 //!
 //! While a meeting *is* being recorded, the same signals are watched the other
 //! way around. "Signals clear" for the auto-stop question means the
@@ -136,14 +157,16 @@ pub const AUTO_STOP_SUGGEST_SECS: u64 = 120;
 /// What "Pause detection" in the tray gives you.
 pub const SNOOZE_MINUTES: u64 = 60;
 
-/// Process names that hint at a meeting. Matched case-insensitively against
-/// the executable name.
+/// Process names of apps that can place or take a call. Matched
+/// case-insensitively against the executable name, on whole words (see
+/// [`friendly_app_name`]).
 ///
 /// Half of this list is chat apps people never quit, which is exactly why a
 /// match here is only ever corroborating evidence for a live microphone and
-/// never a meeting by itself.
+/// never a meeting by itself. The other half — FaceTime, Skype, the VoIP names —
+/// is here so that a call in one of them takes the fast path instead of waiting
+/// out the browser timer for a meeting Echo could already be sure about.
 pub const MEETING_APPS: &[(&str, &str)] = &[
-    ("zoom.us", "Zoom"),
     ("zoom", "Zoom"),
     ("Microsoft Teams", "Teams"),
     ("Teams", "Teams"),
@@ -151,6 +174,46 @@ pub const MEETING_APPS: &[(&str, &str)] = &[
     ("Discord", "Discord"),
     ("Slack", "Slack"),
     ("Google Meet", "Google Meet"),
+    ("FaceTime", "FaceTime"),
+    ("Skype", "Skype"),
+    ("WhatsApp", "WhatsApp"),
+    ("Telegram", "Telegram"),
+    ("Signal", "Signal"),
+    ("Chime", "Amazon Chime"),
+    ("GoToMeeting", "GoTo"),
+    ("GoTo", "GoTo"),
+    ("BlueJeans", "BlueJeans"),
+    ("RingCentral", "RingCentral"),
+    ("Jitsi", "Jitsi"),
+    ("Whereby", "Whereby"),
+    ("Dialpad", "Dialpad"),
+    ("Aircall", "Aircall"),
+    ("Zoiper", "Zoiper"),
+    ("Linphone", "Linphone"),
+];
+
+/// Process names of web browsers, same matching rules.
+///
+/// The weakest signal Echo has, and the only one that makes a browser meeting
+/// noticeable at all: Google Meet, Teams-in-a-tab and every "join from your
+/// browser" link run inside one of these and have no process name of their own.
+/// A browser is never evidence of anything by itself — it is open right now on
+/// the machine reading this — it only decides whether a live microphone is
+/// *allowed* to become a meeting on its own.
+pub const BROWSERS: &[(&str, &str)] = &[
+    ("Google Chrome", "Chrome"),
+    ("Chrome", "Chrome"),
+    ("Chromium", "Chromium"),
+    ("Safari", "Safari"),
+    ("Firefox", "Firefox"),
+    ("Microsoft Edge", "Edge"),
+    ("msedge", "Edge"),
+    ("Edge", "Edge"),
+    ("Brave Browser", "Brave"),
+    ("Brave", "Brave"),
+    ("Arc", "Arc"),
+    ("Opera", "Opera"),
+    ("Vivaldi", "Vivaldi"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -167,13 +230,26 @@ fn auto_stop_threshold_polls() -> u32 {
 // Probes, real and mocked
 // ---------------------------------------------------------------------------
 
+/// What is running right now that could possibly be carrying a call.
+///
+/// Both lists hold friendly names, deduplicated and sorted. Deliberately two
+/// lists and not one: they are worth completely different things, and the whole
+/// point of this rework is that the difference decides whether Echo speaks.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RunningApps {
+    /// Apps that can place or take a call ([`MEETING_APPS`]).
+    pub call_apps: Vec<String>,
+    /// Browsers ([`BROWSERS`]) — where a meeting with no process name lives.
+    pub browsers: Vec<String>,
+}
+
 /// Everything the watcher needs from the outside world, behind a trait so
 /// tests can hand it fake answers instead of asking `sysinfo`/CoreAudio for
 /// real ones.
 pub trait SignalSource: Send + Sync {
-    /// Friendly names of meeting apps currently running (e.g. "Zoom"),
-    /// already deduplicated. Corroborating evidence only.
-    fn running_meeting_apps(&self) -> Result<Vec<String>, DetectError>;
+    /// Which call apps and browsers are running. Corroborating evidence only,
+    /// neither list is a meeting by itself.
+    fn running_apps(&self) -> Result<RunningApps, DetectError>;
     /// Is some app *other than Echo* using an input device right now?
     ///
     /// Excluding Echo's own capture is what makes this signal usable while a
@@ -185,8 +261,8 @@ pub trait SignalSource: Send + Sync {
 struct SystemSignalSource;
 
 impl SignalSource for SystemSignalSource {
-    fn running_meeting_apps(&self) -> Result<Vec<String>, DetectError> {
-        running_meeting_apps()
+    fn running_apps(&self) -> Result<RunningApps, DetectError> {
+        running_apps()
     }
 
     fn input_device_in_use(&self) -> Result<bool, DetectError> {
@@ -194,20 +270,28 @@ impl SignalSource for SystemSignalSource {
     }
 }
 
-/// Which meeting apps are running right now, as friendly names
-/// (deduplicated). `sysinfo`, no per-process detail beyond the name.
-pub fn running_meeting_apps() -> Result<Vec<String>, DetectError> {
+/// Which call apps and browsers are running right now, as friendly names.
+/// `sysinfo`, no per-process detail beyond the name, and one walk of the
+/// process table for both questions (mantra 1).
+pub fn running_apps() -> Result<RunningApps, DetectError> {
     let mut system = sysinfo::System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
-    let mut found = BTreeSet::new();
+    let mut call_apps = BTreeSet::new();
+    let mut browsers = BTreeSet::new();
     for process in system.processes().values() {
         let name = process.name().to_string_lossy();
         if let Some(friendly) = friendly_app_name(&name) {
-            found.insert(friendly.to_string());
+            call_apps.insert(friendly.to_string());
+        }
+        if let Some(friendly) = friendly_browser_name(&name) {
+            browsers.insert(friendly.to_string());
         }
     }
-    Ok(found.into_iter().collect())
+    Ok(RunningApps {
+        call_apps: call_apps.into_iter().collect(),
+        browsers: browsers.into_iter().collect(),
+    })
 }
 
 /// Is some app other than Echo using an input device? CoreAudio on macOS,
@@ -227,13 +311,58 @@ pub fn input_device_in_use() -> Result<bool, DetectError> {
     Ok(false)
 }
 
-/// Map a process name onto a friendly app name, or None when we do not know it.
+/// Map a process name onto a friendly call-app name, or None when we do not
+/// know it.
 pub fn friendly_app_name(process_name: &str) -> Option<&'static str> {
-    let lower = process_name.to_ascii_lowercase();
-    MEETING_APPS
+    match_app(process_name, MEETING_APPS)
+}
+
+/// The same, for browsers.
+pub fn friendly_browser_name(process_name: &str) -> Option<&'static str> {
+    match_app(process_name, BROWSERS)
+}
+
+fn match_app(process_name: &str, table: &[(&str, &'static str)]) -> Option<&'static str> {
+    let name = executable_name(process_name).to_ascii_lowercase();
+    table
         .iter()
-        .find(|(needle, _)| lower.contains(&needle.to_ascii_lowercase()))
+        .find(|(needle, _)| contains_word(&name, &needle.to_ascii_lowercase()))
         .map(|(_, friendly)| *friendly)
+}
+
+/// The last component of whatever the platform called the process, so a full
+/// path matches on the executable rather than on a folder somewhere above it.
+fn executable_name(process_name: &str) -> &str {
+    process_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(process_name)
+}
+
+/// Does `needle` appear in `haystack` as a whole word?
+///
+/// Both are already lowercase. Whole-word rather than plain substring because
+/// the names Echo has to recognise are short and the process table is long:
+/// plain `contains("arc")` matches `searchd`, which is running on every Mac
+/// right now, and a browser signal that is always on is not a signal. Word
+/// edges are non-alphanumeric, so `Arc Helper`, `zoom.us`,
+/// `Microsoft Teams (work)` and `Google Chrome Helper (Renderer)` all match
+/// while `chromedriver` and `SafariBookmarksSyncAgent` do not.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    haystack.match_indices(needle).any(|(at, _)| {
+        let before_is_word = haystack[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric());
+        let after_is_word = haystack[at + needle.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric());
+        !before_is_word && !after_is_word
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +380,74 @@ enum StepEvent {
     SuggestStop,
 }
 
-/// What one poll saw, boiled down to the two facts the decision turns on.
+/// One poll's raw answers, before anything is decided about them.
+///
+/// The two shapes it turns into are on purpose: [`Observation::read`] is the
+/// evidence the state machine weighs, [`Observation::signals`] is what the
+/// person is shown. The second is a description, not a decision — a running
+/// browser is not in it, because "Chrome is open" is not an observation about a
+/// meeting and rendering it as one would be noise in the very screen people
+/// open when detection has behaved oddly.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Observation {
+    call_apps: Vec<String>,
+    browsers: Vec<String>,
+    mic: bool,
+}
+
+impl Observation {
+    /// Boil the poll down to the facts the decision turns on.
+    fn read(&self) -> SignalRead {
+        SignalRead {
+            meeting_app: !self.call_apps.is_empty(),
+            browser: !self.browsers.is_empty(),
+            mic: self.mic,
+        }
+    }
+
+    /// The same poll as the UI sees it.
+    ///
+    /// The confidences say what each observation is worth on its own, which is
+    /// the whole point of the rework: a running app is a weak hint whatever the
+    /// app is, a live microphone is the real signal, and the two together are as
+    /// sure as Echo gets without opening the audio stream itself. Call apps come
+    /// first in the list so that the name shown to the person is the app's, when
+    /// there is one.
+    fn signals(&self) -> Vec<DetectionSignal> {
+        let now = Utc::now().to_rfc3339();
+        let mut signals = Vec::new();
+        let corroborated = self.mic && !self.call_apps.is_empty();
+
+        for app_name in &self.call_apps {
+            signals.push(DetectionSignal {
+                source: DetectionSource::MeetingApp,
+                app: Some(app_name.clone()),
+                since: now.clone(),
+                // Corroborating evidence only. Half this list is chat apps
+                // people never quit, so "it is running" is close to worthless
+                // by itself — and is treated as worthless by the state machine.
+                confidence: 0.25,
+            });
+        }
+
+        if self.mic {
+            signals.push(DetectionSignal {
+                source: DetectionSource::InputDeviceInUse,
+                app: None,
+                since: now,
+                // Something other than Echo is listening. On its own that could
+                // be dictation — and with nothing on the machine that could
+                // carry a call, that is all it can be, which is why this number
+                // is a description and the state machine does the deciding.
+                confidence: if corroborated { 0.9 } else { 0.6 },
+            });
+        }
+
+        signals
+    }
+}
+
+/// What one poll saw, boiled down to the three facts the decision turns on.
 ///
 /// Deliberately not the [`DetectionSignal`] list the UI gets: that one carries
 /// names, timestamps and confidences for display, this one carries the
@@ -259,19 +455,22 @@ enum StepEvent {
 /// without a clock, a process table or a sound card.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SignalRead {
-    /// A known meeting app is running. Corroborating evidence only.
+    /// A known call app is running. Corroborating evidence only.
     meeting_app: bool,
+    /// A browser is running. Weaker still — see the module docs.
+    browser: bool,
     /// Something other than Echo is holding an input device.
     mic: bool,
 }
 
-/// The four states of the world, named, so the tests below read as English.
+/// The states of the world worth naming, so the tests below read as English.
 #[cfg(test)]
 impl SignalRead {
-    /// Nothing at all: no meeting app, quiet microphone.
+    /// Nothing at all: no call app, no browser, quiet microphone.
     const fn quiet() -> Self {
         Self {
             meeting_app: false,
+            browser: false,
             mic: false,
         }
     }
@@ -280,54 +479,76 @@ impl SignalRead {
     const fn app_only() -> Self {
         Self {
             meeting_app: true,
+            browser: false,
             mic: false,
         }
     }
 
-    /// Someone is talking, but to something Echo cannot name — a browser
-    /// meeting, or dictation.
+    /// A microphone held by something that cannot possibly be a call: dictation,
+    /// a voice memo, a transcription utility. No browser, no call app.
     const fn mic_only() -> Self {
         Self {
             meeting_app: false,
+            browser: false,
             mic: true,
         }
     }
 
-    /// The strong case: a meeting app running *and* the microphone live.
+    /// Someone is talking into a browser: Google Meet in a tab.
+    const fn browser_and_mic() -> Self {
+        Self {
+            meeting_app: false,
+            browser: true,
+            mic: true,
+        }
+    }
+
+    /// A browser open and nobody talking — which is to say, a Tuesday.
+    const fn browser_only() -> Self {
+        Self {
+            meeting_app: false,
+            browser: true,
+            mic: false,
+        }
+    }
+
+    /// The strong case: a call app running *and* the microphone live.
     const fn app_and_mic() -> Self {
         Self {
             meeting_app: true,
+            browser: false,
             mic: true,
         }
     }
 }
 
 impl SignalRead {
-    /// Read the two facts back out of what the UI is being told, so there is
-    /// one place that decides what a signal list means.
-    fn from_signals(signals: &[DetectionSignal]) -> Self {
-        Self {
-            meeting_app: signals
-                .iter()
-                .any(|s| s.source == DetectionSource::MeetingApp),
-            mic: signals
-                .iter()
-                .any(|s| s.source == DetectionSource::InputDeviceInUse),
-        }
-    }
-
     /// How many consecutive polls of *this* read it takes before Echo says
     /// something, or `None` when this read is never enough on its own however
     /// long it holds.
     const fn polls_to_nudge(self) -> Option<u32> {
-        match (self.mic, self.meeting_app) {
-            // A live mic with a meeting app behind it: as fast as we dare.
-            (true, true) => Some(DEBOUNCE_POLLS),
-            // A live mic and nothing to corroborate it: wait out dictation.
-            (true, false) => Some(MIC_ONLY_DEBOUNCE_POLLS),
+        match (self.mic, self.meeting_app, self.browser) {
+            // A live mic with an app that makes calls behind it: as fast as we
+            // dare.
+            (true, true, _) => Some(DEBOUNCE_POLLS),
+            // A live mic and only a browser to explain it: could be a meeting in
+            // a tab, could be dictation. Wait out dictation.
+            (true, false, true) => Some(MIC_ONLY_DEBOUNCE_POLLS),
+            // A live mic with nothing on the machine that could be carrying a
+            // call. Whatever is listening, it is not a meeting.
+            (true, false, false) => None,
             // An app and no mic is not a meeting, today or in an hour.
-            (false, _) => None,
+            (false, _, _) => None,
         }
+    }
+
+    /// Is there still something running that could be carrying the call?
+    ///
+    /// Only asked of an already-noticed meeting, to decide whether a microphone
+    /// that just dropped out deserves the grace period. A browser counts here
+    /// for the same reason it counts above: it may be where the meeting is.
+    const fn could_be_carrying_a_call(self) -> bool {
+        self.meeting_app || self.browser
     }
 }
 
@@ -390,14 +611,15 @@ impl DebounceTracker {
             }
             StepEvent::None
         } else {
-            // Quiet microphone. A meeting app may well still be running, and it
-            // buys nothing here: it cannot start a meeting (rule 1), and it
-            // cannot keep the auto-stop safety net switched off.
+            // Quiet microphone. A call app or a browser may well still be
+            // running, and it buys nothing here: neither can start a meeting
+            // (rule 1), and neither can keep the auto-stop safety net switched
+            // off.
             self.mic_streak = 0;
             self.quiet_streak = self.quiet_streak.saturating_add(1);
 
             if self.detected_latched
-                && !(read.meeting_app && self.quiet_streak <= LATCH_GRACE_POLLS)
+                && !(read.could_be_carrying_a_call() && self.quiet_streak <= LATCH_GRACE_POLLS)
             {
                 // Either there is nothing left at all, or the grace period for
                 // a mic that might come back has run out. Whichever it is, we
@@ -623,7 +845,7 @@ impl Watcher {
     /// diagnostics. Does not touch the debounce state — a diagnostic check
     /// should not itself flip the watcher to Detected.
     pub async fn poll_once(&self) -> Result<Vec<DetectionSignal>, DetectError> {
-        self.collect_signals()
+        Ok(self.observe()?.signals())
     }
 
     // -- internals -----------------------------------------------------
@@ -679,45 +901,14 @@ impl Watcher {
     }
 
     /// Look once, and describe honestly what was seen.
-    ///
-    /// The confidences say what each observation is worth on its own, which is
-    /// the whole point of the rework: a running app is a weak hint whatever the
-    /// app is, a live microphone is the real signal, and the two together are
-    /// as sure as Echo gets without opening the audio stream itself. Meeting
-    /// apps come first in the list so that the name shown to the person is the
-    /// app's, when there is one.
-    fn collect_signals(&self) -> Result<Vec<DetectionSignal>, DetectError> {
-        let now = Utc::now().to_rfc3339();
-        let mut signals = Vec::new();
-
-        let mic_in_use = self.source.input_device_in_use()?;
-        let apps = self.source.running_meeting_apps()?;
-        let corroborated = mic_in_use && !apps.is_empty();
-
-        for app_name in apps {
-            signals.push(DetectionSignal {
-                source: DetectionSource::MeetingApp,
-                app: Some(app_name),
-                since: now.clone(),
-                // Corroborating evidence only. Half this list is chat apps
-                // people never quit, so "it is running" is close to worthless
-                // by itself — and is treated as worthless by the state machine.
-                confidence: 0.25,
-            });
-        }
-
-        if mic_in_use {
-            signals.push(DetectionSignal {
-                source: DetectionSource::InputDeviceInUse,
-                app: None,
-                since: now,
-                // Something other than Echo is listening. That alone could be
-                // dictation; with a meeting app running too, it is a meeting.
-                confidence: if corroborated { 0.9 } else { 0.6 },
-            });
-        }
-
-        Ok(signals)
+    fn observe(&self) -> Result<Observation, DetectError> {
+        let mic = self.source.input_device_in_use()?;
+        let apps = self.source.running_apps()?;
+        Ok(Observation {
+            call_apps: apps.call_apps,
+            browsers: apps.browsers,
+            mic,
+        })
     }
 
     /// One real tick of the timer. Runs the probes only when there is a
@@ -743,15 +934,19 @@ impl Watcher {
             return;
         }
 
-        let signals = match self.collect_signals() {
-            Ok(signals) => signals,
+        let observation = match self.observe() {
+            Ok(observation) => observation,
             Err(err) => {
                 tracing::warn!(error = %err, "could not check for a meeting this round");
                 return;
             }
         };
-        let read = SignalRead::from_signals(&signals);
-        let edge = self.debounce.lock().unwrap().step(capture_state, read);
+        let signals = observation.signals();
+        let edge = self
+            .debounce
+            .lock()
+            .unwrap()
+            .step(capture_state, observation.read());
 
         self.recompute_and_emit(capture_state, signals, edge).await;
     }
@@ -1069,14 +1264,19 @@ fn initial_state(enabled: bool) -> DetectionState {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
     struct MockSource {
         apps: Vec<&'static str>,
+        browsers: Vec<&'static str>,
         input_in_use: bool,
     }
 
     impl SignalSource for MockSource {
-        fn running_meeting_apps(&self) -> Result<Vec<String>, DetectError> {
-            Ok(self.apps.iter().map(|s| s.to_string()).collect())
+        fn running_apps(&self) -> Result<RunningApps, DetectError> {
+            Ok(RunningApps {
+                call_apps: self.apps.iter().map(|s| s.to_string()).collect(),
+                browsers: self.browsers.iter().map(|s| s.to_string()).collect(),
+            })
         }
 
         fn input_device_in_use(&self) -> Result<bool, DetectError> {
@@ -1085,10 +1285,7 @@ mod tests {
     }
 
     fn quiet_source() -> Box<dyn SignalSource> {
-        Box::new(MockSource {
-            apps: Vec::new(),
-            input_in_use: false,
-        })
+        Box::new(MockSource::default())
     }
 
     #[test]
@@ -1100,6 +1297,44 @@ mod tests {
         );
         assert_eq!(friendly_app_name("Microsoft Teams (work)"), Some("Teams"));
         assert_eq!(friendly_app_name("Finder"), None);
+    }
+
+    #[test]
+    fn the_apps_that_place_calls_are_recognised_by_name() {
+        // The ones that were missing when people reported calls going unnoticed.
+        assert_eq!(friendly_app_name("FaceTime"), Some("FaceTime"));
+        assert_eq!(friendly_app_name("Skype"), Some("Skype"));
+        assert_eq!(friendly_app_name("WhatsApp"), Some("WhatsApp"));
+        assert_eq!(friendly_app_name("Signal"), Some("Signal"));
+        assert_eq!(friendly_app_name("Cisco Webex Meetings"), Some("Webex"));
+    }
+
+    #[test]
+    fn browsers_are_recognised_and_kept_apart_from_call_apps() {
+        assert_eq!(friendly_browser_name("Google Chrome"), Some("Chrome"));
+        assert_eq!(
+            friendly_browser_name("Google Chrome Helper (Renderer)"),
+            Some("Chrome")
+        );
+        assert_eq!(friendly_browser_name("Safari"), Some("Safari"));
+        assert_eq!(friendly_browser_name("firefox"), Some("Firefox"));
+        assert_eq!(friendly_browser_name("Arc"), Some("Arc"));
+        assert_eq!(friendly_browser_name("Microsoft Edge"), Some("Edge"));
+
+        // The lists answer different questions and must never bleed.
+        assert_eq!(friendly_app_name("Google Chrome"), None);
+        assert_eq!(friendly_browser_name("Slack"), None);
+    }
+
+    #[test]
+    fn a_name_only_matches_on_whole_words() {
+        // `searchd` runs on every Mac. Matched loosely it makes "a browser is
+        // open" permanently true, which would quietly undo the whole fix.
+        assert_eq!(friendly_browser_name("searchd"), None);
+        assert_eq!(friendly_browser_name("chromedriver"), None);
+        assert_eq!(friendly_browser_name("SafariBookmarksSyncAgent"), None);
+        assert_eq!(friendly_app_name("MeetingBar"), None);
+        assert_eq!(friendly_app_name("teamsviewerd"), None);
     }
 
     #[test]
@@ -1145,46 +1380,68 @@ mod tests {
     // -- what each combination of signals is worth ------------------------
 
     #[test]
-    fn a_meeting_app_on_its_own_is_never_enough_however_long_it_runs() {
+    fn an_app_or_a_browser_on_its_own_is_never_enough_however_long_it_runs() {
         assert_eq!(SignalRead::app_only().polls_to_nudge(), None);
+        assert_eq!(SignalRead::browser_only().polls_to_nudge(), None);
+        assert_eq!(SignalRead::quiet().polls_to_nudge(), None);
     }
 
     #[test]
-    fn a_live_mic_is_faster_when_a_meeting_app_corroborates_it() {
+    fn a_live_mic_is_faster_when_a_call_app_corroborates_it() {
         assert_eq!(
             SignalRead::app_and_mic().polls_to_nudge(),
             Some(DEBOUNCE_POLLS)
         );
         assert_eq!(
-            SignalRead::mic_only().polls_to_nudge(),
+            SignalRead::browser_and_mic().polls_to_nudge(),
             Some(MIC_ONLY_DEBOUNCE_POLLS)
         );
     }
 
     #[test]
-    fn a_signal_list_reads_back_as_the_evidence_it_describes() {
-        let app = DetectionSignal {
-            source: DetectionSource::MeetingApp,
-            app: Some("Slack".into()),
-            ..Default::default()
+    fn a_mic_with_nothing_that_could_be_a_call_is_never_a_meeting() {
+        // The field report, as a single assertion: a microphone held by
+        // something that cannot make a call never becomes a nudge, at any
+        // patience.
+        assert_eq!(SignalRead::mic_only().polls_to_nudge(), None);
+    }
+
+    #[test]
+    fn a_poll_reads_back_as_the_evidence_it_describes() {
+        let observed = |apps: &[&str], browsers: &[&str], mic: bool| Observation {
+            call_apps: apps.iter().map(|s| s.to_string()).collect(),
+            browsers: browsers.iter().map(|s| s.to_string()).collect(),
+            mic,
         };
-        let mic = DetectionSignal {
-            source: DetectionSource::InputDeviceInUse,
-            ..Default::default()
-        };
-        assert_eq!(SignalRead::from_signals(&[]), SignalRead::quiet());
+        assert_eq!(observed(&[], &[], false).read(), SignalRead::quiet());
         assert_eq!(
-            SignalRead::from_signals(std::slice::from_ref(&app)),
+            observed(&["Slack"], &[], false).read(),
             SignalRead::app_only()
         );
+        assert_eq!(observed(&[], &[], true).read(), SignalRead::mic_only());
         assert_eq!(
-            SignalRead::from_signals(std::slice::from_ref(&mic)),
-            SignalRead::mic_only()
+            observed(&[], &["Chrome"], true).read(),
+            SignalRead::browser_and_mic()
         );
         assert_eq!(
-            SignalRead::from_signals(&[app, mic]),
+            observed(&["Zoom"], &[], true).read(),
             SignalRead::app_and_mic()
         );
+    }
+
+    #[test]
+    fn what_the_person_is_shown_never_mentions_the_browser() {
+        // A browser decides whether a mic *may* become a meeting; it is not
+        // itself an observation about one, and the diagnostics list should not
+        // read as though Echo thinks Chrome is a meeting.
+        let observation = Observation {
+            call_apps: Vec::new(),
+            browsers: vec!["Chrome".into()],
+            mic: true,
+        };
+        let signals = observation.signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].source, DetectionSource::InputDeviceInUse);
     }
 
     // -- the false positive this heuristic exists to kill -------------------
@@ -1211,7 +1468,7 @@ mod tests {
         let mut d = DebounceTracker::default();
         for _ in 0..(15 / POLL_INTERVAL_SECS) {
             assert_eq!(
-                d.step(CaptureState::Idle, SignalRead::mic_only()),
+                d.step(CaptureState::Idle, SignalRead::browser_and_mic()),
                 StepEvent::None
             );
         }
@@ -1222,12 +1479,45 @@ mod tests {
     }
 
     #[test]
-    fn a_browser_meeting_on_the_mic_alone_fires_within_thirty_five_seconds() {
+    fn a_mic_held_by_a_utility_never_fires_however_long_it_holds() {
+        // Dictation, a voice memo, a transcription tool, a game: something is
+        // listening, and there is nothing on the machine that could be carrying
+        // a call. Echo used to nudge about this after half a minute.
+        let mut d = DebounceTracker::default();
+        for _ in 0..(60 * 60 / POLL_INTERVAL_SECS) {
+            assert_eq!(
+                d.step(CaptureState::Idle, SignalRead::mic_only()),
+                StepEvent::None
+            );
+        }
+        assert!(!d.is_detected(), "no browser, no call app, no meeting");
+        assert_eq!(d.episode(), 0, "and not an episode either");
+    }
+
+    #[test]
+    fn music_on_airpods_never_fires() {
+        // Playback through a duplex headset, with a browser open as it always
+        // is. The probe is what has to know that playing is not listening (see
+        // the `macos` module); this is the state machine's half of the promise —
+        // a browser and a quiet microphone are nothing at all.
+        let mut d = DebounceTracker::default();
+        for _ in 0..(60 * 60 / POLL_INTERVAL_SECS) {
+            assert_eq!(
+                d.step(CaptureState::Idle, SignalRead::browser_only()),
+                StepEvent::None
+            );
+        }
+        assert!(!d.is_detected());
+        assert_eq!(d.episode(), 0);
+    }
+
+    #[test]
+    fn a_browser_meeting_fires_within_thirty_five_seconds() {
         let mut d = DebounceTracker::default();
         let mut fired_at_secs = None;
         let mut fires = 0;
         for poll in 1..=(35 / POLL_INTERVAL_SECS) {
-            if d.step(CaptureState::Idle, SignalRead::mic_only()) == StepEvent::Detected {
+            if d.step(CaptureState::Idle, SignalRead::browser_and_mic()) == StepEvent::Detected {
                 fires += 1;
                 fired_at_secs.get_or_insert(poll * POLL_INTERVAL_SECS);
             }
@@ -1308,15 +1598,37 @@ mod tests {
     #[test]
     fn detected_clears_once_there_is_nothing_left_to_hear() {
         let mut d = DebounceTracker::default();
-        d.step(CaptureState::Idle, SignalRead::mic_only());
-        for _ in 1..MIC_ONLY_DEBOUNCE_POLLS {
-            d.step(CaptureState::Idle, SignalRead::mic_only());
+        for _ in 0..MIC_ONLY_DEBOUNCE_POLLS {
+            d.step(CaptureState::Idle, SignalRead::browser_and_mic());
         }
         assert!(d.is_detected());
         d.step(CaptureState::Idle, SignalRead::quiet());
         assert!(
             !d.is_detected(),
-            "no app, no mic: there is nothing to claim a meeting from"
+            "no app, no browser, no mic: there is nothing to claim a meeting from"
+        );
+    }
+
+    #[test]
+    fn a_browser_meeting_survives_the_mic_dropping_briefly_too() {
+        // Same hysteresis as a Zoom call: a headset swap mid-tab-meeting is one
+        // meeting, not two nudges. Bounded by the same grace period, so a
+        // browser that is always open cannot hold the latch open forever.
+        let mut d = DebounceTracker::default();
+        for _ in 0..MIC_ONLY_DEBOUNCE_POLLS {
+            d.step(CaptureState::Idle, SignalRead::browser_and_mic());
+        }
+        assert_eq!(d.episode(), 1);
+
+        for _ in 0..LATCH_GRACE_POLLS {
+            d.step(CaptureState::Idle, SignalRead::browser_only());
+            assert!(d.is_detected(), "still the same meeting");
+        }
+        d.step(CaptureState::Idle, SignalRead::browser_only());
+        assert!(
+            !d.is_detected(),
+            "grace is for a mic that comes back, not a licence to keep claiming \
+             a meeting because a browser is open"
         );
     }
 
@@ -1445,16 +1757,16 @@ mod tests {
             );
         }
 
-        // A real meeting, in the browser this time: mic only, and it still
-        // gets its own nudge.
+        // A real meeting, in the browser this time, and it still gets its own
+        // nudge.
         for _ in 1..MIC_ONLY_DEBOUNCE_POLLS {
             assert_eq!(
-                d.step(CaptureState::Idle, SignalRead::mic_only()),
+                d.step(CaptureState::Idle, SignalRead::browser_and_mic()),
                 StepEvent::None
             );
         }
         assert_eq!(
-            d.step(CaptureState::Idle, SignalRead::mic_only()),
+            d.step(CaptureState::Idle, SignalRead::browser_and_mic()),
             StepEvent::Detected
         );
         assert_eq!(d.episode(), 2);
@@ -1666,7 +1978,7 @@ mod tests {
             true,
             Box::new(MockSource {
                 apps: vec!["Zoom"],
-                input_in_use: false,
+                ..Default::default()
             }),
         );
         let signals = watcher.poll_once().await.unwrap();
@@ -1681,7 +1993,7 @@ mod tests {
             true,
             Box::new(MockSource {
                 apps: vec!["Slack"],
-                input_in_use: false,
+                ..Default::default()
             }),
         );
         // Half an hour of Slack being Slack.
@@ -1716,6 +2028,7 @@ mod tests {
             Box::new(MockSource {
                 apps: vec!["Zoom"],
                 input_in_use: true,
+                ..Default::default()
             }),
         );
         watcher.tick().await;
@@ -1737,12 +2050,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_facetime_call_reaches_the_ui_on_the_fast_path() {
+        // The name was missing from the list, so a FaceTime call used to wait
+        // out the browser timer — or, with no browser open, never be noticed.
+        let watcher = Watcher::with_source(
+            true,
+            Box::new(MockSource {
+                apps: vec!["FaceTime"],
+                input_in_use: true,
+                ..Default::default()
+            }),
+        );
+        watcher.tick().await;
+        assert_eq!(watcher.status().state, DetectionState::Idle, "10s, not 5s");
+        watcher.tick().await;
+        assert_eq!(watcher.status().state, DetectionState::Detected);
+        assert_eq!(watcher.episode(), 1);
+    }
+
+    #[tokio::test]
     async fn fifteen_seconds_of_dictation_never_reaches_the_ui() {
         let watcher = Watcher::with_source(
             true,
             Box::new(MockSource {
-                apps: Vec::new(),
+                browsers: vec!["Chrome"],
                 input_in_use: true,
+                ..Default::default()
             }),
         );
         for _ in 0..(15 / POLL_INTERVAL_SECS) {
@@ -1750,8 +2083,8 @@ mod tests {
         }
         assert_eq!(watcher.status().state, DetectionState::Idle);
 
-        // Keep going and the same mic, alone, does become a meeting: this is
-        // the only way a browser call is ever noticed.
+        // Keep going and the same mic, with a browser to explain it, does become
+        // a meeting: this is the only way a browser call is ever noticed.
         for _ in 0..MIC_ONLY_DEBOUNCE_POLLS {
             watcher.tick().await;
         }
@@ -1759,12 +2092,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mic_held_with_no_browser_and_no_call_app_never_reaches_the_ui() {
+        // A dictation utility, all afternoon. Nothing that could carry a call is
+        // running, so there is nothing for Echo to offer to record.
+        let watcher = Watcher::with_source(
+            true,
+            Box::new(MockSource {
+                input_in_use: true,
+                ..Default::default()
+            }),
+        );
+        for _ in 0..(30 * 60 / POLL_INTERVAL_SECS) {
+            watcher.tick().await;
+        }
+        assert_eq!(watcher.status().state, DetectionState::Idle);
+        assert_eq!(watcher.episode(), 0, "no nudge, no badge, no episode");
+    }
+
+    #[tokio::test]
+    async fn music_on_airpods_never_reaches_the_ui() {
+        // What people reported: sound coming out of a duplex headset while a
+        // browser sits open. The probe answers "nothing is listening" once it
+        // asks about the input half only (see the `macos` module), and a browser
+        // on its own is worth nothing here.
+        let watcher = Watcher::with_source(
+            true,
+            Box::new(MockSource {
+                browsers: vec!["Chrome", "Safari"],
+                input_in_use: false,
+                ..Default::default()
+            }),
+        );
+        for _ in 0..(30 * 60 / POLL_INTERVAL_SECS) {
+            watcher.tick().await;
+        }
+        assert_eq!(watcher.status().state, DetectionState::Idle);
+        assert_eq!(watcher.episode(), 0);
+        assert!(
+            watcher.status().signals.is_empty(),
+            "nothing was observed, so nothing is claimed"
+        );
+    }
+
+    #[tokio::test]
     async fn a_mocked_input_device_signal_has_no_app_name() {
         let watcher = Watcher::with_source(
             true,
             Box::new(MockSource {
-                apps: Vec::new(),
                 input_in_use: true,
+                ..Default::default()
             }),
         );
         let signals = watcher.poll_once().await.unwrap();
@@ -1779,7 +2155,7 @@ mod tests {
             true,
             Box::new(MockSource {
                 apps: vec!["Zoom"],
-                input_in_use: false,
+                ..Default::default()
             }),
         );
         for _ in 0..10 {

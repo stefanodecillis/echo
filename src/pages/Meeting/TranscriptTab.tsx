@@ -15,11 +15,10 @@ import {
   EVENTS,
   getTranscript,
   listSpeakers,
-  renameSpeaker,
   retranscribeMeeting,
   toUiError,
 } from "@/lib/ipc";
-import { common, labels, meeting as copy, notices } from "@/lib/copy";
+import { common, labels, meeting as copy, notices, peopleCount as peopleCountCopy } from "@/lib/copy";
 import { useEvent } from "@/hooks/useEvent";
 import { useEchoStore } from "@/lib/store";
 import type { Id, MeetingDetail, Segment } from "@/lib/types";
@@ -27,11 +26,11 @@ import type { Id, MeetingDetail, Segment } from "@/lib/types";
 import { ExportMenu } from "./components/ExportMenu";
 import { IconButton } from "./components/IconButton";
 import { MergeSpeakersModal } from "./components/MergeSpeakersModal";
-import { PeopleCountControl } from "./components/PeopleCountControl";
 import { SpeakerChip } from "./components/SpeakerChip";
+import { SpeakersDialog } from "./components/SpeakersDialog";
 import { formatTimestamp } from "./lib/date";
 import type { MeetingDetailWithPeopleCount } from "./lib/peopleCount";
-import { resolveSpeaker } from "./lib/speakers";
+import { canonicalSpeakers, resolveSpeaker } from "./lib/speakers";
 import { buildTranscriptText } from "./lib/transcriptText";
 
 /** Job kinds that mean "the transcript is being read from the recording
@@ -81,6 +80,7 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
   const [segments, setSegments] = useState<Segment[]>();
   const [filter, setFilter] = useState("");
   const [mergeOpen, setMergeOpen] = useState(false);
+  const [speakersOpen, setSpeakersOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [confirmRetranscribe, setConfirmRetranscribe] = useState(false);
   const [retranscribing, setRetranscribing] = useState(false);
@@ -149,16 +149,6 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jumpToMs, segments]);
 
-  const handleRename = (speakerId: string, name: string) => {
-    setDetail((d) => ({
-      ...d,
-      speakers: d.speakers.map((s) => (s.id === speakerId ? { ...s, displayName: name } : s)),
-    }));
-    renameSpeaker(speakerId, name).catch(() => {
-      addToast({ level: "problem", message: notices.somethingWentWrong });
-    });
-  };
-
   const handleMerged = () => {
     listSpeakers(meetingId)
       .then((speakers) => setDetail((d) => ({ ...d, speakers })))
@@ -214,12 +204,18 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
           containerClassName="max-w-sm"
         />
         {typeof detailWithPeopleCount.peopleCount === "number" && (
-          <PeopleCountControl
-            meetingId={meetingId}
-            peopleCount={detailWithPeopleCount.peopleCount}
-            isOverride={!!detailWithPeopleCount.peopleCountIsOverride}
+          <button
+            type="button"
+            onClick={() => setSpeakersOpen(true)}
             disabled={peopleCountDisabled}
-          />
+            title={copy.speakersDialogTitle}
+            className="rounded-full px-2.5 py-1 text-xs font-medium text-ink-faint outline-none transition-colors hover:bg-surface-sunken hover:text-ink-soft focus-visible:ring-2 focus-visible:ring-accent/40 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {peopleCountCopy.triggerLabel(
+              detailWithPeopleCount.peopleCount,
+              !detailWithPeopleCount.peopleCountIsOverride,
+            )}
+          </button>
         )}
         <div className="ml-auto flex items-center gap-1">
           {detail.speakers.length > 1 && (
@@ -272,7 +268,11 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
                   {formatTimestamp(segment.tStartMs)}
                 </span>
                 <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-                  <SpeakerChip speaker={speaker} fallbackId={segment.speakerId} onRename={handleRename} />
+                  <SpeakerChip
+                    speaker={speaker}
+                    fallbackId={segment.speakerId}
+                    onOpen={() => setSpeakersOpen(true)}
+                  />
                   <p className="line-clamp-3 text-sm leading-relaxed text-ink-soft">
                     {highlightMatches(segment.text, filter)}
                   </p>
@@ -288,6 +288,21 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
         onClose={() => setMergeOpen(false)}
         speakers={detail.speakers}
         onMerged={handleMerged}
+      />
+
+      <SpeakersDialog
+        open={speakersOpen}
+        onClose={() => setSpeakersOpen(false)}
+        meetingId={meetingId}
+        speakers={detail.speakers}
+        peopleCount={
+          typeof detailWithPeopleCount.peopleCount === "number"
+            ? detailWithPeopleCount.peopleCount
+            : canonicalSpeakers(detail.speakers).length
+        }
+        peopleCountIsOverride={!!detailWithPeopleCount.peopleCountIsOverride}
+        job={transcribeJob}
+        disabled={peopleCountDisabled}
       />
 
       <Modal

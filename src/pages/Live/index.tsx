@@ -10,6 +10,7 @@ import {
   type VirtualListHandle,
 } from "../../components";
 import { CheckIcon } from "../../components/icons";
+import { cx } from "../../components/lib/cx";
 import { formatElapsed } from "../../components/lib/format";
 import { useCaptureState, useCommand } from "../../hooks";
 import { common, labels, live, notices } from "../../lib/copy";
@@ -22,7 +23,23 @@ import { useTranscriptStream } from "./useTranscriptStream";
 
 const ROW_HEIGHT = 68;
 
+/** Being within this many pixels of the true bottom still counts as "at the
+ * bottom" — enough slack that a stray pixel of scroll jitter never flips
+ * someone into "detached" while they're still glued to the newest line. */
+const BOTTOM_SLACK_PX = ROW_HEIGHT * 1.5;
+
+/** The class VirtualList's real scrolling element ends up with — its
+ * `className` prop lands on that element (see `components/VirtualList.tsx`),
+ * so this is how the page finds the actual DOM node to watch scroll
+ * position on, without VirtualList needing to expose one of its own. */
+const SCROLL_EL_CLASS = "js-live-transcript-scroll";
+
 const ACTIVE_STATES = new Set(["starting", "recording", "paused", "degraded", "stopping"]);
+
+/** States where Echo is actually taking in speech right now — the ones the
+ * bottom "Listening…" row should be visible for. Not `starting` (nothing is
+ * flowing yet), not `paused`, not `stopping` (already wrapping up). */
+const LISTENING_ROW_STATES = new Set(["recording", "degraded"]);
 
 /**
  * Live: the recording view. Reached automatically the moment capture starts
@@ -45,12 +62,57 @@ export default function Live() {
   const [copied, setCopied] = useState(false);
 
   const listRef = useRef<VirtualListHandle>(null);
-  useEffect(() => {
-    listRef.current?.scrollToBottom();
-  }, [lines.length]);
+  const scrollWrapperRef = useRef<HTMLDivElement>(null);
+  const prevLineCount = useRef(0);
+
+  // Whether the person is (still) glued to the newest line. Starts true —
+  // the normal state when there's nothing to scroll up and away from yet.
+  const [atBottom, setAtBottom] = useState(true);
+  // Whether text has arrived since they scrolled away from the bottom —
+  // this, not `!atBottom` alone, is what shows the "Jump to now" pill: being
+  // detached to re-read something is quiet until there's actually something
+  // new to jump to.
+  const [awaitingJump, setAwaitingJump] = useState(false);
 
   const paused = capture.state === "paused";
   const active = capture.meetingId != null && ACTIVE_STATES.has(capture.state);
+  const showListeningRow = LISTENING_ROW_STATES.has(capture.state);
+  const hasLines = lines.length > 0;
+
+  // Watch the real scrolling element (found by class, not a VirtualList API —
+  // see `SCROLL_EL_CLASS`) so the page knows whether new text should follow
+  // the person down or wait for them to come back to it.
+  useEffect(() => {
+    const el = scrollWrapperRef.current?.querySelector<HTMLDivElement>(`.${SCROLL_EL_CLASS}`);
+    if (!el) return;
+    const handleScroll = () => {
+      const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+      const bottom = distance <= BOTTOM_SLACK_PX;
+      setAtBottom(bottom);
+      if (bottom) setAwaitingJump(false);
+    };
+    el.addEventListener("scroll", handleScroll, { passive: true });
+    return () => el.removeEventListener("scroll", handleScroll);
+  }, [hasLines]);
+
+  // A new final lands, or a fresh partial opens: follow it down when the
+  // person is already at the bottom; otherwise leave the view exactly where
+  // they put it and just flag that there's more waiting below.
+  useEffect(() => {
+    if (lines.length === prevLineCount.current) return;
+    prevLineCount.current = lines.length;
+    if (atBottom) {
+      listRef.current?.scrollToBottom();
+    } else {
+      setAwaitingJump(true);
+    }
+  }, [lines.length, atBottom]);
+
+  const handleJumpToNow = () => {
+    listRef.current?.scrollToBottom();
+    setAtBottom(true);
+    setAwaitingJump(false);
+  };
 
   if (!active) {
     return (
@@ -112,23 +174,56 @@ export default function Live() {
         </div>
       )}
 
-      <VirtualList
-        ref={listRef}
-        items={lines}
-        itemHeight={ROW_HEIGHT}
-        getKey={(line) => line.id}
-        className="min-h-0 flex-1 rounded-xl border border-hairline bg-surface"
-        emptyState={
-          <p className="px-5 py-8 text-center text-sm text-ink-ghost">{live.waitingForSpeech}</p>
-        }
-        renderItem={(line) => (
-          <TranscriptLine
-            speakerLabel={speakerLabelFor(line.speakerId, line.channel)}
-            text={line.text}
-            pending={!line.isFinal}
-          />
+      <div
+        ref={scrollWrapperRef}
+        className="relative min-h-0 flex-1 overflow-hidden rounded-xl"
+      >
+        <VirtualList
+          ref={listRef}
+          items={lines}
+          itemHeight={ROW_HEIGHT}
+          getKey={(line) => line.id}
+          className={cx(
+            SCROLL_EL_CLASS,
+            "absolute inset-0 scroll-smooth rounded-xl border border-hairline bg-surface",
+            showListeningRow && "pb-12",
+          )}
+          emptyState={
+            <p className="px-5 py-8 text-center text-sm text-ink-ghost">{live.waitingForSpeech}</p>
+          }
+          renderItem={(line) => (
+            <TranscriptLine
+              tStartMs={line.tStartMs}
+              speakerLabel={speakerLabelFor(line.speakerId, line.channel)}
+              text={line.text}
+              pending={!line.isFinal}
+            />
+          )}
+        />
+
+        {showListeningRow && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center gap-2 bg-gradient-to-t from-surface to-transparent px-5 pb-3 pt-6"
+          >
+            <RecordingDot size="sm" />
+            <span className="text-xs text-ink-faint">{live.listeningNow}</span>
+          </div>
         )}
-      />
+
+        {awaitingJump && !atBottom && (
+          <button
+            type="button"
+            onClick={handleJumpToNow}
+            className={cx(
+              "absolute left-1/2 -translate-x-1/2 rounded-full border border-hairline bg-surface px-4 py-1.5 text-xs font-medium text-ink-soft shadow-lift transition-colors hover:bg-surface-sunken focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent",
+              showListeningRow ? "bottom-11" : "bottom-3",
+            )}
+          >
+            {live.jumpToNow}
+          </button>
+        )}
+      </div>
 
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">

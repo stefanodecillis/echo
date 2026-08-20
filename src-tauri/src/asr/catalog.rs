@@ -784,7 +784,6 @@ pub fn preset_description(level_id: &str) -> String {
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

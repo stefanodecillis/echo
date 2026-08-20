@@ -94,6 +94,7 @@ pub mod features;
 pub mod job;
 pub mod pcm;
 pub mod pipeline;
+pub mod sample;
 pub mod segmentation;
 pub mod timeline;
 
@@ -152,6 +153,14 @@ pub enum DiarizeError {
     /// meetings, or joining them would make a ring of aliases.
     #[error("those two speakers cannot be joined")]
     CannotMerge(String),
+    /// Nobody's fault: this person never talks on their own for long enough to
+    /// cut a recognisable clip out of. See [`sample`].
+    #[error("there is no clear moment of that voice on its own")]
+    NoVoiceSample,
+    /// The words are still there and the audio is not — the recording was
+    /// deleted, or the meeting was kept as a transcript only.
+    #[error("that meeting's audio is no longer on this computer")]
+    AudioForgotten,
 }
 
 /// Acceptance thresholds from spike M0-S4. Below these, live clustering does
