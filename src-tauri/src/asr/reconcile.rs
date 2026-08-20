@@ -27,6 +27,14 @@
 //! present and checked does the engine's config move to the new weights and the
 //! old files go. There is no window in which Echo has no model.
 //!
+//! The same rule covers the two speaker files, which changed for the first time
+//! on 2026-08-20 when the voice-print network moved from CAM++ to WeSpeaker
+//! ResNet34-LM. Nothing about that is a special case: yesterday's voice prints
+//! stay on disk and stay usable until today's are verified, and then they go
+//! ([`is_supersedable`]). The one asset with no replacement candidate in the
+//! catalog — the speech detector — is excluded, because for it "supersede" could
+//! only ever mean "delete the last copy".
+//!
 //! # The matrix
 //!
 //! Two questions, and the answer is the cell they meet in.
@@ -253,17 +261,34 @@ fn replacement_installed(
         .any(|e| e.kind == kind && is_installed(e.id))
 }
 
-/// The only kinds a new model can supersede.
+/// The only kinds a newer model can supersede.
 ///
 /// A second guard on the one destructive path in this module, and deliberately
-/// redundant: the obsolete set is derived from the level, and the level wants
-/// every shared asset, so the speech detector and the two speaker files can
-/// never land in it anyway. But "can never" is a claim about code somebody will
-/// edit later, and the cost of being wrong is deleting the file that lets Echo
-/// hear anybody. So the deletion also checks, from the other direction, that
-/// what it is about to remove is a kind of thing a model replaces.
+/// redundant: the obsolete set is derived from the level, and the level wants one
+/// asset of each of these kinds, so nothing the level still needs can land in it
+/// anyway. But "can never" is a claim about code somebody will edit later, and
+/// the cost of being wrong is deleting the file that lets Echo hear anybody. So
+/// the deletion also checks, from the other direction, that what it is about to
+/// remove is a kind of thing a newer model replaces.
+///
+/// The two speaker files are on the list as of 2026-08-20, when the voice-print
+/// network changed for the first time. A change of voice-print or segmentation
+/// network is the same event as a change of speech model — new bytes wanted, old
+/// bytes on thousands of disks with nothing able to account for them — so it gets
+/// the same treatment and the same guarantee: nothing is deleted until a wanted
+/// asset **of its own kind** is verified installed ([`replacement_installed`]).
+///
+/// The speech detector is deliberately *not* here. It is the one file with no
+/// replacement candidate in the catalog at all, so listing it could only ever
+/// authorise deleting the last copy of it.
 pub fn is_supersedable(kind: AssetKind) -> bool {
-    matches!(kind, AssetKind::Speech | AssetKind::SpeechAccelerator)
+    matches!(
+        kind,
+        AssetKind::Speech
+            | AssetKind::SpeechAccelerator
+            | AssetKind::SpeakerSegmenter
+            | AssetKind::SpeakerEmbedder
+    )
 }
 
 #[cfg(test)]
@@ -616,12 +641,83 @@ mod tests {
         );
     }
 
+    /// The speech detector is the one file with no replacement candidate in the
+    /// catalog, so nothing may ever authorise deleting it.
     #[test]
-    fn only_speech_and_its_companion_can_ever_be_superseded() {
+    fn everything_a_newer_model_replaces_can_be_superseded_except_the_detector() {
         assert!(is_supersedable(AssetKind::Speech));
         assert!(is_supersedable(AssetKind::SpeechAccelerator));
+        assert!(is_supersedable(AssetKind::SpeakerSegmenter));
+        assert!(is_supersedable(AssetKind::SpeakerEmbedder));
         assert!(!is_supersedable(AssetKind::SpeechDetector));
-        assert!(!is_supersedable(AssetKind::SpeakerSegmenter));
-        assert!(!is_supersedable(AssetKind::SpeakerEmbedder));
+    }
+
+    // -----------------------------------------------------------------
+    // A change of voice-print network
+    // -----------------------------------------------------------------
+
+    /// The 2026-08-20 swap, walked through cell by cell. This is the same
+    /// machinery the speech model uses, and the point of the test is that it is
+    /// the same: no new path, no special case, and above all no window in which
+    /// Echo has no way to tell voices apart.
+    #[test]
+    fn yesterdays_voice_prints_keep_working_until_todays_are_verified() {
+        // Yesterday's install: everything current except the voice prints, which
+        // are still CAM++.
+        let mut installed = all_wanted();
+        installed.retain(|id| *id != ids::EMBEDDER);
+        installed.push(ids::EMBEDDER_CAMPLUS);
+
+        let mid = plan_for(&installed);
+        assert_eq!(mid.state, State::Upgrading);
+        assert_eq!(mid.missing, vec![ids::EMBEDDER]);
+        assert!(mid.obsolete.contains(&ids::EMBEDDER_CAMPLUS));
+        assert!(
+            mid.deletable().is_empty(),
+            "deleting CAM++ now would leave the pass with no way to tell voices apart"
+        );
+        assert!(
+            mid.can_serve(),
+            "and the speech model is untouched, so meetings still transcribe"
+        );
+
+        // The 26 MB arrives.
+        installed.push(ids::EMBEDDER);
+        let after = plan_for(&installed);
+        assert_eq!(after.state, State::Switch);
+        assert_eq!(after.deletable(), vec![ids::EMBEDDER_CAMPLUS]);
+
+        // And once it is gone there is nothing left to do.
+        installed.retain(|id| *id != ids::EMBEDDER_CAMPLUS);
+        assert_eq!(plan_for(&installed).state, State::Steady);
+    }
+
+    /// Both models changing at once — a person who skipped a release. Neither
+    /// cleanup waits on the other's kind, and neither happens early.
+    #[test]
+    fn a_speech_change_and_a_voice_print_change_do_not_block_each_other() {
+        let mut installed = shared();
+        installed.retain(|id| *id != ids::EMBEDDER);
+        installed.push(ids::EMBEDDER_CAMPLUS);
+        installed.push(ids::SPEECH_TURBO);
+        if cfg!(target_os = "macos") {
+            installed.push(ids::ACCEL_TURBO);
+        }
+
+        let p = plan_for(&installed);
+        assert_eq!(p.state, State::Upgrading);
+        assert_eq!(p.serving, Some(ids::SPEECH_TURBO));
+        assert!(p.deletable().is_empty());
+
+        // Everything wanted arrives; both generations of leftovers go together.
+        let mut installed = all_wanted();
+        installed.push(ids::EMBEDDER_CAMPLUS);
+        installed.push(ids::SPEECH_TURBO);
+        let doomed = plan_for(&installed).deletable();
+        assert!(doomed.contains(&ids::EMBEDDER_CAMPLUS));
+        assert!(doomed.contains(&ids::SPEECH_TURBO));
+        for id in &doomed {
+            assert!(!all_wanted().contains(id), "{id} is wanted");
+        }
     }
 }

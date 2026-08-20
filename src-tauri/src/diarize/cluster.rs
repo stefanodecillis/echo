@@ -18,32 +18,79 @@ use std::collections::HashMap;
 
 /// Cosine distance above which two fingerprints are different people.
 ///
-/// **This constant is calibrated to one specific fingerprint network** — and to
-/// cosine distance with centroid linkage. It is not a taste setting: 0.7153 is
-/// the value that minimises diarization error on the DIHARD development set for
-/// WeSpeaker **ResNet34-LM**, and it is what the reference pyannote 3.1 pipeline
-/// ships.
+/// **This constant belongs to one specific fingerprint network**, and to cosine
+/// distance with centroid linkage. It is not a taste setting.
 ///
-/// # This number is currently provisional
+/// # Which network
 ///
-/// The asset catalog ships WeSpeaker **CAM++** instead (192 dimensions, not
-/// 256), because the ResNet34-LM export lives in a gated Hugging Face repo that
-/// Echo's unauthenticated resumable download cannot reach. The clustering code
-/// reads the embedding width from the model, so the pass *runs* — but this
-/// threshold has never been measured against CAM++, so the speaker count it
-/// produces is unvalidated. The M0-S4 fixture benchmark has to be re-run before
-/// v1 ships; [`tests::the_threshold_matches_the_fingerprint_asset_it_was_tuned_for`]
-/// is the tripwire that stops the two drifting apart silently.
+/// `catalog::ids::EMBEDDER` — WeSpeaker **ResNet34-LM**, 256 dimensions, the
+/// voice-print model of the reference pyannote 3.1 and community-1 pipelines.
 ///
-/// Nothing user-facing depends on getting this exactly right: a wrong count
-/// means the person merges or renames a chip, which is a thing the UI is built
-/// for. It is a quality regression, not a broken feature.
+/// Before 2026-08-20 the catalog shipped WeSpeaker CAM++ (512 dimensions, a
+/// different embedding space entirely) while this constant held a number
+/// published for ResNet34-LM. The one value deciding how many people Echo thought
+/// were in the room described a geometry it had never been measured in. Swapping
+/// the asset is what fixed that; see the embedder entry in
+/// [`crate::asr::catalog::CATALOG`].
 ///
-/// Lower splits one person into several ("Speaker 3" turns up halfway through a
-/// meeting); higher fuses two people into one, which is the worse failure
-/// because a rename cannot undo it — only a merge can, and merges are the thing
-/// we ask the person to do, not splits.
-pub const DISTANCE_THRESHOLD: f32 = 0.7153;
+/// # Where 0.58 comes from
+///
+/// Not from upstream. pyannote 3.1 ships 0.7046 for this network (0.7153 in
+/// 3.0), and **that number does not reproduce here** — measured, not assumed.
+/// Both pipelines run "centroid-linkage agglomerative clustering over cosine
+/// distance" and the phrase hides real differences: pyannote reaches its
+/// cluster-to-cluster numbers through scipy's Lance-Williams update over a cosine
+/// distance matrix, where [`cluster`] recomputes each centroid and returns it to
+/// the unit sphere, and pyannote discards any cluster holding fewer than twelve
+/// embeddings where [`MIN_CLUSTER_MS`] counts milliseconds. Feed those two
+/// algorithms the same fingerprints and the same cut lands in a different place.
+///
+/// So the number was measured against audio whose answer is known, twice, and
+/// 0.58 is the middle of what both measurements allow.
+///
+/// **Synthetic, many people.** `cargo run --release --example voices_fixture`
+/// builds meetings out of macOS's own text-to-speech voices — 2, 3, 5 and 7
+/// *known* people, three turns each of about twelve seconds, short gaps between
+/// them — runs the real pass ([`super::pipeline::scan`], the same code the app
+/// runs) over each one, and then cuts the same fingerprints at every threshold
+/// from 0.15 to 1.10. Every threshold in **0.2375 … 0.625** gets all four
+/// fixtures exactly right, each cluster at least 97.9% one true voice. Above
+/// about 0.64 the seven-person fixture starts fusing people (six, then five);
+/// below about 0.22 it starts inventing an eighth. Those edges move by one
+/// 0.0125 step between runs, because `say` does not render bit-identically twice;
+/// the interval above is what two runs agreed on.
+///
+/// **Real, two people.** `cargo run --release --example speakers_probe -- --sweep`
+/// over a real 21-minute recorded meeting: exactly two voices, cleanly split
+/// 650 s / 465 s, for every threshold in **0.5625 … 0.6050**. At 0.6075 the two
+/// speakers fuse into one — which is what pyannote's own 0.7046 would do to this
+/// meeting, and what makes this the measurement that mattered. Below 0.5575 the
+/// same two voices are still right, but 4–7 second fragments start surviving
+/// [`MIN_CLUSTER_MS`] and showing up as extra people.
+///
+/// The two windows overlap in 0.5625 … 0.6050, and 0.58 sits in the middle of it
+/// — 0.0175 clear of the fragment edge below, 0.0275 clear of the fusion edge
+/// above, and a long way inside the synthetic plateau.
+///
+/// # What this is not
+///
+/// It is not a diarization error rate. Text-to-speech voices are cleaner and far
+/// more self-consistent than people: no room, no overlap, no crosstalk, no
+/// laughter, and a synthetic voice does not drift the way a real one does inside
+/// a single sentence. And one real meeting is one real meeting — the interval
+/// above is 0.04 wide, which is narrow, and a second meeting could move it. What
+/// the two measurements together do rule out is the failure this was written to
+/// end: a threshold that has never been measured against the network it is
+/// deciding with.
+///
+/// # Which way to be wrong
+///
+/// Lower splits one person into several, or keeps a fragment as a person
+/// ("Speaker 3" turns up halfway through a meeting); higher fuses two people into
+/// one. Fusing is the worse failure — a merge is a thing the UI asks people to
+/// do, but nothing lets them say "these two were actually different" — so where
+/// the interval allows a choice, 0.58 leans low.
+pub const DISTANCE_THRESHOLD: f32 = 0.58;
 
 /// A cluster holding less speech than this is a fragment, not a person. Its
 /// fingerprints are handed to whoever they resemble most instead of becoming a
@@ -850,11 +897,39 @@ mod tests {
         assert_eq!(align_permutation(&[vec![]]), vec![None]);
     }
 
+    /// The measured interval, pinned. Editing [`DISTANCE_THRESHOLD`] to anything
+    /// outside it means the measurement was redone — so redo it, and move these
+    /// numbers with it.
     #[test]
-    fn the_calibrated_threshold_is_the_one_the_fingerprint_asset_was_tuned_for() {
-        assert_eq!(DISTANCE_THRESHOLD, 0.7153);
+    fn the_calibrated_threshold_is_inside_both_measured_windows() {
+        assert_eq!(DISTANCE_THRESHOLD, 0.58);
         // It has to sit inside the cosine range or nothing would ever merge.
         const { assert!(DISTANCE_THRESHOLD > 0.0 && DISTANCE_THRESHOLD < 2.0) };
+
+        // Where the synthetic fixtures get 2, 3, 5 and 7 known speakers exactly
+        // right (examples/voices_fixture.rs, 2026-08-20) — the part two runs
+        // agreed on, since text-to-speech does not render bit-identically twice.
+        const SYNTHETIC: (f32, f32) = (0.2375, 0.625);
+        // Where a real 21-minute two-person meeting comes out as two voices with
+        // no fragments (examples/speakers_probe.rs --sweep, 2026-08-20).
+        const REAL: (f32, f32) = (0.5625, 0.6050);
+        for (low, high) in [SYNTHETIC, REAL] {
+            assert!(
+                DISTANCE_THRESHOLD >= low && DISTANCE_THRESHOLD <= high,
+                "{DISTANCE_THRESHOLD} is outside the measured window {low}..{high}"
+            );
+        }
+        // And it is not sitting on either edge of the tighter one: a threshold
+        // that only just works is a threshold that stops working on the next
+        // meeting.
+        assert!(DISTANCE_THRESHOLD - REAL.0 > 0.01);
+        assert!(REAL.1 - DISTANCE_THRESHOLD > 0.01);
+
+        // The number upstream publishes for this network, kept here because it is
+        // the thing a reader will reach for. It is outside the interval — see the
+        // doc comment for why the two pipelines do not share a threshold.
+        const PYANNOTE_3_1: f32 = 0.7046;
+        assert!(PYANNOTE_3_1 > REAL.1);
     }
 
     /// The threshold and the fingerprint network are one decision, spread across
@@ -862,22 +937,33 @@ mod tests {
     /// one-line change in the catalog — and quietly invalidating the number that
     /// decides how many people Echo thinks were in the room.
     ///
-    /// If this fails, that is the point: re-run the M0-S4 fixture benchmark
-    /// against the new asset, put the measured threshold here, and update both
-    /// this list and [`DISTANCE_THRESHOLD`]'s doc comment.
+    /// It names exactly one asset, not a list of plausible ones. A list is how
+    /// the old version of this test let CAM++ in beside the network the number
+    /// actually came from, and the count went unvalidated for a release.
+    ///
+    /// If this fails, that is the point: run
+    /// `cargo run --release --example voices_fixture` against the new asset, put
+    /// the measured threshold here, and update [`DISTANCE_THRESHOLD`]'s doc
+    /// comment with what the sweep said.
     #[test]
     fn the_threshold_matches_the_fingerprint_asset_it_was_tuned_for() {
-        // The exports 0.7153 is known to be right or plausible for. CAM++ is on
-        // the list under protest: see the doc comment on DISTANCE_THRESHOLD.
-        const CALIBRATED_AGAINST: &[&str] = &[
-            "speaker-embedder-wespeaker-resnet34-lm",
-            "speaker-embedder-wespeaker-campplus",
-        ];
-        let shipped = crate::asr::catalog::ids::EMBEDDER;
-        assert!(
-            CALIBRATED_AGAINST.contains(&shipped),
-            "the catalog ships {shipped:?}, which this threshold has never been \
-             measured against — re-run the fixture benchmark before changing this"
+        /// The one export 0.7153 was measured on: WeSpeaker ResNet34-LM,
+        /// 256 dimensions, DIHARD-tuned upstream and swept over the
+        /// text-to-speech fixtures here.
+        const CALIBRATED_AGAINST: &str = "speaker-embedder-wespeaker-resnet34-lm";
+        assert_eq!(
+            crate::asr::catalog::ids::EMBEDDER,
+            CALIBRATED_AGAINST,
+            "the catalog ships a fingerprint network this threshold has never \
+             been measured against — re-run examples/voices_fixture before \
+             changing this"
+        );
+        // And the network Echo is walking away from must not quietly come back
+        // as the wanted one.
+        assert_ne!(
+            crate::asr::catalog::ids::EMBEDDER,
+            crate::asr::catalog::ids::EMBEDDER_CAMPLUS
         );
     }
 }
+

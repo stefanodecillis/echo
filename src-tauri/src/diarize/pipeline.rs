@@ -206,61 +206,156 @@ struct WindowResult {
     continues: Vec<Option<usize>>,
 }
 
-/// The canonical offline pass. See the module docs for the shape of it.
-pub async fn refine(
+/// Everything the models had to say about one meeting, before any decision about
+/// how many people were in it.
+///
+/// The expensive half of [`refine`] — every window segmented, every stretch of a
+/// single voice fingerprinted — separated from the cheap half, which is one
+/// clustering cut. Splitting them is what lets the calibration tool
+/// (`examples/voices_fixture.rs`) try forty thresholds on one pass over the audio
+/// instead of forty passes, and it means the number in
+/// [`cluster::DISTANCE_THRESHOLD`] was measured through this code rather than
+/// through a copy of it.
+pub struct Scan {
+    items: Vec<ClusterItem>,
+    windows: Vec<WindowResult>,
+    covered: Vec<Span>,
+}
+
+/// One clustering cut of a [`Scan`]: who spoke when, and how many people that is.
+#[derive(Debug, Clone, Default)]
+pub struct ScanCut {
+    /// Per person, the stretches they were talking, ordered by who spoke first.
+    pub tracks: Vec<Vec<Span>>,
+    /// Per person, mean activation while they were talking.
+    pub confidence: Vec<f32>,
+    /// The threshold used, or — in fixed-count mode — the height the hierarchy
+    /// was cut at.
+    pub threshold: f32,
+}
+
+impl Scan {
+    /// How many fingerprints the pass got out of the audio. Below one per person
+    /// no threshold can possibly find them all.
+    pub fn fingerprints(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Length of the fingerprints, or `None` when nothing was fingerprintable.
+    /// Reading it off the vectors is how a calibration run proves it measured the
+    /// network it thinks it did.
+    pub fn fingerprint_dim(&self) -> Option<usize> {
+        self.items.first().map(|i| i.embedding.len())
+    }
+
+    /// Every fingerprint, with the stretches of the meeting clock its audio came
+    /// from.
+    ///
+    /// Only a calibration run wants this, and only because it already knows who
+    /// was talking when: matching a fingerprint back to a span is what turns "the
+    /// count came out right" into "these two voices are 0.83 apart and those two
+    /// are 0.21" — which is the statement a threshold can actually be checked
+    /// against. The clustering itself never looks at where a fingerprint came
+    /// from; that is the whole point of clustering.
+    ///
+    /// The spans are the local speaker's whole activity in its window, which is a
+    /// superset of the single-voice audio the fingerprint was computed from
+    /// (`analyse_window` subtracts everyone else before embedding). For deciding
+    /// *whose* voice a fingerprint is, the superset is the same answer.
+    pub fn fingerprints_with_spans(&self) -> Vec<(&[f32], Vec<Span>)> {
+        let mut out: Vec<(&[f32], Vec<Span>)> = self
+            .items
+            .iter()
+            .map(|i| (i.embedding.as_slice(), Vec::new()))
+            .collect();
+        for window in &self.windows {
+            for (local, slot) in window.fingerprint.iter().enumerate() {
+                if let Some(index) = slot {
+                    if let Some(entry) = out.get_mut(*index) {
+                        entry.1 = window.tracks[local].clone();
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Cut at a distance: the automatic pass. `None` for `target` means exactly
+    /// that; `Some(k)` cuts at a count instead and ignores the threshold, which
+    /// is what an override does.
+    pub fn cut(&self, threshold: f32, target: Option<usize>) -> ScanCut {
+        let clustering = match target {
+            Some(k) => cluster::cluster_fixed(&self.items, k),
+            None => cluster::cluster(&self.items, threshold),
+        };
+        let labelled = label_windows(&self.windows, &clustering.labels);
+        let (mut tracks, mut confidence) =
+            build_tracks(&self.windows, &labelled, clustering.cluster_count);
+
+        // Nothing was fingerprintable — every voice talked over every other one,
+        // or in snatches too short to identify. Falling through to zero speakers
+        // would be a regression on the live labels, which at least said
+        // "Speaker 1", so keep exactly that: one voice covering the speech we did
+        // find.
+        if tracks.is_empty() {
+            let fallback = fallback_track(&self.windows, &self.covered);
+            if !fallback.is_empty() {
+                tracks = vec![fallback];
+                confidence = vec![0.0];
+            }
+        }
+
+        ScanCut {
+            tracks,
+            confidence,
+            threshold: clustering.threshold,
+        }
+    }
+}
+
+/// The audio the pass will read, and what its labels will therefore mean.
+///
+/// A system channel means the far end recorded itself and the microphone is one
+/// known person; no system channel means the whole conversation is in the
+/// microphone recording and every voice in it has to be separated out (module
+/// docs). `None` means there is no committed audio on either channel, and
+/// therefore nothing to load a model for (mantra 1).
+async fn voice_channel(db: &Db, meeting_id: &str) -> Result<Option<(Source, ChunkPcm)>, DiarizeError> {
+    let system = ChunkPcm::new(
+        repo::list_chunks(db, meeting_id, Some(Channel::System))
+            .await
+            .map_err(db_failed)?,
+    );
+    if !system.is_empty() {
+        return Ok(Some((Source::System, system)));
+    }
+    let mic = ChunkPcm::new(
+        repo::list_chunks(db, meeting_id, Some(Channel::Mic))
+            .await
+            .map_err(db_failed)?,
+    );
+    if mic.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((Source::MicOnly, mic)))
+}
+
+/// Segment and fingerprint one meeting's audio. Writes nothing.
+///
+/// The expensive half of [`refine`], and the half a calibration run wants on its
+/// own. Returns `None` when the meeting has no committed audio on either channel,
+/// which is the case where no model is loaded at all (mantra 1).
+pub async fn scan(
     db: &Db,
     meeting_id: &str,
     segmenter_path: &std::path::Path,
     embedder_path: &std::path::Path,
     control: &DiarizeControl,
-) -> Result<DiarizationResult, DiarizeError> {
+) -> Result<Option<Scan>, DiarizeError> {
     control.checkpoint()?;
 
-    // Which channel carries the voices. A system channel means the far end
-    // recorded itself and the microphone is one known person; no system channel
-    // means the whole conversation is in the microphone recording and every voice
-    // in it has to be separated out (module docs).
-    let mut pcm = ChunkPcm::new(
-        repo::list_chunks(db, meeting_id, Some(Channel::System))
-            .await
-            .map_err(db_failed)?,
-    );
-    let source = if pcm.is_empty() {
-        pcm = ChunkPcm::new(
-            repo::list_chunks(db, meeting_id, Some(Channel::Mic))
-                .await
-                .map_err(db_failed)?,
-        );
-        Source::MicOnly
-    } else {
-        Source::System
-    };
-
-    // No committed audio on either channel — a meeting whose recording was
-    // forgotten, or one that never got as far as a chunk. There is nothing to
-    // separate, so channel attribution is the whole answer and no model is
-    // loaded, which is the point of checking first (mantra 1).
-    if pcm.is_empty() {
-        let speakers = pin_channel_speakers(db, meeting_id).await?;
-        let (people_count, people_count_is_override) = people_count(db, meeting_id).await?;
-        control.report(1.0);
-        return Ok(DiarizationResult {
-            turns: Vec::new(),
-            speaker_count: 0,
-            threshold: cluster::DISTANCE_THRESHOLD,
-            speakers,
-            people_count,
-            people_count_is_override,
-        });
-    }
-
-    // How many voices to look for. `None` is the automatic pass and the common
-    // case; `Some` is the person having corrected the count, and it is read
-    // before any model loads so a correction can never be lost to a pass that
-    // was already deciding for itself.
-    let target = match source {
-        Source::System => remote_cluster_target(db, meeting_id).await?,
-        Source::MicOnly => mic_cluster_target(db, meeting_id).await?,
+    let Some((_source, mut pcm)) = voice_channel(db, meeting_id).await? else {
+        return Ok(None);
     };
 
     let threads = inference_threads();
@@ -315,38 +410,67 @@ pub async fn refine(
     control.checkpoint()?;
     control.report(0.85);
 
-    let clustering = match target {
-        Some(k) => cluster::cluster_fixed(&items, k),
-        None => cluster::cluster(&items, cluster::DISTANCE_THRESHOLD),
+    Ok(Some(Scan {
+        items,
+        windows,
+        covered,
+    }))
+}
+
+/// The canonical offline pass. See the module docs for the shape of it.
+pub async fn refine(
+    db: &Db,
+    meeting_id: &str,
+    segmenter_path: &std::path::Path,
+    embedder_path: &std::path::Path,
+    control: &DiarizeControl,
+) -> Result<DiarizationResult, DiarizeError> {
+    control.checkpoint()?;
+
+    let Some((source, _)) = voice_channel(db, meeting_id).await? else {
+        // Nothing on disk to separate. Channel attribution is the whole answer,
+        // and no model is loaded at all.
+        let speakers = pin_channel_speakers(db, meeting_id).await?;
+        let (people_count, people_count_is_override) = people_count(db, meeting_id).await?;
+        control.report(1.0);
+        return Ok(DiarizationResult {
+            turns: Vec::new(),
+            speaker_count: 0,
+            threshold: cluster::DISTANCE_THRESHOLD,
+            speakers,
+            people_count,
+            people_count_is_override,
+        });
     };
-    let labelled = label_windows(&windows, &clustering.labels);
-    let (mut tracks, mut confidence) = build_tracks(&windows, &labelled, clustering.cluster_count);
 
-    // Nothing was fingerprintable — every voice talked over every other one, or
-    // in snatches too short to identify. Falling through to zero speakers would
-    // be a regression on the live labels, which at least said "Speaker 1", so
-    // keep exactly that: one remote voice covering the speech we did find.
-    if tracks.is_empty() {
-        let fallback = fallback_track(&windows, &covered);
-        if !fallback.is_empty() {
-            tracks = vec![fallback];
-            confidence = vec![0.0];
-        }
-    }
+    // How many voices to look for. `None` is the automatic pass and the common
+    // case; `Some` is the person having corrected the count, and it is read
+    // before any model loads so a correction can never be lost to a pass that
+    // was already deciding for itself.
+    let target = match source {
+        Source::System => remote_cluster_target(db, meeting_id).await?,
+        Source::MicOnly => mic_cluster_target(db, meeting_id).await?,
+    };
 
-    let turns = turns_from_tracks(&tracks, &confidence);
+    let Some(scanned) = scan(db, meeting_id, segmenter_path, embedder_path, control).await? else {
+        return Err(DiarizeError::Failed(
+            "the meeting's audio disappeared while the pass was starting".into(),
+        ));
+    };
+    let cut = scanned.cut(cluster::DISTANCE_THRESHOLD, target);
+    let turns = turns_from_tracks(&cut.tracks, &cut.confidence);
 
     control.checkpoint()?;
     control.report(0.9);
 
-    let speakers = persist(db, meeting_id, &tracks, source).await?;
+    let speakers = persist(db, meeting_id, &cut.tracks, source).await?;
     let (people_count, people_count_is_override) = people_count(db, meeting_id).await?;
     control.report(1.0);
 
     Ok(DiarizationResult {
-        speaker_count: tracks.len() as u32,
+        speaker_count: cut.tracks.len() as u32,
         turns,
-        threshold: clustering.threshold,
+        threshold: cut.threshold,
         speakers,
         people_count,
         people_count_is_override,

@@ -36,7 +36,7 @@ use crate::types::AssetKind;
 
 /// Bumped whenever this file changes. Stored in settings so a newer build can
 /// notice it has a newer catalog than the database.
-pub const CATALOG_REVISION: &str = "2026-08-20.1";
+pub const CATALOG_REVISION: &str = "2026-08-20.2";
 
 /// Which platforms need an entry at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,7 +163,9 @@ pub mod ids {
 
     pub const DETECTOR: &str = "speech-detector-silero-v5";
     pub const SEGMENTER: &str = "speaker-segmenter-pyannote-3";
-    pub const EMBEDDER: &str = "speaker-embedder-wespeaker-campplus";
+    /// The voice-print network. See [`super::CATALOG`]'s speaker section for why
+    /// it is this one and not a newer-sounding one.
+    pub const EMBEDDER: &str = "speaker-embedder-wespeaker-resnet34-lm";
 
     // --- retired: catalogued so they can be recognised and removed ---------
     /// What Echo used before 2026-08-20. Still on many disks.
@@ -173,6 +175,9 @@ pub mod ids {
     pub const ACCEL_SMALL: &str = "speech-accelerator-small";
     pub const SPEECH_TINY: &str = "speech-tiny";
     pub const ACCEL_TINY: &str = "speech-accelerator-tiny";
+    /// The voice-print network Echo used before 2026-08-20, whose embedding
+    /// space the clustering threshold had never been measured against.
+    pub const EMBEDDER_CAMPLUS: &str = "speaker-embedder-wespeaker-campplus";
 }
 
 /// Everything the level needs beyond speech itself: speech detection and the
@@ -189,6 +194,11 @@ pub const SHARED_ASSET_IDS: &[&str] = &[ids::DETECTOR, ids::SEGMENTER, ids::EMBE
 /// Nothing reads this to decide what to download. It is derived from the
 /// catalog and the level in [`obsolete_asset_ids`]; the constant only exists so
 /// a test can assert the two agree.
+///
+/// It is not only speech weights. A change of voice-print network is the same
+/// kind of event as a change of speech model, and rides the same reconcile: the
+/// old network stays catalogued so it can be found and removed once the new one
+/// is verified on disk (see [`crate::asr::reconcile::is_supersedable`]).
 pub const OBSOLETE_ASSET_IDS: &[&str] = &[
     ids::SPEECH_TURBO,
     ids::ACCEL_TURBO,
@@ -196,6 +206,7 @@ pub const OBSOLETE_ASSET_IDS: &[&str] = &[
     ids::ACCEL_SMALL,
     ids::SPEECH_TINY,
     ids::ACCEL_TINY,
+    ids::EMBEDDER_CAMPLUS,
 ];
 
 /// The catalog. Order matters in one place only: the speech entries are listed
@@ -359,6 +370,30 @@ pub const CATALOG: &[CatalogEntry] = &[
         pairs_with: None,
     },
     // --- speakers ---------------------------------------------------------
+    //
+    // These two are the pyannote *community-1* pipeline's own two networks, and
+    // that is not a coincidence — it is the result of checking, on 2026-08-20,
+    // what "upgrade to community-1" actually means file by file.
+    //
+    // **Segmentation.** community-1 does not ship a new segmentation network. Its
+    // weights are the weights of segmentation-3.0. Three independent ungated ONNX
+    // exports of "community-1 segmentation" were downloaded and compared against
+    // the checkpoint in pyannote's own ungated mirror
+    // (huggingface.co/pyannote-community/speaker-diarization-community-1,
+    // segmentation/pytorch_model.bin) and against the export below: all four ONNX
+    // files agree bit-for-bit on every convolution, LSTM and projection tensor,
+    // and all four return identical logits — sum -24458.902036 over a fixed 10 s
+    // signal — from `cargo run --example onnx_contract -- --run`. pyannote's own
+    // release notes say the same thing in words: community-1 keeps "the same
+    // segmentation performance … as on pyannote.audio 3.1". So the entry below
+    // stays exactly as it was; there is no segmentation upgrade to make, and
+    // swapping mirrors for a byte-identical network would only add a new file to
+    // trust. What community-1 actually changes is the *clustering* — Bayesian HMM
+    // (VBx) with a PLDA instead of a cosine cut — which is a change to
+    // `diarize::cluster`, not to an asset.
+    //
+    // **Voice prints.** This is where community-1's win lives, and it is the
+    // entry that moved. See the embedder entry below.
     CatalogEntry {
         id: ids::SEGMENTER,
         kind: AssetKind::SpeakerSegmenter,
@@ -372,14 +407,66 @@ pub const CATALOG: &[CatalogEntry] = &[
         provenance: concat!(
             "huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0 — the ",
             "sherpa-onnx project's ONNX conversion of pyannote/segmentation-3.0. ",
-            "Chosen over the tar.bz2 release asset because a single file resumes cleanly."
+            "Chosen over the tar.bz2 release asset because a single file resumes cleanly. ",
+            "Verified on 2026-08-20 to be the same network, tensor for tensor, as the ",
+            "segmentation checkpoint inside pyannote's speaker-diarization-community-1."
         ),
         archive: Archive::None,
         platform: Platform::Any,
         pairs_with: None,
     },
+    // WeSpeaker ResNet34-LM: the voice-print network the reference pyannote
+    // pipelines use, 3.1 and community-1 alike.
+    //
+    // It replaced CAM++ because of the threshold, not because of a leaderboard.
+    // `diarize::cluster::DISTANCE_THRESHOLD` is a *published* number — the cosine
+    // cut that minimises diarization error on DIHARD for centroid-linkage
+    // agglomerative clustering of **these** 256-dimension vectors, which is
+    // exactly the algorithm `diarize::cluster::cluster` runs. Under CAM++ that
+    // number described a different embedding space (512 dimensions, and a
+    // different geometry), so the one constant deciding how many people Echo
+    // thinks were in the room was uncalibrated. Now it is not.
+    //
+    // Verified on 2026-08-20 to be community-1's own embedding network: this file
+    // and the ONNX export bundled with community-1 agree on 73 of 75 weight
+    // tensors bit-for-bit (the two that differ are batch-norm folding) and return
+    // fingerprints that agree to four decimal places.
+    //
+    // Bigger WeSpeaker networks are mirrored next to this one — ResNet152/221/293,
+    // 79 to 114 MB, roughly half the equal-error rate. They are deliberately not
+    // used: no published clustering threshold exists for them, so taking one would
+    // trade a measured number for a guessed one, and the guessed number is what
+    // decides the speaker count. A wrong count is the failure a person has to
+    // clean up by hand; a tenth of a percent of equal-error rate is not.
     CatalogEntry {
         id: ids::EMBEDDER,
+        kind: AssetKind::SpeakerEmbedder,
+        name: "wespeaker en_voxceleb ResNet34-LM (sherpa-onnx export)",
+        file_name: "wespeaker-en-voxceleb-resnet34-lm.onnx",
+        url: "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/0743f301363dec56491a490f6d6cbc9d67f9a3bf/wespeaker_en_voxceleb_resnet34_LM.onnx",
+        sha256: Some("e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012"),
+        bytes: 26_530_550,
+        license: "Apache-2.0 — WeSpeaker (wenet-e2e); ONNX export by the sherpa-onnx project (Apache-2.0)",
+        revision: "0743f301363dec56491a490f6d6cbc9d67f9a3bf",
+        provenance: concat!(
+            "huggingface.co/csukuangfj/speaker-embedding-models — the sherpa-onnx ",
+            "project's mirror of its speaker-recognition release assets, the same ",
+            "pinned revision the CAM++ entry used. 256-dimension WeSpeaker ",
+            "ResNet34 embeddings, large-margin finetuned, trained on VoxCeleb; the ",
+            "voice-print network of the reference pyannote 3.1 and community-1 ",
+            "pipelines. Takes 80-bin Kaldi log-mel features, which is what ",
+            "diarize::features produces."
+        ),
+        archive: Archive::None,
+        platform: Platform::Any,
+        pairs_with: None,
+    },
+    // --- voice prints Echo no longer wants -------------------------------
+    //
+    // Catalogued so the reconcile can find it on disk and remove it once
+    // ResNet34-LM is verified installed. Nothing downloads this any more.
+    CatalogEntry {
+        id: ids::EMBEDDER_CAMPLUS,
         kind: AssetKind::SpeakerEmbedder,
         name: "wespeaker en_voxceleb CAM++ (sherpa-onnx export)",
         file_name: "wespeaker-en-voxceleb-campplus.onnx",
@@ -391,7 +478,9 @@ pub const CATALOG: &[CatalogEntry] = &[
         provenance: concat!(
             "huggingface.co/csukuangfj/speaker-embedding-models — the sherpa-onnx ",
             "project's mirror of its speaker-recognition release assets. ",
-            "192-dimension CAM++ embeddings trained on VoxCeleb."
+            "512-dimension CAM++ embeddings trained on VoxCeleb. Retired on ",
+            "2026-08-20: no clustering threshold was ever measured against this ",
+            "embedding space."
         ),
         archive: Archive::None,
         platform: Platform::Any,
@@ -594,16 +683,22 @@ pub fn default_preset() -> &'static AccuracyPreset {
 }
 
 /// Every asset a preset needs on *this* platform, in the order they should be
-/// fetched: speech first so a recording can start, then the detector, then the
-/// speed-up and the speaker files.
+/// fetched.
+///
+/// Speech first, so a recording can start as early as possible, then speech
+/// detection. Then the two speaker files, and only then the Apple speed-up —
+/// deliberately in that order, even though the speed-up matters more to how Echo
+/// feels. The speaker files are 32 MB against the companion's 1.2 GB, and while
+/// they are missing a finished meeting cannot be split into people at all. Thirty
+/// megabytes of ordering is the difference between "speaker separation works
+/// twenty seconds after the upgrade starts" and "it works twenty minutes later".
+/// The companion only ever costs speed, never correctness.
 pub fn preset_asset_ids(level_id: &str) -> Vec<&'static str> {
     let p = preset_or_default(level_id);
-    let mut wanted = vec![p.speech_id, ids::DETECTOR];
+    let mut wanted = vec![p.speech_id, ids::DETECTOR, ids::SEGMENTER, ids::EMBEDDER];
     if let Some(accel) = p.accelerator_id {
         wanted.push(accel);
     }
-    wanted.push(ids::SEGMENTER);
-    wanted.push(ids::EMBEDDER);
     wanted.retain(|id| entry(id).is_some_and(CatalogEntry::applies_here));
     wanted
 }
@@ -869,6 +964,15 @@ mod tests {
             cfg!(target_os = "macos"),
             "the Apple companion is only fetched on Apple hardware"
         );
+        // The 32 MB of speaker files come before the 1.2 GB speed-up: while they
+        // are missing, a finished meeting cannot be split into people at all,
+        // and a missing speed-up only costs speed. See `preset_asset_ids`.
+        if let (Some(embedder), Some(accel)) = (
+            all.iter().position(|id| *id == ids::EMBEDDER),
+            all.iter().position(|id| *id == ids::ACCEL),
+        ) {
+            assert!(embedder < accel, "{all:?}");
+        }
 
         // Recording only waits for speech plus detection.
         let required = preset_required_asset_ids(DEFAULT_PRESET_ID);
@@ -891,7 +995,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_download_is_the_size_the_copy_says_it_is() {
-        assert_eq!(preset_total_bytes(DEFAULT_PRESET_ID), 4_308_357_836);
+        assert_eq!(preset_total_bytes(DEFAULT_PRESET_ID), 4_305_595_702);
         assert_eq!(
             human_bytes(preset_total_bytes(DEFAULT_PRESET_ID)),
             "4.3 GB",
@@ -910,13 +1014,35 @@ mod tests {
         for id in OBSOLETE_ASSET_IDS {
             let e = entry(id).unwrap_or_else(|| panic!("{id} left the catalog"));
             assert!(
-                matches!(
-                    e.kind,
-                    AssetKind::Speech | AssetKind::SpeechAccelerator
-                ),
-                "{id} is not speech, so it cannot be superseded by a model"
+                crate::asr::reconcile::is_supersedable(e.kind),
+                "{id} is not a kind of file a newer model replaces, so the \
+                 reconcile would never remove it"
             );
         }
+    }
+
+    /// The voice-print swap of 2026-08-20, pinned. Yesterday's network stays
+    /// catalogued and is what the reconcile removes; the new one is what a fresh
+    /// install fetches.
+    #[test]
+    fn the_voice_print_network_is_resnet34_and_camplus_is_only_there_to_be_removed() {
+        let now = entry(ids::EMBEDDER).expect("the shipped voice-print network");
+        assert_eq!(now.kind, AssetKind::SpeakerEmbedder);
+        assert_eq!(now.file_name, "wespeaker-en-voxceleb-resnet34-lm.onnx");
+        assert_eq!(now.bytes, 26_530_550);
+        assert_eq!(
+            now.sha256,
+            Some("e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012")
+        );
+
+        let before = entry(ids::EMBEDDER_CAMPLUS).expect("still catalogued");
+        assert_eq!(before.kind, AssetKind::SpeakerEmbedder);
+        assert!(OBSOLETE_ASSET_IDS.contains(&ids::EMBEDDER_CAMPLUS));
+        assert!(!SHARED_ASSET_IDS.contains(&ids::EMBEDDER_CAMPLUS));
+        assert!(!preset_asset_ids(DEFAULT_PRESET_ID).contains(&ids::EMBEDDER_CAMPLUS));
+        // Same trusted mirror, same pinned revision: the swap changed which file
+        // is fetched, not who is trusted to serve it.
+        assert_eq!(now.revision, before.revision);
     }
 
     #[test]
@@ -1111,7 +1237,7 @@ mod tests {
 
     #[test]
     fn sizes_read_the_way_a_download_is_described() {
-        assert_eq!(human_bytes(4_308_357_836), "4.3 GB");
+        assert_eq!(human_bytes(4_305_595_702), "4.3 GB");
         assert_eq!(human_bytes(3_095_033_483), "3.1 GB");
         assert_eq!(human_bytes(487_601_967), "488 MB");
         assert_eq!(human_bytes(2_327_524), "2.3 MB");

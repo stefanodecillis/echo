@@ -1757,6 +1757,69 @@ mod tests {
         assert!(!settled.switching(), "the person is told once, not every launch");
     }
 
+    /// The same journey for the **voice-print network**, which changed for the
+    /// first time on 2026-08-20. Same reconcile, same rule, same guarantee — and
+    /// this test is what proves the file on disk actually goes, rather than the
+    /// plan merely saying it should.
+    #[tokio::test]
+    async fn a_new_voice_print_network_replaces_the_old_one_and_the_old_file_goes() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+
+        // Yesterday's install: everything current except the voice prints.
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            if id != catalog::ids::EMBEDDER {
+                install(&fx.paths, &db, id).await;
+            }
+        }
+        let old = install(&fx.paths, &db, catalog::ids::EMBEDDER_CAMPLUS).await;
+        assert!(old.exists());
+
+        // Launch 1: the new network is downloading, the old one is left alone.
+        let plan = reconcile(&db, &fx.paths).await.unwrap();
+        assert_eq!(plan.state, reconcile::State::Upgrading);
+        assert_eq!(plan.missing, vec![catalog::ids::EMBEDDER]);
+        assert!(old.exists(), "the only voice prints on disk must survive");
+        assert!(
+            readiness(&db, &fx.paths).await.unwrap().ready,
+            "speech is untouched, so meetings still record and transcribe"
+        );
+        // And nothing pretends the new network is loadable yet.
+        assert_eq!(
+            installed_path(&db, AssetKind::SpeakerEmbedder).await.unwrap(),
+            None
+        );
+
+        // Launch 2: the 26 MB arrives, the switch happens, the old file goes.
+        let new = install(&fx.paths, &db, catalog::ids::EMBEDDER).await;
+        let switched = reconcile(&db, &fx.paths).await.unwrap();
+        assert!(switched.switching());
+        assert!(!old.exists(), "yesterday's voice prints are gone");
+        assert!(new.exists(), "today's are not");
+        assert_eq!(
+            installed_path(&db, AssetKind::SpeakerEmbedder).await.unwrap(),
+            Some(new),
+            "and the pass loads the network the threshold was measured against"
+        );
+        assert!(
+            !repo::get_model(&db, catalog::ids::EMBEDDER_CAMPLUS)
+                .await
+                .unwrap()
+                .unwrap()
+                .installed
+        );
+        // The segmenter was never in question and must not have been touched.
+        let segmenter = catalog::entry(catalog::ids::SEGMENTER).unwrap();
+        assert!(install_path(&fx.paths, segmenter).exists());
+
+        // Launch 3: settled.
+        assert_eq!(
+            reconcile(&db, &fx.paths).await.unwrap().state,
+            reconcile::State::Steady
+        );
+    }
+
     /// Running the reconcile twice from the switch state must not say it twice —
     /// the second run has nothing left to find.
     #[tokio::test]

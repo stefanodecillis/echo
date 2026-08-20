@@ -141,20 +141,32 @@ microphone, a permission dialog to click, and 4.3 GB of weights.
   print-to-file API — only a macOS-only native print dialog — so `write_pdf`
   returns a plain "PDF isn't available on this computer. Word or Markdown will
   work." The format is still offered in the menu, which is a rough edge.
-- **The speaker threshold is provisional.** `cluster::DISTANCE_THRESHOLD` is
-  calibrated to WeSpeaker ResNet34-LM, but the catalog ships CAM++ because the
-  ResNet34-LM export sits in a gated Hugging Face repo an unauthenticated
-  download cannot reach. The pass runs; the speaker count is unvalidated. The
-  M0-S4 fixture benchmark has to be re-run before v1, and a test fails loudly if
-  the asset is swapped again.
+- **The speaker threshold is measured, on synthetic voices and one real
+  meeting.** `cluster::DISTANCE_THRESHOLD` now belongs to the network the catalog
+  actually ships: WeSpeaker ResNet34-LM, the voice-print model of the reference
+  pyannote 3.1 and community-1 pipelines, fetched unauthenticated from the
+  sherpa-onnx mirror. It replaced CAM++, against which the number had never been
+  measured at all. The number itself was chosen by
+  `cargo run --release --example voices_fixture`, which builds meetings of 2, 3,
+  5 and 7 *known* speakers out of macOS text-to-speech voices and sweeps the
+  threshold across the whole cosine range, and confirmed by
+  `cargo run --release --example speakers_probe -- --sweep` on a real recorded
+  meeting. A test fails loudly if the asset is swapped without redoing that.
+  What is still unproven: those fixtures are cleaner than real speech, and one
+  real meeting is one real meeting. Diarization error rate against a labelled
+  corpus is not something we can measure here.
 - **Chunks on disk are WAV, not FLAC.** Deliberate and reversible in about three
   lines: the only FLAC crate in the tree encodes but cannot decode, so FLAC
   chunks would be unreadable by catch-up, the mixdown and click-to-play. WAV also
   writes sample-by-sample, so a crash costs milliseconds instead of a whole 30 s
   window. Cost is space: roughly 115 MB per hour per channel.
 - **Model licenses need an audit.** The catalog records a license and revision
-  for every asset and the URLs were verified by HTTP HEAD, but the speaker
-  assets in particular need a human to confirm the terms before shipping.
+  for every asset, and the speaker assets were downloaded unauthenticated and
+  hashed from the bytes that arrived. Both are Apache-2.0/MIT as recorded. One
+  thing a human should still confirm before shipping: pyannote's own
+  `speaker-diarization-community-1` pipeline is CC-BY-4.0, not Apache-2.0, and
+  while Echo ships neither its files nor its clustering, anything that borrows
+  from it later inherits that licence.
 - **The speech weights have been downloaded and hashed** (2026-08-20): both
   files of the current model were fetched from the pinned upstream commit and
   their SHA-256s computed from the bytes that arrived, which is what the catalog

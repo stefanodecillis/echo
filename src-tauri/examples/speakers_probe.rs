@@ -5,12 +5,22 @@
 //! ```text
 //! cargo run --release --example speakers_probe -- <meeting-id> [flags]
 //!
-//!   --segments P   transcript to seed the throwaway database with, the JSON
-//!                  `catchup_probe --dump` writes. Without it the pass still
-//!                  runs, but there are no words to attribute.
-//!   --people N     exercise the override path: ask for exactly N voices
-//!                  instead of letting the threshold decide.
-//!   --minutes M    only the first M minutes, for a quick loop.
+//!   --segments P    transcript to seed the throwaway database with, the JSON
+//!                   `catchup_probe --dump` writes. Without it the pass still
+//!                   runs, but there are no words to attribute.
+//!   --people N      exercise the override path: ask for exactly N voices
+//!                   instead of letting the threshold decide.
+//!   --minutes M     only the first M minutes, for a quick loop.
+//!   --segmenter P   use this ONNX segmenter instead of the installed one.
+//!   --embedder P    use this ONNX fingerprint network instead of the installed
+//!                   one. How a candidate asset is tried on real audio before it
+//!                   goes in the catalog.
+//!   --sweep         also print how many people every clustering threshold would
+//!                   find on this meeting. The check against having tuned the
+//!                   threshold to synthetic voices: the plateau here and the
+//!                   plateau in `examples/voices_fixture.rs` have to overlap.
+//!   --from --to --step
+//!                   narrow the sweep, to find an edge precisely.
 //! ```
 //!
 //! This is the microphone-only half of the speaker pass, on the audio it was
@@ -24,10 +34,10 @@
 
 use std::path::{Path, PathBuf};
 
-use echo_lib::asr::models;
+use echo_lib::asr::{catalog, models};
 use echo_lib::db::{self, repo};
-use echo_lib::diarize;
-use echo_lib::types::{Channel, Segment, SegmentDraft, TranscriptQuery};
+use echo_lib::diarize::{self, pipeline::DiarizeControl};
+use echo_lib::types::{AssetKind, Channel, Segment, SegmentDraft, TranscriptQuery};
 
 const CHUNK_MS: i64 = 30_000;
 const DEFAULT_MEETING: &str = "13731077-453a-4c75-8e6e-5586fe2ed019";
@@ -58,12 +68,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut segments_file: Option<PathBuf> = None;
     let mut people: Option<u32> = None;
     let mut minutes: Option<i64> = None;
+    let mut segmenter_arg: Option<PathBuf> = None;
+    let mut embedder_arg: Option<PathBuf> = None;
+    let mut do_sweep = false;
+    let mut sweep_from = 0.15f32;
+    let mut sweep_to = 1.10f32;
+    let mut sweep_step = 0.0125f32;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--segments" => segments_file = args.next().map(PathBuf::from),
             "--people" => people = args.next().and_then(|n| n.parse().ok()),
             "--minutes" => minutes = args.next().and_then(|n| n.parse().ok()),
+            "--segmenter" => segmenter_arg = args.next().map(PathBuf::from),
+            "--embedder" => embedder_arg = args.next().map(PathBuf::from),
+            "--sweep" => do_sweep = true,
+            "--from" => {
+                sweep_from = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(sweep_from)
+            }
+            "--to" => sweep_to = args.next().and_then(|n| n.parse().ok()).unwrap_or(sweep_to),
+            "--step" => {
+                sweep_step = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(sweep_step)
+            }
             other => positional.push(other.to_string()),
         }
     }
@@ -104,27 +136,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         source.display()
     );
 
-    // --- a throwaway database pointed at the installed weights ------------
+    // --- a throwaway database pointed at the weights we want to try -------
+    //
+    // Asset ids and file names come from the catalog rather than being spelled
+    // out here, so swapping a model is one edit in one place and this probe
+    // cannot drift out of step with the app.
     let db = db::connect(&tmp.path().join("echo.db")).await?;
     models::sync_catalog(&db).await?;
-    for (id, path) in [
-        (
-            "speaker-segmenter-pyannote-3",
-            speech.join("pyannote-segmentation-3.0.onnx"),
-        ),
-        (
-            "speaker-embedder-wespeaker-campplus",
-            speech.join("wespeaker-en-voxceleb-campplus.onnx"),
-        ),
+    for (id, over) in [
+        (catalog::ids::SEGMENTER, segmenter_arg.as_ref()),
+        (catalog::ids::EMBEDDER, embedder_arg.as_ref()),
     ] {
+        let entry = catalog::entry(id).expect("catalogued speaker asset");
+        let path = over
+            .cloned()
+            .unwrap_or_else(|| speech.join(entry.file_name));
         if !path.exists() {
-            return Err(format!("{} is not installed at {}", id, path.display()).into());
+            return Err(format!(
+                "{id} is not at {} — pass --segmenter/--embedder to point at a candidate",
+                path.display()
+            )
+            .into());
         }
         repo::set_model_installed(&db, id, true, Some(&path.to_string_lossy())).await?;
     }
     let (segmenter, embedder) = diarize::job::model_paths(&db).await?;
     println!("segmenter: {}", segmenter.display());
     println!("embedder:  {}", embedder.display());
+    println!(
+        "threshold: {:.4}  ({})",
+        diarize::DISTANCE_THRESHOLD,
+        catalog::entry(catalog::ids::EMBEDDER)
+            .map(|e| e.name)
+            .unwrap_or("?")
+    );
+    // The rows must name the assets that are actually loaded, or the pass would
+    // silently fall back to something else.
+    for kind in [AssetKind::SpeakerSegmenter, AssetKind::SpeakerEmbedder] {
+        assert!(
+            models::installed_path(&db, kind).await?.is_some(),
+            "{kind:?} did not resolve"
+        );
+    }
 
     // --- the meeting and its committed mic chunks -------------------------
     let created = repo::create_meeting(
@@ -197,6 +250,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("people count override: {n}");
     } else {
         println!("people count: automatic");
+    }
+
+    // --- the threshold, checked against real audio ------------------------
+    //
+    // The whole point of running this: the fixture sweep in
+    // `examples/voices_fixture.rs` measures synthetic voices, which are cleaner
+    // and more self-consistent than people. If the range of thresholds that gets
+    // *this* meeting right and the range that gets the fixtures right do not
+    // overlap, the fixtures were the wrong evidence and the number has to come
+    // from somewhere else.
+    if do_sweep {
+        let scanned = diarize::pipeline::scan(
+            &db,
+            &created.id,
+            &segmenter,
+            &embedder,
+            &DiarizeControl::new(),
+        )
+        .await?
+        .expect("the meeting has audio");
+        println!();
+        println!("=== what every threshold would find on this real meeting ===");
+        println!(
+            "{} fingerprints of {} dimensions",
+            scanned.fingerprints(),
+            scanned.fingerprint_dim().unwrap_or(0)
+        );
+        println!("{:>10}{:>8}   split", "threshold", "voices");
+        let mut index = 0usize;
+        loop {
+            let t = sweep_from + index as f32 * sweep_step.max(1e-4);
+            if t > sweep_to + 1e-6 {
+                break;
+            }
+            index += 1;
+            let cut = scanned.cut(t, None);
+            let per: Vec<String> = cut
+                .tracks
+                .iter()
+                .map(|track| {
+                    format!(
+                        "{:.0}s",
+                        echo_lib::diarize::timeline::total_ms(track) as f64 / 1_000.0
+                    )
+                })
+                .collect();
+            println!(
+                "{t:>10.4}{:>8}   {}{}",
+                cut.tracks.len(),
+                per.join(" "),
+                if (t - diarize::DISTANCE_THRESHOLD).abs() < 1e-4 {
+                    "   <- shipped"
+                } else {
+                    ""
+                }
+            );
+        }
     }
 
     // --- the real pass ----------------------------------------------------
