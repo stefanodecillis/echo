@@ -103,6 +103,15 @@ const IDLE_TICK: Duration = Duration::from_secs(30);
 /// (review of 2026-08-20, finding 6).
 pub const FINAL_BACKLOG_DEGRADE_AT: usize = 3;
 
+/// Consecutive failed decodes that mean the engine itself is the problem.
+///
+/// A single stretch of audio can defeat the decoder; three in a row cannot be
+/// about the audio. When the field regression of 2026-08-20 happened there was
+/// no rung above [`Engine::reset_state`], so 279 identical failures went by
+/// without anything trying anything different. Three is the smallest number that
+/// is unmistakably a pattern rather than a bad minute of a meeting.
+const RELOAD_AFTER_FAILURES: u32 = 3;
+
 /// Cores kept clear of decoding, so capture and the UI never starve.
 const CORES_RESERVED_FOR_CAPTURE: usize = 2;
 
@@ -662,8 +671,7 @@ impl Engine {
             });
         }
         self.abort.store(false, Ordering::SeqCst);
-        let abort = self.abort.clone();
-        params.set_abort_callback_safe(move || abort.load(Ordering::Relaxed));
+        install_abort_callback(&mut params, &self.abort);
 
         // Never the raw utterance: whisper.cpp cannot encode a sub-second window
         // and answers -6 instead of text.
@@ -821,6 +829,56 @@ impl Engine {
     pub fn is_multilingual(&self) -> bool {
         self.ctx.is_multilingual()
     }
+}
+
+/// What whisper.cpp asks at the end of every encode: "should I stop?"
+///
+/// `whisper_encode_internal` ends with `return !(abort_callback &&
+/// abort_callback(data))`, and `whisper_full_with_state` turns a false there
+/// into `return -6`. So this one bool *is* the difference between a transcript
+/// and `Generic whisper error … Error code: -6`, and it has to answer for the
+/// flag we own and nothing else.
+///
+/// # Safety
+/// `user_data` must point at a live [`AtomicBool`]. [`install_abort_callback`]
+/// is the only caller-facing way to set it up, and it passes the one inside an
+/// `Arc` the engine holds for the whole decode.
+unsafe extern "C" fn abort_when_asked(user_data: *mut std::ffi::c_void) -> bool {
+    // SAFETY: the contract above. Relaxed is enough: whoever raises the flag
+    // only needs this decode to notice soon, not at a particular instruction.
+    unsafe { &*(user_data.cast::<AtomicBool>()) }.load(Ordering::Relaxed)
+}
+
+/// Point whisper.cpp's abort callback at `flag`, and hand back exactly the pair
+/// it will call so the wiring can be tested without loading any weights.
+///
+/// Not `FullParams::set_abort_callback_safe`, deliberately (root cause of the
+/// 2026-08-20 field regression). That helper boxes the closure twice and stores
+/// a `*mut Box<dyn FnMut() -> bool>`, but instantiates its trampoline for the
+/// *closure's own* type and casts the pointer to it — so the callback reads a
+/// bool out of whatever heap byte follows the inner box instead of out of our
+/// `AtomicBool`. Nearly every read came back non-zero, whisper.cpp aborted the
+/// encode, and a 21-minute meeting produced 279 `-6`s and eight seconds of text.
+/// Padding cannot cure that and rebuilding the state cannot recover from it,
+/// because nothing was ever wrong with the audio or the state.
+///
+/// A plain `extern "C"` function over a pointer to the flag has no closure to
+/// mistype, allocates nothing, and leaks nothing — the old path leaked its two
+/// boxes on every single utterance.
+fn install_abort_callback(
+    params: &mut FullParams,
+    flag: &Arc<AtomicBool>,
+) -> (whisper_rs::WhisperAbortCallback, *mut std::ffi::c_void) {
+    let user_data = Arc::as_ptr(flag).cast_mut().cast::<std::ffi::c_void>();
+    let callback: whisper_rs::WhisperAbortCallback = Some(abort_when_asked);
+    // SAFETY: `flag` is an `Arc` field of the engine, so the `AtomicBool` it
+    // points at outlives every `whisper_full` call these params are used for,
+    // and `abort_when_asked` reads nothing else.
+    unsafe {
+        params.set_abort_callback(callback);
+        params.set_abort_callback_user_data(user_data);
+    }
+    (callback, user_data)
 }
 
 /// Zero-pad the tail so whisper.cpp always gets a window it can encode.
@@ -1706,6 +1764,22 @@ fn falling_behind(queued_including_this_one: usize) -> bool {
     queued_including_this_one >= FINAL_BACKLOG_DEGRADE_AT
 }
 
+/// The last rung of decode recovery: throw the weights away and read them again.
+///
+/// [`Engine::reset_state`] rebuilds the per-decode scratch state, which is the
+/// right answer when one decode left a half-built graph behind. It is not an
+/// answer to anything wrong with the context itself — a GPU backend that has
+/// gone bad, an encoder companion that will not run — and the field has shown
+/// that a broken engine can fail every utterance of a meeting while
+/// `reset_state` reports success each time.
+///
+/// Once per episode, deliberately: reloading 1.6 GB is expensive, and an engine
+/// that fails again after a fresh load is not going to be fixed by a third one.
+/// A single successful decode ends the episode and re-arms this.
+fn should_reload_weights(consecutive_failures: u32, already_reloaded: bool) -> bool {
+    !already_reloaded && consecutive_failures >= RELOAD_AFTER_FAILURES
+}
+
 /// The engine thread. Owns the weights and nothing else owns them.
 fn run(shared: Arc<Shared>) {
     let mut engine: Option<Engine> = None;
@@ -1714,6 +1788,10 @@ fn run(shared: Arc<Shared>) {
     // Whether new finals are currently narrowing their beam, so the log gets one
     // line per episode rather than one per utterance.
     let mut behind = false;
+    // Decodes that failed back to back, and whether this episode has already had
+    // its one reload (see [`should_reload_weights`]).
+    let mut consecutive_failures: u32 = 0;
+    let mut reloaded_this_episode = false;
 
     loop {
         match shared.queue.take(IDLE_TICK) {
@@ -1756,6 +1834,32 @@ fn run(shared: Arc<Shared>) {
                 }
                 let answer = run_job(&mut engine, &shared, &mut policies, *job, plan, on_partial);
                 last_needed = Instant::now();
+                // A run of failures is about the engine, not the audio. Rebuild
+                // the state after each one (that happens in `Engine`), and after
+                // enough of them read the weights again — loudly, because a
+                // meeting is being lost while this happens.
+                match &answer {
+                    Ok(_) => {
+                        consecutive_failures = 0;
+                        reloaded_this_episode = false;
+                    }
+                    Err(AsrError::Transcribe(_)) => {
+                        consecutive_failures += 1;
+                        if should_reload_weights(consecutive_failures, reloaded_this_episode) {
+                            tracing::error!(
+                                consecutive_failures,
+                                "the speech engine could not read {consecutive_failures} stretches in a row; \
+                                 loading the weights again"
+                            );
+                            engine = None;
+                            shared.loaded.store(false, Ordering::SeqCst);
+                            reloaded_this_episode = true;
+                        }
+                    }
+                    // A cancelled or superseded job says nothing about the
+                    // engine's health, and a load failure is reported already.
+                    Err(_) => {}
+                }
                 let _ = reply.send(answer);
             }
             None => {
@@ -1976,6 +2080,60 @@ mod tests {
             assert_eq!(compiled, "vulkan");
             assert_eq!(gpu_backend_name(), Some("vulkan"));
         }
+    }
+
+    /// The regression of 2026-08-20, in one assertion.
+    ///
+    /// whisper.cpp asks the abort callback once per encode and turns "yes" into
+    /// `-6`, so a callback that answers anything other than our own flag turns
+    /// a whole meeting into `Generic whisper error … code: -6`. This calls
+    /// exactly what whisper.cpp calls, with exactly the pointer whisper.cpp is
+    /// given, so a wrongly-typed trampoline or a dangling user-data pointer
+    /// fails here instead of in somebody's meeting.
+    #[test]
+    fn whisper_only_ever_aborts_a_decode_when_we_asked_it_to() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        let (callback, user_data) = install_abort_callback(&mut params, &flag);
+        let callback = callback.expect("an abort callback is installed");
+
+        // SAFETY: `flag` is alive for the whole test, which is the same
+        // guarantee `Engine` gives for the whole decode.
+        let asked = || unsafe { callback(user_data) };
+
+        // A quiet flag, many times over: one decode of a 28-second window asks
+        // this once per encode, and every one of them has to say "carry on".
+        for i in 0..10_000 {
+            assert!(
+                !asked(),
+                "call {i} told whisper.cpp to abort an encode nobody cancelled, \
+                 which it reports as error -6 and no amount of padding or state \
+                 rebuilding can cure"
+            );
+        }
+
+        flag.store(true, Ordering::SeqCst);
+        assert!(asked(), "a real cancellation has to get through");
+
+        flag.store(false, Ordering::SeqCst);
+        assert!(!asked(), "and clearing it has to be believed again");
+    }
+
+    #[test]
+    fn a_run_of_failures_reloads_the_weights_once_and_only_once() {
+        // One or two bad stretches are the audio's fault; the state rebuild in
+        // `Engine` is the whole response.
+        assert!(!should_reload_weights(0, false));
+        assert!(!should_reload_weights(1, false));
+        assert!(!should_reload_weights(RELOAD_AFTER_FAILURES - 1, false));
+        // Three in a row is the engine's fault.
+        assert!(should_reload_weights(RELOAD_AFTER_FAILURES, false));
+        assert!(should_reload_weights(RELOAD_AFTER_FAILURES + 40, false));
+        // But a reload already happened in this episode: an engine that fails
+        // after a fresh load will not be fixed by re-reading 1.6 GB per
+        // utterance.
+        assert!(!should_reload_weights(RELOAD_AFTER_FAILURES, true));
+        assert!(!should_reload_weights(279, true));
     }
 
     /// whisper.cpp answers `-6` rather than text when it cannot encode the

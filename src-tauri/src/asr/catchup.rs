@@ -744,10 +744,24 @@ mod tests {
         /// One utterance covering everything it was fed, handed over when the
         /// stretch ends: a sentence that ran across every read boundary.
         WholeStretch,
+        /// Many short utterances with gaps between them: what a real speech
+        /// detector makes of a real meeting, and the shape the field regression
+        /// of 2026-08-20 came in (281 stretches over 21 minutes).
+        ManyShort,
     }
 
-    /// Reads back silence of exactly the length asked for, and reports every
+    /// How long each utterance is when the detector hears [`Speech::ManyShort`],
+    /// and the silence it leaves between them. Both taken from the field
+    /// meeting, where the median stretch was a little over a second.
+    const SHORT_UTTERANCE_MS: i64 = 1_200;
+    const SHORT_GAP_MS: i64 = 300;
+
+    /// Reads back audio of exactly the length asked for, and reports every
     /// window it was asked to read.
+    ///
+    /// Not silence: a stretch of zeros is indistinguishable from a chunk reader
+    /// that has stopped finding the files, and one of these tests is about
+    /// telling those apart.
     #[derive(Default)]
     struct FakeAudio {
         reads: Mutex<Vec<(Channel, i64, i64)>>,
@@ -806,6 +820,21 @@ mod tests {
                     self.held.extend_from_slice(&samples);
                     Ok(Vec::new())
                 }
+                Speech::ManyShort => {
+                    let per = (SHORT_UTTERANCE_MS as usize * SR) / 1_000;
+                    let step = ((SHORT_UTTERANCE_MS + SHORT_GAP_MS) as usize * SR) / 1_000;
+                    let mut found = Vec::new();
+                    let mut at = 0usize;
+                    while at + per <= samples.len() {
+                        found.extend(whole_window(
+                            &samples[at..at + per],
+                            t_start_ms + ms_of(at),
+                            self.channel,
+                        ));
+                        at += step;
+                    }
+                    Ok(found)
+                }
             }
         }
 
@@ -847,6 +876,14 @@ mod tests {
                 ..Default::default()
             }
         }
+
+        /// A meeting's worth of ordinary short utterances.
+        fn with_a_meeting_full_of_speech() -> Self {
+            Self {
+                speech: Speech::ManyShort,
+                ..Default::default()
+            }
+        }
     }
 
     impl AudioSource for FakeAudio {
@@ -861,7 +898,12 @@ mod tests {
             let channel = chunks.first().map(|c| c.channel).unwrap_or(Channel::Mic);
             self.reads.lock().unwrap().push((channel, from_ms, to_ms));
             let samples = ((to_ms - from_ms).max(0) as usize * SR) / 1_000;
-            Ok(vec![0.0; samples])
+            // A quiet sawtooth: audible, never clipping, and — unlike a buffer
+            // of zeros — distinguishable from a chunk reader that has stopped
+            // finding the files.
+            Ok((0..samples)
+                .map(|i| ((i % 160) as f32 / 160.0) * 0.25 - 0.125)
+                .collect())
         }
 
         fn open_stream(&self, _detector: Option<&Path>, channel: Channel) -> FakeStream {
@@ -997,6 +1039,104 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Verbatim what whisper.cpp answers when it will not encode a window.
+    const WHISPER_MINUS_SIX: &str =
+        "Generic whisper error. Varies depending on the function. Error code: -6";
+
+    /// Stands in for the whole speech engine, and fails the way it does.
+    ///
+    /// It pads short windows out before decoding, exactly as
+    /// [`crate::asr::engine::Engine::transcribe`] does, so the only thing it
+    /// cannot read is a window with nothing in it: an empty buffer, or the
+    /// silence a chunk reader hands back when it has lost the files. Both of
+    /// those come back as whisper's `-6`, because that is what really happens.
+    #[derive(Default)]
+    struct WhisperLike {
+        asked: AtomicU32,
+        refused: AtomicU32,
+    }
+
+    impl WhisperLike {
+        fn asked(&self) -> u32 {
+            self.asked.load(Ordering::SeqCst)
+        }
+
+        fn refused(&self) -> u32 {
+            self.refused.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Transcriber for WhisperLike {
+        async fn transcribe(&self, job: TranscribeJob) -> Result<Transcription, AsrError> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let readable = job.samples.iter().any(|s| *s != 0.0);
+            if !readable {
+                self.refused.fetch_add(1, Ordering::SeqCst);
+                return Err(AsrError::Transcribe(WHISPER_MINUS_SIX.to_string()));
+            }
+            Ok(Transcription {
+                channel: job.channel,
+                t_start_ms: job.t_start_ms,
+                t_end_ms: job.t_end_ms(),
+                text: "allora, direi che possiamo procedere".into(),
+                language: job.language_hint.clone().or(Some("it".into())),
+                avg_confidence: Some(0.9),
+                model_name: Some("large-v3-turbo".into()),
+                model_revision: Some("rev1".into()),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// The field regression of 2026-08-20, as a bar this pass has to clear.
+    ///
+    /// A 21-minute meeting full of speech produced 281 stretches, 279 `-6`s and
+    /// eight seconds of transcript. Nothing about the plan, the windowing or the
+    /// chunk reading was wrong — but nothing in the test suite noticed either,
+    /// because every catch-up test asserted on a handful of stretches and an
+    /// engine that always answers. This one asserts on the ratio: a meeting this
+    /// full of speech has to come out as text almost all of the way through,
+    /// whatever the engine underneath is doing.
+    #[tokio::test]
+    async fn nearly_every_stretch_of_speech_in_a_meeting_ends_up_as_text() {
+        let db = connect_in_memory().await.unwrap();
+        // 21 minutes on the microphone channel, like the meeting that was lost.
+        let id = meeting_with_audio(&db, 42).await;
+        let audio = FakeAudio::with_a_meeting_full_of_speech();
+        let engine = WhisperLike::default();
+
+        let report = run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &audio,
+        )
+        .await
+        .unwrap();
+
+        let asked = engine.asked();
+        assert!(
+            asked > 200,
+            "a 21-minute meeting of ordinary speech should be hundreds of stretches, not {asked}"
+        );
+        assert_eq!(
+            engine.refused(),
+            0,
+            "the pass handed the engine {} window(s) with no audio in them",
+            engine.refused()
+        );
+        let written = f64::from(report.segments_written);
+        assert!(
+            written / f64::from(asked) > 0.9,
+            "only {} of {asked} stretches became text; the field saw 2 of 281",
+            report.segments_written
+        );
     }
 
     #[tokio::test]
