@@ -319,9 +319,68 @@ pub struct DecodeParams {
     pub no_speech_thold: f32,
 }
 
+/// Widest beam a *live* final utterance is allowed. Beam 5 stays in catch-up,
+/// where nobody is watching the caption appear.
+pub const LIVE_MAX_BEAM: u32 = 2;
+
+/// Temperature step for a live final utterance.
+///
+/// whisper.cpp builds its fallback ladder as `t, t + inc, … < 1.0`, so from 0.0
+/// this one gives exactly two attempts: the deterministic pass and one modest
+/// retry. The full `0.0, 0.2, … 1.0` ladder costs up to six decodes of the same
+/// audio, which is fine on disk and unpredictable on a caption.
+pub const LIVE_TEMPERATURE_INC: f32 = 0.6;
+
 impl DecodeParams {
     pub fn uses_beam_search(&self) -> bool {
         self.beam_size >= 2
+    }
+
+    /// How many decodes of the same audio this may cost, worst case.
+    ///
+    /// Mirrors whisper.cpp's own ladder: `temperature_inc <= 0` means one
+    /// attempt and no fallback at all.
+    pub fn max_attempts(&self) -> u32 {
+        if self.temperature_inc <= 0.0 {
+            return 1;
+        }
+        let mut attempts = 0;
+        let mut t = self.temperature;
+        while t < 1.0 + 1e-6 {
+            attempts += 1;
+            t += self.temperature_inc;
+        }
+        attempts.max(1)
+    }
+
+    /// The same preset, decoding a **final live utterance**: one modest fallback
+    /// at most and no beam wider than [`LIVE_MAX_BEAM`].
+    ///
+    /// This is the utterance a person watches land, so it has to be good *and*
+    /// arrive. Nothing else is capped: no token limit, timestamps on, natural
+    /// segments — those are what turn a long sentence into an abrupt ending.
+    pub const fn live_final(mut self) -> Self {
+        if self.beam_size > LIVE_MAX_BEAM {
+            self.beam_size = LIVE_MAX_BEAM;
+        }
+        if self.best_of > LIVE_MAX_BEAM {
+            self.best_of = LIVE_MAX_BEAM;
+        }
+        self.temperature = 0.0;
+        self.temperature_inc = LIVE_TEMPERATURE_INC;
+        self
+    }
+
+    /// The same preset, decoding a **speculative caption**: greedy, one attempt,
+    /// nothing spent on a hypothesis that is about to be replaced.
+    pub const fn speculative(mut self) -> Self {
+        self.beam_size = 0;
+        self.best_of = 1;
+        self.temperature = 0.0;
+        // No ladder: a caption that arrives late is worse than a caption that is
+        // slightly wrong, and the final decode replaces it either way.
+        self.temperature_inc = 0.0;
+        self
     }
 }
 
@@ -657,6 +716,54 @@ mod tests {
             assert!(p.decode.temperature_inc > 0.0, "fallbacks must be possible");
             assert!(p.decode.best_of >= 1);
         }
+    }
+
+    /// The full ladder and the wide beam belong to the disk pass. Live decoding
+    /// borrows the same preset with the expensive parts taken off.
+    #[test]
+    fn live_decoding_is_the_same_preset_with_the_expensive_parts_taken_off() {
+        for p in PRESETS {
+            let catchup = p.decode;
+            let live = catchup.live_final();
+            let speculative = catchup.speculative();
+
+            assert!(
+                live.beam_size <= LIVE_MAX_BEAM,
+                "{} searches {} beams live",
+                p.id,
+                live.beam_size
+            );
+            assert_eq!(
+                live.max_attempts(),
+                2,
+                "{} allows {} live attempts, not one fallback",
+                p.id,
+                live.max_attempts()
+            );
+            assert_eq!(
+                speculative.max_attempts(),
+                1,
+                "{} falls back on a caption that is about to be replaced",
+                p.id
+            );
+            assert!(!speculative.uses_beam_search());
+            assert_eq!(speculative.best_of, 1);
+            // The thresholds are untouched: they are about what counts as
+            // silence and gibberish, not about how hard to try.
+            assert_eq!(speculative.no_speech_thold, catchup.no_speech_thold);
+            assert_eq!(live.no_speech_thold, catchup.no_speech_thold);
+            // And the preset itself still has its full ladder for the disk pass.
+            assert!(
+                catchup.max_attempts() >= live.max_attempts(),
+                "{} would decode less thoroughly from disk than live",
+                p.id
+            );
+        }
+        // The everyday preset is the one that gives up beam 5 live.
+        let everyday = preset("everyday").unwrap().decode;
+        assert_eq!(everyday.beam_size, 5, "catch-up keeps the wide beam");
+        assert_eq!(everyday.live_final().beam_size, 2);
+        assert_eq!(everyday.max_attempts(), 6, "0.0, 0.2, … 1.0 on disk");
     }
 
     #[test]

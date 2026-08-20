@@ -43,17 +43,37 @@ use crate::audio::ChunkRef;
 use crate::db::{repo, Db};
 use crate::types::{AssetKind, Channel, TranscriptQuery};
 
-/// How much audio is read from disk at a time. Matched to the longest utterance
-/// the speech detector will emit, so a window never splits one in half.
+/// How much audio is read from disk at a time.
+///
+/// Only a read size: one detector is streamed through a whole stretch of missing
+/// text, so where a read happens to end is not a boundary for anything (see
+/// [`AudioSource::open_stream`]).
 pub const DEFAULT_WINDOW_MS: i64 = crate::audio::vad::MAX_UTTERANCE_MS;
 
 /// Holes shorter than this are left alone.
 ///
-/// Speech is written down with padding on both sides, so consecutive utterances
-/// always leave a short silent gap between them; re-reading every one of those
-/// would mean grinding through the whole meeting to find nothing. A hole this
-/// short cannot hold a word once the padding either side is taken off.
-pub const MIN_GAP_MS: i64 = 800;
+/// This used to be 800 ms, on the reasoning that a gap that short cannot hold a
+/// word. It can. "Sì", "no", a name, a date, the clipped last word of a sentence
+/// the live pass gave up on — Italian meetings are full of speech shorter than
+/// that, and skipping it means the words are gone for good with the audio
+/// sitting right there on disk (review finding 3).
+///
+/// 250 ms is the other end of the argument: it is roughly the shortest stretch
+/// that can hold a word *and* be found by the speech detector at all — Silero's
+/// own minimum-speech default is 250 ms, and below that a hole is padding, a
+/// rounding difference between two segment rows, or a breath. The cost of the
+/// lower bar is reading a few hundred short gaps of silence per meeting, where
+/// "reading" means a handful of speech-detector windows that find nothing and
+/// never reach the speech engine. That is cheap. Losing a word is not.
+pub const MIN_GAP_MS: i64 = 250;
+
+/// Below this mean confidence, a decode is treated as evidence that the language
+/// prior was wrong rather than as the truth about the audio.
+///
+/// Deliberately the same bar the language policy uses to throw a detection away
+/// ([`crate::asr::language::MIN_USABLE_CONFIDENCE`]): below it, the answer
+/// carries no information worth keeping.
+const CONFIDENCE_COLLAPSED: f32 = crate::asr::language::MIN_USABLE_CONFIDENCE;
 
 /// How long to wait before looking again, while a recording has priority.
 const YIELD_INTERVAL: Duration = Duration::from_millis(500);
@@ -147,6 +167,9 @@ pub struct CatchUpReport {
 /// [`DiskAudio`] is the real one. Everything else about catch-up is exercised
 /// against a fake.
 pub trait AudioSource: Send + Sync {
+    /// Finds the speech in one continuous stretch, read a window at a time.
+    type Stream: SpeechStream;
+
     /// 16 kHz mono for one window of one channel, read from the committed
     /// chunks. Each chunk carries where it belongs, so the window that comes
     /// back is the audio that happened then.
@@ -157,15 +180,27 @@ pub trait AudioSource: Send + Sync {
         to_ms: i64,
     ) -> impl Future<Output = Result<Vec<f32>, AsrError>> + Send;
 
-    /// Speech inside that window. Without a detector this returns the whole
-    /// window as one stretch, which is slower but never loses words.
-    fn detect_speech(
-        &self,
-        detector: Option<&Path>,
-        samples: &[f32],
-        t_offset_ms: i64,
-        channel: Channel,
+    /// One detector for one continuous stretch of missing text.
+    ///
+    /// It is fed every window of that stretch in order and finished at the end
+    /// of it. That is the whole point: a fresh detector per window (review
+    /// finding 2) makes every read boundary a hard reset — no look-behind, no
+    /// recurrent state, and a word straddling the boundary split in two by an
+    /// accident of buffer sizes. Streamed, the detector never learns that the
+    /// audio arrived in pieces.
+    fn open_stream(&self, detector: Option<&Path>, channel: Channel) -> Self::Stream;
+}
+
+/// A speech detector with a memory, fed one window at a time.
+pub trait SpeechStream: Send {
+    fn push(
+        &mut self,
+        samples: Vec<f32>,
+        t_start_ms: i64,
     ) -> impl Future<Output = Result<Vec<Utterance>, AsrError>> + Send;
+
+    /// End of the stretch: whatever speech is still open is still speech.
+    fn finish(&mut self) -> impl Future<Output = Result<Vec<Utterance>, AsrError>> + Send;
 }
 
 /// Whatever turns audio into text. The real one is [`EngineWorker`].
@@ -196,6 +231,8 @@ impl Transcriber for EngineWorker {
 pub struct DiskAudio;
 
 impl AudioSource for DiskAudio {
+    type Stream = DiskStream;
+
     async fn read_window(
         &self,
         chunks: &[ChunkRef],
@@ -207,24 +244,58 @@ impl AudioSource for DiskAudio {
             .map_err(|e| AsrError::Io(e.to_string()))
     }
 
-    async fn detect_speech(
-        &self,
-        detector: Option<&Path>,
-        samples: &[f32],
-        t_offset_ms: i64,
-        channel: Channel,
+    fn open_stream(&self, detector: Option<&Path>, channel: Channel) -> DiskStream {
+        let detector = detector.and_then(|path| {
+            match crate::audio::vad::OfflineDetector::open(Some(path.to_path_buf()), channel) {
+                Ok(open) => Some(open),
+                Err(e) => {
+                    tracing::warn!(%e, "could not start speech detection; reading the audio whole");
+                    None
+                }
+            }
+        });
+        DiskStream { channel, detector }
+    }
+}
+
+/// The real stream: one speech detector for one stretch of a meeting.
+///
+/// Without a detector — the asset was never downloaded, or it will not start —
+/// every window is handed over whole. That is slower and gives the speech engine
+/// silence to chew on, but it never loses words, which is the only promise this
+/// module makes.
+#[derive(Debug)]
+pub struct DiskStream {
+    channel: Channel,
+    detector: Option<crate::audio::vad::OfflineDetector>,
+}
+
+impl SpeechStream for DiskStream {
+    async fn push(
+        &mut self,
+        samples: Vec<f32>,
+        t_start_ms: i64,
     ) -> Result<Vec<Utterance>, AsrError> {
-        let Some(detector) = detector else {
-            return Ok(whole_window(samples, t_offset_ms, channel));
+        let Some(detector) = self.detector.as_mut() else {
+            return Ok(whole_window(&samples, t_start_ms, self.channel));
         };
-        match crate::audio::vad::detect_offline(detector, samples, t_offset_ms, channel).await {
+        // The copy is kept so that losing the detector mid-stretch can still
+        // hand this window over whole. A memcpy is nothing next to a decode.
+        match detector.push(samples.clone(), t_start_ms).await {
             Ok(found) => Ok(found),
             Err(e) => {
-                // Losing the detector costs time, never words: transcribe the
-                // whole window instead of skipping it.
+                // Losing the detector costs time, never words.
                 tracing::warn!(%e, "could not pick speech out of the recording; taking it whole");
-                Ok(whole_window(samples, t_offset_ms, channel))
+                self.detector = None;
+                Ok(whole_window(&samples, t_start_ms, self.channel))
             }
+        }
+    }
+
+    async fn finish(&mut self) -> Result<Vec<Utterance>, AsrError> {
+        match self.detector.as_mut() {
+            Some(detector) => Ok(detector.finish().await.unwrap_or_default()),
+            None => Ok(Vec::new()),
         }
     }
 }
@@ -261,11 +332,22 @@ where
     T: Transcriber,
     A: AudioSource,
 {
-    if repo::get_meeting(db, meeting_id).await?.is_none() {
+    let Some(meeting) = repo::get_meeting(db, meeting_id).await? else {
         return Err(AsrError::Db(crate::db::DbError::NotFound(format!(
             "meeting {meeting_id}"
         ))));
-    }
+    };
+
+    // What language this meeting turned out to be in is the single most useful
+    // thing we know about it, and catch-up used to throw it away (review
+    // finding 4): every job asked the engine to guess again, from a few seconds
+    // of audio at a time, which is exactly the situation where it guesses wrong.
+    //
+    // A prior, though, not a lock: see [`transcribe_with_prior`].
+    let prior = meeting
+        .language
+        .clone()
+        .or_else(|| transcriber.settled_language(meeting_id));
 
     // Live partials are guesses that never became text. They are not evidence of
     // anything, and leaving them behind would make this pass skip real audio.
@@ -319,8 +401,11 @@ where
         report.from_ms = report.from_ms.min(start);
         report.to_ms = report.to_ms.max(end);
         let mut cursor = start;
+        // One detector for this whole stretch, however many reads it takes.
+        let mut speech = audio.open_stream(detector.as_deref(), channel);
+        let mut read_it_all = false;
 
-        while cursor < end {
+        while !read_it_all {
             if options.cancelled() {
                 report.cancelled = true;
                 report.finish(transcriber, meeting_id, &options, done_ms, total_ms);
@@ -336,65 +421,47 @@ where
                 tokio::time::sleep(YIELD_INTERVAL).await;
             }
 
-            let window_end = (cursor + window).min(end);
-            let samples = audio.read_window(&chunks, cursor, window_end).await?;
-            report.windows_read += 1;
+            let utterances = if cursor < end {
+                let window_end = (cursor + window).min(end);
+                let samples = audio.read_window(&chunks, cursor, window_end).await?;
+                report.windows_read += 1;
+                let found = speech.push(samples, cursor).await?;
+                done_ms += window_end - cursor;
+                cursor = window_end;
+                options.report(done_ms as f32 / total_ms as f32);
+                found
+            } else {
+                // The stretch is over, and the detector may still be holding the
+                // speech that ran up to the end of it.
+                read_it_all = true;
+                speech.finish().await?
+            };
 
-            let utterances = audio
-                .detect_speech(detector.as_deref(), &samples, cursor, channel)
-                .await?;
             for utterance in utterances {
-                // Only speech that actually falls in this hole. Anything that
-                // reaches back into a stretch already written down would say the
-                // same words twice.
-                let overlaps = utterance.t_end_ms > start && utterance.t_start_ms < end;
-                if !overlaps || utterance.samples.is_empty() {
-                    continue;
-                }
-                let job = TranscribeJob {
-                    meeting_id: meeting_id.to_string(),
-                    utterance_id: format!("catchup-{}-{}", channel.as_str(), utterance.t_start_ms),
-                    channel,
-                    t_start_ms: utterance.t_start_ms,
-                    samples: utterance.samples,
-                    language_hint: None,
-                    want_partials: options.want_partials,
-                    // Catch-up work is the last chance this audio has, so it
-                    // waits for the queue instead of being dropped.
-                    droppable: false,
-                };
-                match transcriber.transcribe(job).await {
-                    Ok(text) => {
-                        if text.is_empty() {
-                            continue;
-                        }
-                        repo::insert_segment(db, &text.to_draft(meeting_id)).await?;
-                        report.segments_written += 1;
-                    }
-                    Err(AsrError::Cancelled) => {
+                match write_utterance(
+                    Work {
+                        transcriber,
+                        db,
+                        meeting_id,
+                        channel,
+                        hole: (start, end),
+                        prior: prior.as_deref(),
+                        options: &options,
+                    },
+                    utterance,
+                    &mut report,
+                    &mut skipped,
+                )
+                .await?
+                {
+                    Outcome::Carried => {}
+                    Outcome::Cancelled => {
                         report.cancelled = true;
                         report.finish(transcriber, meeting_id, &options, done_ms, total_ms);
                         return Ok(report);
                     }
-                    // One bad window must not abandon the rest of the meeting —
-                    // nor fill the log with one line per window while it does.
-                    Err(e) => {
-                        skipped += 1;
-                        if skipped == 1 || skipped.is_multiple_of(SKIP_LOG_EVERY) {
-                            tracing::warn!(
-                                %e,
-                                cursor,
-                                count = skipped,
-                                "skipped a stretch that would not decode"
-                            );
-                        }
-                    }
                 }
             }
-
-            done_ms += window_end - cursor;
-            cursor = window_end;
-            options.report(done_ms as f32 / total_ms as f32);
         }
     }
 
@@ -407,6 +474,146 @@ where
     }
     report.finish(transcriber, meeting_id, &options, total_ms, total_ms);
     Ok(report)
+}
+
+/// Everything one utterance needs to become a row, gathered so the transcribe
+/// step reads as one thing rather than nine arguments.
+struct Work<'a, T: Transcriber> {
+    transcriber: &'a T,
+    db: &'a Db,
+    meeting_id: &'a str,
+    channel: Channel,
+    /// The stretch being filled in, so speech reaching outside it is left alone.
+    hole: (i64, i64),
+    /// The meeting's language, when it has one.
+    prior: Option<&'a str>,
+    options: &'a CatchUpOptions,
+}
+
+enum Outcome {
+    /// Written, empty, or skipped — either way the pass carries on.
+    Carried,
+    Cancelled,
+}
+
+/// Transcribe one utterance and write it down.
+async fn write_utterance<T: Transcriber>(
+    work: Work<'_, T>,
+    utterance: Utterance,
+    report: &mut CatchUpReport,
+    skipped: &mut u32,
+) -> Result<Outcome, AsrError> {
+    let (start, end) = work.hole;
+    // Only speech that actually falls in this hole. Anything that reaches back
+    // into a stretch already written down would say the same words twice.
+    let overlaps = utterance.t_end_ms > start && utterance.t_start_ms < end;
+    if !overlaps || utterance.samples.is_empty() {
+        return Ok(Outcome::Carried);
+    }
+    let t_start_ms = utterance.t_start_ms;
+    let job = TranscribeJob {
+        meeting_id: work.meeting_id.to_string(),
+        utterance_id: format!("catchup-{}-{}", work.channel.as_str(), t_start_ms),
+        channel: work.channel,
+        t_start_ms,
+        samples: utterance.samples,
+        language_hint: work.prior.map(str::to_string),
+        want_partials: work.options.want_partials,
+        // Catch-up work is the last chance this audio has, so it waits for the
+        // queue instead of being dropped.
+        droppable: false,
+    };
+    match transcribe_with_prior(work.transcriber, job, work.prior).await {
+        Ok(text) => {
+            if text.is_empty() {
+                return Ok(Outcome::Carried);
+            }
+            repo::insert_segment(work.db, &text.to_draft(work.meeting_id)).await?;
+            report.segments_written += 1;
+        }
+        Err(AsrError::Cancelled) => return Ok(Outcome::Cancelled),
+        // One bad stretch must not abandon the rest of the meeting — nor fill
+        // the log with one line per stretch while it does.
+        Err(e) => {
+            *skipped += 1;
+            if *skipped == 1 || skipped.is_multiple_of(SKIP_LOG_EVERY) {
+                tracing::warn!(
+                    %e,
+                    t_start_ms,
+                    count = *skipped,
+                    "skipped a stretch that would not decode"
+                );
+            }
+        }
+    }
+    Ok(Outcome::Carried)
+}
+
+/// Decode with the meeting's language pinned, and try again without it when the
+/// answer falls apart.
+///
+/// A meeting language is a strong prior and a bad law. Most Italian meetings are
+/// Italian throughout, and telling the engine so is worth more than any decoder
+/// setting. But people quote an English email, a colleague joins and switches
+/// language, someone reads out a product name — and a pinned language turns
+/// those stretches into confident nonsense. Confidence collapsing is the signal
+/// that the prior does not fit *this* stretch, so the stretch is read again with
+/// nothing pinned and the better of the two answers is kept.
+async fn transcribe_with_prior<T: Transcriber>(
+    transcriber: &T,
+    job: TranscribeJob,
+    prior: Option<&str>,
+) -> Result<Transcription, AsrError> {
+    if prior.is_none() {
+        return transcriber.transcribe(job).await;
+    }
+    // Held back only so the retry can happen; a copy of the audio costs nothing
+    // next to a decode of it.
+    let retry = TranscribeJob {
+        language_hint: None,
+        ..job.clone()
+    };
+    let first = transcriber.transcribe(job).await?;
+    if !collapsed(&first) {
+        return Ok(first);
+    }
+    let t_start_ms = retry.t_start_ms;
+    match transcriber.transcribe(retry).await {
+        Ok(second) if improves_on(&second, &first) => {
+            tracing::debug!(
+                target: "echo::asr",
+                t_start_ms,
+                language = second.language.as_deref().unwrap_or("unknown"),
+                "this stretch was not in the meeting's language; kept the second reading"
+            );
+            Ok(second)
+        }
+        Ok(_) => Ok(first),
+        Err(AsrError::Cancelled) => Err(AsrError::Cancelled),
+        // The prior's answer was poor, but poor beats nothing.
+        Err(e) => {
+            tracing::debug!(%e, t_start_ms, "could not read this stretch a second time");
+            Ok(first)
+        }
+    }
+}
+
+/// Nothing worth keeping, or a confidence too low to mean anything.
+fn collapsed(text: &Transcription) -> bool {
+    text.is_empty()
+        || text
+            .avg_confidence
+            .is_some_and(|c| c < CONFIDENCE_COLLAPSED)
+}
+
+fn improves_on(second: &Transcription, first: &Transcription) -> bool {
+    if second.is_empty() {
+        return false;
+    }
+    if first.is_empty() {
+        return true;
+    }
+    second.avg_confidence.unwrap_or(0.0) > first.avg_confidence.unwrap_or(0.0)
 }
 
 impl CatchUpReport {
@@ -526,19 +733,92 @@ mod tests {
 
     const SR: usize = crate::audio::TARGET_SAMPLE_RATE as usize;
 
+    /// What the fake detector claims to hear.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    enum Speech {
+        /// Nothing at all.
+        #[default]
+        None,
+        /// One utterance per window handed to it.
+        PerWindow,
+        /// One utterance covering everything it was fed, handed over when the
+        /// stretch ends: a sentence that ran across every read boundary.
+        WholeStretch,
+    }
+
     /// Reads back silence of exactly the length asked for, and reports every
     /// window it was asked to read.
     #[derive(Default)]
     struct FakeAudio {
         reads: Mutex<Vec<(Channel, i64, i64)>>,
-        /// One utterance per window, or none at all.
-        speech: bool,
+        /// Every window handed to a detector, as (channel, from, to).
+        fed: Arc<Mutex<Vec<(Channel, i64, i64)>>>,
+        /// How many detectors were opened: one per continuous stretch, never one
+        /// per window.
+        detectors: Arc<AtomicU32>,
+        speech: Speech,
     }
 
-    /// The reads, as (channel, from, to).
     impl FakeAudio {
+        /// The reads, as (channel, from, to).
         fn reads(&self) -> Vec<(Channel, i64, i64)> {
             self.reads.lock().unwrap().clone()
+        }
+
+        fn fed(&self) -> Vec<(Channel, i64, i64)> {
+            self.fed.lock().unwrap().clone()
+        }
+
+        fn detectors_opened(&self) -> u32 {
+            self.detectors.load(Ordering::SeqCst)
+        }
+    }
+
+    struct FakeStream {
+        channel: Channel,
+        speech: Speech,
+        fed: Arc<Mutex<Vec<(Channel, i64, i64)>>>,
+        /// What a `WholeStretch` detector is holding on to.
+        held: Vec<f32>,
+        held_from_ms: Option<i64>,
+    }
+
+    fn ms_of(samples: usize) -> i64 {
+        (samples as i64 * 1_000) / i64::from(crate::audio::TARGET_SAMPLE_RATE)
+    }
+
+    impl SpeechStream for FakeStream {
+        async fn push(
+            &mut self,
+            samples: Vec<f32>,
+            t_start_ms: i64,
+        ) -> Result<Vec<Utterance>, AsrError> {
+            self.fed.lock().unwrap().push((
+                self.channel,
+                t_start_ms,
+                t_start_ms + ms_of(samples.len()),
+            ));
+            match self.speech {
+                Speech::None => Ok(Vec::new()),
+                Speech::PerWindow => Ok(whole_window(&samples, t_start_ms, self.channel)),
+                Speech::WholeStretch => {
+                    self.held_from_ms.get_or_insert(t_start_ms);
+                    self.held.extend_from_slice(&samples);
+                    Ok(Vec::new())
+                }
+            }
+        }
+
+        async fn finish(&mut self) -> Result<Vec<Utterance>, AsrError> {
+            let from = match self.held_from_ms.take() {
+                Some(from) => from,
+                None => return Ok(Vec::new()),
+            };
+            Ok(whole_window(
+                &std::mem::take(&mut self.held),
+                from,
+                self.channel,
+            ))
         }
     }
 
@@ -555,13 +835,23 @@ mod tests {
     impl FakeAudio {
         fn with_speech() -> Self {
             Self {
-                speech: true,
+                speech: Speech::PerWindow,
+                ..Default::default()
+            }
+        }
+
+        /// One sentence that runs across every read boundary of a stretch.
+        fn with_one_long_sentence() -> Self {
+            Self {
+                speech: Speech::WholeStretch,
                 ..Default::default()
             }
         }
     }
 
     impl AudioSource for FakeAudio {
+        type Stream = FakeStream;
+
         async fn read_window(
             &self,
             chunks: &[ChunkRef],
@@ -574,17 +864,15 @@ mod tests {
             Ok(vec![0.0; samples])
         }
 
-        async fn detect_speech(
-            &self,
-            _detector: Option<&Path>,
-            samples: &[f32],
-            t_offset_ms: i64,
-            channel: Channel,
-        ) -> Result<Vec<Utterance>, AsrError> {
-            if !self.speech {
-                return Ok(Vec::new());
+        fn open_stream(&self, _detector: Option<&Path>, channel: Channel) -> FakeStream {
+            self.detectors.fetch_add(1, Ordering::SeqCst);
+            FakeStream {
+                channel,
+                speech: self.speech,
+                fed: Arc::clone(&self.fed),
+                held: Vec::new(),
+                held_from_ms: None,
             }
-            Ok(whole_window(samples, t_offset_ms, channel))
         }
     }
 
@@ -594,14 +882,29 @@ mod tests {
         text: String,
         cancel_after: Option<u32>,
         calls: AtomicU32,
+        /// Answers badly whenever a language is pinned: the stretch of a
+        /// bilingual meeting the meeting's language cannot explain.
+        confused_by_a_pinned_language: bool,
+        /// What [`Transcriber::settled_language`] says, if anything.
+        settled: Option<String>,
     }
 
     impl FakeEngine {
         fn saying(text: &str) -> Self {
             Self {
                 text: text.to_string(),
+                settled: Some("en".into()),
                 ..Default::default()
             }
+        }
+
+        fn hints(&self) -> Vec<Option<String>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|j| j.language_hint.clone())
+                .collect()
         }
     }
 
@@ -614,13 +917,27 @@ mod tests {
             let t_end = job.t_end_ms();
             let t_start = job.t_start_ms;
             let channel = job.channel;
+            let pinned = job.language_hint.clone();
             self.seen.lock().unwrap().push(job);
+            if self.confused_by_a_pinned_language && pinned.is_some() {
+                return Ok(Transcription {
+                    channel,
+                    t_start_ms: t_start,
+                    t_end_ms: t_end,
+                    text: "parole che nessuno ha detto".into(),
+                    language: pinned,
+                    avg_confidence: Some(0.1),
+                    model_name: Some("test weights".into()),
+                    model_revision: Some("rev1".into()),
+                    ..Default::default()
+                });
+            }
             Ok(Transcription {
                 channel,
                 t_start_ms: t_start,
                 t_end_ms: t_end,
                 text: self.text.clone(),
-                language: Some("en".into()),
+                language: pinned.or(Some("en".into())),
                 avg_confidence: Some(0.9),
                 model_name: Some("test weights".into()),
                 model_revision: Some("rev1".into()),
@@ -629,7 +946,7 @@ mod tests {
         }
 
         fn settled_language(&self, _meeting_id: &str) -> Option<String> {
-            Some("en".into())
+            self.settled.clone()
         }
     }
 
@@ -915,6 +1232,216 @@ mod tests {
         .unwrap();
         assert!(audio.reads().is_empty(), "{:?}", audio.reads());
         assert_eq!(report.segments_written, 0);
+    }
+
+    #[tokio::test]
+    async fn a_gap_long_enough_to_hold_a_short_word_is_read() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 1).await;
+        // "Sì." — a third of a second the live pass never wrote down. The old
+        // 800 ms floor stepped straight over holes like this one.
+        already_written(&db, &id, Ch::Mic, 0, 10_000).await;
+        already_written(&db, &id, Ch::Mic, 10_300, 30_000).await;
+
+        let audio = FakeAudio::with_speech();
+        let report = run(
+            &FakeEngine::saying("sì"),
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &audio,
+        )
+        .await
+        .unwrap();
+        assert_eq!(audio.reads(), vec![(Channel::Mic, 10_000, 10_300)]);
+        assert_eq!(report.segments_written, 1);
+    }
+
+    #[test]
+    fn the_shortest_hole_worth_reading_is_still_shorter_than_a_word() {
+        // Long enough that ordinary padding differences are not chased, short
+        // enough that a one-syllable answer cannot hide in it.
+        assert!((150..=400).contains(&MIN_GAP_MS), "{MIN_GAP_MS} ms");
+    }
+
+    #[tokio::test]
+    async fn one_detector_is_streamed_through_a_whole_stretch() {
+        let db = connect_in_memory().await.unwrap();
+        // A minute and a half of audio with no text against it at all, read in
+        // 30 s windows: three reads, one continuous stretch.
+        let id = meeting_with_audio(&db, 3).await;
+        let audio = FakeAudio::with_one_long_sentence();
+        let engine = FakeEngine::saying("one long answer that ran across every read");
+
+        let report = run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &audio,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            audio.detectors_opened(),
+            1,
+            "a fresh detector per window resets speech detection every 30 s and splits words"
+        );
+        assert_eq!(
+            audio.fed(),
+            vec![
+                (Channel::Mic, 0, 30_000),
+                (Channel::Mic, 30_000, 60_000),
+                (Channel::Mic, 60_000, 90_000),
+            ],
+            "the detector was not fed the stretch in order"
+        );
+        // Speech that straddled both boundaries came back as one utterance, and
+        // it is written down even though it only finished when the audio ran out.
+        assert_eq!(report.segments_written, 1);
+        let written = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].t_start_ms, 0);
+        assert_eq!(written[0].t_end_ms, 90_000);
+    }
+
+    #[tokio::test]
+    async fn a_separate_detector_for_each_separate_stretch() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 3).await;
+        // Two holes with written text between them: two stretches, and audio on
+        // either side of that text is not continuous with anything.
+        already_written(&db, &id, Ch::Mic, 30_000, 60_000).await;
+
+        let audio = FakeAudio::with_one_long_sentence();
+        let report = run(
+            &FakeEngine::saying("either side"),
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &audio,
+        )
+        .await
+        .unwrap();
+        assert_eq!(audio.detectors_opened(), 2);
+        assert_eq!(report.segments_written, 2);
+    }
+
+    #[tokio::test]
+    async fn the_meetings_own_language_is_what_the_engine_is_told() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 1).await;
+        repo::set_meeting_language(&db, &id, "it").await.unwrap();
+
+        let engine = FakeEngine::saying("allora, ci vediamo giovedì");
+        run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &FakeAudio::with_speech(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            engine.hints(),
+            vec![Some("it".to_string())],
+            "catch-up asked the engine to guess the language again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stretch_the_meetings_language_cannot_explain_is_read_again_without_it() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 1).await;
+        repo::set_meeting_language(&db, &id, "it").await.unwrap();
+
+        let engine = FakeEngine {
+            text: "and then we shipped it".into(),
+            confused_by_a_pinned_language: true,
+            ..Default::default()
+        };
+        let report = run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &FakeAudio::with_speech(),
+        )
+        .await
+        .unwrap();
+
+        // Pinned first, then asked again with nothing pinned — a prior, not a
+        // lock.
+        assert_eq!(engine.hints(), vec![Some("it".to_string()), None]);
+        assert_eq!(report.segments_written, 1, "only one of the two was kept");
+        let written = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            written[0].text, "and then we shipped it",
+            "the confident reading was thrown away for the collapsed one"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_reading_is_one_worth_trying_again() {
+        let good = Transcription {
+            text: "chiaro".into(),
+            avg_confidence: Some(0.8),
+            ..Default::default()
+        };
+        let shaky = Transcription {
+            text: "chiaro".into(),
+            avg_confidence: Some(0.1),
+            ..Default::default()
+        };
+        let nothing = Transcription::default();
+        assert!(!collapsed(&good));
+        assert!(collapsed(&shaky));
+        assert!(collapsed(&nothing), "silence is worth a second look too");
+        // An engine that reports no confidence at all is taken at its word.
+        assert!(!collapsed(&Transcription {
+            text: "chiaro".into(),
+            ..Default::default()
+        }));
+
+        assert!(improves_on(&good, &shaky));
+        assert!(!improves_on(&shaky, &good));
+        assert!(!improves_on(&nothing, &shaky), "nothing never wins");
+        assert!(improves_on(&shaky, &nothing));
     }
 
     #[tokio::test]
@@ -1235,10 +1762,7 @@ mod tests {
         // Nothing written: the whole thing is a hole.
         assert_eq!(subtract(&[(0, 100)], &[]), vec![(0, 100)]);
         // Written in the middle.
-        assert_eq!(
-            subtract(&[(0, 100)], &[(40, 60)]),
-            vec![(0, 40), (60, 100)]
-        );
+        assert_eq!(subtract(&[(0, 100)], &[(40, 60)]), vec![(0, 40), (60, 100)]);
         // Written at both ends.
         assert_eq!(subtract(&[(0, 100)], &[(0, 10), (90, 100)]), vec![(10, 90)]);
         // Fully written.
@@ -1272,7 +1796,10 @@ mod tests {
     }
 
     #[test]
-    fn the_default_window_never_splits_an_utterance() {
+    fn the_default_read_is_as_long_as_the_longest_utterance() {
+        // Not a boundary for anything — one detector is streamed across every
+        // read — but a read shorter than an utterance would mean holding the
+        // same speech across several reads for no reason.
         assert_eq!(DEFAULT_WINDOW_MS, crate::audio::vad::MAX_UTTERANCE_MS);
         assert_eq!(CatchUpOptions::default().window(), DEFAULT_WINDOW_MS);
         assert_eq!(

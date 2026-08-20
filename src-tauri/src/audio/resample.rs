@@ -53,6 +53,86 @@ pub struct Resampler16k {
     delay_to_trim: usize,
     total_in: u64,
     total_out: u64,
+    /// Measures each native channel once, at the start of the stream.
+    survey: Option<ChannelSurvey>,
+}
+
+/// Per-native-channel loudness over the first second of a stream, logged once.
+///
+/// The downmix averages every channel a device delivers. On a laptop that is two
+/// microphones and the average is the point. On a multichannel interface with one
+/// live input it is a way to lose 12 dB or more of speech to seven channels of
+/// nothing, and opposite-phase stereo can cancel it outright (review finding 8).
+/// Nothing here can decide what to do about that — the fix is a channel choice
+/// the person has to make — but a log line that says "channel 0 heard something
+/// and channels 1 to 7 heard silence" turns a mystifyingly quiet recording into
+/// an obvious one.
+///
+/// Loudness only. No audio is kept, and nothing about what was said can be
+/// recovered from a root-mean-square.
+#[derive(Debug)]
+struct ChannelSurvey {
+    /// Sum of squares per channel.
+    energy: Vec<f64>,
+    /// Sum of squares of the mono result, for the attenuation figure.
+    mono_energy: f64,
+    frames: u64,
+    /// Frames to measure before saying anything: one second of audio.
+    until: u64,
+}
+
+impl ChannelSurvey {
+    fn new(channels: usize, rate: u32) -> Self {
+        Self {
+            energy: vec![0.0; channels],
+            mono_energy: 0.0,
+            frames: 0,
+            until: u64::from(rate).max(1),
+        }
+    }
+
+    fn observe(&mut self, frame: &[f32], mono: f32) {
+        for (slot, sample) in self.energy.iter_mut().zip(frame.iter()) {
+            *slot += f64::from(*sample) * f64::from(*sample);
+        }
+        self.mono_energy += f64::from(mono) * f64::from(mono);
+        self.frames += 1;
+    }
+
+    fn ready(&self) -> bool {
+        self.frames >= self.until
+    }
+
+    /// Root-mean-square per channel, then the mono result, rounded to something
+    /// a log can carry.
+    fn report(&self, input_rate: u32) {
+        if self.frames == 0 {
+            return;
+        }
+        let rms =
+            |energy: f64| ((energy / self.frames as f64).sqrt() * 10_000.0).round() / 10_000.0;
+        let per_channel: Vec<f64> = self.energy.iter().copied().map(rms).collect();
+        let loudest = per_channel.iter().copied().fold(0.0f64, f64::max);
+        let silent = per_channel.iter().filter(|level| **level < 1e-4).count();
+        tracing::info!(
+            target: "echo::audio",
+            input_rate,
+            channels = per_channel.len(),
+            levels = ?per_channel,
+            mono_level = rms(self.mono_energy),
+            silent_channels = silent,
+            loudest,
+            "measured each input channel before mixing them down to one"
+        );
+        if silent > 0 && loudest > 1e-4 {
+            tracing::warn!(
+                target: "echo::audio",
+                silent_channels = silent,
+                channels = per_channel.len(),
+                "some input channels carry no sound, so averaging them makes this recording quieter than the microphone really is"
+            );
+        }
+    }
 }
 
 impl std::fmt::Debug for Resampler16k {
@@ -74,6 +154,8 @@ impl Resampler16k {
             )));
         }
         let input_channels = usize::from(input_channels);
+        // Only worth measuring when there is a mix to lose speech in.
+        let survey = (input_channels > 1).then(|| ChannelSurvey::new(input_channels, input_rate));
         if input_rate == TARGET_SAMPLE_RATE {
             return Ok(Self {
                 input_rate,
@@ -86,6 +168,7 @@ impl Resampler16k {
                 delay_to_trim: 0,
                 total_in: 0,
                 total_out: 0,
+                survey,
             });
         }
 
@@ -112,6 +195,7 @@ impl Resampler16k {
             delay_to_trim,
             total_in: 0,
             total_out: 0,
+            survey,
         })
     }
 
@@ -146,6 +230,10 @@ impl Resampler16k {
     /// out instead of being swallowed, then trim back to the length the input
     /// actually justifies.
     pub fn flush(&mut self) -> Vec<f32> {
+        // A stream shorter than the survey's second still deserves its line.
+        if let Some(survey) = self.survey.take() {
+            survey.report(self.input_rate);
+        }
         if self.inner.is_none() {
             let out = std::mem::take(&mut self.pending);
             self.total_out += out.len() as u64;
@@ -178,7 +266,16 @@ impl Resampler16k {
         let scale = 1.0 / self.input_channels as f32;
         for frame in interleaved.chunks_exact(self.input_channels) {
             let sum: f32 = frame.iter().sum();
-            self.pending.push(sum * scale);
+            let mono = sum * scale;
+            if let Some(survey) = self.survey.as_mut() {
+                survey.observe(frame, mono);
+            }
+            self.pending.push(mono);
+        }
+        if self.survey.as_ref().is_some_and(ChannelSurvey::ready) {
+            if let Some(survey) = self.survey.take() {
+                survey.report(self.input_rate);
+            }
         }
     }
 

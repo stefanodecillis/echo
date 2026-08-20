@@ -1,4 +1,5 @@
-//! Getting a meeting out of Echo: Markdown, DOCX, PDF, plain text.
+//! Getting a meeting out of Echo: Markdown, DOCX, PDF, plain text, and the
+//! recording itself.
 //!
 //! IMPLEMENTED-BY: export agent (M7).
 //!
@@ -8,6 +9,11 @@
 //! * PDF by printing from a hidden webview to a file. That pipeline gets spiked
 //!   before anyone relies on it; there is no pure-Rust PDF path here.
 //! * Plain text for pasting into a chat.
+//! * The recording itself ([`copy_recording`]): the playback mix
+//!   [`crate::session::jobs`] already builds for the audio player, handed to
+//!   the person as a plain `.wav` file. Nothing here re-encodes it — WAV in,
+//!   WAV out — so if a compressed download ever matters, that is new work,
+//!   not a fix to this module.
 //!
 //! Exports go where the person picks, through the system save dialog. Echo never
 //! writes outside its own directories on its own.
@@ -47,6 +53,8 @@ pub enum ExportError {
     Write(String),
     #[error("PDF export is not available on this system: {0}")]
     PdfUnavailable(String),
+    #[error("there is no recording saved for this meeting")]
+    NoRecording,
     #[error("database problem: {0}")]
     Db(#[from] crate::db::DbError),
 }
@@ -553,6 +561,29 @@ pub async fn write_pdf(_doc: &ExportDocument, _destination: &Path) -> Result<u64
 }
 
 // ---------------------------------------------------------------------------
+// Recording download
+// ---------------------------------------------------------------------------
+
+/// Copies the meeting's already-built playback file to wherever the person
+/// picked in the save dialog — their own recording, handed to them as a plain
+/// `.wav` file. `commands::download_recording` resolves `source` (building
+/// the playback mix first, on demand, if it doesn't exist yet) and only
+/// calls this once that file is really there; the existence check here is a
+/// last-moment guard against it disappearing in between (audio deleted from
+/// another window, say), not the primary path.
+pub async fn copy_recording(source: &Path, destination: &Path) -> Result<u64, ExportError> {
+    validate_destination(destination)?;
+    if !source.exists() {
+        return Err(ExportError::NoRecording);
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ExportError::Write(e.to_string()))?;
+    }
+    std::fs::copy(source, destination).map_err(|e| ExportError::Write(e.to_string()))?;
+    Ok(std::fs::metadata(destination).map(|m| m.len()).unwrap_or(0))
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostics bundle
 // ---------------------------------------------------------------------------
 
@@ -891,6 +922,43 @@ Good meeting.
         let err = write_pdf(&doc, &path).await.unwrap_err();
         assert!(matches!(err, ExportError::PdfUnavailable(_)));
         assert!(!path.exists());
+    }
+
+    // -- copy_recording ---------------------------------------------------
+
+    #[tokio::test]
+    async fn copy_recording_copies_the_bytes_to_the_chosen_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("mixed.wav");
+        std::fs::write(&source, b"not a real wav, just some bytes").unwrap();
+        let destination = tmp.path().join("out").join("Meeting.wav");
+
+        let bytes = copy_recording(&source, &destination).await.unwrap();
+        assert_eq!(bytes, std::fs::metadata(&destination).unwrap().len());
+        assert_eq!(std::fs::read(&destination).unwrap(), std::fs::read(&source).unwrap());
+    }
+
+    #[tokio::test]
+    async fn copy_recording_reports_missing_source_honestly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("mixed.wav"); // never created
+        let destination = tmp.path().join("Meeting.wav");
+
+        let err = copy_recording(&source, &destination).await.unwrap_err();
+        assert!(matches!(err, ExportError::NoRecording));
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn copy_recording_rejects_traversal_destinations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("mixed.wav");
+        std::fs::write(&source, b"x").unwrap();
+
+        let err = copy_recording(&source, Path::new("/tmp/../etc/echo.wav"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExportError::Write(_)));
     }
 
     // -- silence unused-import lint for types only referenced by name ----

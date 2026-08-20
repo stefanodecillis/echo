@@ -186,6 +186,10 @@ impl From<export::ExportError> for UiError {
                 "PDF isn't available on this computer. Word or Markdown will work.",
             )
             .with_detail(detail),
+            E::NoRecording => UiError::new(
+                UiErrorKind::NotReady,
+                "There's no recording saved for this meeting.",
+            ),
             E::Db(e) => e.into(),
             other => UiError::unexpected(other.to_string()),
         }
@@ -955,6 +959,69 @@ pub async fn export_diagnostics(
     Ok(export::export_diagnostics(&state.paths, &dest).await?)
 }
 
+/// Saves the meeting's recording to wherever the person picked in the save
+/// dialog, as a plain `.wav` file.
+///
+/// The playback mix usually already exists — it is queued automatically the
+/// moment a recording stops (`SessionManager::finish`) — so this is normally
+/// instant. For an older meeting, or one where that pass hasn't finished (or
+/// was interrupted), this queues the same [`JobKind::Mixdown`] job the
+/// post-meeting pipeline runs and waits on it, so the Info tab's own
+/// progress display (already wired to every job through `list_jobs`/
+/// `jobProgress`) is the only progress UI this needs — nothing new to build
+/// there. Capped so a stuck job can't hang this command forever; the person
+/// can just press Save again once it catches up.
+#[tauri::command]
+pub async fn download_recording(
+    state: State<'_, AppState>,
+    meeting_id: Id,
+    destination: String,
+) -> CmdResult<()> {
+    check_id(&meeting_id)?;
+    let dest = std::path::PathBuf::from(&destination);
+    if !dest.is_absolute() {
+        return Err(UiError::invalid("Pick where to save the file first."));
+    }
+
+    let mut path = get_playback_path(state.clone(), meeting_id.clone()).await?;
+    if path.is_none() {
+        let job_id = state
+            .session
+            .queue_job(Some(&meeting_id), JobKind::Mixdown)
+            .await?;
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const MAX_WAIT_TICKS: u32 = 600; // ~5 minutes for a very long recording
+        for _ in 0..MAX_WAIT_TICKS {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            let Some(job) = repo::get_job(&state.db, &job_id).await? else {
+                break;
+            };
+            if job.status.is_terminal() {
+                if job.status == JobStatus::Failed {
+                    return Err(UiError::new(
+                        UiErrorKind::NotReady,
+                        job.error.unwrap_or_else(|| {
+                            "Echo couldn't get this recording ready to save.".into()
+                        }),
+                    ));
+                }
+                break;
+            }
+        }
+        path = get_playback_path(state.clone(), meeting_id.clone()).await?;
+    }
+
+    let Some(source) = path else {
+        return Err(UiError::new(
+            UiErrorKind::NotReady,
+            "Echo is still getting this recording ready. Try Save again in a moment.",
+        ));
+    };
+
+    export::copy_recording(std::path::Path::new(&source), &dest).await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
@@ -1278,6 +1345,7 @@ macro_rules! echo_command_handler {
             // export
             $crate::commands::export_meeting,
             $crate::commands::export_diagnostics,
+            $crate::commands::download_recording,
             // settings
             $crate::commands::get_settings,
             $crate::commands::update_settings,

@@ -318,6 +318,13 @@ export const exportMeeting = (request: ExportRequest) =>
 export const exportDiagnostics = (destination: string) =>
   call<ExportResult>("export_diagnostics", { destination });
 
+/** `destination` must be an absolute path from the save dialog. Builds the
+ * playback mix first, on demand, if it doesn't exist yet — that wait shows
+ * up as this promise taking longer, not as a separate loading state to wire
+ * up; the Info tab's own job progress already covers it. */
+export const downloadRecording = (meetingId: Id, destination: string) =>
+  call<void>("download_recording", { meetingId, destination });
+
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------

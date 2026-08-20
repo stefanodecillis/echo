@@ -46,7 +46,9 @@ use crate::db::Db;
 use crate::types::{Id, Speaker};
 
 pub use cluster::DISTANCE_THRESHOLD;
-pub use pipeline::{DiarizeControl, SELF_CLUSTER_KEY, SELF_DISPLAY_NAME};
+pub use pipeline::{
+    cluster_key, display_name, DiarizeControl, SELF_CLUSTER_KEY, SELF_DISPLAY_NAME,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiarizeError {

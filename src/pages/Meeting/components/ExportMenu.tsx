@@ -33,8 +33,15 @@ export interface ExportMenuProps {
   summaryId?: Id;
 }
 
-/** The Recap tab's Export button: a small dropdown of formats, each backed
- * by a native save dialog so `exportMeeting` gets a real destination path. */
+/** The Export button: a small dropdown of formats, each backed by a native
+ * save dialog so `exportMeeting` gets a real destination path. Every export
+ * carries the recap, action items, and the full transcript together — there
+ * is one export, not per-section ones, so it always includes what the person
+ * came here for even if `summaryId` is left unset (no recap yet). Shown on
+ * both the Recap tab (always, not only once a recap exists — the app is
+ * usable before any recap is configured, DESIGN §0) and the Transcript tab,
+ * so getting a meeting out is reachable from wherever a person is looking
+ * for it, not just the one tab that happens to have a recap. */
 export function ExportMenu({ meetingId, meetingTitle, summaryId }: ExportMenuProps) {
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState<ExportFormat>();
@@ -73,6 +80,7 @@ export function ExportMenu({ meetingId, meetingTitle, summaryId }: ExportMenuPro
         destination,
         includeRecap: true,
         includeActionItems: true,
+        includeTranscript: true,
         summaryId,
       });
       addToast({ level: "info", message: notices.exportedTo });

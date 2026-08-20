@@ -46,6 +46,8 @@ pub struct MicCapture {
     next_t_ms: i64,
     /// 16 kHz samples emitted so far, the authority for timestamps.
     emitted: u64,
+    /// Drift corrections applied so far. Logged, never shown.
+    corrections: u64,
     alive: Arc<AtomicBool>,
 }
 
@@ -121,6 +123,20 @@ impl MicCapture {
             .map_err(map_cpal_error)?;
         stream.play().map_err(map_cpal_error)?;
 
+        // What the device actually gave us, once, at the top of the recording.
+        // Everything downstream is 16 kHz mono, so this is the only place the
+        // native format is visible — and a mismatch here (an eight-channel
+        // interface, a 96 kHz rate) is the first thing to look at when a
+        // recording comes back quiet or empty.
+        tracing::info!(
+            target: "echo::audio",
+            device = %device_name,
+            native_rate,
+            native_channels,
+            sample_format = ?sample_format,
+            "microphone open"
+        );
+
         Ok(Self {
             stream,
             consumer,
@@ -134,6 +150,7 @@ impl MicCapture {
             pending: Vec::with_capacity(TARGET_SAMPLE_RATE as usize),
             next_t_ms: 0,
             emitted: 0,
+            corrections: 0,
             alive,
         })
     }
@@ -162,15 +179,42 @@ impl MicCapture {
                 padded.extend_from_slice(&resampled);
                 resampled = padded;
                 self.drift.apply_correction(correction);
+                self.log_correction(correction);
             } else if correction < 0 {
                 let drop = (-correction as usize).min(resampled.len());
                 resampled.drain(..drop);
                 self.drift.apply_correction(-(drop as i64));
+                self.log_correction(-(drop as i64));
             }
         }
 
         self.pending.extend_from_slice(&resampled);
         self.cut_frames(Channel::Mic)
+    }
+
+    /// Say what was moved, every time, and where.
+    ///
+    /// A correction of a couple of hundred milliseconds is not a rounding
+    /// detail: removing that much audio at a frame boundary can take the onset
+    /// of a word with it (review finding 9). If these lines show up in a quiet
+    /// meeting, or in a steady stream, the tracker is reacting to callback
+    /// scheduling jitter rather than to a device that is genuinely off-rate —
+    /// which is exactly the thing this log exists to make visible. Sizes and
+    /// offsets only; never anything about what was said.
+    fn log_correction(&mut self, samples: i64) {
+        self.corrections += 1;
+        let ms = samples * 1_000 / i64::from(TARGET_SAMPLE_RATE);
+        tracing::info!(
+            target: "echo::audio",
+            channel = "mic",
+            at_ms = self.next_t_ms,
+            correction_ms = ms,
+            drift_ms = self.drift.drift_ms(),
+            corrections = self.corrections,
+            device = %self.device_name,
+            "{} audio to keep the microphone on the meeting clock",
+            if samples > 0 { "inserted silent" } else { "dropped" }
+        );
     }
 
     fn cut_frames(&mut self, channel: Channel) -> Vec<Frame> {

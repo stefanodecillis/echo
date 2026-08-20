@@ -9,12 +9,14 @@ import {
   VirtualList,
   type VirtualListHandle,
 } from "../../components";
+import { CheckIcon } from "../../components/icons";
 import { formatElapsed } from "../../components/lib/format";
 import { useCaptureState, useCommand } from "../../hooks";
-import { common, labels, live } from "../../lib/copy";
+import { common, labels, live, notices } from "../../lib/copy";
 import { addMarker, pauseRecording, resumeRecording, stopRecording, toUiError } from "../../lib/ipc";
 import { useEchoStore } from "../../lib/store";
 import { TranscriptLine } from "./TranscriptLine";
+import { buildLiveTranscriptText } from "./transcriptText";
 import { useSpeakerNames } from "./useSpeakerNames";
 import { useTranscriptStream } from "./useTranscriptStream";
 
@@ -40,6 +42,7 @@ export default function Live() {
   const stopCmd = useCommand(stopRecording);
   const markerCmd = useCommand(addMarker);
   const [confirmStop, setConfirmStop] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   const listRef = useRef<VirtualListHandle>(null);
   useEffect(() => {
@@ -70,6 +73,19 @@ export default function Live() {
       addToast({ level: "info", message: live.flagged });
     } catch (err) {
       addToast({ level: "problem", message: toUiError(err).message });
+    }
+  };
+
+  const handleCopyTranscript = async () => {
+    if (lines.length === 0) return;
+    const text = buildLiveTranscriptText(lines, speakerLabelFor);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      addToast({ level: "info", message: notices.copiedToClipboard });
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      addToast({ level: "problem", message: notices.somethingWentWrong });
     }
   };
 
@@ -115,9 +131,19 @@ export default function Live() {
       />
 
       <div className="flex items-center justify-between gap-2">
-        <Button variant="secondary" loading={markerCmd.loading} onClick={handleFlag}>
-          {live.flagButton}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="secondary" loading={markerCmd.loading} onClick={handleFlag}>
+            {live.flagButton}
+          </Button>
+          <Button
+            variant="secondary"
+            leftIcon={copied ? <CheckIcon /> : undefined}
+            disabled={lines.length === 0}
+            onClick={handleCopyTranscript}
+          >
+            {copied ? common.copied : live.copyTranscriptButton}
+          </Button>
+        </div>
         <div className="flex items-center gap-2">
           <Button
             variant="secondary"

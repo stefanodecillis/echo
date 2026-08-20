@@ -2,16 +2,19 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { Button, EmptyState, SearchInput, VirtualList, type VirtualListHandle } from "@/components";
+import { CheckIcon } from "@/components/icons";
 import { EVENTS, getTranscript, listSpeakers, renameSpeaker } from "@/lib/ipc";
 import { common, meeting as copy, notices } from "@/lib/copy";
 import { useEvent } from "@/hooks/useEvent";
 import { useEchoStore } from "@/lib/store";
 import type { Id, MeetingDetail, Segment } from "@/lib/types";
 
+import { ExportMenu } from "./components/ExportMenu";
 import { MergeSpeakersModal } from "./components/MergeSpeakersModal";
 import { SpeakerChip } from "./components/SpeakerChip";
 import { formatTimestamp } from "./lib/date";
 import { resolveSpeaker } from "./lib/speakers";
+import { buildTranscriptText } from "./lib/transcriptText";
 
 const ROW_HEIGHT = 96;
 
@@ -54,6 +57,7 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
   const [segments, setSegments] = useState<Segment[]>();
   const [filter, setFilter] = useState("");
   const [mergeOpen, setMergeOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
   const listRef = useRef<VirtualListHandle>(null);
   const addToast = useEchoStore((s) => s.addToast);
 
@@ -117,6 +121,19 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
       });
   };
 
+  const handleCopyTranscript = async () => {
+    if (!segments || segments.length === 0) return;
+    const text = buildTranscriptText(segments, detail.speakers);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      addToast({ level: "info", message: notices.copiedToClipboard });
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      addToast({ level: "problem", message: notices.somethingWentWrong });
+    }
+  };
+
   if (segments === undefined) {
     return <div className="px-8 py-6 text-sm text-ink-faint">{common.loading}</div>;
   }
@@ -130,11 +147,23 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
           placeholder={copy.transcriptFilterPlaceholder}
           containerClassName="max-w-sm"
         />
-        {detail.speakers.length > 1 && (
-          <Button variant="secondary" size="sm" onClick={() => setMergeOpen(true)} className="ml-auto">
-            {copy.mergeSpeakersButton}
+        <div className="ml-auto flex items-center gap-2">
+          {detail.speakers.length > 1 && (
+            <Button variant="secondary" size="sm" onClick={() => setMergeOpen(true)}>
+              {copy.mergeSpeakersButton}
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            leftIcon={copied ? <CheckIcon /> : undefined}
+            disabled={segments.length === 0}
+            onClick={handleCopyTranscript}
+          >
+            {copied ? common.copied : copy.copyTranscriptButton}
           </Button>
-        )}
+          <ExportMenu meetingId={meetingId} meetingTitle={detail.meeting.title} />
+        </div>
       </div>
 
       {filtered.length === 0 ? (

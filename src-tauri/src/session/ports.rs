@@ -194,6 +194,30 @@ pub trait AsrPort: Send + Sync + 'static {
         on_partial: Option<PartialFn>,
     ) -> BoxFuture<'a, Result<Transcription, AsrError>>;
 
+    /// One live job, with a plan: whether this is a finished utterance or a
+    /// caption of speech that is still going, and any words carried across a
+    /// forced cut. See [`crate::asr::engine::DecodePlan`].
+    ///
+    /// Default: the same as [`AsrPort::transcribe`], so a test double only has
+    /// to know about one of them.
+    fn transcribe_live<'a>(
+        &'a self,
+        job: TranscribeJob,
+        _plan: crate::asr::engine::DecodePlan,
+        on_partial: Option<PartialFn>,
+    ) -> BoxFuture<'a, Result<Transcription, AsrError>> {
+        self.transcribe(job, on_partial)
+    }
+
+    /// Throw away captions of speech that is still going. Default: nothing to
+    /// throw away.
+    fn abandon_speculative(&self, _meeting_id: &str) {}
+
+    /// Hand a meeting over to the disk pass, hard: drop every live job, queued
+    /// or in flight, so nothing half-finished can race the catch-up pass
+    /// (review of 2026-08-20, finding 7). Default: nothing to abandon.
+    fn abandon_live(&self, _meeting_id: &str) {}
+
     /// Transcribe whatever the committed chunks on disk have no text against
     /// yet, per channel. This is what makes "audio on disk is the source of
     /// truth" real, and what makes the catch-up job resumable.
@@ -271,6 +295,23 @@ impl AsrPort for EngineAsr {
         on_partial: Option<PartialFn>,
     ) -> BoxFuture<'a, Result<Transcription, AsrError>> {
         Box::pin(async move { self.worker.submit(job, on_partial).await })
+    }
+
+    fn transcribe_live<'a>(
+        &'a self,
+        job: TranscribeJob,
+        plan: crate::asr::engine::DecodePlan,
+        on_partial: Option<PartialFn>,
+    ) -> BoxFuture<'a, Result<Transcription, AsrError>> {
+        Box::pin(async move { self.worker.submit_with(job, plan, on_partial).await })
+    }
+
+    fn abandon_speculative(&self, meeting_id: &str) {
+        self.worker.abandon_speculative(meeting_id);
+    }
+
+    fn abandon_live(&self, meeting_id: &str) {
+        self.worker.abandon_live(meeting_id);
     }
 
     fn catch_up<'a>(

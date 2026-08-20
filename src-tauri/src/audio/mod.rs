@@ -19,12 +19,15 @@
 //!                    (never blocks)               └─► frame queue ─► speech
 //!                                                    (drop oldest)    detection
 //!                                                                        │
-//!                                                          bounded utterance queue
+//!                                                              signal channel
+//!                                                            (session pipeline)
 //! ```
 //!
 //! The pump owns the devices and the writers, so disk work can never be starved
-//! by inference. Speech detection sits behind a queue that drops its *oldest*
-//! work when it fills: the live transcript falls behind, the recording does not.
+//! by inference. Utterances leave through the signal channel the moment they are
+//! found; the queue that can fall behind — and that decides what live work is
+//! dropped — belongs to the session pipeline, which is the thing actually
+//! waiting on the speech engine.
 
 pub mod clock;
 pub mod mic;
@@ -53,7 +56,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::audio::clock::MeetingClock;
-use crate::audio::vad::{SpeechDetector, Utterance, UtteranceQueue, DEFAULT_QUEUE_CAPACITY};
+use crate::audio::vad::{OpenSpeech, SpeechDetector, Utterance};
 use crate::audio::writer::{ChunkWriter, CommittedChunk};
 use crate::types::{AudioDevice, Channel, DegradedReason, PermissionState, PermissionTarget};
 
@@ -78,6 +81,17 @@ const FRAME_QUEUE_CAPACITY: usize = 5 * 1_000 / FRAME_MS as usize;
 
 /// How long to wait before trying a lost system-audio stream again.
 const REOPEN_BACKOFF: Duration = Duration::from_secs(5);
+
+/// New speech before another [`CaptureSignal::SpeechSoFar`] is offered for a
+/// channel, measured in audio rather than wall clock.
+///
+/// The detect thread wakes every 20 ms; a snapshot carries seconds of audio, so
+/// offering one per wake would copy megabytes a second for a consumer that
+/// decodes a caption every three. This is comfortably finer-grained than the
+/// pipeline's own caption step, so the consumer never waits on this side for
+/// material — it just has fresher material than it needs, which is the cheap
+/// direction to be wrong in.
+const SNAPSHOT_OFFER_MS: i64 = 1_000;
 
 /// How long a channel that *started* may deliver nothing before Echo says so.
 ///
@@ -194,8 +208,15 @@ pub struct CaptureStarted {
 pub enum CaptureSignal {
     /// A chunk is durable on disk and can be journalled.
     ChunkCommitted(CommittedChunk),
-    /// Speech was found and is queued for transcription.
+    /// Speech was found. Whether it gets live text is the pipeline's decision;
+    /// the audio is on disk either way.
     UtteranceReady(Utterance),
+    /// A look at speech that is *still going*, so the live view can show words
+    /// while someone is still talking instead of only once they stop.
+    ///
+    /// Offered often and cheap to ignore: the pipeline decides which of these
+    /// are worth a decode and drops the rest ([`crate::audio::vad::OpenSpeech`]).
+    SpeechSoFar(OpenSpeech),
     /// Smoothed loudness for the recording indicator. Rate-capped here, not in
     /// the UI (DESIGN §3).
     Levels { mic: f32, system: f32, t_ms: i64 },
@@ -369,7 +390,6 @@ pub struct CaptureSession {
     meeting_id: String,
     shared: Arc<SessionShared>,
     clock: Arc<Mutex<MeetingClock>>,
-    utterances: Arc<UtteranceQueue>,
     signals: Mutex<Option<UnboundedReceiver<CaptureSignal>>>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
@@ -459,7 +479,6 @@ impl CaptureSession {
         });
 
         let (signal_tx, signal_rx) = unbounded_channel();
-        let utterances = Arc::new(UtteranceQueue::new(DEFAULT_QUEUE_CAPACITY));
         let frames = Arc::new(FrameQueue::new(FRAME_QUEUE_CAPACITY * 2));
         let clock = Arc::new(Mutex::new(clock));
 
@@ -480,7 +499,6 @@ impl CaptureSession {
                 detector_path,
                 Arc::clone(&shared),
                 Arc::clone(&frames),
-                Arc::clone(&utterances),
                 signal_tx,
             )?,
         ];
@@ -490,7 +508,6 @@ impl CaptureSession {
                 meeting_id: cfg.meeting_id.clone(),
                 shared,
                 clock,
-                utterances,
                 signals: Mutex::new(Some(signal_rx)),
                 threads: Mutex::new(threads),
             },
@@ -521,12 +538,6 @@ impl CaptureSession {
     /// port asks for.
     pub fn subscribe(&self) -> Option<UnboundedReceiver<CaptureSignal>> {
         self.take_signals()
-    }
-
-    /// Work waiting for the speech engine. Shared, so the engine can pull from
-    /// it directly.
-    pub fn utterances(&self) -> Arc<UtteranceQueue> {
-        Arc::clone(&self.utterances)
     }
 
     pub fn meeting_id(&self) -> &str {
@@ -606,17 +617,25 @@ impl CaptureSession {
         out
     }
 
-    /// How many utterances are waiting for text. The UI turns this into
-    /// "catching up", never a number.
+    /// How much work capture is holding back from the speech engine: none.
+    ///
+    /// Capture hands every utterance straight out through the signal channel as
+    /// soon as it is found, so nothing queues up here. There *was* a queue in
+    /// this layer — pushed on every utterance and popped by nobody (review
+    /// finding 6). Its depth only ever went up, so it reached its capacity in
+    /// the first busy minute of any meeting and reported "the transcript is
+    /// catching up" for the rest of it, whatever the real state of the pipeline.
+    ///
+    /// The queue that can genuinely fall behind is the session pipeline's, and
+    /// its depth is what the status reads now.
     pub fn pending_utterances(&self) -> u32 {
-        self.utterances.len() as u32
+        0
     }
 }
 
 impl Drop for CaptureSession {
     fn drop(&mut self) {
         self.shared.stopping.store(true, Ordering::Relaxed);
-        self.utterances.close();
         let threads: Vec<_> =
             std::mem::take(&mut *self.threads.lock().unwrap_or_else(|e| e.into_inner()));
         for thread in threads {
@@ -967,7 +986,6 @@ fn spawn_speech(
     detector_path: Option<PathBuf>,
     shared: Arc<SessionShared>,
     frames: Arc<FrameQueue>,
-    utterances: Arc<UtteranceQueue>,
     signals: UnboundedSender<CaptureSignal>,
 ) -> Result<std::thread::JoinHandle<()>, AudioError> {
     std::thread::Builder::new()
@@ -978,39 +996,93 @@ fn spawn_speech(
             let mut system_detector =
                 SpeechDetector::load_or_fallback(detector_path.as_deref(), Channel::System);
             let mut batch: Vec<Frame> = Vec::new();
-            let mut behind_reported = false;
+            let mut was_paused = false;
+            // Set on resume, cleared per channel by the first frame that
+            // arrives after it — which may be several ticks later on a channel
+            // that is quiet.
+            let mut restart_mic = false;
+            let mut restart_system = false;
+            // Per channel: which open stretch was last snapshotted, and how far
+            // into it that snapshot reached. Both halves matter — a new stretch
+            // is a new line and goes out at once, where more of the same
+            // stretch waits for [`SNAPSHOT_OFFER_MS`] of new speech.
+            let mut offered_mic: Option<(i64, i64)> = None;
+            let mut offered_system: Option<(i64, i64)> = None;
 
             loop {
                 // Wait for the pump to say it is done, not just for the stop
                 // request: the last frames of a meeting are the ones a person
                 // most notices missing from the live transcript.
                 let finished = shared.pump_finished.load(Ordering::Relaxed);
+                // A paused stretch is written as silence, so the timestamps stay
+                // continuous and nothing here notices the gap — but the audio
+                // either side of it is not adjacent, and both detectors are
+                // carrying state that says it is (review finding 10). Resuming
+                // starts them again, from the first frame that arrives after.
+                let paused = shared.paused.load(Ordering::Relaxed);
+                if was_paused && !paused {
+                    restart_mic = true;
+                    restart_system = true;
+                    tracing::debug!(
+                        target: "echo::audio",
+                        "recording resumed; speech detection starts again"
+                    );
+                }
+                was_paused = paused;
+
                 batch.clear();
                 frames.drain(&mut batch);
                 for frame in batch.drain(..) {
-                    let detector = match frame.channel {
-                        Channel::System => &mut system_detector,
-                        _ => &mut mic_detector,
+                    let (detector, restart) = match frame.channel {
+                        Channel::System => (&mut system_detector, &mut restart_system),
+                        _ => (&mut mic_detector, &mut restart_mic),
                     };
-                    for utterance in detector.push(&frame.samples, frame.t_start_ms) {
-                        let kept = utterances.push(utterance.clone());
-                        let _ = signals.send(CaptureSignal::UtteranceReady(utterance));
-                        if !kept && !behind_reported {
-                            behind_reported = true;
-                            let _ = signals.send(CaptureSignal::Degraded {
-                                channel: None,
-                                reason: DegradedReason::TranscriptBehind,
-                                message: "The live text is a little behind. Nothing is lost — Echo will catch up when the meeting ends."
-                                    .to_string(),
-                            });
+                    if std::mem::take(restart) {
+                        if let Some(utterance) = detector.reset_at(frame.t_start_ms) {
+                            let _ = signals.send(CaptureSignal::UtteranceReady(utterance));
                         }
+                    }
+                    for utterance in detector.push(&frame.samples, frame.t_start_ms) {
+                        let _ = signals.send(CaptureSignal::UtteranceReady(utterance));
+                    }
+                }
+
+                // Words on screen while someone is still talking. Only ever a
+                // look at what is open: the utterance itself still arrives when
+                // the speech ends, and it is the one that gets written down.
+                if !paused {
+                    for (detector, offered) in [
+                        (&mic_detector, &mut offered_mic),
+                        (&system_detector, &mut offered_system),
+                    ] {
+                        let Some(snapshot) = detector.snapshot() else {
+                            // Nothing open: the next stretch starts fresh.
+                            *offered = None;
+                            continue;
+                        };
+                        let end = snapshot.window_end_ms();
+                        // A new stretch is offered straight away, however
+                        // little of it there is: it is a new line on screen,
+                        // and holding it back is a second of someone talking to
+                        // a view that shows nothing. Within one stretch, only
+                        // once the speech has actually moved on.
+                        let due = match *offered {
+                            Some((start, last)) if start == snapshot.t_start_ms => {
+                                end - last >= SNAPSHOT_OFFER_MS
+                            }
+                            _ => true,
+                        };
+                        if !due {
+                            continue;
+                        }
+                        *offered = Some((snapshot.t_start_ms, end));
+                        let _ = signals.send(CaptureSignal::SpeechSoFar(snapshot));
                     }
                 }
 
                 if finished {
                     for detector in [&mut mic_detector, &mut system_detector] {
                         if let Some(utterance) = detector.finish() {
-                            utterances.push(utterance.clone());
                             let _ = signals.send(CaptureSignal::UtteranceReady(utterance));
                         }
                     }
@@ -1171,12 +1243,7 @@ impl ChunkRef {
 
     /// From a chunk that has just been closed.
     pub fn from_committed(chunk: &CommittedChunk) -> Self {
-        Self::new(
-            &chunk.path,
-            chunk.channel,
-            chunk.t_start_ms,
-            chunk.t_end_ms,
-        )
+        Self::new(&chunk.path, chunk.channel, chunk.t_start_ms, chunk.t_end_ms)
     }
 
     pub fn duration_ms(&self) -> i64 {

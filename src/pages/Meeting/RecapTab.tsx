@@ -80,6 +80,15 @@ export function RecapTab({ meetingId, meetingTitle, detail, setDetail }: RecapTa
   return (
     <div className="flex flex-col gap-8 px-8 py-6">
       <section className="flex flex-col gap-4">
+        {/* Always reachable, with or without a recap yet: exporting the
+            transcript never depended on a summary provider being set up
+            (DESIGN §0 — recording and transcripts work with none
+            configured), so this can't wait behind the "no recap yet"
+            branch below. */}
+        <div className="flex items-center justify-end">
+          <ExportMenu meetingId={meetingId} meetingTitle={meetingTitle} summaryId={currentSummary?.id} />
+        </div>
+
         <RecapControls
           meetingId={meetingId}
           hasSummary={detail.summaries.length > 0}
@@ -98,7 +107,6 @@ export function RecapTab({ meetingId, meetingTitle, detail, setDetail }: RecapTa
               >
                 {copied ? common.copied : common.copy}
               </Button>
-              <ExportMenu meetingId={meetingId} meetingTitle={meetingTitle} summaryId={currentSummary.id} />
             </div>
             <RecapMarkdown content={currentSummary.contentMd} />
           </div>

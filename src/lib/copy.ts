@@ -189,6 +189,7 @@ export const live = {
   nothingRecordingTitle: "Nothing is being recorded",
   nothingRecordingDescription: "Start a meeting from Home to see it here.",
   goHomeButton: "Go to Home",
+  copyTranscriptButton: "Copy transcript",
 } as Record<string, string>;
 
 /** Meeting detail: Recap, Transcript, Info tabs. */
@@ -249,6 +250,10 @@ export const meeting = {
   recapWritingTitle: "Writing your recap…",
   recapWritingDescription: "This usually takes less than a minute.",
   infoCapturedLabel: "Captured",
+  copyTranscriptButton: "Copy transcript",
+  infoSaveRecording: "Save the recording",
+  infoSaveRecordingDescription: "Saves the audio as a file you can keep or share.",
+  recordingFileType: "Recording",
 } as Record<string, string>;
 
 /** History and search. */

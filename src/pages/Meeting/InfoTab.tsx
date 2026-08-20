@@ -1,10 +1,11 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { save } from "@tauri-apps/plugin-dialog";
 
 import { Button, Chip, Modal, ProgressBar } from "@/components";
 import { formatBytes } from "@/components/lib/format";
 import { channels, common, labels, meeting as copy, notices } from "@/lib/copy";
-import { deleteMeeting } from "@/lib/ipc";
+import { deleteMeeting, downloadRecording, toUiError } from "@/lib/ipc";
 import { useEchoStore } from "@/lib/store";
 import type { Channel, Id, MeetingDetail } from "@/lib/types";
 
@@ -26,10 +27,41 @@ export function InfoTab({ meetingId, detail }: InfoTabProps) {
   const [confirmAudio, setConfirmAudio] = useState(false);
   const [confirmAll, setConfirmAll] = useState(false);
   const [pending, setPending] = useState(false);
+  const [savingRecording, setSavingRecording] = useState(false);
 
   const language = languageName(detail.meeting.language);
   const hasAudio = detail.audioBytes > 0 && !detail.meeting.deletedAt;
   const activeJobs = detail.jobs.filter((j) => j.status === "running" || j.status === "queued");
+
+  /** Builds the playback mix on demand if it isn't ready yet (an older
+   * meeting, or one where that pass hasn't finished) — `downloadRecording`
+   * waits on that itself, so this button just shows a spinner the whole
+   * time. Its actual progress is already visible above, in "Still working",
+   * the same way any other background job is. */
+  const handleSaveRecording = async () => {
+    const safeName = detail.meeting.title.trim().replace(/[/\\:*?"<>|]+/g, " ").trim() || "meeting";
+    let destination: string | null;
+    try {
+      destination = await save({
+        title: common.export,
+        defaultPath: `${safeName}.wav`,
+        filters: [{ name: copy.recordingFileType, extensions: ["wav"] }],
+      });
+    } catch {
+      return;
+    }
+    if (!destination) return;
+
+    setSavingRecording(true);
+    try {
+      await downloadRecording(meetingId, destination);
+      addToast({ level: "info", message: notices.exportedTo });
+    } catch (err) {
+      addToast({ level: "problem", message: toUiError(err).message });
+    } finally {
+      setSavingRecording(false);
+    }
+  };
 
   const runDelete = async (mode: "audioOnly" | "everything") => {
     setPending(true);
@@ -98,6 +130,17 @@ export function InfoTab({ meetingId, detail }: InfoTabProps) {
       )}
 
       <section className="flex flex-col gap-3">
+        {hasAudio && (
+          <div className="flex items-center justify-between gap-4 rounded-xl border border-hairline p-4">
+            <div>
+              <p className="text-sm font-medium text-ink">{copy.infoSaveRecording}</p>
+              <p className="text-xs text-ink-faint">{copy.infoSaveRecordingDescription}</p>
+            </div>
+            <Button variant="secondary" loading={savingRecording} onClick={handleSaveRecording}>
+              {common.save}
+            </Button>
+          </div>
+        )}
         {hasAudio && (
           <div className="flex items-center justify-between gap-4 rounded-xl border border-hairline p-4">
             <div>
