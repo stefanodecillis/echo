@@ -39,6 +39,7 @@ pub mod jobs;
 pub mod pipeline;
 pub mod ports;
 pub mod recovery;
+pub mod retranscribe;
 
 #[cfg(test)]
 mod mock;
@@ -78,6 +79,10 @@ pub enum SessionError {
     NotRecording,
     #[error("Echo could not hear anything: {0}")]
     NoAudioSources(String),
+    /// There is no committed audio behind this meeting, so nothing can be read
+    /// back off disk. The person deleted the recording and kept the words.
+    #[error("no recorded audio for this meeting")]
+    NoRecordedAudio,
     #[error("storage problem: {0}")]
     Storage(String),
     #[error("database problem: {0}")]
@@ -1120,6 +1125,23 @@ impl SessionManager {
         action: RecoveryAction,
     ) -> Result<(), SessionError> {
         recovery::resolve(&self.0, meeting_id, action).await
+    }
+
+    /// "Listen again": throw this meeting's transcript away and write it again
+    /// from the audio on disk.
+    ///
+    /// Turned down while a recording is live; a no-op while one is already
+    /// running for this meeting, so a double-click cannot wipe what the running
+    /// pass has already written. See [`retranscribe`].
+    pub async fn retranscribe(
+        &self,
+        meeting_id: &str,
+    ) -> Result<retranscribe::Retranscribed, SessionError> {
+        let inner = self.0.clone();
+        // The same lock start and stop take: a wipe must not land in the middle
+        // of a recording starting.
+        let _command = inner.command.lock().await;
+        retranscribe::run(&inner, meeting_id).await
     }
 
     /// Queue background work. Deduplicated per meeting and kind.

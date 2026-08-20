@@ -530,6 +530,20 @@ impl CollectingEvents {
         self.names().iter().filter(|n| **n == name).count()
     }
 
+    /// The "everything you hold for this meeting is stale" announcements, in
+    /// order.
+    pub(crate) fn transcript_revisions(&self) -> Vec<crate::events::TranscriptRevisedPayload> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::TranscriptRevised(payload) => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The transcript lines that went out, in the order they were sent.
     pub(crate) fn finals(&self) -> Vec<crate::events::TranscriptFinalPayload> {
         self.seen

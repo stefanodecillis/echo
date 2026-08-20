@@ -222,7 +222,6 @@ export const meeting = {
   languageDetecting: "Detecting…",
   untitledMeeting: "Untitled meeting",
   exportMarkdown: "Markdown",
-  exportWord: "Word document",
   exportPdf: "PDF",
   modelPickerLabel: "Written by",
   modelPickerDefault: "Default",
@@ -254,6 +253,10 @@ export const meeting = {
   infoSaveRecording: "Save the recording",
   infoSaveRecordingDescription: "Saves the audio as a file you can keep or share.",
   recordingFileType: "Recording",
+  listenAgainButton: "Listen again",
+  listenAgainConfirmTitle: "Rewrite the transcript from the recording?",
+  listenAgainConfirmDescription: "The current one is replaced — the recap stays.",
+  listenAgainConfirmButton: "Rewrite",
 } as Record<string, string>;
 
 /** History and search. */

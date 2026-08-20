@@ -669,6 +669,66 @@ pub async fn delete_partial_segments(db: &Db, meeting_id: &str) -> Result<u64, D
     Ok(r.rows_affected())
 }
 
+/// What [`clear_transcript`] took away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClearedTranscript {
+    pub segments_deleted: u64,
+    pub speakers_deleted: u64,
+    /// One past the revision the transcript was on, so anything watching can
+    /// tell that what it holds is stale.
+    ///
+    /// The stored revision lives on the segment rows ([`transcript_revision`] is
+    /// `MAX(revision)`), so once they are gone there is nothing left to read: a
+    /// wiped meeting is back at 0 until the pass that re-reads the audio writes
+    /// its first row. This number is the one the *event* carries, and it only
+    /// ever moves forward.
+    pub revision: i64,
+}
+
+/// Throw away everything derived from this meeting's audio that a fresh pass
+/// would write again: the transcript and the speakers, aliases included.
+///
+/// For "listen again" — the audio on disk is the truth (mantra 3), so a
+/// transcript written by a broken pipeline is safe to delete and read back from
+/// the recording. Deliberately **not** the recap or its task list: those are the
+/// person's to keep or rewrite.
+///
+/// Two details this depends on, both the same as [`delete_meeting`]:
+/// * segments are deleted by name so the `segments_fts_ad` trigger fires and
+///   both search indexes lose the words. A cascade might not fire triggers, and
+///   somebody's search results are not a thing to bet on a build detail.
+/// * speakers go after segments, so nothing depends on `ON DELETE SET NULL`
+///   having run first.
+///
+/// Chunks, markers, summaries and action items are left exactly where they are.
+pub async fn clear_transcript(db: &Db, meeting_id: &str) -> Result<ClearedTranscript, DbError> {
+    let mut tx = db.begin().await?;
+    let previous: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT MAX(revision) FROM segments WHERE meeting_id = ?1")
+            .bind(meeting_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let previous = previous.and_then(|r| r.0).unwrap_or(0);
+
+    let segments = sqlx::query("DELETE FROM segments WHERE meeting_id = ?1")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let speakers = sqlx::query("DELETE FROM speakers WHERE meeting_id = ?1")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+
+    Ok(ClearedTranscript {
+        segments_deleted: segments,
+        speakers_deleted: speakers,
+        revision: previous.saturating_add(1),
+    })
+}
+
 /// Highest revision anywhere in this meeting, the "transcript revision" a
 /// recap is pinned to.
 pub async fn transcript_revision(db: &Db, meeting_id: &str) -> Result<i64, DbError> {
@@ -2531,6 +2591,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found(db.clone(), "watermelon").await, 0);
+    }
+
+    /// What "listen again" leans on: the transcript and the speakers go, the
+    /// search index goes with them (via the delete trigger, not a cascade), the
+    /// revision it reports moves forward — and the recording, the markers and
+    /// the recap are all still there afterwards.
+    #[tokio::test]
+    async fn clearing_a_transcript_leaves_the_recording_and_the_recap_alone() {
+        let (db, m) = seeded().await;
+        let chunk = insert_chunk(&db, &m.id, Channel::Mic, 0, "/a/0.flac", 0, 30_000)
+            .await
+            .unwrap();
+        commit_chunk(&db, &chunk, 30_000).await.unwrap();
+        insert_marker(&db, &m.id, 1_000, MarkerKind::ActionItem, None)
+            .await
+            .unwrap();
+        let speaker = upsert_speaker(&db, &m.id, "mic", "You", true)
+            .await
+            .unwrap();
+        let alias = upsert_speaker(&db, &m.id, "c2", "Speaker 2", false)
+            .await
+            .unwrap();
+        merge_speakers(&db, &alias.id, &speaker.id).await.unwrap();
+        let ids = insert_segments(&db, &[draft(&m.id, 0, "kumquat")])
+            .await
+            .unwrap();
+        revise_segment(&db, &ids[0], Some("kumquat again"), None, 4, true)
+            .await
+            .unwrap();
+        let summary = insert_summary(
+            &db,
+            &m.id,
+            None,
+            None,
+            Provider::OnThisComputer,
+            Some("test-model"),
+            Some("en"),
+            4,
+            "## Recap",
+        )
+        .await
+        .unwrap();
+
+        let cleared = clear_transcript(&db, &m.id).await.unwrap();
+        assert_eq!(cleared.segments_deleted, 1);
+        assert_eq!(cleared.speakers_deleted, 2, "the alias row goes too");
+        assert_eq!(cleared.revision, 5, "one past where the transcript was");
+
+        assert!(get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: m.id.clone(),
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        assert!(list_speakers(&db, &m.id).await.unwrap().is_empty());
+        assert!(search_segments(
+            &db,
+            &SearchQuery {
+                text: "kumquat".into(),
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap()
+        .is_empty());
+
+        // Everything that is not derived from a transcription pass survives.
+        assert_eq!(
+            last_committed_offset_ms(&db, &m.id, Channel::Mic)
+                .await
+                .unwrap(),
+            30_000
+        );
+        assert_eq!(list_markers(&db, &m.id).await.unwrap().len(), 1);
+        assert_eq!(
+            latest_summary(&db, &m.id).await.unwrap().map(|s| s.id),
+            Some(summary.id)
+        );
     }
 
     #[tokio::test]

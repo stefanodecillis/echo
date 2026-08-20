@@ -281,6 +281,21 @@ impl From<session::SessionError> for UiError {
             )
             .with_detail(detail)
             .with_action(UiErrorAction::OpenMicrophoneSettings),
+            // Something that needs the machine was asked for while a meeting is
+            // being recorded. Recording has absolute priority (DESIGN §3), so the
+            // answer is "later", said as a sentence rather than as a shrug.
+            S::AlreadyRecording => UiError::new(
+                UiErrorKind::NotReady,
+                "Echo is recording right now. It can do this once your recording has finished.",
+            ),
+            // Asked to read a meeting back off disk when the recording is gone:
+            // the person deleted the audio and kept the words. Nothing is broken,
+            // and there is nothing to try again.
+            S::NoRecordedAudio => UiError::new(
+                UiErrorKind::NotReady,
+                "The recording for this meeting isn't on this computer any more, so Echo can't \
+                 listen to it again.",
+            ),
             S::Storage(detail) => UiError::new(
                 UiErrorKind::Storage,
                 "Echo couldn't save to the place you chose for recordings.",
@@ -599,6 +614,27 @@ pub async fn get_transcript(
 ) -> CmdResult<Vec<Segment>> {
     check_id(&query.meeting_id)?;
     Ok(repo::get_segments(&state.db, &query).await?)
+}
+
+/// "Listen again": write this meeting's transcript again from its recording.
+///
+/// For a meeting recorded while transcription was not working. The audio on disk
+/// is the truth (mantra 3), so the words can always be read back out of it.
+///
+/// Everything derived from the audio goes — the transcript and the speakers —
+/// and the ordinary catch-up and speaker passes are queued to write them again.
+/// The recording, the recap and its task list are left alone; the recap can be
+/// rewritten from the new transcript whenever the person wants.
+///
+/// Nothing to return: progress arrives on the job-progress event, exactly like
+/// the work that follows a normal recording, and the transcript refreshes on the
+/// transcript-revised event. Turned down while a recording is live, and a no-op
+/// while one is already running for this meeting.
+#[tauri::command]
+pub async fn retranscribe_meeting(state: State<'_, AppState>, meeting_id: Id) -> CmdResult<()> {
+    check_id(&meeting_id)?;
+    state.session.retranscribe(&meeting_id).await?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1373,6 +1409,7 @@ macro_rules! echo_command_handler {
             $crate::commands::delete_meeting,
             $crate::commands::delete_all_data,
             $crate::commands::get_transcript,
+            $crate::commands::retranscribe_meeting,
             $crate::commands::search_transcripts,
             $crate::commands::get_markers,
             $crate::commands::get_playback_path,
@@ -1495,6 +1532,8 @@ mod tests {
             summarize::SummarizeError::MalformedReply.into(),
             export::ExportError::Empty.into(),
             session::SessionError::NoAudioSources("x".into()).into(),
+            session::SessionError::AlreadyRecording.into(),
+            session::SessionError::NoRecordedAudio.into(),
             DbError::NotFound("meeting".into()).into(),
         ];
         let banned = [
@@ -1629,6 +1668,24 @@ mod tests {
         .into();
         assert!(!blocked.message.contains("RECITATION"), "{blocked:?}");
         assert_eq!(blocked.detail.as_deref(), Some("RECITATION"));
+    }
+
+    /// "Listen again" while recording, and on a meeting whose audio is gone, are
+    /// both answers rather than faults: they say what is true and what to do
+    /// next, and neither hides behind "Something went wrong".
+    #[test]
+    fn turning_down_listen_again_says_why() {
+        let recording: UiError = session::SessionError::AlreadyRecording.into();
+        let no_audio: UiError = session::SessionError::NoRecordedAudio.into();
+        for err in [&recording, &no_audio] {
+            assert_eq!(err.kind, UiErrorKind::NotReady, "{err:?}");
+            assert!(
+                !err.message.starts_with("Something went wrong"),
+                "{:?}",
+                err.message
+            );
+        }
+        assert_ne!(recording.message, no_audio.message);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { Button, ProgressBar } from "@/components";
+import { cx } from "@/components/lib/cx";
 import { labels, meeting as copy } from "@/lib/copy";
 import { generateSummary, listTemplates } from "@/lib/ipc";
 import type { Id, Job, Template } from "@/lib/types";
@@ -14,13 +15,18 @@ export interface RecapControlsProps {
    * progress bar and disables the button while it runs. */
   activeJob?: Job;
   onQueued: (jobId: Id) => void;
+  /** Used below an existing recap, where this becomes a secondary action next
+   * to Copy and Export rather than the one thing on the tab — a smaller,
+   * quieter button and a row that hugs the right instead of sitting centered.
+   * The default (false) is the confident, centered CTA an empty state needs. */
+  subtle?: boolean;
 }
 
-/** Recap style and the button that kicks the whole thing off — everything
- * the Recap tab needs above the fold when there's work still to do. Who
- * actually writes it (provider + model) is a Settings concern, not this
- * page's. */
-export function RecapControls({ meetingId, hasSummary, activeJob, onQueued }: RecapControlsProps) {
+/** Recap style and the button that kicks the whole thing off. With no recap
+ * yet this is the tab's one call to action; once a recap exists, it's the
+ * quiet "try again" row underneath it. Who actually writes it (provider +
+ * model) is a Settings concern, not this page's. */
+export function RecapControls({ meetingId, hasSummary, activeJob, onQueued, subtle = false }: RecapControlsProps) {
   const [templates, setTemplates] = useState<Template[]>([]);
   const [templateId, setTemplateId] = useState<Id>();
   const [queuing, setQueuing] = useState(false);
@@ -54,8 +60,8 @@ export function RecapControls({ meetingId, hasSummary, activeJob, onQueued }: Re
   };
 
   return (
-    <div className="flex flex-col gap-3 rounded-xl border border-hairline bg-surface-sunken p-4">
-      <div className="flex flex-wrap items-center gap-3">
+    <div className="flex flex-col gap-3">
+      <div className={cx("flex flex-wrap items-center gap-3", subtle ? "justify-end" : "justify-center")}>
         {templates.length > 0 && (
           <label className="flex items-center gap-2 text-xs text-ink-faint">
             {copy.templateLabel}
@@ -74,7 +80,12 @@ export function RecapControls({ meetingId, hasSummary, activeJob, onQueued }: Re
           </label>
         )}
 
-        <Button variant="primary" loading={running} onClick={write} className="ml-auto">
+        <Button
+          variant={subtle ? "secondary" : "primary"}
+          size={subtle ? "sm" : "md"}
+          loading={running}
+          onClick={write}
+        >
           {hasSummary ? copy.regenerateButton : copy.writeRecapButton}
         </Button>
       </div>

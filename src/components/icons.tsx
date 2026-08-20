@@ -224,3 +224,60 @@ export function GeminiIcon(props: IconProps) {
     </svg>
   );
 }
+
+/** Two sheets, one behind the other — "copy this text". Used for the
+ * icon-only copy actions in compact toolbars. */
+export function CopyIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path
+        d="M12.5 6.5V5A1.5 1.5 0 0011 3.5H5.5A1.5 1.5 0 004 5v6.5A1.5 1.5 0 005.5 13H7"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <rect x="7" y="6.5" width="8.5" height="10" rx="1.5" stroke="currentColor" strokeWidth="1.4" />
+    </svg>
+  );
+}
+
+/** Two speakers becoming one — the "combine two speakers" action. */
+export function CombineIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <circle cx="6" cy="6.5" r="2.25" stroke="currentColor" strokeWidth="1.4" />
+      <circle cx="14" cy="6.5" r="2.25" stroke="currentColor" strokeWidth="1.4" />
+      <path
+        d="M6 8.9v0.9a3.1 3.1 0 003.1 3.1h1.8a3.1 3.1 0 003.1-3.1V8.9"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+      />
+      <circle cx="10" cy="15.5" r="1.9" fill="currentColor" />
+    </svg>
+  );
+}
+
+/** A circular arrow — "do that again". Used for re-running a pass on
+ * something that already ran once (re-reading a recording, refreshing a
+ * check). */
+export function ReplayIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path
+        d="M15.4 6.4A6.5 6.5 0 104.7 12.4"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+      />
+      <path
+        d="M15.9 3.3l.3 3.4-3.3-.5"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}

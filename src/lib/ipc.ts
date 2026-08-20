@@ -170,6 +170,21 @@ export const deleteAllData = () => call<void>("delete_all_data");
 export const getTranscript = (query: TranscriptQuery) =>
   call<Segment[]>("get_transcript", { query });
 
+/**
+ * "Listen again": write this meeting's transcript again from its recording.
+ *
+ * For a meeting recorded while transcription wasn't working — the sound is on
+ * disk, so the words can always be read back out of it. The old transcript and
+ * the speakers go; the recording, the recap and its tasks stay.
+ *
+ * Nothing comes back: progress arrives on `jobProgress`, exactly like the work
+ * that follows a normal recording, and the transcript refreshes on
+ * `transcriptRevised`. Safe to call twice — a second call while one is running
+ * changes nothing. Rejects while a recording is live.
+ */
+export const retranscribeMeeting = (meetingId: Id) =>
+  call<void>("retranscribe_meeting", { meetingId });
+
 export const searchTranscripts = (query: SearchQuery) =>
   call<SearchHit[]>("search_transcripts", { query });
 

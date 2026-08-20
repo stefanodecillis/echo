@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { Button, EmptyState, ProgressBar } from "@/components";
-import { CheckIcon } from "@/components/icons";
+import { CheckIcon, CopyIcon, EchoMark } from "@/components/icons";
 import { common, meeting as copy, notices } from "@/lib/copy";
 import { updateActionItem } from "@/lib/ipc";
 import { useEchoStore } from "@/lib/store";
@@ -79,35 +79,13 @@ export function RecapTab({ meetingId, meetingTitle, detail, setDetail }: RecapTa
 
   return (
     <div className="flex flex-col gap-8 px-8 py-6">
-      <section className="flex flex-col gap-4">
-        {/* Always reachable, with or without a recap yet: exporting the
-            transcript never depended on a summary provider being set up
-            (DESIGN §0 — recording and transcripts work with none
-            configured), so this can't wait behind the "no recap yet"
-            branch below. */}
-        <div className="flex items-center justify-end">
-          <ExportMenu meetingId={meetingId} meetingTitle={meetingTitle} summaryId={currentSummary?.id} />
-        </div>
-
-        <RecapControls
-          meetingId={meetingId}
-          hasSummary={detail.summaries.length > 0}
-          activeJob={activeJob}
-          onQueued={setPendingJobId}
-        />
-
+      <section className="flex flex-col gap-3">
+        {/* Content first: the recap itself, the "still writing" progress, or —
+            with nothing yet — the one card that gets one written. Whichever
+            it is, it's the thing this tab is for, so it comes before any
+            action around it. */}
         {currentSummary ? (
           <div className="echo-card p-6">
-            <div className="mb-4 flex items-center justify-end gap-2">
-              <Button
-                variant="ghost"
-                size="sm"
-                leftIcon={copied ? <CheckIcon /> : undefined}
-                onClick={copyRecap}
-              >
-                {copied ? common.copied : common.copy}
-              </Button>
-            </div>
             <RecapMarkdown content={currentSummary.contentMd} />
           </div>
         ) : activeJob ? (
@@ -119,27 +97,76 @@ export function RecapTab({ meetingId, meetingTitle, detail, setDetail }: RecapTa
             </div>
           </div>
         ) : (
-          <EmptyState title={copy.noRecapTitle} description={copy.noRecapDescription} />
+          <div className="echo-card">
+            <EmptyState
+              icon={<EchoMark className="h-8 w-8" />}
+              title={copy.noRecapTitle}
+              description={copy.noRecapDescription}
+              action={
+                <RecapControls
+                  meetingId={meetingId}
+                  hasSummary={false}
+                  activeJob={activeJob}
+                  onQueued={setPendingJobId}
+                />
+              }
+            />
+          </div>
         )}
+
+        {/* Actions stay quiet underneath: reachable, never louder than the
+            content above. Export is always here — exporting the transcript
+            never depended on a summary provider being set up (DESIGN §0 —
+            recording and transcripts work with none configured), so it
+            can't wait behind a recap existing. */}
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          {currentSummary && (
+            <>
+              <RecapControls
+                meetingId={meetingId}
+                hasSummary
+                activeJob={activeJob}
+                onQueued={setPendingJobId}
+                subtle
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                leftIcon={copied ? <CheckIcon /> : <CopyIcon />}
+                onClick={copyRecap}
+              >
+                {copied ? common.copied : common.copy}
+              </Button>
+            </>
+          )}
+          <ExportMenu
+            meetingId={meetingId}
+            meetingTitle={meetingTitle}
+            summaryId={currentSummary?.id}
+            size="sm"
+          />
+        </div>
       </section>
 
-      <section className="flex flex-col gap-2">
-        <h2 className="text-sm font-semibold text-ink">{copy.actionItemsTitle}</h2>
-        {detail.actionItems.length === 0 ? (
-          <p className="text-sm text-ink-faint">{copy.actionItemsEmpty}</p>
-        ) : (
-          <ul className="divide-y divide-hairline">
-            {detail.actionItems.map((item) => (
-              <ActionItemRow
-                key={item.id}
-                item={item}
-                onToggleDone={(i) => applyActionItemPatch(i, { done: !i.done })}
-                onOwnerChange={(i, owner) => applyActionItemPatch(i, { owner: owner || undefined })}
-              />
-            ))}
-          </ul>
-        )}
-      </section>
+      {currentSummary && (
+        <section className="flex flex-col gap-2">
+          <h2 className="text-sm font-semibold text-ink">{copy.actionItemsTitle}</h2>
+          {detail.actionItems.length === 0 ? (
+            <p className="text-sm text-ink-faint">{copy.actionItemsEmpty}</p>
+          ) : (
+            <ul className="divide-y divide-hairline">
+              {detail.actionItems.map((item) => (
+                <ActionItemRow
+                  key={item.id}
+                  item={item}
+                  onToggleDone={(i) => applyActionItemPatch(i, { done: !i.done })}
+                  onOwnerChange={(i, owner) => applyActionItemPatch(i, { owner: owner || undefined })}
+                />
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
     </div>
   );
 }

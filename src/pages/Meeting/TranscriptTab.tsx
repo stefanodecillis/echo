@@ -1,20 +1,42 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
-import { Button, EmptyState, SearchInput, VirtualList, type VirtualListHandle } from "@/components";
-import { CheckIcon } from "@/components/icons";
-import { EVENTS, getTranscript, listSpeakers, renameSpeaker } from "@/lib/ipc";
-import { common, meeting as copy, notices } from "@/lib/copy";
+import {
+  Button,
+  EmptyState,
+  Modal,
+  ProgressBar,
+  SearchInput,
+  VirtualList,
+  type VirtualListHandle,
+} from "@/components";
+import { CheckIcon, CombineIcon, CopyIcon, ReplayIcon } from "@/components/icons";
+import {
+  EVENTS,
+  getTranscript,
+  listSpeakers,
+  renameSpeaker,
+  retranscribeMeeting,
+  toUiError,
+} from "@/lib/ipc";
+import { common, labels, meeting as copy, notices } from "@/lib/copy";
 import { useEvent } from "@/hooks/useEvent";
 import { useEchoStore } from "@/lib/store";
 import type { Id, MeetingDetail, Segment } from "@/lib/types";
 
 import { ExportMenu } from "./components/ExportMenu";
+import { IconButton } from "./components/IconButton";
 import { MergeSpeakersModal } from "./components/MergeSpeakersModal";
 import { SpeakerChip } from "./components/SpeakerChip";
 import { formatTimestamp } from "./lib/date";
 import { resolveSpeaker } from "./lib/speakers";
 import { buildTranscriptText } from "./lib/transcriptText";
+
+/** Job kinds that mean "the transcript is being read from the recording
+ * again" — the same offline pass a fresh recording gets, re-run on demand.
+ * There is no dedicated kind for it; reusing these is the point (the tab
+ * already knows how to show them working). */
+const TRANSCRIBE_JOB_KINDS = new Set(["transcribeCatchup", "diarize"]);
 
 const ROW_HEIGHT = 96;
 
@@ -58,6 +80,8 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
   const [filter, setFilter] = useState("");
   const [mergeOpen, setMergeOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [confirmRetranscribe, setConfirmRetranscribe] = useState(false);
+  const [retranscribing, setRetranscribing] = useState(false);
   const listRef = useRef<VirtualListHandle>(null);
   const addToast = useEchoStore((s) => s.addToast);
 
@@ -86,6 +110,26 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
       return next;
     });
   });
+
+  // "Listen again" rewrites the transcript wholesale rather than touching a
+  // known range, so the simplest correct response to a revision is a full
+  // reload rather than trying to patch individual segments in place.
+  useEvent(EVENTS.transcriptRevised, (payload) => {
+    if (payload.meetingId !== meetingId) return;
+    getTranscript({ meetingId })
+      .then((result) => setSegments(result))
+      .catch(() => {
+        // The job-progress event already reflects that something is
+        // happening; a later revision or a manual reload picks this up.
+      });
+  });
+
+  const transcribeJob = detail.jobs.find(
+    (j) =>
+      j.meetingId === meetingId &&
+      TRANSCRIBE_JOB_KINDS.has(j.kind) &&
+      (j.status === "running" || j.status === "queued"),
+  );
 
   const filtered = useMemo(() => {
     const list = segments ?? [];
@@ -134,6 +178,20 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
     }
   };
 
+  const handleRetranscribe = async () => {
+    setConfirmRetranscribe(false);
+    setRetranscribing(true);
+    try {
+      await retranscribeMeeting(meetingId);
+    } catch (err) {
+      addToast({ level: "problem", message: toUiError(err).message });
+    } finally {
+      setRetranscribing(false);
+    }
+  };
+
+  const hasAudio = detail.audioBytes > 0 && !detail.meeting.deletedAt;
+
   if (segments === undefined) {
     return <div className="px-8 py-6 text-sm text-ink-faint">{common.loading}</div>;
   }
@@ -147,24 +205,39 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
           placeholder={copy.transcriptFilterPlaceholder}
           containerClassName="max-w-sm"
         />
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex items-center gap-1">
           {detail.speakers.length > 1 && (
-            <Button variant="secondary" size="sm" onClick={() => setMergeOpen(true)}>
-              {copy.mergeSpeakersButton}
-            </Button>
+            <IconButton
+              icon={<CombineIcon />}
+              aria-label={copy.mergeSpeakersButton}
+              title={copy.mergeSpeakersButton}
+              onClick={() => setMergeOpen(true)}
+            />
           )}
-          <Button
-            variant="ghost"
-            size="sm"
-            leftIcon={copied ? <CheckIcon /> : undefined}
+          <IconButton
+            icon={copied ? <CheckIcon /> : <CopyIcon />}
+            aria-label={copied ? common.copied : copy.copyTranscriptButton}
+            title={copy.copyTranscriptButton}
             disabled={segments.length === 0}
             onClick={handleCopyTranscript}
-          >
-            {copied ? common.copied : copy.copyTranscriptButton}
-          </Button>
-          <ExportMenu meetingId={meetingId} meetingTitle={detail.meeting.title} />
+          />
+          <IconButton
+            icon={<ReplayIcon />}
+            aria-label={copy.listenAgainButton}
+            title={copy.listenAgainButton}
+            disabled={!hasAudio || retranscribing || !!transcribeJob}
+            onClick={() => setConfirmRetranscribe(true)}
+          />
+          <ExportMenu meetingId={meetingId} meetingTitle={detail.meeting.title} size="sm" />
         </div>
       </div>
+
+      {transcribeJob && (
+        <div className="flex flex-col gap-1.5 rounded-xl border border-hairline bg-surface-sunken p-4">
+          <ProgressBar value={transcribeJob.progress} label={labels.jobKind[transcribeJob.kind]} />
+          <span className="text-xs text-ink-faint">{labels.jobKind[transcribeJob.kind]}…</span>
+        </div>
+      )}
 
       {filtered.length === 0 ? (
         <EmptyState title={filter ? copy.transcriptNoMatches : copy.transcriptEmpty} />
@@ -200,6 +273,24 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
         speakers={detail.speakers}
         onMerged={handleMerged}
       />
+
+      <Modal
+        open={confirmRetranscribe}
+        onClose={() => setConfirmRetranscribe(false)}
+        title={copy.listenAgainConfirmTitle}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setConfirmRetranscribe(false)}>
+              {common.cancel}
+            </Button>
+            <Button variant="primary" loading={retranscribing} onClick={handleRetranscribe}>
+              {copy.listenAgainConfirmButton}
+            </Button>
+          </>
+        }
+      >
+        {copy.listenAgainConfirmDescription}
+      </Modal>
     </div>
   );
 }

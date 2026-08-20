@@ -45,7 +45,7 @@ export function MeetingHeader({ meeting, onTitleChange }: MeetingHeaderProps) {
   const language = languageName(meeting.language);
 
   return (
-    <header className="flex flex-col gap-3 border-b border-hairline px-8 py-6">
+    <header className="flex flex-col gap-3 px-8 py-6">
       <button
         type="button"
         onClick={() => navigate(-1)}

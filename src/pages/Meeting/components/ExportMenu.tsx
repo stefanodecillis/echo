@@ -19,11 +19,14 @@ interface ExportOption {
 //
 // PDF is still listed even though the core cannot produce one yet (Tauri 2 has no
 // headless print-to-file API). Picking it gets the plain "PDF isn't available on
-// this computer. Word or Markdown will work." — a named next step rather than a
-// dead end. Hide the row once a capability flag exists to hide it by.
+// this computer. Markdown will work." — a named next step rather than a dead
+// end. Hide the row once a capability flag exists to hide it by.
+//
+// Word/.docx is deliberately not offered here even though the Rust exporter
+// can still produce one — Markdown plus the recording is the reachable set;
+// this is a menu trim, not a capability removal.
 const OPTIONS: ExportOption[] = [
   { format: "markdown", label: copy.exportMarkdown, extension: "md" },
-  { format: "docx", label: copy.exportWord, extension: "docx" },
   { format: "pdf", label: copy.exportPdf, extension: "pdf" },
 ];
 
@@ -31,6 +34,10 @@ export interface ExportMenuProps {
   meetingId: Id;
   meetingTitle: string;
   summaryId?: Id;
+  /** `sm` shrinks the trigger to match an icon-only toolbar (the Transcript
+   * tab's compact row, the Recap tab's quiet actions line) — the dropdown
+   * itself is unchanged. Defaults to the regular size. */
+  size?: "sm" | "md";
 }
 
 /** The Export button: a small dropdown of formats, each backed by a native
@@ -42,7 +49,7 @@ export interface ExportMenuProps {
  * usable before any recap is configured, DESIGN §0) and the Transcript tab,
  * so getting a meeting out is reachable from wherever a person is looking
  * for it, not just the one tab that happens to have a recap. */
-export function ExportMenu({ meetingId, meetingTitle, summaryId }: ExportMenuProps) {
+export function ExportMenu({ meetingId, meetingTitle, summaryId, size = "md" }: ExportMenuProps) {
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState<ExportFormat>();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -95,6 +102,7 @@ export function ExportMenu({ meetingId, meetingTitle, summaryId }: ExportMenuPro
     <div ref={containerRef} className="relative">
       <Button
         variant="secondary"
+        size={size}
         rightIcon={<ChevronDownIcon className="h-3.5 w-3.5" />}
         loading={pending !== undefined}
         onClick={() => setOpen((v) => !v)}
