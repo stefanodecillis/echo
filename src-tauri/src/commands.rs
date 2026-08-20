@@ -124,6 +124,19 @@ impl From<diarize::DiarizeError> for UiError {
     }
 }
 
+/// Which button a turned-down request deserves.
+///
+/// Most 4xx answers are settled: the same request gets the same refusal, so the
+/// only move that helps is choosing a different writer. A few are about *when*
+/// rather than *what*, and those are worth one more go.
+fn refused_request_action(status: u16) -> UiErrorAction {
+    match status {
+        // Request Timeout, Conflict, Too Early: the request itself was fine.
+        408 | 409 | 425 => UiErrorAction::Retry,
+        _ => UiErrorAction::OpenSummarySettings,
+    }
+}
+
 impl From<summarize::SummarizeError> for UiError {
     fn from(err: summarize::SummarizeError) -> Self {
         use summarize::SummarizeError as S;
@@ -153,6 +166,24 @@ impl From<summarize::SummarizeError> for UiError {
             )
             .with_detail(detail)
             .with_action(UiErrorAction::OpenSummarySettings),
+            // The key was fine and the service still said no — to *this
+            // request*, not to the person's credentials. Blaming the key here
+            // sent people to Settings to replace something that was working
+            // (review of 2026-08-20, finding 5).
+            S::RequestRefused { status, detail } => {
+                let action = refused_request_action(status);
+                let message = if matches!(action, UiErrorAction::Retry) {
+                    "That service wouldn't take this request just now. Your recording and \
+                     transcript are safe — try the recap again."
+                } else {
+                    "That service wouldn't write a recap from this request. Your recording and \
+                     transcript are safe, and you can pick something else to write recaps in \
+                     Settings."
+                };
+                UiError::new(UiErrorKind::Network, message)
+                    .with_detail(format!("http {status}: {detail}"))
+                    .with_action(action)
+            }
             // Not a bad key — the key worked and the allowance behind it is
             // spent. Folded in with a refused key this sent people off to
             // re-paste something that was never the problem.
@@ -1450,6 +1481,11 @@ mod tests {
             summarize::SummarizeError::MissingCredential.into(),
             summarize::SummarizeError::NoTranscript.into(),
             summarize::SummarizeError::Rejected("401".into()).into(),
+            summarize::SummarizeError::RequestRefused {
+                status: 400,
+                detail: "Unknown name \"additionalProperties\"".into(),
+            }
+            .into(),
             summarize::SummarizeError::QuotaExhausted.into(),
             summarize::SummarizeError::Blocked {
                 reason: "SAFETY".into(),
@@ -1517,6 +1553,24 @@ mod tests {
             ),
             (S::EmptyReply.into(), Some(UiErrorAction::Retry)),
             (S::MalformedReply.into(), Some(UiErrorAction::Retry)),
+            // The key was accepted and the request was not. Settled refusals
+            // offer a different writer; a refusal about timing offers a retry.
+            (
+                S::RequestRefused {
+                    status: 400,
+                    detail: "Unknown name \"widget\"".into(),
+                }
+                .into(),
+                Some(UiErrorAction::OpenSummarySettings),
+            ),
+            (
+                S::RequestRefused {
+                    status: 408,
+                    detail: "request timeout".into(),
+                }
+                .into(),
+                Some(UiErrorAction::Retry),
+            ),
         ];
 
         let mut messages = Vec::new();
@@ -1545,6 +1599,27 @@ mod tests {
         let spent: UiError = S::QuotaExhausted.into();
         assert_eq!(refused.kind, UiErrorKind::Credential);
         assert_ne!(spent.kind, UiErrorKind::Credential);
+
+        // A turned-down request is not a credential problem, and the status goes
+        // in `detail`, where only Settings → Advanced renders it.
+        let turned_down: UiError = S::RequestRefused {
+            status: 400,
+            detail: "Unknown name \"widget\"".into(),
+        }
+        .into();
+        assert_ne!(
+            turned_down.kind,
+            UiErrorKind::Credential,
+            "a schema Google did not like is not a bad key"
+        );
+        assert!(
+            !turned_down.message.to_lowercase().contains("key"),
+            "{turned_down:?}"
+        );
+        assert_eq!(
+            turned_down.detail.as_deref(),
+            Some("http 400: Unknown name \"widget\"")
+        );
 
         // The service's own word for a block is diagnostic, not screen copy: it
         // belongs in `detail`, which only Settings → Advanced renders.

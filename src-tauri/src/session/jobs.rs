@@ -40,6 +40,13 @@ use crate::types::{
 const IDLE_POLL: Duration = Duration::from_secs(30);
 /// How often the loop re-checks whether the recording finished.
 const BLOCKED_POLL: Duration = Duration::from_secs(5);
+/// How often the loop re-derives the speech engine's lifecycle from the table,
+/// whichever edges did or did not fire.
+///
+/// The backstop for [`JobRuntime::reconcile`]: every path that changes either
+/// fact calls [`JobRuntime::refresh_engine_residency`] itself, and this is what
+/// makes that a belt rather than the only thing holding the trousers up.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// Progress updates are cheap but not free; cap them.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -782,6 +789,12 @@ fn summarize_failure(cancel: &Cancel, error: crate::summarize::SummarizeError) -
             "That service wouldn't accept the key Echo has saved for it. Open Settings and paste \
              it again.",
         ),
+        // The key was accepted and the request was not. Saying "paste the key
+        // again" here is a wild goose chase (review of 2026-08-20, finding 5).
+        S::RequestRefused { .. } => JobFailure::failed(
+            "That service wouldn't write a recap from this request. Your recording and transcript \
+             are safe, and you can pick something else to write recaps in Settings.",
+        ),
         S::QuotaExhausted => JobFailure::failed(
             "That service won't take any more requests just now. Your recording and transcript \
              are safe — try the recap again later.",
@@ -820,6 +833,14 @@ pub struct JobRuntime {
     running: std::sync::Mutex<Option<(Id, Cancel)>>,
     /// A recording owns the machine.
     blocked: AtomicBool,
+    /// Asked "is a capture live right now?" once the session spine has wired
+    /// itself up.
+    ///
+    /// [`JobRuntime::blocked`] is close but not the same thing: it is a flag
+    /// somebody has to remember to clear, and the engine's lifecycle is not
+    /// something to hang on a flag (review of 2026-08-20, finding 2). This asks
+    /// the capture state machine, which is the fact itself.
+    capturing: std::sync::Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
     stopped: AtomicBool,
     started: AtomicBool,
     wake: Notify,
@@ -833,6 +854,7 @@ impl JobRuntime {
             ports,
             running: std::sync::Mutex::new(None),
             blocked: AtomicBool::new(false),
+            capturing: std::sync::Mutex::new(None),
             stopped: AtomicBool::new(false),
             started: AtomicBool::new(false),
             wake: Notify::new(),
@@ -874,14 +896,38 @@ impl JobRuntime {
         Ok(job)
     }
 
+    /// Point the residency rule at the capture state machine. Called once, when
+    /// the session spine builds itself.
+    pub(crate) fn watch_capture(&self, is_live: Arc<dyn Fn() -> bool + Send + Sync>) {
+        *self.capturing.lock().expect("capture hook poisoned") = Some(is_live);
+    }
+
+    /// Is a capture running right now?
+    fn capture_is_live(&self) -> bool {
+        let hook = self
+            .capturing
+            .lock()
+            .expect("capture hook poisoned")
+            .clone();
+        match hook {
+            Some(is_live) => is_live(),
+            // Before the spine wires itself up — and in tests that drive this
+            // runtime on its own — the parking flag is the best fact there is.
+            None => self.blocked.load(Ordering::SeqCst),
+        }
+    }
+
     /// Hold the speech engine while a recording or a meeting's work is
     /// outstanding, and let the grace period start once neither is true.
     ///
-    /// Called on every edge this loop knows about: work queued, work finished.
-    /// `blocked` is the recording's own flag, set for the whole of a capture, so
-    /// nothing here has to reach into the capture state machine.
+    /// **The** recompute: every caller — queue, cancel, retry, a job finishing, a
+    /// recording starting or stopping, the periodic reconcile — asks this one
+    /// question and gets the answer from the same two facts, both read fresh.
+    /// Nothing accumulates, so no edge can be "the one that was missed": the
+    /// worst a missed call costs is being right one tick late
+    /// (review of 2026-08-20, finding 2).
     pub(crate) async fn refresh_engine_residency(&self) {
-        let capturing = self.blocked.load(Ordering::SeqCst);
+        let capturing = self.capture_is_live();
         let outstanding = outstanding_meeting_jobs(&self.db).await;
         self.ports
             .asr
@@ -907,6 +953,11 @@ impl JobRuntime {
         if let Some(updated) = repo::get_job(&self.db, job_id).await? {
             self.announce(&updated);
         }
+        // Cancelling the last thing a meeting was waiting for is exactly as much
+        // of an edge as queueing the first one, and it used to be the one edge
+        // nobody reported: the engine stayed held with nothing left to do and no
+        // later edge that could ever clear it.
+        self.refresh_engine_residency().await;
         Ok(())
     }
 
@@ -923,6 +974,9 @@ impl JobRuntime {
         if let Some(updated) = repo::get_job(&self.db, job_id).await? {
             self.announce(&updated);
         }
+        // And the mirror image: a meeting with work in the queue again needs the
+        // engine again, whether or not the loop reaches the row this second.
+        self.refresh_engine_residency().await;
         self.wake.notify_one();
         Ok(())
     }
@@ -991,9 +1045,14 @@ impl JobRuntime {
     }
 
     async fn run_loop(self: Arc<Self>) {
+        let mut last_reconcile = Instant::now() - RECONCILE_INTERVAL;
         loop {
             if self.stopped.load(Ordering::SeqCst) {
                 return;
+            }
+            if last_reconcile.elapsed() >= RECONCILE_INTERVAL {
+                last_reconcile = Instant::now();
+                self.reconcile().await;
             }
             if self.blocked.load(Ordering::SeqCst) {
                 self.wait(BLOCKED_POLL).await;
@@ -1009,6 +1068,67 @@ impl JobRuntime {
                     self.wait(IDLE_POLL).await;
                 }
             }
+        }
+    }
+
+    /// The lifecycle backstop, run on the loop's own tick.
+    ///
+    /// Two things, both derived from the table rather than from a flag: a row
+    /// claiming to be running that nothing is running is put back in the queue,
+    /// and the engine's residency is recomputed from what is left. Together they
+    /// are the answer to "what if an edge is missed": nothing here accumulates,
+    /// so a wrong answer lasts one tick rather than until Echo is restarted
+    /// (review of 2026-08-20, finding 2).
+    pub(crate) async fn reconcile(&self) {
+        self.requeue_abandoned_rows().await;
+        self.refresh_engine_residency().await;
+    }
+
+    /// A row marked `running` that this loop is not running belongs to nobody.
+    ///
+    /// It can only happen if a status write failed or something died between
+    /// marking the row and running it — and while it sits there it counts as
+    /// outstanding work forever, which is 1.6 GB of weights held for a job that
+    /// will never finish. Queued again, it either runs or fails, and either way
+    /// it reaches a terminal state.
+    ///
+    /// Safe because this loop is the only thing that runs jobs and it never gets
+    /// here while one is in flight: [`JobRuntime::execute`] is awaited from the
+    /// same task, and the id it registers is skipped anyway.
+    async fn requeue_abandoned_rows(&self) {
+        if self.blocked.load(Ordering::SeqCst) {
+            // A recording parks rows on purpose. Nothing here is abandoned.
+            return;
+        }
+        let mine = self.running_job();
+        let rows = repo::list_jobs(
+            &self.db,
+            &JobQuery {
+                status: Some(JobStatus::Running),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_default();
+        for job in rows {
+            if mine.as_deref() == Some(job.id.as_str()) {
+                continue;
+            }
+            tracing::warn!(
+                job = %job.id,
+                kind = ?job.kind,
+                "work was marked as running with nothing running it; queueing it again"
+            );
+            if let Err(error) =
+                repo::set_job_status(&self.db, &job.id, JobStatus::Queued, None).await
+            {
+                tracing::warn!(%error, "could not put abandoned work back in the queue");
+                continue;
+            }
+            if let Ok(Some(requeued)) = repo::get_job(&self.db, &job.id).await {
+                self.announce(&requeued);
+            }
+            self.wake.notify_one();
         }
     }
 

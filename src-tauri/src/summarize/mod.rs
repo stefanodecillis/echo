@@ -53,6 +53,19 @@ pub enum SummarizeError {
     /// The key itself was refused: wrong, revoked, or not allowed to do this.
     #[error("the service refused the request: {0}")]
     Rejected(String),
+    /// The service turned this *request* down, and not over the key: a schema
+    /// keyword it does not know, a shape it does not accept, a feature the
+    /// chosen model does not have. Any 4xx that is not about the credential and
+    /// not an exhausted allowance.
+    ///
+    /// Its own variant because [`Self::Rejected`] means "the key was refused"
+    /// all the way to the screen. Folded together, a 400 about a schema sent
+    /// people to Settings to replace a key that was working perfectly
+    /// (review of 2026-08-20, finding 5). `status` is the number, for the
+    /// Advanced-only detail line; `detail` is the service's own prose, which
+    /// never reaches the screen.
+    #[error("the service turned the request down (http {status})")]
+    RequestRefused { status: u16, detail: String },
     /// The key is fine — the account's allowance for it is used up (HTTP 429).
     ///
     /// Deliberately its own variant. Folded into [`Self::Rejected`] it became

@@ -23,7 +23,11 @@
 //! applies it wherever either fact changes ([`Inner::refresh_engine_residency`]).
 //! If the engine comes up *during* a recording, the backlog on disk is read into
 //! the transcript before live decoding carries on
-//! ([`pipeline::catch_up_backlog`]).
+//! ([`pipeline::catch_up_backlog`]). That handover splits the meeting clock in
+//! two — the recording owns what came before, the live pass what comes after
+//! ([`pipeline::Backlog`]) — and the pass doing the reading is a task this
+//! module owns, so a stop waits for it before queueing the job that finishes the
+//! meeting.
 //!
 //! Every entry point is idempotent: a second Start while recording returns the
 //! meeting already in progress, and a second Stop returns the same result.
@@ -203,6 +207,14 @@ pub(crate) struct Inner {
     /// Serialises start/stop/pause/resume so two clicks cannot interleave.
     pub(crate) command: tokio::sync::Mutex<()>,
     pub(crate) tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    /// How the meeting clock is split between the live pass and the pass that
+    /// reads this meeting's start off disk, for the recording in progress
+    /// ([`pipeline::Backlog`]). Replaced by every start.
+    pub(crate) backlog: std::sync::Mutex<Option<Arc<pipeline::Backlog>>>,
+    /// The task doing that reading, owned rather than detached: a stop has to be
+    /// able to wait for it before the finalize job is queued, or the two passes
+    /// fill the same holes (review of 2026-08-20, finding 1).
+    pub(crate) backlog_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// Utterances waiting for text, for the "catching up" hint.
     pub(crate) pending: AtomicU32,
 }
@@ -340,6 +352,9 @@ impl Inner {
         if let Some(handle) = handle {
             let _ = handle.stop().await;
         }
+        // The backlog pass is a task of its own, so waiting for it here is safe
+        // and necessary: this path queues the finalize job too.
+        self.join_backlog_pass().await;
 
         let committed = jobs::committed_end_ms(&self.db, meeting_id)
             .await
@@ -451,6 +466,49 @@ impl Inner {
         self.refresh_engine_residency().await;
     }
 
+    /// End the pass reading this meeting's start off disk, and wait for it.
+    ///
+    /// Cancellation is cooperative and already armed: that pass asks between
+    /// windows whether this meeting is still the one being recorded, and by the
+    /// time anything calls this it is not. So this is the *waiting* half, and it
+    /// is the half that matters — the finalize job must not start while another
+    /// pass is still writing segments, because "which stretches have no text
+    /// against them" is a question with a different answer a second later
+    /// (review of 2026-08-20, finding 1).
+    ///
+    /// Bounded, like every other wait on the stop path: a pass that will not stop
+    /// is dropped rather than allowed to hold up the end of a meeting. Dropping
+    /// the task cancels it at its next await, which is inside the engine queue,
+    /// so nothing is left decoding either.
+    pub(crate) async fn join_backlog_pass(&self) {
+        let task = self
+            .backlog_task
+            .lock()
+            .expect("backlog task lock")
+            .take();
+        *self.backlog.lock().expect("backlog lock") = None;
+        let Some(mut task) = task else {
+            return;
+        };
+        if tokio::time::timeout(DRAIN_TIMEOUT, &mut task).await.is_err() {
+            tracing::warn!("the backlog pass took too long to stop; dropping it");
+            task.abort();
+        }
+    }
+
+    /// A start that got nowhere: back to `Failed`, and let the engine go unless
+    /// something else still wants it.
+    ///
+    /// Every failed start has to come through here. Residency is claimed on the
+    /// first line of a start (review of 2026-08-20, finding 3), so a start that
+    /// gives up without this would hold the weights for a recording that never
+    /// happened.
+    pub(crate) async fn start_failed(&self) {
+        self.transition(&CaptureEvent::Failed);
+        self.emit_state();
+        self.refresh_engine_residency().await;
+    }
+
     /// Tell the speech engine whether a meeting still needs it.
     ///
     /// The whole of the listening-scoped lifecycle on this side: the engine is
@@ -463,12 +521,13 @@ impl Inner {
     /// Cheap and idempotent, so every path that changes either fact can just
     /// call it: start, stop, a capture that died, a job that finished, a job that
     /// was queued.
+    ///
+    /// One line, because the rule has to be computed in exactly one place. The
+    /// job runtime owns that computation — it is the half that also runs on a
+    /// tick — and it reads this capture state through the hook installed in
+    /// [`SessionManager::with_ports`].
     pub(crate) async fn refresh_engine_residency(&self) {
-        let capturing = engine_is_needed_by_capture(self.state());
-        let outstanding = jobs::outstanding_meeting_jobs(&self.db).await;
-        self.ports
-            .asr
-            .hold_resident(engine_stays_resident(capturing, outstanding));
+        self.jobs.refresh_engine_residency().await;
     }
 }
 
@@ -525,7 +584,7 @@ impl SessionManager {
     /// "record from a file" mode.
     pub fn with_ports(db: Db, paths: AppPaths, ports: Ports) -> Self {
         let jobs = jobs::JobRuntime::new(db.clone(), paths.clone(), ports.clone());
-        Self(Arc::new(Inner {
+        let inner = Arc::new(Inner {
             db,
             paths,
             ports,
@@ -534,8 +593,21 @@ impl SessionManager {
             capture: tokio::sync::Mutex::new(None),
             command: tokio::sync::Mutex::new(()),
             tasks: std::sync::Mutex::new(Vec::new()),
+            backlog: std::sync::Mutex::new(None),
+            backlog_task: std::sync::Mutex::new(None),
             pending: AtomicU32::new(0),
-        }))
+        });
+        // The job runtime owns the residency rule, and half of that rule is "is
+        // a capture live". This is where it gets to ask. Weak on purpose: the
+        // spine owns the runtime, so a strong pointer back would be a cycle
+        // nothing ever breaks.
+        let capture = Arc::downgrade(&inner);
+        inner.jobs.watch_capture(Arc::new(move || {
+            capture
+                .upgrade()
+                .is_some_and(|inner| engine_is_needed_by_capture(inner.state()))
+        }));
+        Self(inner)
     }
 
     pub fn db(&self) -> &Db {
@@ -580,6 +652,13 @@ impl SessionManager {
 
         let settings = crate::settings::load(&inner.db).await?;
         inner.transition(&CaptureEvent::StartRequested);
+        // Before the meeting row, before the devices, before anything that can
+        // take a moment: an engine already counting down its grace period has to
+        // hear about this recording *now*. Told afterwards, it can unload 1.6 GB
+        // between the click and the first chunk and then load it straight back
+        // (review of 2026-08-20, finding 3). `Starting` is the state that says
+        // so, and this is the first line after it.
+        inner.refresh_engine_residency().await;
         {
             let mut live = inner.live.lock().expect("capture state lock");
             live.meeting_id = None;
@@ -607,8 +686,7 @@ impl SessionManager {
         {
             Ok(meeting) => meeting,
             Err(error) => {
-                inner.transition(&CaptureEvent::Failed);
-                inner.emit_state();
+                inner.start_failed().await;
                 return Err(error.into());
             }
         };
@@ -617,8 +695,7 @@ impl SessionManager {
         if let Err(error) = std::fs::create_dir_all(&audio_dir) {
             let _ = repo::set_meeting_status(&inner.db, &meeting.id, MeetingStatus::Failed).await;
             let _ = repo::soft_delete_meeting(&inner.db, &meeting.id).await;
-            inner.transition(&CaptureEvent::Failed);
-            inner.emit_state();
+            inner.start_failed().await;
             return Err(SessionError::Storage(format!(
                 "{}: {error}",
                 audio_dir.display()
@@ -654,8 +731,7 @@ impl SessionManager {
                 let _ =
                     repo::set_meeting_status(&inner.db, &meeting.id, MeetingStatus::Failed).await;
                 let _ = repo::soft_delete_meeting(&inner.db, &meeting.id).await;
-                inner.transition(&CaptureEvent::Failed);
-                inner.emit_state();
+                inner.start_failed().await;
                 return Err(session_error_for(error));
             }
         };
@@ -664,8 +740,7 @@ impl SessionManager {
             let _ = handle.stop().await;
             let _ = repo::set_meeting_status(&inner.db, &meeting.id, MeetingStatus::Failed).await;
             let _ = repo::soft_delete_meeting(&inner.db, &meeting.id).await;
-            inner.transition(&CaptureEvent::Failed);
-            inner.emit_state();
+            inner.start_failed().await;
             return Err(SessionError::NoAudioSources(
                 started
                     .system_audio_error
@@ -745,7 +820,14 @@ impl SessionManager {
         }
 
         // 4a. The live pipeline: journal chunks, write down what is said.
-        let tasks = pipeline::spawn(inner.clone(), meeting.id.clone(), feed);
+        //
+        //     It is handed the split of the meeting clock it shares with the
+        //     backlog pass ([`pipeline::Backlog`]). Empty for now, and for most
+        //     recordings it stays that way: the engine is usually ready before
+        //     the meeting is.
+        let backlog = pipeline::Backlog::new();
+        *inner.backlog.lock().expect("backlog lock") = Some(backlog.clone());
+        let tasks = pipeline::spawn(inner.clone(), meeting.id.clone(), feed, backlog.clone());
         {
             let mut slot = inner.tasks.lock().expect("pipeline task lock");
             *slot = tasks;
@@ -754,19 +836,23 @@ impl SessionManager {
         // 4b. The speech engine, last, and off the critical path: failing to
         //     load it must not end a recording. The audio is already on disk.
         //
-        //     It is also told to stay: from here until this meeting's last job
-        //     finishes, the weights do not go anywhere (mantra 1's amendment of
-        //     2026-08-20).
-        inner.refresh_engine_residency().await;
+        //     It was told to stay on the first line of this function, before the
+        //     row and the devices, so the weights cannot have gone anywhere in
+        //     the meantime (mantra 1's amendment of 2026-08-20).
+        //
+        //     The task is *owned*, not detached: a stop waits for it before it
+        //     queues the finalize job, so there is never a backlog pass still
+        //     writing while the post-meeting one works out where the holes are
+        //     (review of 2026-08-20, finding 1).
         let engine = inner.clone();
         let engine_meeting = meeting.id.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             match engine.ports.asr.prewarm().await {
                 // Ready — but possibly minutes after the meeting started, if the
                 // weights had to be read or the graphics compiler had work to do.
                 // Whatever was said in the meantime is on disk, so read it back
                 // into the transcript before carrying on live.
-                Ok(()) => pipeline::catch_up_backlog(engine, engine_meeting).await,
+                Ok(()) => pipeline::catch_up_backlog(engine, engine_meeting, backlog).await,
                 Err(error) => {
                     tracing::warn!(%error, "speech understanding is not ready");
                     engine.notice(NoticePayload {
@@ -781,6 +867,7 @@ impl SessionManager {
                 }
             }
         });
+        *inner.backlog_task.lock().expect("backlog task lock") = Some(task);
 
         tracing::info!(meeting = %meeting.id, channels = ?started.channels, "recording");
         Ok(meeting.id)
@@ -834,6 +921,9 @@ impl SessionManager {
                 tracing::warn!("the live pipeline took too long to finish; carrying on");
             }
         }
+        // And the pass reading this meeting's start off disk, before anything
+        // queues the one that reads the rest of it.
+        inner.join_backlog_pass().await;
 
         // The journal is the truth about how long this meeting was.
         let committed = jobs::committed_end_ms(&inner.db, &meeting_id)
@@ -1819,6 +1909,126 @@ mod tests {
         assert!(!h.session.speech_loaded(), "idle Echo holds no weights");
     }
 
+    /// The edge nobody reported: the last thing a meeting was waiting for is
+    /// cancelled, so there is nothing left to do — and nothing left that could
+    /// ever produce the edge that lets the engine go
+    /// (review of 2026-08-20, finding 2).
+    #[tokio::test]
+    async fn cancelling_the_last_of_a_meetings_work_lets_the_engine_go() {
+        let h = Harness::new().await;
+        let meeting = repo::create_meeting(&h.db, "Yesterday", "/tmp", None)
+            .await
+            .unwrap();
+        let job = h
+            .session
+            .queue_job(Some(&meeting.id), JobKind::Summarize)
+            .await
+            .unwrap();
+        assert!(
+            h.asr.is_resident(),
+            "queued work for a meeting holds the engine"
+        );
+
+        h.session.cancel_job(&job).await.unwrap();
+        assert!(
+            !h.asr.is_resident(),
+            "with nothing left to do, the grace period has to start"
+        );
+        h.session.release_idle_resources().await;
+        assert!(!h.session.speech_loaded(), "idle Echo holds no weights");
+    }
+
+    /// And the mirror image: asking for that work again needs the engine again,
+    /// whether or not the loop reaches the row this second.
+    #[tokio::test]
+    async fn retrying_cancelled_work_asks_for_the_engine_again() {
+        let h = Harness::new().await;
+        let meeting = repo::create_meeting(&h.db, "Yesterday", "/tmp", None)
+            .await
+            .unwrap();
+        let job = h
+            .session
+            .queue_job(Some(&meeting.id), JobKind::Summarize)
+            .await
+            .unwrap();
+        h.session.cancel_job(&job).await.unwrap();
+        assert!(!h.asr.is_resident());
+
+        h.session.retry_job(&job).await.unwrap();
+        assert!(
+            h.asr.is_resident(),
+            "work back in the queue is work the engine is needed for"
+        );
+    }
+
+    /// A row nothing is running cannot be allowed to hold 1.6 GB for the life of
+    /// the process. The loop's own tick is the backstop: the row goes back in the
+    /// queue, reaches a terminal state, and the engine is let go.
+    #[tokio::test]
+    async fn a_row_left_running_by_nothing_is_unstuck_by_the_tick() {
+        let h = Harness::new().await;
+        let meeting = repo::create_meeting(&h.db, "Yesterday", "/tmp", None)
+            .await
+            .unwrap();
+        let job = repo::ensure_job(&h.db, Some(&meeting.id), JobKind::Summarize)
+            .await
+            .unwrap();
+        // The shape a failed status write, or something dying mid-job, leaves
+        // behind: `running`, with nothing running it.
+        repo::set_job_status(&h.db, &job.id, JobStatus::Running, None)
+            .await
+            .unwrap();
+        h.session.0.jobs.refresh_engine_residency().await;
+        assert!(h.asr.is_resident(), "a non-terminal row counts as work");
+
+        h.session.0.jobs.reconcile().await;
+        let after = repo::get_job(&h.db, &job.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            JobStatus::Queued,
+            "an abandoned row belongs back in the queue"
+        );
+        assert!(
+            h.asr.is_resident(),
+            "queued work still needs the engine; it is no longer stuck, that is all"
+        );
+
+        // And now that it can finish, it does, and the engine is let go.
+        h.session.start_job_runner().await.unwrap();
+        h.wait_until("the engine to be let go", || !h.asr.is_resident())
+            .await;
+    }
+
+    /// An engine part-way through its grace period must not be allowed to unload
+    /// between the click and the first chunk (review of 2026-08-20, finding 3).
+    #[tokio::test]
+    async fn a_start_claims_the_engine_before_it_touches_a_device() {
+        let h = Harness::new().await;
+        assert_eq!(h.capture.engine_held_when_opened(), None);
+
+        h.session.start(Default::default()).await.unwrap();
+        assert_eq!(
+            h.capture.engine_held_when_opened(),
+            Some(true),
+            "the engine has to be claimed before the devices are opened, or it can \
+             unload and reload across one Start"
+        );
+    }
+
+    /// And a start that gets nowhere does not leave the engine held for a
+    /// recording that never happened.
+    #[tokio::test]
+    async fn a_start_that_fails_hands_the_engine_back() {
+        let h = Harness::new().await;
+        h.capture.fail_with(crate::audio::AudioError::NoInputDevice);
+        assert!(h.session.start(Default::default()).await.is_err());
+        h.settle().await;
+        assert!(
+            !h.asr.is_resident(),
+            "nothing is being recorded and nothing is queued"
+        );
+    }
+
     #[tokio::test]
     async fn a_live_recording_never_has_its_resources_taken_away() {
         let h = Harness::new().await;
@@ -1886,6 +2096,136 @@ mod tests {
         );
         // These lines replace no live line: there was nothing on screen for them.
         assert!(shown.iter().all(|line| line.utterance_id.is_none()));
+    }
+
+    /// The whole point of the split: the backlog first, in order, and then live —
+    /// with no stretch written twice, not even the one the live pass was still
+    /// decoding when the backlog pass claimed it
+    /// (review of 2026-08-20, finding 1).
+    #[tokio::test]
+    async fn the_backlog_is_read_in_order_and_the_live_pass_writes_nothing_over_it() {
+        let h = Harness::new().await;
+        // What is on disk for the stretch before the engine was ready.
+        h.asr.backlog_writes(&[(0, 4_000, "the bit before")]);
+        // The engine arrives a moment after Start, and every decode is slow
+        // enough that the live one is still in flight when it does.
+        h.asr.prewarm_takes(Duration::from_millis(150));
+        h.asr.transcribe_takes(Duration::from_millis(250));
+        h.capture.set_elapsed(30_000);
+
+        let id = h.session.start(Default::default()).await.unwrap();
+        // A live utterance for exactly the stretch the backlog pass is about to
+        // claim. It is in the engine when the claim happens, and the mock engine
+        // answers it anyway.
+        h.capture
+            .send(ports::CaptureSignal::UtteranceReady(Utterance {
+                channel: Channel::Mic,
+                t_start_ms: 1_000,
+                t_end_ms: 3_000,
+                samples: vec![0.0; 16_000],
+                truncated: false,
+            }));
+
+        h.wait_until("the backlog to be read back", || {
+            h.events
+                .finals()
+                .iter()
+                .any(|line| line.segment.text == "the bit before")
+        })
+        .await;
+
+        // And now the other half of the race: an utterance for that same stretch
+        // reaching the live pass *after* the backlog pass has read what is
+        // covered. Written, it would be a second copy of words already in the
+        // transcript — the duplicate this whole split exists to prevent.
+        h.capture
+            .send(ports::CaptureSignal::UtteranceReady(Utterance {
+                channel: Channel::Mic,
+                t_start_ms: 3_500,
+                t_end_ms: 3_900,
+                samples: vec![0.0; 6_400],
+                truncated: false,
+            }));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        h.settle().await;
+
+        let below = repo::get_segments(
+            &h.db,
+            &TranscriptQuery {
+                meeting_id: id.clone(),
+                to_ms: Some(4_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            below.len(),
+            1,
+            "one stretch, one line: the live pass and the backlog pass must not both \
+             write it: {below:?}"
+        );
+        assert_eq!(
+            below[0].text, "the bit before",
+            "the backlog pass owns everything below the floor"
+        );
+
+        // And live carries on above the floor: same recording, same pipeline.
+        h.capture.set_elapsed(40_000);
+        h.capture
+            .send(ports::CaptureSignal::UtteranceReady(Utterance {
+                channel: Channel::Mic,
+                t_start_ms: 35_000,
+                t_end_ms: 37_000,
+                samples: vec![0.0; 16_000],
+                truncated: false,
+            }));
+        h.wait_until("live text to carry on after the backlog", || {
+            h.events
+                .finals()
+                .iter()
+                .any(|line| line.segment.t_start_ms >= 30_000)
+        })
+        .await;
+    }
+
+    /// The stop handoff owns the backlog pass. It used to be detached, which
+    /// meant it could still be filling holes while the finalize job worked out
+    /// where the holes were (review of 2026-08-20, finding 1).
+    #[tokio::test]
+    async fn a_stop_waits_for_the_backlog_pass_before_queueing_the_finalize_job() {
+        let h = Harness::new().await;
+        h.asr.backlog_writes(&[(0, 4_000, "the bit before")]);
+        h.asr.prewarm_takes(Duration::from_millis(50));
+        h.capture.set_elapsed(30_000);
+
+        let id = h.session.start(Default::default()).await.unwrap();
+        h.wait_until("the backlog pass to start", || {
+            !h.asr.backlog_calls().is_empty()
+        })
+        .await;
+        h.record_a_minute(&id).await;
+        h.session.stop().await.unwrap();
+
+        assert!(
+            h.session
+                .0
+                .backlog_task
+                .lock()
+                .expect("backlog task lock")
+                .is_none(),
+            "the stop owns that task and waits for it"
+        );
+        assert!(
+            h.session.0.backlog.lock().expect("backlog lock").is_none(),
+            "and the split goes with the recording it belonged to"
+        );
+        assert!(
+            h.queued_kinds(&id)
+                .await
+                .contains(&JobKind::TranscribeCatchup),
+            "only then does the disk pass for the rest of the meeting get queued"
+        );
     }
 
     #[tokio::test]

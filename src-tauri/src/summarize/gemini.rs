@@ -247,14 +247,44 @@ fn is_model_not_found(status: reqwest::StatusCode, body: &str) -> bool {
         || lower.contains("unexpected model name")
 }
 
+/// Does this refusal read as being about the key itself?
+///
+/// The status alone cannot decide it: Google's own answer to a bad key is a
+/// `400 INVALID_ARGUMENT` saying *"API key not valid"*, not a 401. So the two
+/// auth statuses count on their own, and any other 4xx counts only when the
+/// body names the credential.
+fn is_about_the_key(status: u16, body: &str) -> bool {
+    if matches!(status, 401 | 403) {
+        return true;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("api key")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("credential")
+        || lower.contains("unauthenticated")
+        || lower.contains("unauthorized")
+}
+
 fn classify_status(status: reqwest::StatusCode, body: &str) -> SummarizeError {
-    match status.as_u16() {
-        401 | 403 => SummarizeError::Rejected("the saved key was refused".into()),
+    let code = status.as_u16();
+    match code {
         // Not a bad key: the key worked and the allowance behind it is spent.
         // Told apart because the two need opposite advice — re-check the key,
         // versus wait or raise the limit.
         429 => SummarizeError::QuotaExhausted,
-        400..=499 => SummarizeError::Rejected(truncate(body, 200)),
+        400..=499 if is_about_the_key(code, body) => {
+            SummarizeError::Rejected("the saved key was refused".into())
+        }
+        // Everything else in the 4xx range is Google turning *this request*
+        // down — a schema keyword it does not know, a shape it does not accept,
+        // a feature this model does not have. Folding these in with a refused
+        // key sent people off to replace a key that was working perfectly
+        // (review of 2026-08-20, finding 5).
+        400..=499 => SummarizeError::RequestRefused {
+            status: code,
+            detail: truncate(body, 200),
+        },
         _ => SummarizeError::Failed(format!("http {status}: {}", truncate(body, 200))),
     }
 }
@@ -300,9 +330,15 @@ struct CallTally {
     /// Payloads that did not. The number that tells a framing bug from an
     /// empty answer.
     parse_failures: usize,
-    /// The first deserialization failure's own words. Serde reports a position
-    /// and an expectation, never the document, so this carries no content.
-    first_parse_error: Option<String>,
+    /// The shape of the first deserialization failure: which kind of failure it
+    /// was and where in the payload it happened, and nothing else.
+    ///
+    /// Deliberately **not** `serde_json::Error::to_string()`. Serde's message
+    /// for a type mismatch quotes the offending value — `invalid type: string
+    /// "…", expected a sequence` — so the "counters only" promise this whole
+    /// struct is built on was not one the old field could keep
+    /// (review of 2026-08-20, finding 4).
+    first_parse_shape: Option<String>,
     candidates: usize,
     parts: usize,
     text_parts: usize,
@@ -326,6 +362,24 @@ struct CallTally {
     saw_cr: bool,
     bom: bool,
     done_marker: bool,
+}
+
+/// A deserialization failure, described without quoting any of the document.
+///
+/// Serde's own `Display` is not safe to log here: for a type mismatch it prints
+/// the value it did not like, which for a Gemini reply is a piece of somebody's
+/// meeting. The category and the position say everything a fix needs — "the
+/// payload was valid JSON of the wrong shape, twelve lines in" — and carry
+/// nothing that could be content.
+fn parse_failure_shape(error: &serde_json::Error) -> String {
+    use serde_json::error::Category;
+    let kind = match error.classify() {
+        Category::Io => "io",
+        Category::Syntax => "not json",
+        Category::Data => "wrong shape",
+        Category::Eof => "cut short",
+    };
+    format!("{kind} at line {} column {}", error.line(), error.column())
 }
 
 /// Note which line endings some part of the reply used. The one field that says
@@ -412,7 +466,7 @@ impl CallTally {
                 parse_failures = self.parse_failures,
                 line_endings = self.line_endings(),
                 bom = self.bom,
-                reason = self.first_parse_error.as_deref().unwrap_or("-"),
+                reason = self.first_parse_shape.as_deref().unwrap_or("-"),
                 "some of Google's reply could not be read"
             );
         }
@@ -509,8 +563,8 @@ fn absorb_event(
         }
         Err(e) => {
             tally.parse_failures += 1;
-            if tally.first_parse_error.is_none() {
-                tally.first_parse_error = Some(e.to_string());
+            if tally.first_parse_shape.is_none() {
+                tally.first_parse_shape = Some(parse_failure_shape(&e));
             }
             return;
         }
@@ -621,9 +675,15 @@ async fn read_sse_body(
 /// what the outcome was. The three failures are told apart on purpose:
 ///
 /// * **blocked** — Google answered and refused. Nothing to retry.
-/// * **empty** — Google answered, Echo read it, there was no text in it.
-/// * **malformed** — events arrived and none of them parsed. Echo's bug, not
-///   the meeting's, and the counters in the log line say which one.
+/// * **empty** — Google answered, Echo read it, there was no text in it. Text
+///   that is nothing but whitespace counts as no text: a recap of four newlines
+///   is not a recap, and passing it on would put a blank page where the meeting
+///   should be.
+/// * **malformed** — events arrived and **not one** of them parsed. Echo's bug,
+///   not the meeting's, and the counters in the log line say which one. Strictly
+///   "none parsed": a reply where some events parsed and some did not is a
+///   *partial* reply, and it is reported as the success it is with a loud line
+///   in the log rather than thrown away (review of 2026-08-20, finding 4).
 async fn drain_sse(
     mut resp: reqwest::Response,
     cancel: &CancelFlag,
@@ -645,11 +705,31 @@ async fn drain_sse(
     {
         return Err(SummarizeError::Blocked { reason });
     }
-    if full.is_empty() {
-        if tally.parse_failures > 0 {
+    if full.trim().is_empty() {
+        // Events came down the wire and Echo could read none of them: the two
+        // sides disagree about the shape of an answer, which is Echo's bug.
+        // Anything else with no text in it is an empty reply, whatever else went
+        // wrong on the way.
+        if tally.events > 0 && tally.parsed == 0 {
             return Err(SummarizeError::MalformedReply);
         }
         return Err(SummarizeError::EmptyReply);
+    }
+
+    // Some of the reply was unreadable and there is still a recap here. It goes
+    // out — a recap missing a paragraph beats no recap at all — but not quietly:
+    // this is the line that says the recap somebody is reading is incomplete.
+    if tally.parse_failures > 0 {
+        tracing::warn!(
+            target: TELEMETRY_TARGET,
+            model = %model,
+            parsed = tally.parsed,
+            parse_failures = tally.parse_failures,
+            text_chars = tally.text_chars,
+            reason = tally.first_parse_shape.as_deref().unwrap_or("-"),
+            "this recap was assembled from a reply Echo could only partly read; \
+             some of what Google sent is missing from it"
+        );
     }
 
     events.push(GenerateEvent::Done { text: full });
@@ -893,6 +973,18 @@ impl Connector for GeminiConnector {
                 Err(SummarizeError::Rejected(_)) => Ok(ProviderTestResult {
                     ok: false,
                     message: "That key wasn't accepted. Check it and try again.".into(),
+                    caps,
+                    models: Vec::new(),
+                    leaves_machine: true,
+                }),
+                // Google answered, and said no to the request rather than to the
+                // key. "That key wasn't accepted" would be a lie about a key
+                // that was.
+                Err(SummarizeError::RequestRefused { .. }) => Ok(ProviderTestResult {
+                    ok: false,
+                    message: "That key works, but Google wouldn't take the request. Try again, \
+                              or pick something else to write recaps."
+                        .into(),
                     caps,
                     models: Vec::new(),
                     leaves_machine: true,
@@ -1364,6 +1456,75 @@ mod tests {
         ));
     }
 
+    /// The regression this taxonomy was rewritten for: every unmatched 4xx used
+    /// to become "that key wasn't accepted", so a schema Google did not like sent
+    /// people off to replace a key that was working
+    /// (review of 2026-08-20, finding 5).
+    #[test]
+    fn a_4xx_that_is_not_about_the_key_does_not_blame_the_key() {
+        let schema_400 = classify_status(
+            reqwest::StatusCode::BAD_REQUEST,
+            "{\"error\":{\"message\":\"Invalid JSON payload received. Unknown name \
+             \\\"additionalProperties\\\"\",\"status\":\"INVALID_ARGUMENT\"}}",
+        );
+        match schema_400 {
+            SummarizeError::RequestRefused { status, detail } => {
+                assert_eq!(status, 400);
+                assert!(detail.contains("additionalProperties"), "{detail}");
+            }
+            other => panic!("a schema 400 is not about the key: {other:?}"),
+        }
+
+        // Anything else in the range that says nothing about a credential.
+        for code in [404u16, 405, 413, 415, 422] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert!(
+                matches!(
+                    classify_status(status, "{\"error\":{\"message\":\"no\"}}"),
+                    SummarizeError::RequestRefused { .. }
+                ),
+                "http {code} blamed the key"
+            );
+        }
+
+        // Google's own answer to a bad key is a 400, not a 401 — so the wording
+        // decides, not the number.
+        assert!(matches!(
+            classify_status(
+                reqwest::StatusCode::BAD_REQUEST,
+                "{\"error\":{\"message\":\"API key not valid. Please pass a valid API key.\",\
+                 \"status\":\"INVALID_ARGUMENT\"}}"
+            ),
+            SummarizeError::Rejected(_)
+        ));
+    }
+
+    /// And the sentence that reaches the person says the request was turned
+    /// down, not that the key is wrong.
+    #[tokio::test]
+    async fn a_request_google_turns_down_is_not_reported_as_a_bad_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1beta/models"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "{\"error\":{\"code\":400,\"message\":\"Unknown name \\\"widget\\\"\",\
+                 \"status\":\"INVALID_ARGUMENT\"}}",
+            ))
+            .mount(&server)
+            .await;
+
+        let connector = GeminiConnector::new("good-key", None).with_api_base(server.uri());
+        let result = connector.check().await.unwrap();
+        assert!(!result.ok);
+        let lower = result.message.to_lowercase();
+        assert!(
+            !lower.contains("wasn't accepted"),
+            "a schema 400 must not blame the key: {}",
+            result.message
+        );
+        assert!(lower.contains("key works"), "{}", result.message);
+    }
+
     #[tokio::test]
     async fn a_used_up_allowance_is_never_reported_as_a_bad_key() {
         let server = MockServer::start().await;
@@ -1591,6 +1752,75 @@ mod tests {
         assert_eq!(done_text(&events), "the recap");
     }
 
+    /// The half-and-half case, which used to be called malformed even though a
+    /// perfectly good recap had arrived: some events parsed, some did not. It is
+    /// a partial reply, which is a success — loudly logged, never discarded
+    /// (review of 2026-08-20, finding 4).
+    #[tokio::test]
+    async fn a_reply_only_partly_readable_still_produces_the_recap_it_carried() {
+        let body = format!(
+            "{}\n\ndata: {{\"candidates\":[{{\"content\":\"not an object\"}}]}}\n\n{}\n\n",
+            text_event("first half "),
+            text_event("second half")
+        );
+        let events = drain(body.as_bytes()).await.unwrap();
+        assert_eq!(done_text(&events), "first half second half");
+        assert_eq!(
+            streamed_text(&events),
+            vec!["first half ".to_string(), "second half".to_string()]
+        );
+    }
+
+    /// "None parsed" is the definition of malformed, so one event that parsed is
+    /// enough to make an answer with no text in it an *empty* one.
+    #[tokio::test]
+    async fn a_textless_reply_with_one_unreadable_event_is_empty_not_malformed() {
+        let body = "data: {\"candidates\":[]}\n\ndata: not json\n\n";
+        let err = drain(body.as_bytes()).await.unwrap_err();
+        assert!(matches!(err, SummarizeError::EmptyReply), "{err:?}");
+    }
+
+    /// A recap of four newlines is not a recap. It used to pass the emptiness
+    /// check and land on the screen as a blank page.
+    #[tokio::test]
+    async fn a_reply_that_is_only_whitespace_is_an_empty_one() {
+        for whitespace in ["\\n\\n\\n", " ", "\\t \\n"] {
+            let body = format!("{}\n\n", text_event(whitespace));
+            let err = drain(body.as_bytes()).await.unwrap_err();
+            assert!(
+                matches!(err, SummarizeError::EmptyReply),
+                "{whitespace:?} gave {err:?}"
+            );
+        }
+    }
+
+    /// The telemetry promise: counters and positions, never a fragment of
+    /// somebody's meeting. Serde's own message quotes the value it rejected, so
+    /// this is the one thing that must not be logged verbatim.
+    #[test]
+    fn a_parse_failure_is_described_without_quoting_the_payload() {
+        let err = serde_json::from_str::<GenerateChunk>(
+            "{\"candidates\":\"acquisition of Contoso for 4.2 million\"}",
+        )
+        .expect_err("a string where a list belongs");
+        let shape = parse_failure_shape(&err);
+        assert!(!shape.contains("Contoso"), "{shape}");
+        assert!(!shape.contains("acquisition"), "{shape}");
+        assert!(shape.contains("wrong shape"), "{shape}");
+        assert!(shape.contains("line"), "{shape}");
+
+        assert!(
+            parse_failure_shape(
+                &serde_json::from_str::<GenerateChunk>("<html>nope</html>").unwrap_err()
+            )
+            .contains("not json")
+        );
+        assert!(parse_failure_shape(
+            &serde_json::from_str::<GenerateChunk>("{\"candidates\":[").unwrap_err()
+        )
+        .contains("cut short"));
+    }
+
     #[tokio::test]
     async fn a_models_own_reasoning_never_lands_in_the_recap() {
         let body = "data: {\"candidates\":[{\"content\":{\"parts\":[\
@@ -1660,7 +1890,7 @@ mod tests {
         assert_eq!(tally.events, 2);
         assert_eq!(tally.parsed, 1);
         assert_eq!(tally.parse_failures, 1);
-        assert!(tally.first_parse_error.is_some());
+        assert!(tally.first_parse_shape.is_some());
         assert_eq!(tally.candidates, 1);
         assert_eq!(tally.parts, 1);
         assert_eq!(tally.text_parts, 1);

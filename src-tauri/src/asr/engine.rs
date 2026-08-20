@@ -87,7 +87,7 @@ pub const IDLE_GRACE: Duration = Duration::from_secs(5 * 60);
 /// How often the worker wakes to check the grace period.
 const IDLE_TICK: Duration = Duration::from_secs(30);
 
-/// Finished utterances waiting before new finals narrow their beam.
+/// Finished utterances queued before new finals narrow their beam.
 ///
 /// The valve behind [`catalog::DecodeParams::live_final_degraded`]. Two channels
 /// decoding at the preset's full width is the right trade almost always; when it
@@ -95,6 +95,12 @@ const IDLE_TICK: Duration = Duration::from_secs(30);
 /// the cure is to spend less per utterance until it is empty again. Three is one
 /// utterance per channel plus one: below that, the queue is just two people
 /// talking at once.
+///
+/// Counted **at the moment the decision is made**, with the final about to be
+/// decoded included — see [`falling_behind`]. The valve used to be read after
+/// that final had been popped and against a strict `>`, so it took five queued
+/// utterances to open a valve documented to open at three
+/// (review of 2026-08-20, finding 6).
 pub const FINAL_BACKLOG_DEGRADE_AT: usize = 3;
 
 /// Cores kept clear of decoding, so capture and the UI never starve.
@@ -1236,6 +1242,12 @@ impl JobQueue {
         self.lock().abandon(meeting_id, what)
     }
 
+    /// Wake the worker without giving it anything to do, so it re-reads the
+    /// lifecycle facts now rather than at the next tick.
+    fn wake(&self) {
+        self.ready.notify_all();
+    }
+
     /// Refuse anything new and wake the worker so it can stop.
     fn close(&self) {
         let mut state = self.lock();
@@ -1284,6 +1296,14 @@ struct Shared {
     /// The grace period does not even start until this is false
     /// ([`EngineWorker::set_resident`]).
     resident: AtomicBool,
+    /// The moment residency was last dropped, stamped by whoever dropped it.
+    ///
+    /// The grace period is measured from here, and it has to be: the worker only
+    /// looks up every [`IDLE_TICK`], so a clock kept by the worker started the
+    /// countdown at the *last tick before* the meeting's work finished and
+    /// handed the weights back up to thirty seconds early (review of
+    /// 2026-08-20, finding 3).
+    idle_since: Mutex<Option<Instant>>,
     queue: JobQueue,
     backend: Mutex<BackendReport>,
     /// What to load when something needs the engine. `None` = nothing chosen
@@ -1347,20 +1367,28 @@ impl EngineWorker {
     ///
     /// `false` arms the grace period, which starts *now* rather than at the last
     /// decode: the point of reference is when the meeting's work finished, not
-    /// when the engine was last busy.
+    /// when the engine was last busy. The moment is stamped here and the worker
+    /// is woken to read it, so the countdown is the whole of [`IDLE_GRACE`]
+    /// rather than whatever was left of it since the last tick.
     pub fn set_resident(&self, resident: bool) {
         let was = self.shared.resident.swap(resident, Ordering::SeqCst);
         if was == resident {
             return;
         }
         if resident {
+            *self.shared.idle_since.lock().expect("idle edge poisoned") = None;
             tracing::debug!("holding speech understanding for a meeting");
         } else {
+            *self.shared.idle_since.lock().expect("idle edge poisoned") = Some(Instant::now());
             tracing::debug!(
                 grace_secs = IDLE_GRACE.as_secs(),
                 "nothing needs speech understanding; it goes back shortly"
             );
         }
+        // Whichever way it went, the worker's idea of when the engine was last
+        // needed has just changed. Waking it is what makes the edge the start of
+        // the countdown instead of the tick that happens to notice it.
+        self.shared.queue.wake();
     }
 
     /// Is something still holding the engine?
@@ -1655,10 +1683,31 @@ fn should_release(loaded: bool, resident: bool, idle_for: Duration) -> bool {
     loaded && !resident && idle_for >= IDLE_GRACE
 }
 
+/// When the grace period started: the later of "the engine was last busy" and
+/// "the last meeting let go of it".
+///
+/// Both matter. The edge is normally later — the meeting's last job finishes,
+/// then residency drops — and taking it is what gives the countdown its full
+/// length instead of whatever was left of it since the last tick. But a decode
+/// *after* the edge (a one-off transcription with nothing holding the engine)
+/// has to count too, or that work would be measured as idle time.
+fn grace_starts_at(last_needed: Instant, idle_since: Option<Instant>) -> Instant {
+    match idle_since {
+        Some(edge) => last_needed.max(edge),
+        None => last_needed,
+    }
+}
+
 /// Does a final leaving the queue have to narrow its beam? See
 /// [`FINAL_BACKLOG_DEGRADE_AT`].
-fn falling_behind(finals_waiting: usize) -> bool {
-    finals_waiting > FINAL_BACKLOG_DEGRADE_AT
+///
+/// `queued_including_this_one` is the depth of the finals lane as it was when
+/// this final was still in it: the ones still waiting, plus the one now being
+/// decided about. That is the number the threshold is written in terms of, and
+/// counting it after the pop (against a strict `>`) is what made the valve open
+/// two utterances later than documented.
+fn falling_behind(queued_including_this_one: usize) -> bool {
+    queued_including_this_one >= FINAL_BACKLOG_DEGRADE_AT
 }
 
 /// The engine thread. Owns the weights and nothing else owns them.
@@ -1693,12 +1742,15 @@ fn run(shared: Arc<Shared>) {
                     ..
                 } = pending;
                 if plan.kind == JobKind::Final {
-                    plan.behind = falling_behind(shared.queue.finals_waiting());
+                    // This final has already been popped, so the lane it came
+                    // from was one deeper than it is now.
+                    let queued = shared.queue.finals_waiting() + 1;
+                    plan.behind = falling_behind(queued);
                     if plan.behind != behind {
                         behind = plan.behind;
                         if behind {
                             tracing::info!(
-                                waiting = shared.queue.finals_waiting(),
+                                queued,
                                 "live text is falling behind; decoding it more cheaply until it catches up"
                             );
                         } else {
@@ -1718,10 +1770,18 @@ fn run(shared: Arc<Shared>) {
                 // period only ever starts once nothing does.
                 if shared.resident.load(Ordering::SeqCst) {
                     last_needed = Instant::now();
-                } else if should_release(engine.is_some(), false, last_needed.elapsed()) {
-                    engine = None;
-                    shared.loaded.store(false, Ordering::SeqCst);
-                    tracing::info!("speech engine released after being idle");
+                } else {
+                    // The countdown runs from the moment residency was dropped,
+                    // which the dropper stamped — not from this tick, and not
+                    // from the tick before the edge, which is what used to cut
+                    // the grace period short by up to `IDLE_TICK`.
+                    let edge = *shared.idle_since.lock().expect("idle edge poisoned");
+                    last_needed = grace_starts_at(last_needed, edge);
+                    if should_release(engine.is_some(), false, last_needed.elapsed()) {
+                        engine = None;
+                        shared.loaded.store(false, Ordering::SeqCst);
+                        tracing::info!("speech engine released after being idle");
+                    }
                 }
             }
         }
@@ -2508,7 +2568,14 @@ mod tests {
     #[test]
     fn finals_narrow_their_beam_only_while_the_queue_is_deep() {
         assert!(!falling_behind(0));
-        assert!(!falling_behind(FINAL_BACKLOG_DEGRADE_AT));
+        assert!(
+            !falling_behind(FINAL_BACKLOG_DEGRADE_AT - 1),
+            "two people talking at once is not a backlog"
+        );
+        assert!(
+            falling_behind(FINAL_BACKLOG_DEGRADE_AT),
+            "the threshold is the number in the documentation, exactly"
+        );
         assert!(falling_behind(FINAL_BACKLOG_DEGRADE_AT + 1));
 
         let preset = catalog::preset("everyday").unwrap().decode;
@@ -2541,12 +2608,39 @@ mod tests {
         }
         assert!(!falling_behind(queue.finals_waiting()), "captions are not a backlog");
 
-        for i in 0..(FINAL_BACKLOG_DEGRADE_AT + 1) as i64 {
+        for i in 0..FINAL_BACKLOG_DEGRADE_AT as i64 {
             let (utterance, a) = queued("m", Channel::Mic, JobKind::Final, i * 2_000, 2_000);
             queue.push_job(utterance).ok();
             answers.push(a);
         }
-        assert!(falling_behind(queue.finals_waiting()));
+        // Exactly the documented number of finished utterances is queued, and the
+        // valve is read the way the worker reads it: after popping the one being
+        // decided about, counting that one back in.
+        let popped = taken(queue.take(Duration::from_millis(0)));
+        assert_eq!(popped.plan.kind, JobKind::Final);
+        assert!(
+            falling_behind(queue.finals_waiting() + 1),
+            "three queued finals is the threshold, not five"
+        );
+    }
+
+    /// The valve as the worker actually reads it: one utterance per channel is
+    /// two people talking, and the third is a queue.
+    #[test]
+    fn the_valve_opens_at_the_number_it_documents() {
+        let queue = JobQueue::default();
+        let mut answers = Vec::new();
+        for i in 0..(FINAL_BACKLOG_DEGRADE_AT - 1) as i64 {
+            let (utterance, a) = queued("m", Channel::Mic, JobKind::Final, i * 2_000, 2_000);
+            queue.push_job(utterance).ok();
+            answers.push(a);
+        }
+        let popped = taken(queue.take(Duration::from_millis(0)));
+        assert!(
+            !falling_behind(queue.finals_waiting() + 1),
+            "two queued finals decode at full width"
+        );
+        drop(popped);
     }
 
     // -----------------------------------------------------------------------
@@ -2565,6 +2659,60 @@ mod tests {
         assert!(!should_release(true, false, IDLE_GRACE / 2));
         // Nothing loaded, nothing to release.
         assert!(!should_release(false, false, IDLE_GRACE * 100));
+    }
+
+    /// The grace period starts at the edge, not at the tick that noticed it.
+    #[test]
+    fn the_countdown_starts_when_the_meeting_let_go_not_when_the_worker_looked() {
+        let tick = Instant::now();
+        // The worker's last tick was IDLE_TICK ago; the meeting let go just now.
+        // Measuring from the tick would hand the weights back `IDLE_TICK` early.
+        let long_ago = tick - IDLE_TICK;
+        let edge = tick;
+        assert_eq!(grace_starts_at(long_ago, Some(edge)), edge);
+        assert!(!should_release(
+            true,
+            false,
+            grace_starts_at(long_ago, Some(edge)).elapsed() + IDLE_GRACE - IDLE_TICK
+        ));
+
+        // A decode after the edge is the engine being needed again, and it wins.
+        let decode = tick + Duration::from_secs(1);
+        assert_eq!(grace_starts_at(decode, Some(edge)), decode);
+        // Nothing ever let go: the last decode is all there is to go on.
+        assert_eq!(grace_starts_at(decode, None), decode);
+    }
+
+    #[tokio::test]
+    async fn letting_go_stamps_the_moment_the_countdown_starts() {
+        let worker = EngineWorker::new();
+        assert!(
+            worker.shared.idle_since.lock().unwrap().is_none(),
+            "nothing has let go of a fresh worker"
+        );
+
+        worker.set_resident(true);
+        assert!(
+            worker.shared.idle_since.lock().unwrap().is_none(),
+            "a meeting holding the engine is not a countdown"
+        );
+
+        worker.set_resident(false);
+        let edge = worker
+            .shared
+            .idle_since
+            .lock()
+            .unwrap()
+            .expect("letting go stamps the edge");
+        assert!(
+            edge.elapsed() < Duration::from_secs(1),
+            "the edge is now, not the last tick"
+        );
+
+        // Taking it back clears the countdown outright.
+        worker.set_resident(true);
+        assert!(worker.shared.idle_since.lock().unwrap().is_none());
+        worker.shutdown();
     }
 
     #[tokio::test]

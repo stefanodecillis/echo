@@ -30,6 +30,13 @@
 //! with nothing written down against it. That pass reads it back into the live
 //! transcript, at lower priority than new speech, and then gets out of the way.
 //!
+//! The two passes do not overlap, and [`Backlog`] is how: the meeting clock is
+//! split once, at the moment the engine came up. Everything before the split is
+//! read back off the recording in order and declined by the live pass;
+//! everything after it is the live pass's, and the disk pass never looks there.
+//! Read that type before changing either pass — a stretch written by both is a
+//! paragraph the person reads twice.
+//!
 //! ## Why a caption task at all
 //!
 //! Whisper cannot transcribe speech that has not finished, so text used to
@@ -231,12 +238,24 @@ impl LiveLanguage {
 
 /// Start the tasks for one recording. They end on their own when the capture
 /// feed closes, which is what stopping a capture does.
-pub(crate) fn spawn(inner: Arc<Inner>, meeting_id: Id, feed: CaptureFeed) -> Vec<JoinHandle<()>> {
+pub(crate) fn spawn(
+    inner: Arc<Inner>,
+    meeting_id: Id,
+    feed: CaptureFeed,
+    backlog: Arc<Backlog>,
+) -> Vec<JoinHandle<()>> {
     // The capture layer's snapshots arrive interleaved with everything else on
     // the capture feed; this is where they are split back out, so the caption
     // task never waits behind a chunk being journalled.
     let (captions_tx, captions_rx) = mpsc::channel::<OpenUtterance>(SNAPSHOT_QUEUE);
-    spawn_with_captions(inner, meeting_id, feed, Some(captions_tx), Some(captions_rx))
+    spawn_with_captions(
+        inner,
+        meeting_id,
+        feed,
+        Some(captions_tx),
+        Some(captions_rx),
+        backlog,
+    )
 }
 
 /// As [`spawn`], plus live captions of speech that is still going.
@@ -251,6 +270,7 @@ pub(crate) fn spawn_with_captions(
     feed: CaptureFeed,
     snapshots: Option<CaptionSender>,
     captions: Option<CaptionFeed>,
+    backlog: Arc<Backlog>,
 ) -> Vec<JoinHandle<()>> {
     let (utterances_tx, utterances_rx) = mpsc::channel::<Utterance>(UTTERANCE_QUEUE);
     // Capture stopping is a fact both speech tasks have to see promptly: it
@@ -291,6 +311,7 @@ pub(crate) fn spawn_with_captions(
             lines,
             language,
             stopping,
+            backlog,
         )
         .await
     }));
@@ -315,6 +336,121 @@ const BACKLOG_WORTH_READING_MS: i64 = 2_000;
 /// Often enough that the transcript visibly fills in, rare enough to be free.
 const BACKLOG_EMIT_INTERVAL: Duration = Duration::from_millis(750);
 
+/// Longest the disk pass waits for the live pass to confirm the handoff.
+///
+/// The live pass answers within one [`BATCH_INTERVAL`] of being asked, so this is
+/// only what happens when it cannot answer at all — it has already stopped, or
+/// it is stuck in a decode that will not abort. Reading the backlog is worth more
+/// than waiting forever for a confirmation, and the coverage the pass then reads
+/// is the truth as the database has it: at worst a stretch is read twice, which
+/// is what a *bounded* wait trades against never catching up at all.
+const BACKLOG_SETTLE_WAIT: Duration = Duration::from_millis(3_000);
+
+// ---------------------------------------------------------------------------
+// The split between the backlog pass and the live pass
+// ---------------------------------------------------------------------------
+
+/// Who owns which part of the meeting clock while the start of a meeting is
+/// being read back off disk.
+///
+/// The engine can come up minutes after Start (mantra 1's amendment), and when
+/// it does there are two passes with an interest in the same seconds of audio:
+/// the live pass, which may be holding finals for them — queued for the engine,
+/// in flight, or decoded and waiting in the batch — and the disk pass, about to
+/// ask the database which stretches have no text against them. Both writing is
+/// how one stretch of a meeting ends up in the transcript twice
+/// (review of 2026-08-20, finding 1).
+///
+/// So the clock is split, once, at a **floor**:
+///
+/// * **below the floor** is the disk pass's, in order, from the beginning. The
+///   live pass declines every utterance that starts there — including one
+///   straddling the floor, whose tail becomes an honest hole for the
+///   post-meeting job rather than an overlapping second copy.
+/// * **at or above the floor** is the live pass's, and the disk pass never looks
+///   past it.
+///
+/// A floor on its own would not be enough, because the live pass can be holding
+/// finished text for the stretch below it that the database has not seen yet. So
+/// claiming the floor is a handshake: the disk pass waits for the live pass to
+/// say it has written down or let go of everything below the floor, and only
+/// then asks what is covered. "Backlog in order, then live" is those two facts
+/// together.
+#[derive(Debug)]
+pub(crate) struct Backlog {
+    /// Where the split is, once there is one.
+    floor: tokio::sync::watch::Sender<Option<i64>>,
+    /// Set by the live pass when it has finished with everything below the
+    /// floor.
+    settled: tokio::sync::watch::Sender<bool>,
+}
+
+impl Backlog {
+    /// A recording with no split in it yet, which is what every recording starts
+    /// as and most stay: the engine is usually ready before the meeting is.
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            floor: tokio::sync::watch::channel(None).0,
+            settled: tokio::sync::watch::channel(false).0,
+        })
+    }
+
+    /// Where the split is, or `None` while the whole meeting is the live pass's.
+    pub(crate) fn floor(&self) -> Option<i64> {
+        *self.floor.borrow()
+    }
+
+    /// Claim everything before `to_ms` for the disk pass. Idempotent-ish: a
+    /// second claim can only ever move the floor later, and there is only one
+    /// backlog pass per recording, so it never happens.
+    ///
+    /// `send_replace`, not `send`: the value has to be stored whether or not
+    /// anybody is listening yet. `send` fails when there is no live receiver and
+    /// leaves the value untouched, which would mean a floor claimed while the
+    /// live pass happened to be between borrows was silently no floor at all.
+    fn claim(&self, to_ms: i64) {
+        self.floor.send_replace(Some(to_ms));
+    }
+
+    /// Wait until there is a floor. Cancel-safe, and safe to call after the
+    /// claim has already happened.
+    async fn claimed(&self) {
+        let mut rx = self.floor.subscribe();
+        loop {
+            if rx.borrow_and_update().is_some() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                // The sender lives in this same value, so this cannot happen —
+                // and if it somehow does, never resolving is better than a
+                // caller spinning on an answer that will not come.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// The live pass has written down or let go of everything below the floor.
+    fn done_below_the_floor(&self) {
+        self.settled.send_replace(true);
+    }
+
+    /// Wait for that, but not forever. `false` means the wait ran out.
+    async fn wait_until_settled(&self, longest: Duration) -> bool {
+        let mut rx = self.settled.subscribe();
+        let wait = async {
+            loop {
+                if *rx.borrow_and_update() {
+                    return;
+                }
+                if rx.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        tokio::time::timeout(longest, wait).await.is_ok()
+    }
+}
+
 /// Read this meeting's already-captured backlog into the transcript, then leave
 /// the live pass to it.
 ///
@@ -326,15 +462,19 @@ const BACKLOG_EMIT_INTERVAL: Duration = Duration::from_millis(750);
 /// the same code path the post-meeting catch-up job uses, scoped to what has been
 /// captured so far.
 ///
-/// Three things make it safe to run underneath a live meeting:
-/// * it asks only for stretches with no text against them, so nothing the live
-///   pass already wrote down is read twice;
+/// Four things make it safe to run underneath a live meeting, and the first two
+/// are what make it "the backlog, in order, and *then* live" rather than two
+/// passes racing for the same seconds (review of 2026-08-20, finding 1):
+/// * the meeting clock is split at a floor, and the live pass declines
+///   everything below it — see [`Backlog`];
+/// * the split is a handshake, so the coverage this pass reads already includes
+///   everything the live pass had in flight for that stretch;
 /// * its decodes are catch-up work, which the engine serves *after* live finals,
 ///   so new speech never waits behind old;
 /// * it stops the moment this meeting is no longer the one being recorded — from
 ///   there the finalize job owns the meeting, and two passes filling the same
 ///   holes is how a stretch gets transcribed twice.
-pub(crate) async fn catch_up_backlog(inner: Arc<Inner>, meeting_id: Id) {
+pub(crate) async fn catch_up_backlog(inner: Arc<Inner>, meeting_id: Id, backlog: Arc<Backlog>) {
     let Some(to_ms) = backlog_end_ms(&inner, &meeting_id).await else {
         return;
     };
@@ -344,6 +484,29 @@ pub(crate) async fn catch_up_backlog(inner: Arc<Inner>, meeting_id: Id) {
             "speech understanding was ready in time; nothing to read back"
         );
         return;
+    }
+
+    // The split, in three steps that have to happen in this order.
+    //
+    // 1. The floor: from here the live pass writes nothing below `to_ms`, and
+    //    this pass reads nothing above it.
+    backlog.claim(to_ms);
+    // 2. Everything the live pass has *queued* for that stretch goes. Every live
+    //    job at this instant is a look at audio that was captured before `to_ms`
+    //    — `to_ms` is "now" — so dropping all of them drops exactly the stretch
+    //    being handed over, and the abandoned utterances become holes this pass
+    //    fills from the recording.
+    inner.ports.asr.abandon_live(&meeting_id);
+    // 3. And the handshake: whatever the live pass had already finished with is
+    //    written down before this pass looks at what is covered. Without it the
+    //    batch waiting to be written is invisible, and invisible text is text
+    //    this pass would write a second time.
+    if !backlog.wait_until_settled(BACKLOG_SETTLE_WAIT).await {
+        tracing::warn!(
+            meeting = %meeting_id,
+            "the live pass did not confirm the handoff; reading the backlog against \
+             the transcript as it stands"
+        );
     }
 
     // Everything that already has text: these lines are on screen and must not
@@ -730,6 +893,7 @@ fn hand_over(inner: &Arc<Inner>, meeting_id: &str, stopping: &AtomicBool, lines:
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn speech_loop(
     inner: Arc<Inner>,
     meeting_id: Id,
@@ -738,6 +902,7 @@ async fn speech_loop(
     lines: LiveLines,
     language: LiveLanguage,
     stopping: Arc<AtomicBool>,
+    backlog: Arc<Backlog>,
 ) {
     let mut batch: Vec<(String, SegmentDraft)> = Vec::new();
     let mut last_flush = Instant::now();
@@ -745,11 +910,23 @@ async fn speech_loop(
     let mut failures = FailureRun::default();
     let mut carry = ContextCarry::default();
     let mut handoff = Handoff::default();
+    // Whether the handshake with the disk pass has been answered yet.
+    let mut answered_backlog = false;
 
     loop {
         if handoff.expired() {
             hand_over(&inner, &meeting_id, &stopping, &lines);
             break;
+        }
+        // The disk pass has claimed the start of this meeting. Everything the
+        // live pass finished before the claim goes to the database now, so the
+        // coverage that pass is about to read includes it — and then it is told
+        // it may look (see [`Backlog`]).
+        if !answered_backlog && backlog.floor().is_some() {
+            flush(&inner, &meeting_id, &mut batch).await;
+            last_flush = Instant::now();
+            backlog.done_below_the_floor();
+            answered_backlog = true;
         }
         let until_flush = BATCH_INTERVAL.saturating_sub(last_flush.elapsed());
         let received = tokio::select! {
@@ -760,6 +937,9 @@ async fn speech_loop(
                 stop_captions(&inner, &meeting_id, &stopping, &lines);
                 continue;
             }
+            // Answered promptly rather than at the next flush: the disk pass is
+            // waiting on it before it can start.
+            () = backlog.claimed(), if !answered_backlog => continue,
             _ = tokio::time::sleep(until_flush) => {
                 flush(&inner, &meeting_id, &mut batch).await;
                 last_flush = Instant::now();
@@ -772,6 +952,25 @@ async fn speech_loop(
             stop_captions(&inner, &meeting_id, &stopping, &lines);
             break;
         };
+        // Below the floor is not this pass's stretch any more. Decoding it as
+        // well would spend the engine on audio the disk pass is already reading
+        // and write the same words a second time.
+        if below_the_floor(&backlog, utterance.t_start_ms) {
+            tracing::debug!(
+                t_start_ms = utterance.t_start_ms,
+                "this stretch is the backlog pass's; the live pass lets it go"
+            );
+            close_partial(
+                &inner,
+                &meeting_id,
+                &live_line_id(utterance.channel, utterance.t_start_ms),
+                utterance.channel,
+                utterance.t_start_ms,
+                utterance.t_end_ms,
+            );
+            inner.pending.fetch_sub(1, Ordering::SeqCst);
+            continue;
+        }
         let entry = transcribe(
             &inner,
             &meeting_id,
@@ -786,8 +985,27 @@ async fn speech_loop(
             &stopping,
         )
         .await;
-        if let Some(entry) = entry {
-            batch.push(entry);
+        if let Some((utterance_id, draft)) = entry {
+            // The same rule again, after the decode rather than before it: this
+            // is the one that was already in flight when the floor was claimed.
+            // Its abandon may not have caught it in time, and one late row is
+            // all a duplicate takes.
+            if below_the_floor(&backlog, draft.t_start_ms) {
+                tracing::debug!(
+                    t_start_ms = draft.t_start_ms,
+                    "a live decode landed inside the backlog pass's stretch; not written"
+                );
+                close_partial(
+                    &inner,
+                    &meeting_id,
+                    &utterance_id,
+                    draft.channel,
+                    draft.t_start_ms,
+                    draft.t_end_ms,
+                );
+            } else {
+                batch.push((utterance_id, draft));
+            }
         }
         inner.pending.fetch_sub(1, Ordering::SeqCst);
         if batch.len() >= BATCH_SEGMENTS {
@@ -796,6 +1014,22 @@ async fn speech_loop(
         }
     }
     flush(&inner, &meeting_id, &mut batch).await;
+    // The live pass is over, so it is finished with everything below any floor —
+    // claimed or not. Saying so releases a backlog pass still waiting on the
+    // handshake instead of leaving it to wait the whole timeout out on a pass
+    // that is never going to answer.
+    backlog.done_below_the_floor();
+}
+
+/// Does this stretch belong to the backlog pass rather than the live one?
+///
+/// The start decides, not the end: an utterance that straddles the floor is one
+/// utterance, and giving it to whichever pass owns its beginning is what keeps
+/// the two from overlapping. Its tail is then a hole above the floor, which the
+/// post-meeting catch-up job fills from the recording — a gap Echo closes later
+/// rather than the same words written twice.
+fn below_the_floor(backlog: &Backlog, t_start_ms: i64) -> bool {
+    backlog.floor().is_some_and(|floor_ms| t_start_ms < floor_ms)
 }
 
 /// Await one live decode, honouring the stop handoff.
@@ -2108,6 +2342,58 @@ mod tests {
             "a working utterance in between means live text is not stuck"
         );
     }
+    // -----------------------------------------------------------------------
+    // The split between the backlog pass and the live pass
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_start_of_an_utterance_decides_which_pass_owns_it() {
+        let backlog = Backlog::new();
+        assert!(
+            !below_the_floor(&backlog, 0),
+            "with no split, the whole meeting is the live pass's"
+        );
+
+        backlog.claim(10_000);
+        assert!(below_the_floor(&backlog, 0));
+        assert!(
+            below_the_floor(&backlog, 9_999),
+            "an utterance straddling the floor started below it, so it is the disk \
+             pass's; its tail is a hole the finalize job fills"
+        );
+        assert!(
+            !below_the_floor(&backlog, 10_000),
+            "the floor itself is where live takes over"
+        );
+        assert!(!below_the_floor(&backlog, 20_000));
+    }
+
+    #[tokio::test]
+    async fn the_split_holds_the_disk_pass_until_the_live_pass_answers() {
+        let backlog = Backlog::new();
+        assert_eq!(backlog.floor(), None);
+        // Nothing claimed: waiting for a claim waits.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), backlog.claimed())
+                .await
+                .is_err()
+        );
+
+        backlog.claim(30_000);
+        assert_eq!(backlog.floor(), Some(30_000));
+        // A claim made before anybody was listening is still a claim — the bug
+        // that made the whole split a no-op the first time it was written.
+        tokio::time::timeout(Duration::from_millis(20), backlog.claimed())
+            .await
+            .expect("a claim already made is seen straight away");
+
+        // And the disk pass waits, bounded, for the live pass to confirm it has
+        // finished with everything below the floor.
+        assert!(!backlog.wait_until_settled(Duration::from_millis(20)).await);
+        backlog.done_below_the_floor();
+        assert!(backlog.wait_until_settled(Duration::from_millis(20)).await);
+    }
+
     // -----------------------------------------------------------------------
     // The backlog pass, through the real catch-up code
     // -----------------------------------------------------------------------

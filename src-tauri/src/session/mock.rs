@@ -48,6 +48,11 @@ pub(crate) struct MockCapture {
     fail: std::sync::Mutex<Option<AudioError>>,
     system_audio_error: std::sync::Mutex<Option<String>>,
     opens: AtomicU32,
+    /// The speech engine, so opening a device can record what the engine's
+    /// lifecycle looked like at that exact moment.
+    asr: std::sync::Mutex<Option<Arc<MockAsr>>>,
+    /// Was the engine already claimed when the first device was opened?
+    resident_at_open: std::sync::Mutex<Option<bool>>,
 }
 
 impl MockCapture {
@@ -59,7 +64,21 @@ impl MockCapture {
             fail: std::sync::Mutex::new(None),
             system_audio_error: std::sync::Mutex::new(None),
             opens: AtomicU32::new(0),
+            asr: std::sync::Mutex::new(None),
+            resident_at_open: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Watch the engine, so the order of "claim the engine" and "open the
+    /// devices" is something a test can assert on.
+    pub(crate) fn watch_engine(&self, asr: Arc<MockAsr>) {
+        *self.asr.lock().unwrap() = Some(asr);
+    }
+
+    /// Whether a meeting was already holding the engine when the first device
+    /// was opened. `None` until something opens one.
+    pub(crate) fn engine_held_when_opened(&self) -> Option<bool> {
+        *self.resident_at_open.lock().unwrap()
     }
 
     /// The next `open` fails with this.
@@ -94,7 +113,16 @@ impl MockCapture {
 impl CapturePort for MockCapture {
     fn open<'a>(&'a self, _cfg: CaptureConfig) -> BoxFuture<'a, Result<CaptureStart, AudioError>> {
         Box::pin(async move {
-            self.opens.fetch_add(1, Ordering::SeqCst);
+            let first = self.opens.fetch_add(1, Ordering::SeqCst) == 0;
+            if first {
+                let held = self
+                    .asr
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|asr| asr.is_resident());
+                *self.resident_at_open.lock().unwrap() = held;
+            }
             if let Some(error) = self.fail.lock().unwrap().take() {
                 return Err(error);
             }
@@ -173,6 +201,9 @@ pub(crate) struct MockAsr {
     fail_prewarm: AtomicBool,
     /// How long loading takes, the way a first-ever launch takes minutes.
     prewarm_takes: std::sync::Mutex<Option<Duration>>,
+    /// How long one live decode takes, so a test can still have one in flight
+    /// when something else happens.
+    transcribe_takes: std::sync::Mutex<Option<Duration>>,
     text: std::sync::Mutex<String>,
     /// Rows the next live backlog pass writes: (t_start_ms, t_end_ms, text).
     backlog_writes: std::sync::Mutex<Vec<(i64, i64, String)>>,
@@ -189,6 +220,7 @@ impl MockAsr {
             catch_up_segments: AtomicU32::new(0),
             fail_prewarm: AtomicBool::new(false),
             prewarm_takes: std::sync::Mutex::new(None),
+            transcribe_takes: std::sync::Mutex::new(None),
             text: std::sync::Mutex::new("hello there".to_string()),
             backlog_writes: std::sync::Mutex::new(Vec::new()),
             backlog_calls: std::sync::Mutex::new(Vec::new()),
@@ -214,6 +246,16 @@ impl MockAsr {
     /// pressed Start while Echo was still getting ready.
     pub(crate) fn prewarm_takes(&self, how_long: Duration) {
         *self.prewarm_takes.lock().unwrap() = Some(how_long);
+    }
+
+    /// Every decode takes this long, so a test can be the meeting where a live
+    /// utterance is still in the engine when the backlog pass claims its stretch.
+    ///
+    /// Deliberately *not* cancellable: this stands in for the engine whose abort
+    /// landed a moment too late and answered anyway, which is the only way a live
+    /// final can still turn up below the floor.
+    pub(crate) fn transcribe_takes(&self, how_long: Duration) {
+        *self.transcribe_takes.lock().unwrap() = Some(how_long);
     }
 
     /// What the next live backlog pass finds on disk and writes down.
@@ -257,6 +299,10 @@ impl AsrPort for MockAsr {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.loaded.store(true, Ordering::SeqCst);
+            let takes = *self.transcribe_takes.lock().unwrap();
+            if let Some(takes) = takes {
+                tokio::time::sleep(takes).await;
+            }
             let text = self.text.lock().unwrap().clone();
             if let Some(on_partial) = on_partial {
                 on_partial(&text);
@@ -533,6 +579,7 @@ impl Harness {
 
         let capture = Arc::new(MockCapture::new());
         let asr = Arc::new(MockAsr::new());
+        capture.watch_engine(asr.clone());
         let executor = Arc::new(TestExecutor::new());
         let events = Arc::new(CollectingEvents::default());
         let bus = EventBus::new();
