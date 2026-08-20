@@ -38,7 +38,7 @@
         "scope": []
       }
     },
-    "macOSPrivateApi": false
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,
