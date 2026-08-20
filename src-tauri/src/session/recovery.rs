@@ -332,6 +332,43 @@ pub(crate) async fn meeting_has_content(
 /// Nothing is queued for it and anything already queued is cancelled, so no
 /// catch-up, speaker pass or recap runs against a row that is on its way out.
 async fn discard_empty_meeting(inner: &Arc<Inner>, meeting_id: &str) {
+    discard_empty_meeting_inner(inner, meeting_id, true).await;
+}
+
+/// One pass over the finished meetings already in the library, discarding any
+/// husk the same test at stop-time would have discarded. Exists for records
+/// created before that test did, so an old empty row cannot sit in the list
+/// looking like a bug. Runs once at launch; quiet on purpose — a toast per
+/// stale husk would greet the person with noise about meetings they never had.
+pub(crate) async fn sweep_husks(inner: &Arc<Inner>) -> u64 {
+    let candidates = match repo::finished_meeting_ids(&inner.db).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::warn!(%error, "could not look for empty meetings to tidy up");
+            return 0;
+        }
+    };
+    let mut swept = 0;
+    for meeting_id in candidates {
+        match meeting_has_content(inner, &meeting_id).await {
+            Ok(false) => {
+                discard_empty_meeting_inner(inner, &meeting_id, false).await;
+                swept += 1;
+            }
+            Ok(true) => {}
+            Err(error) => {
+                // Cannot tell: keep it. Deleting blind is the one wrong answer.
+                tracing::warn!(%error, meeting = %meeting_id, "left a meeting alone: could not check it");
+            }
+        }
+    }
+    if swept > 0 {
+        tracing::info!(swept, "tidied up empty meetings from before");
+    }
+    swept
+}
+
+async fn discard_empty_meeting_inner(inner: &Arc<Inner>, meeting_id: &str, announce: bool) {
     // Stop the work first: a job holding this id must not carry on reading files
     // that are about to disappear.
     inner.ports.asr.forget_meeting(meeting_id);
@@ -374,13 +411,15 @@ async fn discard_empty_meeting(inner: &Arc<Inner>, meeting_id: &str) {
             deleted: true,
         },
     ));
-    inner.notice(NoticePayload {
-        level: NoticeLevel::Info,
-        message: "That one was too short to keep, so Echo let it go.".into(),
-        persistent: false,
-        meeting_id: None,
-        tag: Some("nothingToKeep".into()),
-    });
+    if announce {
+        inner.notice(NoticePayload {
+            level: NoticeLevel::Info,
+            message: "That one was too short to keep, so Echo let it go.".into(),
+            persistent: false,
+            meeting_id: None,
+            tag: Some("nothingToKeep".into()),
+        });
+    }
 }
 
 /// The jobs that turn committed audio into a finished meeting. The same list

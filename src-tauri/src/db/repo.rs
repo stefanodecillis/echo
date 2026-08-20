@@ -235,6 +235,18 @@ pub async fn forget_audio(db: &Db, meeting_id: &str) -> Result<Vec<String>, DbEr
     Ok(paths.into_iter().map(|p| p.0).collect())
 }
 
+/// Ids of meetings whose capture is over (nothing recording or waiting on a
+/// person), not deleted — the launch-time empty-husk sweep looks at these.
+pub async fn finished_meeting_ids(db: &Db) -> Result<Vec<Id>, DbError> {
+    let rows: Vec<(Id,)> = sqlx::query_as(
+        "SELECT id FROM meetings
+         WHERE deleted_at IS NULL AND status IN ('processing', 'complete', 'failed')",
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
 /// Mark deleted without removing rows, so an undo is still possible.
 pub async fn soft_delete_meeting(db: &Db, id: &str) -> Result<(), DbError> {
     sqlx::query("UPDATE meetings SET deleted_at = ?2 WHERE id = ?1")

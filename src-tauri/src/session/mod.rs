@@ -969,6 +969,12 @@ impl SessionManager {
         recovery::scan(&self.0).await
     }
 
+    /// Quietly remove finished meetings with nothing in them — records from
+    /// before the stop-time husk test existed. Once at launch.
+    pub async fn tidy_empty_meetings(&self) -> u64 {
+        recovery::sweep_husks(&self.0).await
+    }
+
     /// Act on the person's choice for an interrupted meeting.
     pub async fn resolve_interrupted(
         &self,

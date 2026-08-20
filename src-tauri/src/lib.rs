@@ -442,6 +442,8 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(_) => {}
                 Err(error) => tracing::warn!(%error, "could not look for interrupted meetings"),
             }
+            // Old empty husks from before the stop-time test existed. Quiet.
+            let _ = state.session.tidy_empty_meetings().await;
         });
     }
 
