@@ -962,7 +962,8 @@ pub enum DetectionState {
     Off,
 }
 
-/// One reason the watcher thinks a meeting is happening.
+/// One thing the watcher can see. Not on its own a reason to believe a meeting
+/// is happening — see `confidence`, and the decision table in `crate::detect`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectionSignal {
@@ -971,16 +972,20 @@ pub struct DetectionSignal {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
     pub since: Timestamp,
+    /// What this observation is worth on its own: an app merely running is
+    /// close to nothing, a live microphone is the real signal, and the two
+    /// together are as sure as Echo gets before it opens the audio stream.
     pub confidence: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DetectionSource {
-    /// A known meeting app is running.
+    /// A known meeting app is running. Corroborating evidence only: Slack and
+    /// Discord sit open all day, so this can never mean a meeting by itself.
     #[default]
     MeetingApp,
-    /// Something else is using the microphone.
+    /// Something other than Echo is using the microphone.
     InputDeviceInUse,
 }
 
@@ -992,7 +997,9 @@ pub struct DetectionStatus {
     pub signals: Vec<DetectionSignal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<Timestamp>,
-    /// Signals have been clear long enough that we suggest stopping.
+    /// The microphone has been quiet long enough, while recording, that we
+    /// suggest stopping. A meeting app that is merely still running does not
+    /// hold this back — that is how "you forgot to stop" gets caught.
     pub suggest_stop: bool,
 }
 

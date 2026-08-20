@@ -57,7 +57,10 @@ fn probe() -> Result<bool, pw::Error> {
                 return;
             }
             // Echo's own capture, if it happens to be running, tags itself;
-            // everyone else counts as "something else is listening".
+            // everyone else counts as "something else is listening". Excluding
+            // ourselves is load-bearing, not tidiness: the auto-stop safety net
+            // asks whether the room has gone quiet *while Echo is recording it*,
+            // and would otherwise only ever hear itself.
             let is_echo = props
                 .get("application.name")
                 .map(|name| name == "Echo")
