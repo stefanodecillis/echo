@@ -501,6 +501,11 @@ export const anchors = {
  */
 export const panel = {
   detectedTitle: "Meeting detected",
+  /** The line under the title: the app Echo noticed and how long ago, or just
+   * how long ago when it cannot name the app. */
+  detectedMeta: (ago: string, appName?: string) => (appName ? `${appName} · ${ago}` : ago),
+  /** Paused, where the elapsed clock would be a lie: say what is true instead. */
+  pausedHint: "Not listening right now",
 } as const;
 
 /** Words for the two microphone-versus-computer channels. */

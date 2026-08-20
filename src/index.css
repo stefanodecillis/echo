@@ -24,6 +24,22 @@
     overscroll-behavior: none;
   }
 
+  /* The floating panel is this same app loaded with `?window=panel` (see
+     `main.tsx`, which stamps the attribute). Its window is see-through so the
+     card inside can float as a rounded shape over whatever is behind it, so
+     this one window paints nothing at all: no white body, no white root, or
+     the panel would show up as the square white rectangle the window really
+     is. Every other screen keeps `body`'s `bg-surface` above.
+
+     `overflow: hidden` because the window is sized to the card exactly — a
+     scrollbar on something this small would be its own small disaster. */
+  html[data-window="panel"],
+  html[data-window="panel"] body,
+  html[data-window="panel"] #root {
+    background: transparent;
+    overflow: hidden;
+  }
+
   ::selection {
     background: theme("colors.accent.soft");
   }

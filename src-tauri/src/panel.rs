@@ -39,10 +39,19 @@ use crate::types::CaptureState;
 /// focus a window itself.
 pub const LABEL: &str = "panel";
 
-/// Logical size. Wide enough for "Meeting detected", the elapsed time and two
-/// buttons; short enough to read as a toast rather than a window.
+/// Logical size, cut to the card the page draws rather than the other way
+/// round: any spare height here is see-through window nobody asked for, and
+/// (worse, when the window cannot be transparent) a bare white margin.
+///
+/// The card is one 36px row of icon-tile, two lines and a pill inside 14px of
+/// padding — 66px tall — and both faces of the panel (detected and recording)
+/// are built to that same row, so one size fits both. Width is what "Meeting
+/// detected", the app's name, the clock and the Start pill need side by side.
+/// The remainder is the few pixels the card's shadow falls into: 8 around the
+/// top and sides, 12 below, since shadows fall downwards. Keep this in step
+/// with `PanelShell`'s outer padding.
 pub const WIDTH: f64 = 340.0;
-pub const HEIGHT: f64 = 120.0;
+pub const HEIGHT: f64 = 86.0;
 
 /// Breathing room between the panel and the edge of the usable screen.
 pub const MARGIN: f64 = 16.0;

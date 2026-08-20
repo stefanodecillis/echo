@@ -19,13 +19,13 @@ if (!root) {
 const isPanel = new URLSearchParams(window.location.search).get("window") === "panel";
 
 if (isPanel) {
-  // That window is transparent so the panel can float as a rounded card with
-  // nothing behind it; `index.css` paints every window's `body` opaque
-  // (`bg-surface`) for the normal case, so this overrides it here rather
-  // than touching a file shared with every other screen. Inline styles beat
-  // the class regardless of Tailwind's own specificity.
-  document.documentElement.style.background = "transparent";
-  document.body.style.background = "transparent";
+  // That window is see-through so the panel can float as a rounded card with
+  // nothing behind it, while every other screen keeps its painted white
+  // background. Stamping the attribute here — before React renders — lets
+  // `index.css` scope the transparency to this one window in CSS, where the
+  // rest of the app's theming already lives, instead of smuggling three
+  // inline styles in from JavaScript.
+  document.documentElement.dataset.window = "panel";
 }
 
 ReactDOM.createRoot(root).render(

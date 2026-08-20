@@ -2,9 +2,10 @@ import { useState } from "react";
 
 import { Button, RecordingDot } from "../components";
 import { formatElapsed } from "../components/lib/format";
-import { anchors, home, labels } from "../lib/copy";
+import { anchors, home, labels, panel } from "../lib/copy";
 import { panelClose, stopRecording, toUiError } from "../lib/ipc";
 import type { PanelState, UiError } from "../lib/types";
+import { PanelTile } from "./PanelTile";
 import { useNow } from "./useNow";
 
 export interface RecordingPanelProps {
@@ -41,27 +42,46 @@ export function RecordingPanel({ state }: RecordingPanelProps) {
   const paused = state.paused;
 
   return (
-    <div className="flex items-center gap-3">
-      {/* No label: the line beside the dot already says it, and a screen reader
-          should hear it once. */}
-      <RecordingDot paused={paused} />
+    <>
+      {/* Paused holds still: the tile only breathes while sound is actually
+          being kept. */}
+      <PanelTile motion={paused ? "still" : "breathe"} />
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-semibold text-ink">
+        <p className="truncate text-[13px] font-semibold leading-tight text-ink">
           {paused ? labels.captureState.paused : anchors.listening}
         </p>
-        {/* The clock counts from when the recording began, so it is only true
-            while the recording is running. Paused, it says nothing rather than
-            something wrong. */}
-        {!paused && (
-          <p className="tabular-nums text-xs text-ink-faint">
-            {formatElapsed(Math.max(0, now - state.startedAtMs))}
-          </p>
-        )}
-        {error && <p className="mt-1 truncate text-xs text-live">{error.message}</p>}
+        {/* One second line in every state, so the card's height never moves:
+            the error if there is one, otherwise the clock — or, paused, the
+            plain fact that nothing is being kept. The clock counts from when
+            the recording began, so it is only true while it is running. */}
+        <div className="mt-1 flex min-w-0 items-center gap-1.5">
+          {error ? (
+            <p className="truncate text-[11.5px] leading-tight text-live">{error.message}</p>
+          ) : paused ? (
+            <p className="truncate text-[11.5px] leading-tight text-ink-faint">
+              {panel.pausedHint}
+            </p>
+          ) : (
+            <>
+              {/* No label: the line above already says "Listening…", and a
+                  screen reader should hear it once. */}
+              <RecordingDot size="sm" />
+              <p className="text-[11.5px] leading-tight tabular-nums text-ink-faint">
+                {formatElapsed(Math.max(0, now - state.startedAtMs))}
+              </p>
+            </>
+          )}
+        </div>
       </div>
-      <Button variant="primary" size="sm" loading={stopping} onClick={() => void handleStop()}>
+      <Button
+        variant="primary"
+        size="sm"
+        className="px-3.5"
+        loading={stopping}
+        onClick={() => void handleStop()}
+      >
         {home.stopButton}
       </Button>
-    </div>
+    </>
   );
 }

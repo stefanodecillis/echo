@@ -1,10 +1,12 @@
 import { useState } from "react";
 
-import { Button, EchoMark } from "../components";
+import { Button } from "../components";
+import { cx } from "../components/lib/cx";
 import { home, panel } from "../lib/copy";
 import { panelClose, startRecording, toUiError } from "../lib/ipc";
 import type { PanelState, UiError } from "../lib/types";
 import { formatAgo } from "./format";
+import { PanelTile } from "./PanelTile";
 import { useNow } from "./useNow";
 
 export interface DetectedPanelProps {
@@ -35,18 +37,36 @@ export function DetectedPanel({ state }: DetectedPanelProps) {
   };
 
   return (
-    <div className="flex items-center gap-3">
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent-soft text-accent">
-        <EchoMark className="h-5 w-5" />
-      </div>
+    <>
+      <PanelTile motion="radiate" />
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-semibold text-ink">{panel.detectedTitle}</p>
-        <p className="tabular-nums text-xs text-ink-faint">{formatAgo(state.detectedAtMs, now)}</p>
-        {error && <p className="mt-1 truncate text-xs text-live">{error.message}</p>}
+        <p className="truncate text-[13px] font-semibold leading-tight text-ink">
+          {panel.detectedTitle}
+        </p>
+        {/* One second line, never two: an error takes the place of the clock
+            rather than stacking under it, so the card is the same height in
+            every state and the window never has to guess. `tabular-nums` keeps
+            the seconds from nudging the words sideways as they tick. */}
+        <p
+          className={cx(
+            "mt-1 truncate text-[11.5px] leading-tight tabular-nums",
+            error ? "text-live" : "text-ink-faint",
+          )}
+        >
+          {error
+            ? error.message
+            : panel.detectedMeta(formatAgo(state.detectedAtMs, now), state.appName)}
+        </p>
       </div>
-      <Button variant="primary" size="sm" loading={starting} onClick={() => void handleStart()}>
+      <Button
+        variant="primary"
+        size="sm"
+        className="px-3.5"
+        loading={starting}
+        onClick={() => void handleStart()}
+      >
         {home.startButton}
       </Button>
-    </div>
+    </>
   );
 }

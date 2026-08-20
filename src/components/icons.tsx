@@ -149,18 +149,27 @@ export function DownloadIcon(props: IconProps) {
   );
 }
 
-/** A quiet trash can, for the hover-only delete affordance on a meeting row. */
+/** A trash can, for the hover-only delete affordance on a meeting row. Same
+ * stroke weight as the rest of the set (1.6) so it doesn't read as timid next
+ * to Search/Close/Plus. */
 export function TrashIcon(props: IconProps) {
   return (
     <svg {...base(props)}>
       <path
-        d="M5 6.5h10M8 6.5V5a1 1 0 011-1h2a1 1 0 011 1v1.5M6.5 6.5l.6 9.2a1 1 0 001 .8h3.8a1 1 0 001-.8l.6-9.2"
+        d="M4.25 6.75h11.5M8.1 6.75V5a1.25 1.25 0 011.25-1.25h1.3A1.25 1.25 0 0111.9 5v1.75"
         stroke="currentColor"
-        strokeWidth="1.4"
+        strokeWidth="1.6"
         strokeLinecap="round"
         strokeLinejoin="round"
       />
-      <path d="M8.5 9.5v5M11.5 9.5v5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      <path
+        d="M6.4 6.75l.68 9.1A1.5 1.5 0 008.58 17.3h2.84a1.5 1.5 0 001.5-1.45l.68-9.1"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M8.6 9.4v5.2M11.4 9.4v5.2" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   );
 }

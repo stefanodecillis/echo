@@ -62,7 +62,7 @@ export function MeetingRow({ meeting, onDeleted }: MeetingRowProps) {
           event.stopPropagation();
           setConfirmOpen(true);
         }}
-        className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full p-1.5 text-ink-ghost opacity-0 transition-opacity hover:bg-surface-sunken hover:text-live focus-visible:opacity-100 group-hover:opacity-100"
+        className="absolute right-3 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-lg bg-surface-sunken text-ink-ghost opacity-0 outline-none transition-colors hover:bg-live/10 hover:text-live focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-live/40 group-hover:opacity-100 group-focus-within:opacity-100"
       >
         <TrashIcon className="h-4 w-4" />
       </button>
