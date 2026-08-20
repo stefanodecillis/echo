@@ -1,8 +1,14 @@
-//! Catch-up probe: run the **real** catch-up pass over the first few minutes of
-//! a real meeting's chunks, against the **real** installed weights, and print
-//! what every speech stretch handed to whisper.cpp and what came back.
+//! Catch-up probe: run the **real** catch-up pass over a real meeting's chunks,
+//! against the **real** installed weights, and print what every speech stretch
+//! handed to whisper.cpp and what came back.
 //!
-//!   cargo run --release --example catchup_probe -- <meeting-id> [minutes]
+//! ```text
+//! cargo run --release --example catchup_probe -- <meeting-id> [minutes|all] [flags]
+//!
+//!   minutes    how much of the meeting to decode; `all` for the whole thing
+//!   --table    one line per decode attempt (private audio: 8 words each)
+//!   --dump P   write the segments this pass wrote to P, as JSON
+//! ```
 //!
 //! Nothing in the app's own storage is written: the chunks are copied to a
 //! temporary directory, the database is a fresh temporary file, and the model
@@ -11,6 +17,10 @@
 //! This exists because a field meeting produced 281 speech stretches and 279
 //! `Generic whisper error … code: -6` failures, and a fix must be proved against
 //! the audio that produced it rather than against a synthetic tone.
+//!
+//! `--dump` is what makes the coverage this proves reusable: `speakers_probe`
+//! seeds its own throwaway database from the file and runs the speaker pass over
+//! the same words, without decoding twenty-one minutes of audio a second time.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -26,6 +36,11 @@ use echo_lib::types::{AssetKind, Channel, TranscriptQuery};
 const CHUNK_MS: i64 = 30_000;
 const DEFAULT_MEETING: &str = "13731077-453a-4c75-8e6e-5586fe2ed019";
 const DEFAULT_MINUTES: i64 = 4;
+/// How many transcript lines to show. Private audio: a glance is the evidence,
+/// not the transcript.
+const SAMPLES: usize = 5;
+/// Words per sample line.
+const SAMPLE_WORDS: usize = 10;
 
 /// One decode attempt, as it happened.
 struct Attempt {
@@ -101,15 +116,50 @@ fn app_support() -> PathBuf {
     Path::new(&home).join("Library/Application Support/Echo")
 }
 
+/// Total length of a set of spans, with overlaps counted once.
+fn covered_ms(mut spans: Vec<(i64, i64)>) -> i64 {
+    spans.sort_unstable();
+    let mut total = 0i64;
+    let mut open: Option<(i64, i64)> = None;
+    for (from, to) in spans {
+        match open {
+            Some((start, end)) if from <= end => open = Some((start, end.max(to))),
+            Some((start, end)) => {
+                total += end - start;
+                open = Some((from, to));
+            }
+            None => open = Some((from, to)),
+        }
+    }
+    if let Some((start, end)) = open {
+        total += end - start;
+    }
+    total
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut positional: Vec<String> = Vec::new();
+    let mut want_table = false;
+    let mut dump: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
-    let meeting = args.next().unwrap_or_else(|| DEFAULT_MEETING.to_string());
-    let minutes: i64 = args
-        .next()
-        .and_then(|m| m.parse().ok())
-        .unwrap_or(DEFAULT_MINUTES);
-    let chunks_wanted = (minutes * 60_000 / CHUNK_MS).max(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--table" => want_table = true,
+            "--dump" => dump = args.next().map(PathBuf::from),
+            other => positional.push(other.to_string()),
+        }
+    }
+    let meeting = positional
+        .first()
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_MEETING.to_string());
+    // `all` is the whole meeting; a number is that many minutes of it.
+    let chunks_wanted = match positional.get(1).map(String::as_str) {
+        Some("all") | Some("full") => i64::MAX,
+        Some(n) => (n.parse::<i64>().unwrap_or(DEFAULT_MINUTES) * 60_000 / CHUNK_MS).max(1),
+        None => (DEFAULT_MINUTES * 60_000 / CHUNK_MS).max(1),
+    };
 
     let support = app_support();
     let source = support.join("recordings").join(&meeting);
@@ -232,51 +282,105 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = started.elapsed();
 
     // --- what happened ----------------------------------------------------
-    println!();
-    println!(
-        "{:>9}  {:>8}  {:>8}  {:>8}  {:>6}  {:>4}  outcome",
-        "t_start", "dur_ms", "samples", "nonzero", "peak", "lang"
-    );
-    for a in probe.attempts.lock().unwrap().iter() {
+    if want_table {
+        println!();
         println!(
-            "{:>9}  {:>8}  {:>8}  {:>8}  {:>6.3}  {:>4}  {}",
-            a.t_start_ms,
-            a.duration_ms,
-            a.samples,
-            a.nonzero,
-            a.peak,
-            a.pinned.as_deref().unwrap_or("-"),
-            a.outcome
+            "{:>9}  {:>8}  {:>8}  {:>8}  {:>6}  {:>4}  outcome",
+            "t_start", "dur_ms", "samples", "nonzero", "peak", "lang"
         );
+        for a in probe.attempts.lock().unwrap().iter() {
+            println!(
+                "{:>9}  {:>8}  {:>8}  {:>8}  {:>6.3}  {:>4}  {}",
+                a.t_start_ms,
+                a.duration_ms,
+                a.samples,
+                a.nonzero,
+                a.peak,
+                a.pinned.as_deref().unwrap_or("-"),
+                a.outcome
+            );
+        }
     }
-
-    let attempts = probe.attempts.lock().unwrap().len();
-    println!();
-    println!(
-        "decode attempts={attempts} ok={} failed={} | stretches with text={} windows_read={} in {:.1}s",
-        probe.ok.load(Ordering::SeqCst),
-        probe.failed.load(Ordering::SeqCst),
-        report.segments_written,
-        report.windows_read,
-        elapsed.as_secs_f32(),
-    );
 
     let written = repo::get_segments(
         &db,
         &TranscriptQuery {
             meeting_id: created.id.clone(),
+            limit: Some(50_000),
             ..Default::default()
         },
     )
     .await?;
-    println!("segments written = {}", written.len());
-    for s in written.iter().take(4) {
+
+    let (attempts, stretch_ms) = {
+        let held = probe.attempts.lock().unwrap();
+        (
+            held.len(),
+            covered_ms(
+                held.iter()
+                    .map(|a| (a.t_start_ms, a.t_start_ms + a.duration_ms))
+                    .collect(),
+            ),
+        )
+    };
+    let ok = probe.ok.load(Ordering::SeqCst);
+    let failed = probe.failed.load(Ordering::SeqCst);
+    let meeting_ms = copied.len() as i64 * CHUNK_MS;
+    let transcribed_ms = covered_ms(written.iter().map(|s| (s.t_start_ms, s.t_end_ms)).collect());
+    let pct = |part: i64, whole: i64| {
+        if whole > 0 {
+            100.0 * part as f64 / whole as f64
+        } else {
+            0.0
+        }
+    };
+
+    println!();
+    println!("=== coverage ===");
+    println!("meeting length            {:>8.1} s", meeting_ms as f64 / 1_000.0);
+    println!(
+        "speech stretches found    {attempts:>8}   ({:.1} s, {:.1}% of the meeting)",
+        stretch_ms as f64 / 1_000.0,
+        pct(stretch_ms, meeting_ms)
+    );
+    println!(
+        "decodes ok / failed       {ok:>8} / {failed}   ({:.1}% ok)",
+        pct(i64::from(ok), i64::from(ok + failed))
+    );
+    println!(
+        "speech transcribed        {:>8.1} s   ({:.1}% of the meeting, {:.1}% of the speech found)",
+        transcribed_ms as f64 / 1_000.0,
+        pct(transcribed_ms, meeting_ms),
+        pct(transcribed_ms, stretch_ms)
+    );
+    println!(
+        "segments written          {:>8}   (pass reported {}, windows read {})",
+        written.len(),
+        report.segments_written,
+        report.windows_read
+    );
+    println!("wall clock                {:>8.1} s", elapsed.as_secs_f32());
+
+    // Five lines spread across the whole meeting, so the evidence is that the
+    // end was transcribed as well as the beginning.
+    println!();
+    println!("=== {SAMPLES} lines across the meeting (first {SAMPLE_WORDS} words) ===");
+    for i in 0..SAMPLES.min(written.len()) {
+        let last = written.len() - 1;
+        let at = if SAMPLES > 1 { i * last / (SAMPLES - 1) } else { 0 };
+        let s = &written[at];
         println!(
-            "  [{:>7}..{:>7}] {}",
-            s.t_start_ms,
-            s.t_end_ms,
-            first_words(&s.text, 10)
+            "  [{:>3}:{:02}] {}",
+            s.t_start_ms / 60_000,
+            (s.t_start_ms % 60_000) / 1_000,
+            first_words(&s.text, SAMPLE_WORDS)
         );
+    }
+
+    if let Some(path) = dump {
+        std::fs::write(&path, serde_json::to_vec_pretty(&written)?)?;
+        println!();
+        println!("wrote {} segments to {}", written.len(), path.display());
     }
 
     engine.shutdown();

@@ -1,7 +1,7 @@
 //! The offline pass, end to end.
 //!
 //! ```text
-//! committed system-channel chunks
+//! committed chunks of the channel the voices arrived on
 //!   └─ 10 s window, 5 s hop ─┐
 //!                            ├─ segmentation → powerset decode → local turns
 //!                            ├─ line up local labels with the previous window
@@ -19,9 +19,41 @@
 //!    can be run again, or abandoned, without losing anything (mantra 3).
 //! 2. **It yields.** A recording starting outranks it absolutely, and it drops
 //!    both models when it does (mantra 1).
-//! 3. **The microphone is always "You".** Channel attribution is right about the
-//!    person at the keyboard by construction, so this pass only ever decides who
-//!    the *other* voices are.
+//! 3. **It never invents a name.** A voice Echo separated out but cannot identify
+//!    is "Speaker N", never a guess at who it was.
+//!
+//! ## Which channel gets separated, and what "You" means
+//!
+//! There are two shapes of meeting, and the difference decides everything below.
+//!
+//! **A meeting with a system channel** — headphones, or any call Echo could tap.
+//! The far end is on its own recording and the microphone holds exactly one
+//! person: whoever is at the keyboard. Channel attribution is right about them by
+//! construction, so the microphone is pinned to "You" and the separation pass
+//! only ever decides who the *other* voices are. [`remote_target`] owns the
+//! arithmetic that turns "there were N of us" into a number of remote voices.
+//!
+//! **A meeting with no system channel at all** — the person was on speakers, or
+//! sitting across a table. Every voice in the room, theirs included, arrived
+//! through the one microphone. Pinning that channel to "You" would claim a
+//! two-person conversation was a monologue, so instead the same windows, the same
+//! fingerprints and the same clustering run on the **microphone** channel, and:
+//!
+//! * The clusters are the people. A count the person gives maps straight through
+//!   — N people means N microphone clusters, no subtraction — see
+//!   [`mic_target`].
+//! * **Nothing is called "You".** Echo has no way to know which of two voices in
+//!   one recording is the person holding the laptop: there is no second channel
+//!   to compare against and no enrolled voice print. Claiming to know would be a
+//!   lie the person then has to notice and undo, so the honest output is
+//!   "Speaker 1" and "Speaker 2" and a rename away from being right.
+//! * The "You" row the live channel pass left behind is pruned with every other
+//!   row this cut no longer produces, and any line still on it is released to
+//!   unattributed rather than left labelled with a voice this pass does not
+//!   believe in.
+//!
+//! Renaming works exactly the same in both shapes: rows are keyed by cluster key,
+//! so `speaker-01` keeps the name the person typed on it across a re-run.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -144,6 +176,21 @@ fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
+/// Which channel the pass is separating, and therefore what its labels mean.
+///
+/// See the module docs. This is decided once, before any model loads, from what
+/// is actually on disk — never from a setting, because the setting cannot know
+/// whether the person happened to be wearing headphones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// The far end has a channel of its own. The microphone is "You" by
+    /// construction; the clustering names only the other voices.
+    System,
+    /// No system channel: everyone audible arrived through the microphone. The
+    /// clustering names all of them and nobody is "You".
+    MicOnly,
+}
+
 /// What one sliding window produced. Local speaker indices are meaningless
 /// outside the window they came from.
 #[derive(Debug, Clone, Default)]
@@ -169,13 +216,29 @@ pub async fn refine(
 ) -> Result<DiarizationResult, DiarizeError> {
     control.checkpoint()?;
 
-    let chunks = repo::list_chunks(db, meeting_id, Some(Channel::System))
-        .await
-        .map_err(db_failed)?;
-    let mut pcm = ChunkPcm::new(chunks);
+    // Which channel carries the voices. A system channel means the far end
+    // recorded itself and the microphone is one known person; no system channel
+    // means the whole conversation is in the microphone recording and every voice
+    // in it has to be separated out (module docs).
+    let mut pcm = ChunkPcm::new(
+        repo::list_chunks(db, meeting_id, Some(Channel::System))
+            .await
+            .map_err(db_failed)?,
+    );
+    let source = if pcm.is_empty() {
+        pcm = ChunkPcm::new(
+            repo::list_chunks(db, meeting_id, Some(Channel::Mic))
+                .await
+                .map_err(db_failed)?,
+        );
+        Source::MicOnly
+    } else {
+        Source::System
+    };
 
-    // A microphone-only meeting: channel attribution already knows everything
-    // there is to know, so pin the transcript to "You" and stop. No model is
+    // No committed audio on either channel — a meeting whose recording was
+    // forgotten, or one that never got as far as a chunk. There is nothing to
+    // separate, so channel attribution is the whole answer and no model is
     // loaded, which is the point of checking first (mantra 1).
     if pcm.is_empty() {
         let speakers = pin_channel_speakers(db, meeting_id).await?;
@@ -195,7 +258,10 @@ pub async fn refine(
     // case; `Some` is the person having corrected the count, and it is read
     // before any model loads so a correction can never be lost to a pass that
     // was already deciding for itself.
-    let target = remote_cluster_target(db, meeting_id).await?;
+    let target = match source {
+        Source::System => remote_cluster_target(db, meeting_id).await?,
+        Source::MicOnly => mic_cluster_target(db, meeting_id).await?,
+    };
 
     let threads = inference_threads();
     let mut segmenter = Segmenter::load(segmenter_path, threads)?;
@@ -273,7 +339,7 @@ pub async fn refine(
     control.checkpoint()?;
     control.report(0.9);
 
-    let speakers = persist(db, meeting_id, &tracks).await?;
+    let speakers = persist(db, meeting_id, &tracks, source).await?;
     let (people_count, people_count_is_override) = people_count(db, meeting_id).await?;
     control.report(1.0);
 
@@ -326,6 +392,28 @@ pub fn remote_target(people: u32, mic_has_speech: bool) -> usize {
         people
     };
     remote.max(1) as usize
+}
+
+/// How many voices a microphone-only meeting's clustering should aim for, or
+/// `None` for "let the calibrated threshold decide".
+async fn mic_cluster_target(db: &Db, meeting_id: &str) -> Result<Option<usize>, DiarizeError> {
+    Ok(repo::speaker_count_override(db, meeting_id)
+        .await
+        .map_err(db_failed)?
+        .map(mic_target))
+}
+
+/// Turn "there were N people in this meeting" into "look for this many voices in
+/// the microphone recording".
+///
+/// It maps straight through. With no system channel there is no separate,
+/// certain microphone speaker to take off the total: the person at the keyboard
+/// is one more voice in the same recording, to be found by the same clustering as
+/// everybody else. Subtracting one here — the arithmetic
+/// [`remote_target`] does, and correctly, for a meeting with two channels — would
+/// answer "there were two of us" with a single cluster covering both voices.
+pub fn mic_target(people: u32) -> usize {
+    super::clamp_people(people) as usize
 }
 
 /// The number the UI shows, and whether it is the person's or Echo's.
@@ -552,10 +640,14 @@ fn turns_from_tracks(tracks: &[Vec<Span>], confidence: &[f32]) -> Vec<SpeakerTur
 
 /// Create the speaker rows and re-point the transcript at them.
 ///
-/// The microphone keeps "You" whatever the models decided. Every other final
-/// segment goes to the person who was talking over most of it. Segments nothing
-/// covers are left alone rather than guessed at, so an unattributed line stays
-/// honestly unattributed.
+/// With a system channel the microphone keeps "You" whatever the models decided,
+/// and every other final segment goes to the voice that was talking over most of
+/// it. Microphone-only, there is no "You" to keep — the microphone segments are
+/// the ones being split, and the row the live pass created for "You" is one of
+/// the rows this cut no longer produces (module docs).
+///
+/// Segments nothing covers are left alone rather than guessed at, so an
+/// unattributed line stays honestly unattributed.
 ///
 /// **Reuse, never duplicate.** Rows are keyed by cluster key, so running the
 /// pass again lands on the rows that are already there — which is what lets a
@@ -567,15 +659,21 @@ async fn persist(
     db: &Db,
     meeting_id: &str,
     tracks: &[Vec<Span>],
+    source: Source,
 ) -> Result<Vec<Speaker>, DiarizeError> {
     let revision = repo::transcript_revision(db, meeting_id)
         .await
         .map_err(db_failed)?
         + 1;
 
-    let me = repo::upsert_speaker(db, meeting_id, SELF_CLUSTER_KEY, SELF_DISPLAY_NAME, true)
-        .await
-        .map_err(db_failed)?;
+    let me = match source {
+        Source::System => Some(
+            repo::upsert_speaker(db, meeting_id, SELF_CLUSTER_KEY, SELF_DISPLAY_NAME, true)
+                .await
+                .map_err(db_failed)?,
+        ),
+        Source::MicOnly => None,
+    };
 
     let mut remote_ids: Vec<Id> = Vec::with_capacity(tracks.len());
     for i in 0..tracks.len() {
@@ -604,19 +702,27 @@ async fn persist(
         }
     }
 
+    // Which channel's lines the clustering is entitled to speak for. The other
+    // one is either "You" (a microphone line, when the far end had its own
+    // channel) or nothing at all.
+    let separated = match source {
+        Source::System => Channel::System,
+        Source::MicOnly => Channel::Mic,
+    };
+
     let mut by_speaker: Vec<(Id, Vec<Id>)> = Vec::new();
     for segment in segments {
         let span: Span = (segment.t_start_ms, segment.t_end_ms);
-        match segment.channel {
-            Channel::Mic => push(&mut by_speaker, &me.id, segment.id),
-            Channel::System => {
-                let hit = timeline::assign_by_overlap(span, tracks)
-                    .or_else(|| timeline::nearest_track(span, tracks, NEAREST_TOLERANCE_MS));
-                if let Some(speaker_id) = hit.and_then(|i| remote_ids.get(i)).cloned() {
-                    push(&mut by_speaker, &speaker_id, segment.id);
-                }
+        if segment.channel == separated {
+            let hit = timeline::assign_by_overlap(span, tracks)
+                .or_else(|| timeline::nearest_track(span, tracks, NEAREST_TOLERANCE_MS));
+            if let Some(speaker_id) = hit.and_then(|i| remote_ids.get(i)).cloned() {
+                push(&mut by_speaker, &speaker_id, segment.id);
             }
-            Channel::Mixed => {}
+        } else if segment.channel == Channel::Mic {
+            if let Some(me) = &me {
+                push(&mut by_speaker, &me.id, segment.id);
+            }
         }
     }
 
@@ -631,7 +737,9 @@ async fn persist(
     // back to unattributed rather than leaving it labelled with a voice the pass
     // no longer believes in.
     let mut keep: Vec<String> = Vec::with_capacity(tracks.len() + 1);
-    keep.push(SELF_CLUSTER_KEY.to_string());
+    if let Some(me) = &me {
+        keep.push(me.cluster_key.clone());
+    }
     keep.extend((0..tracks.len()).map(cluster_key));
     repo::prune_speakers_except(db, meeting_id, &keep)
         .await
@@ -645,8 +753,14 @@ async fn persist(
 }
 
 /// Channel attribution on its own: "You" for the microphone, and one provisional
-/// remote voice when there is a system channel. Costs nothing, always right
-/// about the person at the keyboard.
+/// remote voice when there is a system channel. Costs nothing.
+///
+/// This is the live answer, and it is the best one available while a recording is
+/// happening. On a meeting that turns out to have no system channel it is also
+/// *provisionally wrong* about the microphone — a second person in the room is in
+/// that recording too — and [`refine`] is what corrects it, replacing "You" with
+/// the voices it separates out. Live, there is nothing better to say: no model is
+/// allowed to run during a recording (mantra 1).
 pub async fn pin_channel_speakers(db: &Db, meeting_id: &str) -> Result<Vec<Speaker>, DiarizeError> {
     let me = repo::upsert_speaker(db, meeting_id, SELF_CLUSTER_KEY, SELF_DISPLAY_NAME, true)
         .await
@@ -982,7 +1096,9 @@ mod tests {
             vec![(5_000, 9_000)],
             vec![(10_000, 14_000)],
         ];
-        let after_first = persist(&db, &meeting.id, &three).await.unwrap();
+        let after_first = persist(&db, &meeting.id, &three, Source::System)
+            .await
+            .unwrap();
         assert_eq!(after_first.len(), 4, "You and three voices");
         assert_eq!(repo::count_people(&db, &meeting.id).await.unwrap(), 4);
 
@@ -996,7 +1112,9 @@ mod tests {
 
         // Second pass, cut to one voice covering the same speech.
         let one = vec![vec![(0i64, 14_000i64)]];
-        let after_second = persist(&db, &meeting.id, &one).await.unwrap();
+        let after_second = persist(&db, &meeting.id, &one, Source::System)
+            .await
+            .unwrap();
 
         // Two rows, not five: the first pass's rows were reused and the two the
         // second pass no longer produces are gone.
@@ -1042,7 +1160,7 @@ mod tests {
             .await
             .unwrap();
 
-        let first = persist(&db, &meeting.id, &[vec![(0i64, 4_000i64)]])
+        let first = persist(&db, &meeting.id, &[vec![(0i64, 4_000i64)]], Source::System)
             .await
             .unwrap();
         let voice = first
@@ -1054,7 +1172,7 @@ mod tests {
         let me = first.iter().find(|s| s.is_self).unwrap();
         repo::rename_speaker(&db, &me.id, "Stefano").await.unwrap();
 
-        let second = persist(&db, &meeting.id, &[vec![(0i64, 4_000i64)]])
+        let second = persist(&db, &meeting.id, &[vec![(0i64, 4_000i64)]], Source::System)
             .await
             .unwrap();
         assert_eq!(second.len(), 2);
@@ -1076,9 +1194,226 @@ mod tests {
             .await
             .unwrap();
 
-        let speakers = persist(&db, &meeting.id, &[]).await.unwrap();
+        let speakers = persist(&db, &meeting.id, &[], Source::System).await.unwrap();
         assert_eq!(speakers.len(), 1);
         assert_eq!(speakers[0].cluster_key, SELF_CLUSTER_KEY);
         assert!(speakers[0].is_self);
+    }
+
+    // -----------------------------------------------------------------------
+    // Both voices came through the microphone
+    // -----------------------------------------------------------------------
+
+    fn mic_line(meeting_id: &str, from: i64, to: i64) -> crate::types::SegmentDraft {
+        crate::types::SegmentDraft {
+            channel: Channel::Mic,
+            ..remote_line(meeting_id, from, to)
+        }
+    }
+
+    /// The other half of the count arithmetic. Subtracting the microphone is
+    /// right when the microphone is one known person on its own channel, and
+    /// wrong when it is the whole room: "there were two of us" would then ask for
+    /// one cluster and put both voices in it.
+    #[test]
+    fn on_one_channel_the_count_the_person_gives_is_the_number_of_voices_to_find() {
+        assert_eq!(mic_target(2), 2);
+        assert_eq!(mic_target(1), 1);
+        assert_eq!(mic_target(5), 5);
+        // Nothing to subtract, so the two arithmetics disagree by exactly one.
+        assert_eq!(mic_target(2), remote_target(2, true) + 1);
+    }
+
+    #[test]
+    fn a_count_outside_range_is_pulled_in_on_the_microphone_path_too() {
+        assert_eq!(mic_target(0), super::super::MIN_PEOPLE as usize);
+        assert_eq!(mic_target(9_999), super::super::MAX_PEOPLE as usize);
+    }
+
+    /// The whole point of the microphone path: two voices that both arrived
+    /// through the one microphone come out as two people, and neither is claimed
+    /// to be the person at the keyboard.
+    #[tokio::test]
+    async fn two_voices_on_the_microphone_become_two_speakers_and_no_one_is_you() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Coffee", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                mic_line(&meeting.id, 0, 4_000),
+                mic_line(&meeting.id, 5_000, 9_000),
+            ],
+        )
+        .await
+        .unwrap();
+        // The live channel pass already said "You" and put both lines on it.
+        let live = pin_channel_speakers(&db, &meeting.id).await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].cluster_key, SELF_CLUSTER_KEY);
+
+        let two = vec![vec![(0i64, 4_000i64)], vec![(5_000, 9_000)]];
+        let speakers = persist(&db, &meeting.id, &two, Source::MicOnly)
+            .await
+            .unwrap();
+
+        // Two people, both anonymous, and the live pass's "You" is gone rather
+        // than left as a third chip with nothing behind it.
+        let keys: Vec<&str> = speakers.iter().map(|s| s.cluster_key.as_str()).collect();
+        assert_eq!(keys, vec![cluster_key(0).as_str(), cluster_key(1).as_str()]);
+        assert!(
+            speakers.iter().all(|s| !s.is_self),
+            "Echo cannot know which voice is the person: {speakers:?}"
+        );
+        assert_eq!(
+            speakers
+                .iter()
+                .map(|s| s.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Speaker 1", "Speaker 2"]
+        );
+        // And that is the number the UI shows: N people is N microphone clusters.
+        assert_eq!(repo::count_people(&db, &meeting.id).await.unwrap(), 2);
+
+        // One line each, on the voice that was talking over it.
+        let segments = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let first = speakers[0].id.clone();
+        let second = speakers[1].id.clone();
+        assert_eq!(segments[0].speaker_id.as_deref(), Some(first.as_str()));
+        assert_eq!(segments[1].speaker_id.as_deref(), Some(second.as_str()));
+        assert!(segments.iter().all(|s| s.text == "hello"));
+    }
+
+    /// A microphone-only line the clustering could not cover is released to
+    /// unattributed rather than left on the "You" row it was pinned to live —
+    /// the row is gone, so keeping the pointer would be a chip for a voice this
+    /// pass does not believe in.
+    #[tokio::test]
+    async fn a_microphone_line_no_voice_covers_ends_up_unattributed() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Workshop", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                mic_line(&meeting.id, 0, 4_000),
+                // Nowhere near the one track below.
+                mic_line(&meeting.id, 60_000, 64_000),
+            ],
+        )
+        .await
+        .unwrap();
+        pin_channel_speakers(&db, &meeting.id).await.unwrap();
+
+        persist(&db, &meeting.id, &[vec![(0i64, 4_000i64)]], Source::MicOnly)
+            .await
+            .unwrap();
+
+        let segments = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(segments[0].speaker_id.is_some());
+        assert!(
+            segments[1].speaker_id.is_none(),
+            "a line nothing covers stays honestly unattributed"
+        );
+        assert_eq!(repo::count_people(&db, &meeting.id).await.unwrap(), 1);
+    }
+
+    /// Renames are keyed on the cluster key, which the microphone path uses
+    /// exactly as the system path does — so naming the two voices in the room
+    /// survives a re-run.
+    #[tokio::test]
+    async fn naming_the_voices_in_the_room_survives_a_re_run() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Kitchen table", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                mic_line(&meeting.id, 0, 4_000),
+                mic_line(&meeting.id, 5_000, 9_000),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let two = vec![vec![(0i64, 4_000i64)], vec![(5_000, 9_000)]];
+        let first = persist(&db, &meeting.id, &two, Source::MicOnly)
+            .await
+            .unwrap();
+        repo::rename_speaker(&db, &first[0].id, "Stefano")
+            .await
+            .unwrap();
+        repo::rename_speaker(&db, &first[1].id, "Giulia")
+            .await
+            .unwrap();
+
+        let second = persist(&db, &meeting.id, &two, Source::MicOnly)
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 2);
+        let names: Vec<&str> = second.iter().map(|s| s.display_name.as_str()).collect();
+        assert!(names.contains(&"Stefano"), "{names:?}");
+        assert!(names.contains(&"Giulia"), "{names:?}");
+        // Same rows, so the ids the UI is holding are still good.
+        assert_eq!(second[0].id, first[0].id);
+        assert_eq!(second[1].id, first[1].id);
+    }
+
+    /// The system path is untouched by any of the above: a meeting with a system
+    /// channel still pins the microphone to "You" and clusters only the far end.
+    #[tokio::test]
+    async fn with_a_system_channel_the_microphone_is_still_you() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Client call", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                mic_line(&meeting.id, 0, 4_000),
+                remote_line(&meeting.id, 5_000, 9_000),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let speakers = persist(&db, &meeting.id, &[vec![(5_000i64, 9_000i64)]], Source::System)
+            .await
+            .unwrap();
+        assert_eq!(speakers.len(), 2);
+        let me = speakers.iter().find(|s| s.is_self).expect("You");
+        assert_eq!(me.display_name, SELF_DISPLAY_NAME);
+
+        let segments = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(segments[0].speaker_id.as_deref(), Some(me.id.as_str()));
+        assert_ne!(segments[1].speaker_id.as_deref(), Some(me.id.as_str()));
+        assert!(segments[1].speaker_id.is_some());
     }
 }

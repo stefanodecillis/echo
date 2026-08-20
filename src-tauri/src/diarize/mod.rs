@@ -6,9 +6,24 @@
 //!    channel is one provisional remote speaker. This costs nothing and is
 //!    always right about the person using the computer.
 //! 2. **Offline refinement, canonical.** After the recording ends, segmentation
-//!    plus speaker fingerprints split the system channel into individual people
-//!    and stabilise the labels. This pass owns the final answer and bumps the
-//!    segment revision.
+//!    plus speaker fingerprints split the recording into individual people and
+//!    stabilise the labels. This pass owns the final answer and bumps the segment
+//!    revision.
+//!
+//! Which recording gets split depends on what the meeting actually captured, and
+//! this is the one place the two layers can disagree:
+//!
+//! * **With a system channel**, the far end is on its own recording. The
+//!   microphone holds one known person, so layer 1's "You" stands and the pass
+//!   only names the other voices.
+//! * **With no system channel** — the person was on speakers, or in the same room
+//!   as whoever they were talking to — everybody's voice is in the microphone
+//!   recording. The pass splits *that*, the clusters become "Speaker 1..N", and
+//!   **nothing is called "You"**: with one channel and no enrolled voice print
+//!   Echo cannot tell which voice belongs to the person holding the laptop, and
+//!   guessing would be a claim they then have to notice and undo. Layer 1's "You"
+//!   row is pruned like any other row the final cut does not produce.
+//!   [`pipeline`]'s module docs carry the detail.
 //!
 //! If the M0-S4 quality gate fails, v1 ships layer 1 live plus this pass
 //! offline, and no live clustering — [`LiveClusterHook`] is the seam that would
@@ -18,7 +33,7 @@
 //!
 //! | step | module |
 //! |---|---|
-//! | read committed system-channel chunks, a window at a time | [`pcm`] |
+//! | read the committed chunks of the channel the voices arrived on, a window at a time | [`pcm`] |
 //! | segment a 10 s window, decode the powerset output into turns | [`segmentation`] |
 //! | log-mel features for the fingerprint network | [`features`] |
 //! | fingerprint the audio where one person talks alone | [`embedding`] |
@@ -40,15 +55,24 @@
 //!
 //! **The number is the total, including whoever was at this computer.** That is
 //! what "people in this meeting" means to a human, and the UI asks the question
-//! in those words, so an override of 3 on a meeting where the microphone caught
-//! speech asks the clustering for 2 remote voices — see [`remote_target`], which
-//! owns that arithmetic and is the only place it is done.
+//! in those words. What it turns into depends on the shape of the meeting, and
+//! there are exactly two functions that do the turning:
+//!
+//! * [`remote_target`] — with a system channel. The microphone is a certain,
+//!   separate speaker no clustering is involved in, so an override of 3 asks for
+//!   2 remote voices when the microphone caught speech.
+//! * [`mic_target`] — with no system channel. Every voice is in the one
+//!   recording, the person's own included, so an override of 3 asks for 3
+//!   microphone clusters. Nothing is subtracted, because nothing is certain.
 //!
 //! What survives a change of count, honestly stated:
 //!
-//! * **"You" always survives.** The microphone is the person at the keyboard by
-//!   construction; no count changes that, and a rename of it is keyed on a
-//!   cluster key that never moves.
+//! * **"You" survives as long as there is a system channel.** The microphone is
+//!   then the person at the keyboard by construction; no count changes that, and a
+//!   rename of it is keyed on a cluster key that never moves. On a
+//!   microphone-only meeting there is no "You" row for a name to live on — see
+//!   above — and a name typed onto one before the offline pass ran goes with the
+//!   row.
 //! * **A rename survives when the cluster does.** Speaker rows are keyed
 //!   `speaker-01`, `speaker-02`, … in the order people first speak, so cutting a
 //!   meeting from 4 voices to 3 keeps the first three rows and the names on them
@@ -80,7 +104,8 @@ use crate::types::{Id, Speaker};
 
 pub use cluster::DISTANCE_THRESHOLD;
 pub use pipeline::{
-    cluster_key, display_name, remote_target, DiarizeControl, SELF_CLUSTER_KEY, SELF_DISPLAY_NAME,
+    cluster_key, display_name, mic_target, remote_target, DiarizeControl, SELF_CLUSTER_KEY,
+    SELF_DISPLAY_NAME,
 };
 
 /// Fewest people a meeting can be said to have had in it. One: the person
@@ -158,8 +183,12 @@ impl SpeakerTurn {
 #[derive(Debug, Clone, Default)]
 pub struct DiarizationResult {
     pub turns: Vec<SpeakerTurn>,
-    /// How many distinct people the pass believes were on the system channel.
-    /// Remote voices only — the microphone is not one of them.
+    /// How many distinct voices the pass separated out of the channel it read.
+    ///
+    /// With a system channel these are the remote voices and the microphone is
+    /// not one of them, so the number of people in the meeting is one more. With
+    /// no system channel the pass read the microphone instead and this *is*
+    /// everybody. Either way [`Self::people_count`] is the number to show.
     pub speaker_count: u32,
     /// Clustering threshold used, for diagnostics. In fixed-count mode there is
     /// no threshold, so this is the distance the hierarchy was cut at instead.
@@ -207,10 +236,12 @@ pub async fn ensure_channel_speakers(
 
 /// The canonical offline pass.
 ///
-/// Reads the system channel from disk, runs segmentation and fingerprinting
-/// with a sliding window, decodes overlaps, clusters with a calibrated
-/// threshold — or with the count the person gave us, if they gave us one — then
-/// writes speakers and re-points segments at them with a fresh revision.
+/// Reads the channel the voices arrived on from disk — the system channel, or the
+/// microphone on a meeting that has no system channel — runs segmentation and
+/// fingerprinting with a sliding window, decodes overlaps, clusters with a
+/// calibrated threshold (or with the count the person gave us, if they gave us
+/// one), then writes speakers and re-points segments at them with a fresh
+/// revision.
 ///
 /// Not cancellable on its own — use [`refine_speakers_with`] or [`job::run`] for
 /// that. This shape exists for callers that already know the pass should run to
@@ -509,8 +540,11 @@ mod tests {
         assert!(same.alias_of.is_none());
     }
 
+    /// A meeting with no audio left on either channel — forgotten, or never
+    /// committed. There is nothing to separate, so channel attribution is the
+    /// whole answer and no model is touched.
     #[tokio::test]
-    async fn the_pass_on_a_microphone_only_meeting_needs_no_models_at_all() {
+    async fn a_meeting_with_no_audio_on_disk_needs_no_models_at_all() {
         let db = db().await;
         let meeting = repo::create_meeting(&db, "Voice note", "/tmp/echo-test", None)
             .await
@@ -533,6 +567,43 @@ mod tests {
         assert!(result.turns.is_empty());
         assert_eq!(result.speakers.len(), 1);
         assert_eq!(result.speakers[0].display_name, "You");
+    }
+
+    /// A meeting recorded on speakers: microphone audio, no system channel. The
+    /// other person's voice is in that recording, so the pass has to run on it —
+    /// which means reaching for the models rather than pinning everything to
+    /// "You" and stopping.
+    #[tokio::test]
+    async fn a_microphone_only_meeting_with_audio_still_gets_separated() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Coffee", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        let chunk = repo::insert_chunk(
+            &db,
+            &meeting.id,
+            Channel::Mic,
+            0,
+            "/tmp/echo-test/mic-0.wav",
+            0,
+            30_000,
+        )
+        .await
+        .unwrap();
+        repo::commit_chunk(&db, &chunk, 30_000).await.unwrap();
+        repo::insert_segments(&db, &[line(&meeting.id, Channel::Mic, 0, 5_000)])
+            .await
+            .unwrap();
+
+        let err = refine_speakers(
+            &db,
+            &meeting.id,
+            Path::new("/nonexistent/segmenter.onnx"),
+            Path::new("/nonexistent/fingerprints.onnx"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DiarizeError::NotInstalled), "{err:?}");
     }
 
     #[tokio::test]
