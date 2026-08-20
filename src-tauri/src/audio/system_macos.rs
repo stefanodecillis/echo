@@ -14,6 +14,16 @@
 //!   pretending it worked.
 //! * Sample buffers carry their own presentation timestamps; convert them onto
 //!   the meeting clock instead of trusting arrival order.
+//! * **A stream output only calls back on the queue it was given.** Echo hands
+//!   `addStreamOutput:type:sampleHandlerQueue:` its own serial queues and keeps
+//!   them alive for the stream's life. A nil queue there produced exactly one
+//!   symptom in the field: a stream that started with no error, never stopped,
+//!   and delivered no audio for an entire meeting. Nothing above this layer can
+//!   tell that apart from a working stream, so it must be right here.
+//! * A screen output is registered next to the audio one and every video frame
+//!   is dropped. Not because the frames are wanted, but because an `SCStream`
+//!   always has a video side and audio-only registration is not a configuration
+//!   Apple documents as working. It costs a 16x16 frame a second.
 //!
 //! ## Shape of the implementation
 //!
@@ -36,11 +46,12 @@
 #![allow(non_snake_case)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
+use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
@@ -64,6 +75,21 @@ const REQUESTED_CHANNELS: u16 = 2;
 /// How long to wait for ScreenCaptureKit to answer before giving up and
 /// degrading to microphone-only.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Video cannot be switched off on an `SCStream`: the configuration always
+/// describes a video stream, and Apple's own sample registers a screen output
+/// next to the audio one. So Echo registers both and throws every video frame
+/// away. Small and slow, but not degenerate — a size or interval the framework
+/// has to special-case is exactly the kind of thing that makes a stream start
+/// and then deliver nothing.
+const VIDEO_SIDE: usize = 16;
+/// One 16x16 frame a second, all of them dropped. Effectively free.
+const VIDEO_FRAME_INTERVAL: CMTime = CMTime {
+    value: 1,
+    timescale: 1,
+    flags: CMTimeFlags::Valid,
+    epoch: 0,
+};
 
 // ---------------------------------------------------------------------------
 // The parts of CoreMedia / CoreGraphics / CoreFoundation we need by hand
@@ -171,6 +197,27 @@ struct SystemShared {
     /// display disconnected, or the daemon gave up.
     stopped_reason: Mutex<Option<String>>,
     stopped: AtomicBool,
+    /// Counters, not audio. A stream that starts and then delivers nothing
+    /// looks identical to a working one from the outside, so the next real
+    /// meeting has to be able to say *where* it went quiet: never called at
+    /// all, called with video only, or called with buffers we refused.
+    counts: BufferCounts,
+    /// Set once the first audio buffer's format has been written to the log.
+    format_logged: AtomicBool,
+}
+
+/// How many sample buffers arrived and what became of them.
+#[derive(Debug, Default)]
+struct BufferCounts {
+    audio: AtomicU64,
+    /// Video frames, which we drop on purpose.
+    other: AtomicU64,
+    /// Not packed float, so we did not guess at it.
+    not_float: AtomicU64,
+    /// CoreMedia would not give us an audio buffer list.
+    unreadable: AtomicU64,
+    /// Carried no samples.
+    empty: AtomicU64,
 }
 
 impl SystemShared {
@@ -210,10 +257,15 @@ define_class!(
             kind: SCStreamOutputType,
         ) {
             if kind != SCStreamOutputType::Audio {
-                // Video frames are never consumed: we asked for audio only and
-                // dropping them keeps the cost at nothing.
+                // Video frames are never consumed: they exist only because an
+                // `SCStream` always has a video side, and dropping them keeps
+                // the cost at nothing. Counted, because "macOS called us with
+                // video but never with audio" is a completely different
+                // diagnosis from "macOS never called us".
+                self.ivars().counts.other.fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            self.ivars().counts.audio.fetch_add(1, Ordering::Relaxed);
             handle_audio(self.ivars(), sample_buffer);
         }
     }
@@ -243,6 +295,7 @@ fn handle_audio(shared: &Arc<SystemShared>, sbuf: &CMSampleBuffer) {
     // Format first: if this is not packed float we do not guess.
     let mut rate = REQUESTED_RATE;
     let mut is_float = true;
+    let mut described: Option<(u32, u32, u32, u32)> = None;
     unsafe {
         let desc = CMSampleBufferGetFormatDescription(raw);
         if !desc.is_null() {
@@ -253,10 +306,40 @@ fn handle_audio(shared: &Arc<SystemShared>, sbuf: &CMSampleBuffer) {
                     rate = asbd.sample_rate as u32;
                 }
                 is_float = asbd.format_flags & FORMAT_FLAG_IS_FLOAT != 0;
+                described = Some((
+                    rate,
+                    asbd.channels_per_frame,
+                    asbd.bits_per_channel,
+                    asbd.format_flags,
+                ));
             }
         }
     }
+
+    // Exactly once per stream, and never audio content: what macOS actually
+    // negotiated, so the next real meeting's log either proves this path works
+    // or says which field is wrong. One log line on a dispatch queue that is
+    // already taking two mutexes below costs nothing.
+    if !shared.format_logged.swap(true, Ordering::Relaxed) {
+        match described {
+            Some((rate, channels, bits, flags)) => tracing::info!(
+                target: "echo::audio",
+                rate,
+                channels,
+                bits,
+                format_flags = flags,
+                is_float,
+                "first system-audio buffer arrived"
+            ),
+            None => tracing::info!(
+                target: "echo::audio",
+                "first system-audio buffer arrived with no format description"
+            ),
+        }
+    }
+
     if !is_float {
+        shared.counts.not_float.fetch_add(1, Ordering::Relaxed);
         return;
     }
     shared.rate.store(rate, Ordering::Relaxed);
@@ -276,6 +359,7 @@ fn handle_audio(shared: &Arc<SystemShared>, sbuf: &CMSampleBuffer) {
         )
     };
     if status != 0 {
+        shared.counts.unreadable.fetch_add(1, Ordering::Relaxed);
         if !block_buffer.is_null() {
             unsafe { CFRelease(block_buffer) };
         }
@@ -284,12 +368,16 @@ fn handle_audio(shared: &Arc<SystemShared>, sbuf: &CMSampleBuffer) {
 
     let channel_count = (list.number_buffers as usize).min(MAX_BUFFERS);
     if channel_count == 0 {
+        shared.counts.empty.fetch_add(1, Ordering::Relaxed);
         unsafe { CFRelease(block_buffer) };
         return;
     }
 
     // ScreenCaptureKit delivers de-interleaved float: one buffer per channel.
     let frames = (list.buffers[0].data_byte_size as usize) / std::mem::size_of::<f32>();
+    if frames == 0 {
+        shared.counts.empty.fetch_add(1, Ordering::Relaxed);
+    }
     if frames > 0 {
         let mut scratch = shared.scratch.lock().unwrap_or_else(|e| e.into_inner());
         scratch.clear();
@@ -405,6 +493,8 @@ impl SystemCapture {
             rate: AtomicU32::new(REQUESTED_RATE),
             stopped_reason: Mutex::new(None),
             stopped: AtomicBool::new(false),
+            counts: BufferCounts::default(),
+            format_logged: AtomicBool::new(false),
         });
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -555,6 +645,28 @@ impl SystemCapture {
         self.counters.dropped_samples()
     }
 
+    /// One line of counters for the diagnostics log, so a silent channel can say
+    /// *where* it went silent. Never audio content.
+    ///
+    /// Read it as a funnel: `audio_buffers=0 video_buffers=0` means macOS never
+    /// called back at all; `audio_buffers=0 video_buffers>0` means the stream is
+    /// running but carries no audio; a non-zero `not_float`/`unreadable`/`empty`
+    /// means the buffers arrived and this file threw them away.
+    pub fn diagnostics(&self) -> String {
+        let counts = &self.shared.counts;
+        format!(
+            "audio_buffers={} video_buffers={} not_float={} unreadable={} empty={} pushed_samples={} dropped_samples={} rate={}",
+            counts.audio.load(Ordering::Relaxed),
+            counts.other.load(Ordering::Relaxed),
+            counts.not_float.load(Ordering::Relaxed),
+            counts.unreadable.load(Ordering::Relaxed),
+            counts.empty.load(Ordering::Relaxed),
+            self.counters.pushed_samples(),
+            self.counters.dropped_samples(),
+            self.shared.rate.load(Ordering::Relaxed),
+        )
+    }
+
     /// Where on the meeting clock this channel started. -1 until the first
     /// buffer arrives.
     pub fn start_offset_ms(&self) -> i64 {
@@ -582,6 +694,10 @@ impl SystemCapture {
             .unwrap_or_else(|e| e.into_inner()) = None;
         self.shared.stopped.store(false, Ordering::Relaxed);
         self.shared.counters.mark_running();
+        // A new stream gets to describe its own first buffer: the format can
+        // change under us when the output device does. The buffer counts stay
+        // cumulative, because they are the record of the whole meeting.
+        self.shared.format_logged.store(false, Ordering::Relaxed);
         self.shutdown = Arc::new(AtomicBool::new(false));
 
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), AudioError>>();
@@ -637,7 +753,7 @@ fn run_stream(
     shutdown: Arc<AtomicBool>,
     ready: mpsc::Sender<Result<(), AudioError>>,
 ) {
-    let started = match start_stream(&shared) {
+    let parts = match start_stream(&shared) {
         Ok(parts) => {
             let _ = ready.send(Ok(()));
             parts
@@ -647,7 +763,13 @@ fn run_stream(
             return;
         }
     };
-    let (stream, tap) = started;
+    let StreamParts {
+        stream,
+        tap,
+        audio_queue,
+        video_queue,
+        screen_registered,
+    } = parts;
 
     while !shutdown.load(Ordering::Relaxed) {
         if shared.stopped.load(Ordering::Relaxed) {
@@ -670,11 +792,60 @@ fn run_stream(
             SCStreamOutputType::Audio,
         )
     };
+    if screen_registered {
+        let _ = unsafe {
+            stream.removeStreamOutput_type_error(
+                ProtocolObject::from_ref(&*tap),
+                SCStreamOutputType::Screen,
+            )
+        };
+    }
     drop(tap);
     drop(stream);
+    // The queues go last: ScreenCaptureKit was dispatching onto them until the
+    // outputs came off, and a queue released while a block is still in flight is
+    // a crash rather than a missing recording.
+    drop(audio_queue);
+    drop(video_queue);
 }
 
-type StreamParts = (Retained<SCStream>, Retained<AudioTap>);
+/// Everything the stream needs to stay alive, held on the worker thread for the
+/// life of the capture.
+///
+/// The queues are in here for a reason. `addStreamOutput:type:sampleHandlerQueue:`
+/// is documented as delivering sample buffers "on the provided queue", and
+/// ScreenCaptureKit does not keep it alive for you — a queue dropped after start
+/// is a stream that runs and delivers nothing, which is precisely the failure
+/// this file exists to have fixed.
+struct StreamParts {
+    stream: Retained<SCStream>,
+    tap: Retained<AudioTap>,
+    audio_queue: DispatchRetained<DispatchQueue>,
+    video_queue: DispatchRetained<DispatchQueue>,
+    /// Whether the screen output was accepted, so teardown removes exactly what
+    /// was added.
+    screen_registered: bool,
+}
+
+/// The stream configuration Echo asks for. Separate from [`start_stream`] so a
+/// test can check every field round-trips through ScreenCaptureKit without a
+/// display, a signed build or anybody's permission.
+fn audio_configuration() -> Retained<SCStreamConfiguration> {
+    let config = unsafe { SCStreamConfiguration::new() };
+    unsafe {
+        config.setCapturesAudio(true);
+        config.setExcludesCurrentProcessAudio(true);
+        config.setSampleRate(REQUESTED_RATE as isize);
+        config.setChannelCount(REQUESTED_CHANNELS as isize);
+        // Video cannot be switched off, so make it small and slow rather than
+        // degenerate, and never read a frame.
+        config.setWidth(VIDEO_SIDE);
+        config.setHeight(VIDEO_SIDE);
+        config.setMinimumFrameInterval(VIDEO_FRAME_INTERVAL);
+        config.setQueueDepth(6);
+    }
+    config
+}
 
 fn start_stream(shared: &Arc<SystemShared>) -> Result<StreamParts, AudioError> {
     let content = shareable_content()?;
@@ -705,24 +876,7 @@ fn start_stream(shared: &Arc<SystemShared>) -> Result<StreamParts, AudioError> {
         )
     };
 
-    let config = unsafe { SCStreamConfiguration::new() };
-    unsafe {
-        config.setCapturesAudio(true);
-        config.setExcludesCurrentProcessAudio(true);
-        config.setSampleRate(REQUESTED_RATE as isize);
-        config.setChannelCount(REQUESTED_CHANNELS as isize);
-        // Video cannot be switched off, so make it as close to free as the API
-        // allows: a 2x2 frame every ten minutes, and we never read one.
-        config.setWidth(2);
-        config.setHeight(2);
-        config.setMinimumFrameInterval(CMTime {
-            value: 600,
-            timescale: 1,
-            flags: CMTimeFlags::Valid,
-            epoch: 0,
-        });
-        config.setQueueDepth(6);
-    }
+    let config = audio_configuration();
 
     let tap = AudioTap::new(Arc::clone(shared));
     let delegate: &ProtocolObject<dyn SCStreamDelegate> = ProtocolObject::from_ref(&*tap);
@@ -735,18 +889,52 @@ fn start_stream(shared: &Arc<SystemShared>) -> Result<StreamParts, AudioError> {
         )
     };
 
+    // ScreenCaptureKit calls a stream output back **on the queue handed to
+    // `addStreamOutput:type:sampleHandlerQueue:`**. There is no documented
+    // fallback for nil, and Apple's own sample always supplies one — a stream
+    // registered with nil starts cleanly, reports no error, never stops, and
+    // never delivers a single buffer. Echo owns two serial queues instead, and
+    // keeps them alive for the stream's life.
+    let audio_queue = DispatchQueue::new("dev.echo.system-audio", DispatchQueueAttr::SERIAL);
+    let video_queue = DispatchQueue::new("dev.echo.system-audio.video", DispatchQueueAttr::SERIAL);
+
     let output: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*tap);
-    // A nil queue means ScreenCaptureKit uses a private serial queue, which is
-    // exactly what we want: samples arrive in order, off our threads.
     unsafe {
         stream.addStreamOutput_type_sampleHandlerQueue_error(
             output,
             SCStreamOutputType::Audio,
-            None,
+            Some(&audio_queue),
         )
     }
     .map_err(|e| AudioError::Backend(describe_error(&e)))?;
 
+    // The screen output is not wanted, it is insurance: an `SCStream` always has
+    // a video side, and Apple's sample registers a screen output alongside the
+    // audio one. Audio-only registration is not a configuration Apple documents
+    // as working, and this path cannot be re-tested quickly, so register both
+    // and throw every frame away. A refusal here is not fatal — audio is the
+    // whole point.
+    let screen_registered = match unsafe {
+        stream.addStreamOutput_type_sampleHandlerQueue_error(
+            output,
+            SCStreamOutputType::Screen,
+            Some(&video_queue),
+        )
+    } {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!(
+                target: "echo::audio",
+                "the throwaway video output was refused, continuing with audio only: {}",
+                describe_error(&e)
+            );
+            false
+        }
+    };
+
+    // `startCaptureWithCompletionHandler:` returns immediately; the *completion*
+    // carries the verdict. Treating the call itself as success is how a stream
+    // that failed its permission re-check ends up looking like a working one.
     let (tx, rx) = mpsc::channel::<Option<String>>();
     let handler = RcBlock::new(move |error: *mut NSError| {
         let message = if error.is_null() {
@@ -759,12 +947,47 @@ fn start_stream(shared: &Arc<SystemShared>) -> Result<StreamParts, AudioError> {
     unsafe { stream.startCaptureWithCompletionHandler(Some(&handler)) };
 
     match rx.recv_timeout(OPEN_TIMEOUT) {
-        Ok(None) => Ok((stream, tap)),
+        Ok(None) => {
+            log_negotiated_configuration(&config, screen_registered);
+            Ok(StreamParts {
+                stream,
+                tap,
+                audio_queue,
+                video_queue,
+                screen_registered,
+            })
+        }
         Ok(Some(message)) => Err(classify_start_error(&message)),
         Err(_) => Err(AudioError::SystemAudioUnsupported(
             "macOS did not start sharing in time".into(),
         )),
     }
+}
+
+/// What macOS agreed to, read back off the configuration rather than repeated
+/// from what we asked for. This is the line that tells the next real meeting
+/// whether the stream was set up right, before any buffer has arrived.
+fn log_negotiated_configuration(config: &SCStreamConfiguration, screen_registered: bool) {
+    let (sample_rate, channel_count, captures_audio, excludes_own_audio, queue_depth) = unsafe {
+        (
+            config.sampleRate(),
+            config.channelCount(),
+            config.capturesAudio(),
+            config.excludesCurrentProcessAudio(),
+            config.queueDepth(),
+        )
+    };
+    tracing::info!(
+        target: "echo::audio",
+        sample_rate,
+        channel_count,
+        captures_audio,
+        excludes_own_audio,
+        queue_depth,
+        screen_output_registered = screen_registered,
+        sample_handler_queue = "dev.echo.system-audio",
+        "system audio stream started"
+    );
 }
 
 fn shareable_content() -> Result<Retained<SCShareableContent>, AudioError> {
@@ -991,6 +1214,66 @@ mod tests {
     fn the_buffer_list_is_big_enough_for_a_real_stream() {
         assert!(MAX_BUFFERS >= usize::from(REQUESTED_CHANNELS));
         assert_eq!(std::mem::size_of::<AudioBufferRaw>(), 16);
+    }
+
+    #[test]
+    fn the_configuration_macos_gets_is_the_one_we_asked_for() {
+        // A configuration object is plain state: no display, no daemon, no
+        // permission. So the one thing that *can* be checked here is that every
+        // field really took — a setter that silently did nothing is a stream
+        // that starts and delivers nothing.
+        let config = audio_configuration();
+        unsafe {
+            assert!(config.capturesAudio(), "audio was never switched on");
+            assert!(
+                config.excludesCurrentProcessAudio(),
+                "playing a recording back would leak into the next one"
+            );
+            assert_eq!(config.sampleRate(), REQUESTED_RATE as isize);
+            assert_eq!(config.channelCount(), REQUESTED_CHANNELS as isize);
+            assert_eq!(config.width(), VIDEO_SIDE);
+            assert_eq!(config.height(), VIDEO_SIDE);
+            assert!(config.queueDepth() >= 3, "too shallow to absorb a hiccup");
+        }
+        // And the log line built from it must not panic on any of that.
+        log_negotiated_configuration(&config, true);
+    }
+
+    #[test]
+    fn the_video_side_of_the_stream_is_cheap_but_not_degenerate() {
+        // Registered and thrown away. It exists because an SCStream always has a
+        // video side; it must never be a size or a rate the framework has to
+        // special-case.
+        let side = VIDEO_SIDE;
+        assert!(side >= 16, "small enough that macOS may refuse it");
+        assert_eq!(side % 2, 0, "an odd frame size is asking for trouble");
+
+        let interval = VIDEO_FRAME_INTERVAL;
+        assert!(interval.timescale > 0, "a zero timescale is not a duration");
+        assert!(interval.value > 0, "a zero interval means as fast as possible");
+        assert!(
+            interval.value / i64::from(interval.timescale) <= 60,
+            "an interval measured in minutes is not a documented configuration"
+        );
+    }
+
+    #[test]
+    fn audio_and_video_arrive_under_different_labels() {
+        // The tap tells them apart by this value alone: if they ever collided,
+        // every dropped video frame would be counted as audio and the
+        // watchdog would never fire.
+        assert_ne!(SCStreamOutputType::Audio, SCStreamOutputType::Screen);
+    }
+
+    #[test]
+    fn a_serial_queue_for_the_sample_handler_can_be_made() {
+        // The bug this file was fixed for: ScreenCaptureKit only calls a stream
+        // output back on the queue it was handed, and nil is not a queue.
+        let queue = DispatchQueue::new("dev.echo.system-audio.test", DispatchQueueAttr::SERIAL);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        queue.exec_sync(move || flag.store(true, Ordering::SeqCst));
+        assert!(ran.load(Ordering::SeqCst), "the queue never ran anything");
     }
 
     #[test]

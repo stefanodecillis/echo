@@ -79,6 +79,18 @@ const FRAME_QUEUE_CAPACITY: usize = 5 * 1_000 / FRAME_MS as usize;
 /// How long to wait before trying a lost system-audio stream again.
 const REOPEN_BACKOFF: Duration = Duration::from_secs(5);
 
+/// How long a channel that *started* may deliver nothing before Echo says so.
+///
+/// Long enough that a slow first buffer, a device switch or a quiet opening are
+/// never mistaken for a failure; short enough that the person finds out inside
+/// the first minute rather than at the end of the meeting.
+const SILENT_CHANNEL_GRACE: Duration = Duration::from_secs(10);
+
+/// What the person is told when the computer's audio started but carries
+/// nothing. The same sentence the UI already uses for this reason.
+const SYSTEM_AUDIO_SILENT_MESSAGE: &str =
+    "Echo can hear you, but not the other people. It will keep recording.";
+
 /// Loudness is reported ten times a second, capped here rather than in the UI.
 const LEVELS_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -237,6 +249,91 @@ impl FrameQueue {
 
     fn dropped(&self) -> u32 {
         self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The silent-channel watchdog
+// ---------------------------------------------------------------------------
+
+/// What the watchdog decided this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SilenceVerdict {
+    /// The channel started, has produced nothing, and the other channel is
+    /// clearly producing — so the clock is running and this really is a
+    /// failure. Tell the person once.
+    WentSilent,
+    /// Frames finally arrived after we had already said so.
+    CameBack,
+}
+
+/// Notices a channel that opened successfully and then delivered nothing.
+///
+/// This is the hole the first real meeting fell into: ScreenCaptureKit reported
+/// a running stream, no error and no stop, and handed over not one audio buffer.
+/// From above the capture layer that is indistinguishable from a meeting where
+/// nobody else spoke — so nothing was reported, nothing was written, and the
+/// person found out afterwards.
+///
+/// The reference channel is what makes the judgement safe: "no frames here" only
+/// means something when the *other* source is producing. A paused recording, a
+/// machine asleep or a pump that never ran move both counts together, and the
+/// watchdog stays quiet.
+///
+/// No clock of its own and no I/O: the caller passes `now`, which is what makes
+/// this testable without waiting ten seconds.
+#[derive(Debug)]
+struct SilenceWatchdog {
+    started_at: Instant,
+    grace: Duration,
+    watched_frames: u64,
+    reference_frames: u64,
+    /// True once the person has been told, so the banner is sent once.
+    reported: bool,
+}
+
+impl SilenceWatchdog {
+    fn new(started_at: Instant, grace: Duration) -> Self {
+        Self {
+            started_at,
+            grace,
+            watched_frames: 0,
+            reference_frames: 0,
+            reported: false,
+        }
+    }
+
+    /// Count frames seen this tick on the watched channel and on the one that
+    /// proves the clock is running.
+    fn observe(&mut self, watched: u64, reference: u64) {
+        self.watched_frames = self.watched_frames.saturating_add(watched);
+        self.reference_frames = self.reference_frames.saturating_add(reference);
+    }
+
+    fn watched_frames(&self) -> u64 {
+        self.watched_frames
+    }
+
+    fn reference_frames(&self) -> u64 {
+        self.reference_frames
+    }
+
+    /// `Some(..)` exactly on the tick the answer changes; `None` otherwise.
+    fn poll(&mut self, now: Instant) -> Option<SilenceVerdict> {
+        if self.reported {
+            if self.watched_frames > 0 {
+                self.reported = false;
+                return Some(SilenceVerdict::CameBack);
+            }
+            return None;
+        }
+        let clock_is_running = self.reference_frames > 0;
+        let out_of_patience = now.duration_since(self.started_at) >= self.grace;
+        if self.watched_frames == 0 && clock_is_running && out_of_patience {
+            self.reported = true;
+            return Some(SilenceVerdict::WentSilent);
+        }
+        None
     }
 }
 
@@ -559,6 +656,9 @@ impl SystemCaptureStub {
     pub fn stopped_reason(&self) -> Option<String> {
         None
     }
+    pub fn diagnostics(&self) -> String {
+        "no system-audio backend on this platform".to_string()
+    }
     pub fn reopen(&mut self) -> Result<(), AudioError> {
         Err(AudioError::NotImplemented)
     }
@@ -622,6 +722,11 @@ fn spawn_pump(
             let mut system_reported_lost = false;
             let mut next_reopen: Option<Instant> = None;
             let mut last_levels = Instant::now() - LEVELS_INTERVAL;
+            // Only watched when the computer's audio actually opened: a channel
+            // that never started is already reported by `system_audio_error`.
+            let mut system_silence = system_capture
+                .is_some()
+                .then(|| SilenceWatchdog::new(Instant::now(), SILENT_CHANNEL_GRACE));
 
             loop {
                 let stopping = shared.stopping.load(Ordering::Relaxed);
@@ -641,6 +746,18 @@ fn spawn_pump(
                     if stopping {
                         batch.extend(s.flush());
                     }
+                }
+
+                if let Some(watchdog) = system_silence.as_mut() {
+                    let mut system_frames = 0u64;
+                    let mut mic_frames = 0u64;
+                    for frame in &batch {
+                        match frame.channel {
+                            Channel::System => system_frames += 1,
+                            _ => mic_frames += 1,
+                        }
+                    }
+                    watchdog.observe(system_frames, mic_frames);
                 }
 
                 for mut frame in batch {
@@ -724,6 +841,46 @@ fn spawn_pump(
                         });
                     }
                 }
+                // Started, still claims to be running, and has never produced a
+                // frame. The stream-stopped path below owns the banner once the
+                // stream admits it is gone; this one is for the case where it
+                // never will.
+                if let (Some(watchdog), Some(s)) =
+                    (system_silence.as_mut(), system_capture.as_ref())
+                {
+                    if s.is_running() && !system_reported_lost {
+                        match watchdog.poll(Instant::now()) {
+                            Some(SilenceVerdict::WentSilent) => {
+                                shared.system_active.store(false, Ordering::Relaxed);
+                                tracing::warn!(
+                                    target: "echo::audio",
+                                    system_frames = watchdog.watched_frames(),
+                                    mic_frames = watchdog.reference_frames(),
+                                    detail = %s.diagnostics(),
+                                    "the computer's audio started but has delivered nothing; recording the microphone only"
+                                );
+                                let _ = signals.send(CaptureSignal::Degraded {
+                                    channel: Some(Channel::System),
+                                    reason: DegradedReason::SystemAudioUnavailable,
+                                    message: SYSTEM_AUDIO_SILENT_MESSAGE.to_string(),
+                                });
+                            }
+                            Some(SilenceVerdict::CameBack) => {
+                                shared.system_active.store(true, Ordering::Relaxed);
+                                tracing::info!(
+                                    target: "echo::audio",
+                                    system_frames = watchdog.watched_frames(),
+                                    "the computer's audio started arriving after all"
+                                );
+                                let _ = signals.send(CaptureSignal::Recovered {
+                                    channel: Channel::System,
+                                });
+                            }
+                            None => {}
+                        }
+                    }
+                }
+
                 if let Some(s) = system_capture.as_mut() {
                     if !s.is_running() {
                         if !system_reported_lost {
@@ -1242,6 +1399,120 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].t_start_ms, 60);
         assert_eq!(out[1].t_start_ms, 80);
+    }
+
+    // The watchdog carries no clock of its own, so these run instantly and
+    // deterministically. `origin` stands in for "when the recording started".
+    const GRACE: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn a_channel_that_started_but_never_delivers_is_reported_once() {
+        let origin = Instant::now();
+        let mut w = SilenceWatchdog::new(origin, GRACE);
+
+        // The microphone is producing, the computer's audio is not.
+        for tick in 1..=9 {
+            w.observe(0, 50);
+            assert_eq!(
+                w.poll(origin + Duration::from_secs(tick)),
+                None,
+                "gave up after {tick}s, inside the grace period"
+            );
+        }
+
+        assert_eq!(
+            w.poll(origin + GRACE),
+            Some(SilenceVerdict::WentSilent),
+            "a channel silent for the whole grace period was never reported"
+        );
+        // And only once, however long it stays silent.
+        for tick in 11..=30 {
+            w.observe(0, 50);
+            assert_eq!(w.poll(origin + Duration::from_secs(tick)), None);
+        }
+    }
+
+    #[test]
+    fn a_channel_delivering_audio_is_never_reported() {
+        let origin = Instant::now();
+        let mut w = SilenceWatchdog::new(origin, GRACE);
+        for tick in 1..=60 {
+            w.observe(50, 50);
+            assert_eq!(w.poll(origin + Duration::from_secs(tick)), None);
+        }
+        assert_eq!(w.watched_frames(), 3_000);
+    }
+
+    #[test]
+    fn a_stopped_clock_is_not_a_silent_channel() {
+        // Neither source is producing: the machine slept, the pump never ran, or
+        // the whole recording is broken in a way this watchdog must not
+        // misdescribe as "we can hear you but not them".
+        let origin = Instant::now();
+        let mut w = SilenceWatchdog::new(origin, GRACE);
+        for tick in 1..=60 {
+            w.observe(0, 0);
+            assert_eq!(
+                w.poll(origin + Duration::from_secs(tick)),
+                None,
+                "blamed the computer's audio when nothing at all was arriving"
+            );
+        }
+    }
+
+    #[test]
+    fn a_channel_that_comes_back_is_reported_recovered_once() {
+        let origin = Instant::now();
+        let mut w = SilenceWatchdog::new(origin, GRACE);
+        w.observe(0, 50);
+        assert_eq!(w.poll(origin + GRACE), Some(SilenceVerdict::WentSilent));
+
+        // The first real frame arrives a minute in.
+        w.observe(1, 50);
+        assert_eq!(
+            w.poll(origin + Duration::from_secs(60)),
+            Some(SilenceVerdict::CameBack)
+        );
+        w.observe(50, 50);
+        assert_eq!(
+            w.poll(origin + Duration::from_secs(61)),
+            None,
+            "recovery was announced twice"
+        );
+    }
+
+    #[test]
+    fn a_late_first_frame_inside_the_grace_period_is_not_a_failure() {
+        let origin = Instant::now();
+        let mut w = SilenceWatchdog::new(origin, GRACE);
+        w.observe(0, 50);
+        assert_eq!(w.poll(origin + Duration::from_secs(9)), None);
+        // Nine and a bit seconds late is a slow start, not a broken channel.
+        w.observe(1, 50);
+        assert_eq!(w.poll(origin + Duration::from_secs(20)), None);
+    }
+
+    #[test]
+    fn the_silent_channel_notice_is_the_sentence_the_ui_already_uses() {
+        // Copy lives in src/lib/copy.ts as notices.systemAudioLost and
+        // recording.micOnlyBanner. If it changes there it changes here.
+        assert_eq!(
+            SYSTEM_AUDIO_SILENT_MESSAGE,
+            "Echo can hear you, but not the other people. It will keep recording."
+        );
+        for jargon in [
+            "ScreenCaptureKit",
+            "SCStream",
+            "OSStatus",
+            "queue",
+            "buffer",
+            "stream",
+        ] {
+            assert!(
+                !SYSTEM_AUDIO_SILENT_MESSAGE.contains(jargon),
+                "{SYSTEM_AUDIO_SILENT_MESSAGE} leaks {jargon} to the person"
+            );
+        }
     }
 
     #[test]

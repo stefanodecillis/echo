@@ -239,6 +239,18 @@ impl SystemCapture {
         self.counters.dropped_samples()
     }
 
+    /// One line of counters for the diagnostics log, so a channel that started
+    /// and then went silent can say where. Never audio content.
+    pub fn diagnostics(&self) -> String {
+        format!(
+            "pushed_samples={} dropped_samples={} rate={} channels={}",
+            self.counters.pushed_samples(),
+            self.counters.dropped_samples(),
+            self.shared.rate.load(Ordering::Relaxed),
+            self.shared.channels.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn start_offset_ms(&self) -> i64 {
         self.start_offset_ms
     }
