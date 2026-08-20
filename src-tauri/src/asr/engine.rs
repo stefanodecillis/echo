@@ -22,8 +22,14 @@
 //!
 //! Lazy by construction (mantra 1): [`EngineWorker::new`] starts a thread that
 //! holds nothing. The weights are read on the first job, or on an explicit
-//! pre-warm, and dropped again after
-//! [`EngineWorker`]'s idle period with no work.
+//! pre-warm.
+//!
+//! Resident while listening (mantra 1's amendment of 2026-08-20): they are
+//! *kept* for as long as the session layer says a meeting is being listened to
+//! or has work outstanding — [`EngineWorker::set_resident`]. Only once that is
+//! false does the grace period start, and only after [`IDLE_GRACE`] of it with
+//! nothing new are the weights handed back. Nothing here decides when a meeting
+//! is over; it is told.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -68,10 +74,28 @@ pub const QUEUE_CAPACITY: usize = 8;
 /// newer snapshot exists").
 const STALE_SNAPSHOT_MS: i64 = 4_000;
 
-/// Default idle period before the weights are handed back, when the caller does
-/// not say. Ten minutes is long enough to cover the gap between two
-/// back-to-back meetings and short enough that an idle Echo is empty.
-pub const DEFAULT_IDLE_RELEASE_MINUTES: u32 = 10;
+/// How long the weights stay in memory once nothing needs them any more.
+///
+/// Not a setting, deliberately (product decision of 2026-08-20): a person
+/// cannot be asked how many minutes of memory a speech engine should hold, and
+/// the honest answer does not depend on them. The engine is resident while a
+/// meeting is being listened to or its jobs are outstanding, and this is the
+/// grace after that — long enough for the pause between two back-to-back
+/// meetings, short enough that an idle Echo is empty.
+pub const IDLE_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// How often the worker wakes to check the grace period.
+const IDLE_TICK: Duration = Duration::from_secs(30);
+
+/// Finished utterances waiting before new finals narrow their beam.
+///
+/// The valve behind [`catalog::DecodeParams::live_final_degraded`]. Two channels
+/// decoding at the preset's full width is the right trade almost always; when it
+/// is not, the symptom is a queue of finished utterances that keeps growing, and
+/// the cure is to spend less per utterance until it is empty again. Three is one
+/// utterance per channel plus one: below that, the queue is just two people
+/// talking at once.
+pub const FINAL_BACKLOG_DEGRADE_AT: usize = 3;
 
 /// Cores kept clear of decoding, so capture and the UI never starve.
 const CORES_RESERVED_FOR_CAPTURE: usize = 2;
@@ -271,6 +295,10 @@ pub struct DecodePlan {
     /// keeps that off and hands over the words it chose (codex §3 "Context and
     /// prompts").
     pub prompt: Option<String>,
+    /// Set by the worker as the job leaves the queue, never by the caller:
+    /// finished utterances are piling up, so this one narrows its beam
+    /// ([`FINAL_BACKLOG_DEGRADE_AT`]). Only ever true for [`JobKind::Final`].
+    pub(crate) behind: bool,
 }
 
 impl DecodePlan {
@@ -278,7 +306,7 @@ impl DecodePlan {
     pub fn final_utterance() -> Self {
         Self {
             kind: JobKind::Final,
-            prompt: None,
+            ..Default::default()
         }
     }
 
@@ -286,7 +314,7 @@ impl DecodePlan {
     pub fn speculative() -> Self {
         Self {
             kind: JobKind::Speculative,
-            prompt: None,
+            ..Default::default()
         }
     }
 
@@ -294,7 +322,7 @@ impl DecodePlan {
     pub fn catch_up() -> Self {
         Self {
             kind: JobKind::CatchUp,
-            prompt: None,
+            ..Default::default()
         }
     }
 
@@ -317,7 +345,11 @@ struct Decoding {
 }
 
 impl Decoding {
-    fn for_job(kind: JobKind, preset: &DecodeParams) -> Self {
+    /// `behind` is the safety valve: a final decoded while finished utterances
+    /// are piling up narrows its beam (see [`FINAL_BACKLOG_DEGRADE_AT`]).
+    /// Captions never change — they are already as cheap as a decode gets — and
+    /// the disk pass never does either, because nothing is waiting for it.
+    fn for_job(kind: JobKind, preset: &DecodeParams, behind: bool) -> Self {
         match kind {
             JobKind::Speculative => Self {
                 params: preset.speculative(),
@@ -325,7 +357,11 @@ impl Decoding {
                 timestamps: false,
             },
             JobKind::Final => Self {
-                params: preset.live_final(),
+                params: if behind {
+                    preset.live_final_degraded()
+                } else {
+                    preset.live_final()
+                },
                 single_segment: false,
                 timestamps: true,
             },
@@ -569,7 +605,7 @@ impl Engine {
             return Ok(result);
         }
 
-        let decoding = Decoding::for_job(plan.kind, &self.config.decode);
+        let decoding = Decoding::for_job(plan.kind, &self.config.decode, plan.behind);
         let mut params = FullParams::new(sampling_strategy(&decoding.params));
         params.set_n_threads(self.backend.threads as i32);
         // Transcription, never translation.
@@ -956,6 +992,13 @@ impl QueueState {
         self.finals.len() + self.catchup.len() + self.speculative.len()
     }
 
+    /// Finished utterances still waiting for text. This, and not the total, is
+    /// what "falling behind" means: captions are replaceable and the disk pass
+    /// has nobody waiting on it.
+    fn finals_waiting(&self) -> usize {
+        self.finals.len()
+    }
+
     /// Queue one job, or hand it back when there is no room for it.
     ///
     /// Returns whether the decode in flight has been overtaken and should be
@@ -1212,6 +1255,10 @@ impl JobQueue {
         self.lock().closed
     }
 
+    fn finals_waiting(&self) -> usize {
+        self.lock().finals_waiting()
+    }
+
     /// Utterances waiting for text. Captions are not counted: a snapshot is not
     /// something that can be behind, and counting it would make Echo claim it is
     /// falling behind while it is keeping up perfectly.
@@ -1233,6 +1280,10 @@ impl JobQueue {
 #[derive(Default)]
 struct Shared {
     loaded: AtomicBool,
+    /// True while a meeting is being listened to or still has work outstanding.
+    /// The grace period does not even start until this is false
+    /// ([`EngineWorker::set_resident`]).
+    resident: AtomicBool,
     queue: JobQueue,
     backend: Mutex<BackendReport>,
     /// What to load when something needs the engine. `None` = nothing chosen
@@ -1267,26 +1318,54 @@ impl std::fmt::Debug for EngineWorker {
 impl EngineWorker {
     /// Create the worker. Loads nothing yet.
     ///
-    /// `idle_release_minutes` of 0 means "use the default"; there is no way to
-    /// ask for weights that never go away, because that would break mantra 1.
-    pub fn new(idle_release_minutes: u32) -> Self {
-        let minutes = if idle_release_minutes == 0 {
-            DEFAULT_IDLE_RELEASE_MINUTES
-        } else {
-            idle_release_minutes
-        };
-        let idle = Duration::from_secs(u64::from(minutes) * 60);
+    /// There is no idle period to pass in any more: the weights are held while
+    /// [`EngineWorker::set_resident`] says a meeting needs them and released
+    /// [`IDLE_GRACE`] after it stops saying so. Neither half is a setting
+    /// (product decision of 2026-08-20).
+    pub fn new() -> Self {
         let shared = Arc::new(Shared::default());
         let worker_shared = shared.clone();
         let thread = std::thread::Builder::new()
             .name("echo-speech".to_string())
-            .spawn(move || run(worker_shared, idle))
+            .spawn(move || run(worker_shared))
             .ok();
 
         Self {
             shared,
             thread: Mutex::new(thread),
         }
+    }
+
+    /// Say whether a meeting still needs the engine.
+    ///
+    /// `true` while audio is being captured **or** any of a meeting's
+    /// post-meeting work is running or queued: catch-up, the speaker pass, the
+    /// recap. While it holds, the weights stay put however long the room is
+    /// silent — a meeting with a ten-minute gap in it is still one meeting, and
+    /// unloading 1.6 GB in the middle of it only means loading it again
+    /// (mantra 1's amendment of 2026-08-20).
+    ///
+    /// `false` arms the grace period, which starts *now* rather than at the last
+    /// decode: the point of reference is when the meeting's work finished, not
+    /// when the engine was last busy.
+    pub fn set_resident(&self, resident: bool) {
+        let was = self.shared.resident.swap(resident, Ordering::SeqCst);
+        if was == resident {
+            return;
+        }
+        if resident {
+            tracing::debug!("holding speech understanding for a meeting");
+        } else {
+            tracing::debug!(
+                grace_secs = IDLE_GRACE.as_secs(),
+                "nothing needs speech understanding; it goes back shortly"
+            );
+        }
+    }
+
+    /// Is something still holding the engine?
+    pub fn is_resident(&self) -> bool {
+        self.shared.resident.load(Ordering::SeqCst)
     }
 
     /// Choose what to load. Changing the weights releases whatever is loaded, so
@@ -1552,6 +1631,12 @@ impl EngineWorker {
     }
 }
 
+impl Default for EngineWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for EngineWorker {
     fn drop(&mut self) {
         self.shared.queue.close();
@@ -1561,18 +1646,32 @@ impl Drop for EngineWorker {
     }
 }
 
+/// Should the weights go back now?
+///
+/// Pure, so the lifecycle rule is testable without a thread or 1.6 GB on disk:
+/// resident beats everything, and the grace is measured from the last moment
+/// anything needed the engine — a decode, a load, or a meeting holding it.
+fn should_release(loaded: bool, resident: bool, idle_for: Duration) -> bool {
+    loaded && !resident && idle_for >= IDLE_GRACE
+}
+
+/// Does a final leaving the queue have to narrow its beam? See
+/// [`FINAL_BACKLOG_DEGRADE_AT`].
+fn falling_behind(finals_waiting: usize) -> bool {
+    finals_waiting > FINAL_BACKLOG_DEGRADE_AT
+}
+
 /// The engine thread. Owns the weights and nothing else owns them.
-fn run(shared: Arc<Shared>, idle: Duration) {
+fn run(shared: Arc<Shared>) {
     let mut engine: Option<Engine> = None;
-    let mut last_used = Instant::now();
+    let mut last_needed = Instant::now();
     let mut policies: HashMap<String, LanguagePolicy> = HashMap::new();
-    // Wake often enough to honour the idle period without polling hard.
-    let tick = idle
-        .min(Duration::from_secs(30))
-        .max(Duration::from_secs(1));
+    // Whether new finals are currently narrowing their beam, so the log gets one
+    // line per episode rather than one per utterance.
+    let mut behind = false;
 
     loop {
-        match shared.queue.take(tick) {
+        match shared.queue.take(IDLE_TICK) {
             Some(Task::Control(Control::Shutdown)) => break,
             Some(Task::Control(Control::Release)) => {
                 if engine.take().is_some() {
@@ -1582,26 +1681,44 @@ fn run(shared: Arc<Shared>, idle: Duration) {
             }
             Some(Task::Control(Control::Load { reply })) => {
                 let answer = ensure_loaded(&mut engine, &shared).map(|e| e.backend());
-                last_used = Instant::now();
+                last_needed = Instant::now();
                 let _ = reply.send(answer);
             }
             Some(Task::Job(pending)) => {
                 let Pending {
                     job,
-                    plan,
+                    mut plan,
                     on_partial,
                     reply,
                     ..
                 } = pending;
+                if plan.kind == JobKind::Final {
+                    plan.behind = falling_behind(shared.queue.finals_waiting());
+                    if plan.behind != behind {
+                        behind = plan.behind;
+                        if behind {
+                            tracing::info!(
+                                waiting = shared.queue.finals_waiting(),
+                                "live text is falling behind; decoding it more cheaply until it catches up"
+                            );
+                        } else {
+                            tracing::info!("live text caught up; back to full accuracy");
+                        }
+                    }
+                }
                 let answer = run_job(&mut engine, &shared, &mut policies, *job, plan, on_partial);
-                last_used = Instant::now();
+                last_needed = Instant::now();
                 let _ = reply.send(answer);
             }
             None => {
                 if shared.queue.is_closed() {
                     break;
                 }
-                if engine.is_some() && last_used.elapsed() >= idle {
+                // A meeting holding the engine counts as needing it, so the grace
+                // period only ever starts once nothing does.
+                if shared.resident.load(Ordering::SeqCst) {
+                    last_needed = Instant::now();
+                } else if should_release(engine.is_some(), false, last_needed.elapsed()) {
                     engine = None;
                     shared.loaded.store(false, Ordering::SeqCst);
                     tracing::info!("speech engine released after being idle");
@@ -1910,7 +2027,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_fresh_worker_holds_nothing_and_says_so() {
-        let worker = EngineWorker::new(10);
+        let worker = EngineWorker::new();
         assert!(!worker.is_loaded(), "mantra 1: nothing loads on its own");
         assert_eq!(worker.queue_depth(), 0);
         assert!(worker.configured().is_none());
@@ -1923,7 +2040,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_download_there_is_nothing_to_load() {
-        let worker = EngineWorker::new(10);
+        let worker = EngineWorker::new();
         let err = worker.load_now().await.unwrap_err();
         assert!(matches!(err, AsrError::NotInstalled), "{err:?}");
 
@@ -1945,7 +2062,7 @@ mod tests {
 
     #[tokio::test]
     async fn work_for_a_cancelled_meeting_is_thrown_away_without_loading_anything() {
-        let worker = EngineWorker::new(10);
+        let worker = EngineWorker::new();
         // Point it at weights that do not exist: if the cancellation check did
         // not come first, this would fail with NotInstalled instead.
         worker
@@ -1997,7 +2114,7 @@ mod tests {
 
     #[tokio::test]
     async fn prewarming_takes_the_provenance_from_whichever_weights_they_are() {
-        let worker = EngineWorker::new(10);
+        let worker = EngineWorker::new();
         let tiny = catalog::entry(catalog::ids::SPEECH_FASTEST).unwrap();
         let path = PathBuf::from("/nowhere").join(tiny.file_name);
 
@@ -2027,7 +2144,7 @@ mod tests {
 
     #[tokio::test]
     async fn choosing_a_different_preset_replaces_what_would_be_loaded() {
-        let worker = EngineWorker::new(10);
+        let worker = EngineWorker::new();
         let first = EngineConfig {
             model_path: PathBuf::from("/nowhere/ggml-tiny.bin"),
             accelerator_path: None,
@@ -2049,7 +2166,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dead_worker_reports_itself_rather_than_hanging() {
-        let worker = EngineWorker::new(10);
+        let worker = EngineWorker::new();
         worker.shutdown();
         let err = worker.load_now().await.unwrap_err();
         assert!(matches!(err, AsrError::EngineGone), "{err:?}");
@@ -2122,7 +2239,7 @@ mod tests {
                 }),
                 plan: DecodePlan {
                     kind,
-                    prompt: None,
+                    ..Default::default()
                 },
                 on_partial: None,
                 reply,
@@ -2360,33 +2477,110 @@ mod tests {
         assert_eq!(queue.depth(), 1);
     }
 
+    /// The 2026-08-20 product decision, in one test: a caption is still the
+    /// cheapest decode there is, and a final is now as good as the disk pass.
     #[test]
-    fn a_caption_is_the_cheapest_decode_and_a_final_is_not_the_disk_pass() {
+    fn a_final_is_decoded_at_catch_up_quality_and_a_caption_stays_a_guess() {
         let preset = catalog::preset("everyday").unwrap().decode;
 
-        let caption = Decoding::for_job(JobKind::Speculative, &preset);
+        let caption = Decoding::for_job(JobKind::Speculative, &preset, false);
         assert_eq!(caption.params.max_attempts(), 1, "no fallback on a guess");
-        assert!(!caption.params.uses_beam_search());
+        assert!(!caption.params.uses_beam_search(), "captions stay greedy");
         assert!(caption.single_segment, "one replaceable hypothesis");
         assert!(!caption.timestamps);
 
-        let live = Decoding::for_job(JobKind::Final, &preset);
+        let live = Decoding::for_job(JobKind::Final, &preset, false);
         assert_eq!(live.params.max_attempts(), 2, "one modest fallback");
-        assert_eq!(live.params.beam_size, catalog::LIVE_MAX_BEAM);
+        assert_eq!(
+            live.params.beam_size, preset.beam_size,
+            "text a person keeps is decoded as well as the recording would be"
+        );
         assert!(!live.single_segment, "natural segments on a final");
         assert!(live.timestamps, "coverage needs them");
 
-        let disk = Decoding::for_job(JobKind::CatchUp, &preset);
+        let disk = Decoding::for_job(JobKind::CatchUp, &preset, false);
         assert_eq!(disk.params, preset, "the disk pass keeps the whole preset");
         assert!(disk.timestamps);
     }
 
+    /// The safety valve: while finals pile up, new ones narrow, and captions and
+    /// the disk pass are not touched.
     #[test]
-    fn the_default_idle_period_gives_the_memory_back() {
-        assert_eq!(DEFAULT_IDLE_RELEASE_MINUTES, 10);
-        // A caller asking for nothing still gets a release, not "never".
-        let worker = EngineWorker::new(0);
+    fn finals_narrow_their_beam_only_while_the_queue_is_deep() {
+        assert!(!falling_behind(0));
+        assert!(!falling_behind(FINAL_BACKLOG_DEGRADE_AT));
+        assert!(falling_behind(FINAL_BACKLOG_DEGRADE_AT + 1));
+
+        let preset = catalog::preset("everyday").unwrap().decode;
+        let behind = Decoding::for_job(JobKind::Final, &preset, true);
+        assert_eq!(behind.params.beam_size, catalog::LIVE_DEGRADED_BEAM);
+        assert_eq!(
+            behind.params.max_attempts(),
+            Decoding::for_job(JobKind::Final, &preset, false)
+                .params
+                .max_attempts(),
+            "the valve narrows the beam and changes nothing else"
+        );
+        assert!(behind.timestamps, "a degraded final is still a final");
+
+        let caption = Decoding::for_job(JobKind::Speculative, &preset, true);
+        assert_eq!(caption.params, preset.speculative(), "captions are untouched");
+        let disk = Decoding::for_job(JobKind::CatchUp, &preset, true);
+        assert_eq!(disk.params, preset, "the disk pass is untouched");
+    }
+
+    /// The queue counts what "behind" means: finished utterances waiting.
+    #[test]
+    fn only_finished_utterances_count_towards_falling_behind() {
+        let queue = JobQueue::default();
+        let mut answers = Vec::new();
+        for i in 0..(FINAL_BACKLOG_DEGRADE_AT + 1) as i64 {
+            let (caption, a) = queued("m", Channel::Mic, JobKind::Speculative, i * 3_000, 3_000);
+            queue.push_job(caption).ok();
+            answers.push(a);
+        }
+        assert!(!falling_behind(queue.finals_waiting()), "captions are not a backlog");
+
+        for i in 0..(FINAL_BACKLOG_DEGRADE_AT + 1) as i64 {
+            let (utterance, a) = queued("m", Channel::Mic, JobKind::Final, i * 2_000, 2_000);
+            queue.push_job(utterance).ok();
+            answers.push(a);
+        }
+        assert!(falling_behind(queue.finals_waiting()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle: resident while listening, released after the grace period
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_grace_period_only_starts_once_nothing_needs_the_engine() {
+        // Armed: nothing holds the engine and the grace has run out.
+        assert!(should_release(true, false, IDLE_GRACE));
+        assert!(should_release(true, false, IDLE_GRACE * 2));
+        // Disarmed: a meeting is still being listened to, or its jobs are still
+        // running. However long that takes, the weights stay.
+        assert!(!should_release(true, true, IDLE_GRACE * 100));
+        // Armed but not yet due.
+        assert!(!should_release(true, false, IDLE_GRACE / 2));
+        // Nothing loaded, nothing to release.
+        assert!(!should_release(false, false, IDLE_GRACE * 100));
+    }
+
+    #[tokio::test]
+    async fn a_worker_holds_nothing_until_something_needs_it_and_says_when_it_is_held() {
+        let worker = EngineWorker::new();
         assert!(!worker.is_loaded());
+        assert!(!worker.is_resident(), "a fresh worker holds nothing");
+
+        worker.set_resident(true);
+        assert!(worker.is_resident());
+        // Idempotent: the session layer refreshes this on every job that ends.
+        worker.set_resident(true);
+        assert!(worker.is_resident());
+
+        worker.set_resident(false);
+        assert!(!worker.is_resident());
         worker.shutdown();
     }
 }

@@ -50,8 +50,37 @@ pub enum SummarizeError {
     Unreachable(String),
     #[error("no key is saved for this service")]
     MissingCredential,
+    /// The key itself was refused: wrong, revoked, or not allowed to do this.
     #[error("the service refused the request: {0}")]
     Rejected(String),
+    /// The key is fine — the account's allowance for it is used up (HTTP 429).
+    ///
+    /// Deliberately its own variant. Folded into [`Self::Rejected`] it became
+    /// "that key wasn't accepted", which sent people off to re-paste a key that
+    /// was never the problem.
+    #[error("that service's allowance is used up for now")]
+    QuotaExhausted,
+    /// The service answered, and its answer was "no": its own safety or
+    /// recitation rules stopped it writing about this meeting. Trying again with
+    /// the same text gets the same answer, so this is not a retry.
+    ///
+    /// `reason` is the service's own word for it (`SAFETY`, `RECITATION`, …),
+    /// for the log and the Advanced-only detail line — never for the screen.
+    #[error("the service wouldn't write a recap from this meeting's text")]
+    Blocked { reason: String },
+    /// The call worked, the reply was readable, and there was no recap in it —
+    /// no candidates, or candidates with no text. Worth trying again.
+    #[error("the reply arrived with nothing written in it")]
+    EmptyReply,
+    /// The reply arrived in a shape Echo could not read at all: events came
+    /// down the wire and not one of them parsed.
+    ///
+    /// A different bug class from [`Self::EmptyReply`] on purpose — empty means
+    /// the service had nothing to say, this means Echo and the service disagree
+    /// about the shape of an answer, which is Echo's bug to fix. The telemetry
+    /// line logged alongside it carries the counters that say which.
+    #[error("the reply arrived in a shape Echo couldn't read")]
+    MalformedReply,
     /// The model saved in Settings is not one this service answers for — it was
     /// renamed, retired, or mistyped. The person fixes it by choosing another
     /// one, so the whole sentence is written for them: this string can reach the
@@ -107,6 +136,10 @@ pub struct GenerateRequest {
     /// [`Caps::json_mode`] is true; otherwise the prompt carries the schema and
     /// the reply is validated locally either way.
     pub json_schema: Option<serde_json::Value>,
+    /// How adventurous the wording may be, for backends that take a number for
+    /// it. Only [`ollama`] reads this: Google asks that recent Gemini models be
+    /// left at their own defaults, and a low value there is a documented cause
+    /// of degraded replies, so [`gemini`] sends no sampling settings at all.
     pub temperature: Option<f32>,
     pub timeout: Duration,
     pub cancel: CancelFlag,
@@ -396,7 +429,7 @@ async fn run_generate(
             GenerateEvent::Done { text } => last = Some(text),
         }
     }
-    last.ok_or_else(|| SummarizeError::Failed("the reply ended without any text".into()))
+    last.ok_or(SummarizeError::EmptyReply)
 }
 
 /// Every final segment for this meeting, one line per segment, with speakers
@@ -460,16 +493,49 @@ async fn dominant_language(
     Ok(fallback.map(String::from))
 }
 
-/// Write a recap for one meeting.
+/// A finished recap and the task list that came with it.
 ///
-/// Map-reduce over the transcript, then a strict-JSON pass for action items,
-/// then sanitize, then store the recap with its provenance. Cancellable, and a
-/// recording preempts it.
+/// The two travel together because they are written together, exactly once —
+/// see [`summarize_meeting_with_actions`].
+#[derive(Debug, Clone)]
+pub struct RecapOutcome {
+    pub summary: Summary,
+    /// Stored task items for this recap, as they now are in the database.
+    /// Empty when the extraction pass found nothing or did not pan out; a recap
+    /// is never failed over its task list.
+    pub action_items: Vec<ActionItem>,
+}
+
+/// Write a recap for one meeting. See [`summarize_meeting_with_actions`], which
+/// this wraps — the recap and its task list are written in one pass, and this
+/// form simply drops the task list for callers that only want the recap.
 pub async fn summarize_meeting(
     db: &Db,
     req: &SummaryReq,
     cancel: CancelFlag,
 ) -> Result<Summary, SummarizeError> {
+    summarize_meeting_with_actions(db, req, cancel)
+        .await
+        .map(|outcome| outcome.summary)
+}
+
+/// Write a recap for one meeting, task list included.
+///
+/// Map-reduce over the transcript, then a strict-JSON pass for action items,
+/// then sanitize, then store the recap with its provenance. Cancellable, and a
+/// recording preempts it.
+///
+/// **This function is the only place a recap's task list is written.** It used
+/// to run here *and* again in the summarize job, which meant two model calls
+/// (four when both took their repair retry), two database writes, and a real
+/// chance of the second pass overwriting a good first result with a worse one.
+/// Callers that need the items take them from [`RecapOutcome`] rather than
+/// calling [`extract_action_items`] a second time.
+pub async fn summarize_meeting_with_actions(
+    db: &Db,
+    req: &SummaryReq,
+    cancel: CancelFlag,
+) -> Result<RecapOutcome, SummarizeError> {
     if cancel.is_cancelled() {
         return Err(SummarizeError::Cancelled);
     }
@@ -499,7 +565,16 @@ pub async fn summarize_meeting(
                 && existing.template_id.as_deref() == Some(template.id.as_str())
                 && req.provider.map(|p| p == existing.provider).unwrap_or(true)
             {
-                return Ok(existing);
+                // The task list that already belongs to it, so a caller that
+                // shows both does not have to go and ask for it (and must not
+                // re-extract it: nothing about this meeting has changed).
+                let action_items = repo::list_action_items(db, &req.meeting_id)
+                    .await
+                    .map_err(db_err)?;
+                return Ok(RecapOutcome {
+                    summary: existing,
+                    action_items,
+                });
             }
         }
     }
@@ -607,18 +682,28 @@ pub async fn summarize_meeting(
     .await
     .map_err(db_err)?;
 
-    if !cancel.is_cancelled() {
-        // Action items are a bonus on top of a recap that already succeeded —
-        // never fail the whole recap because the follow-up JSON pass did not
-        // pan out (see the module doc comment: "a graceful 'no action items
-        // found'").
-        if let Err(e) = extract_action_items(db, &req.meeting_id, &summary.id, cancel.clone()).await
-        {
-            tracing::warn!("action items not written for summary {}: {e}", summary.id);
+    // Action items are a bonus on top of a recap that already succeeded — never
+    // fail the whole recap because the follow-up JSON pass did not pan out (see
+    // the module doc comment: "a graceful 'no action items found'").
+    let action_items = if cancel.is_cancelled() {
+        Vec::new()
+    } else {
+        // The recap's own language, resolved above and now stored on the row —
+        // not whatever the global setting says by the time this line runs.
+        let language = action_item_language(summary.language.as_deref(), &ctx.output_language);
+        match write_action_items(db, &summary, language, cancel.clone()).await {
+            Ok(items) => items,
+            Err(e) => {
+                tracing::warn!("action items not written for summary {}: {e}", summary.id);
+                Vec::new()
+            }
         }
-    }
+    };
 
-    Ok(summary)
+    Ok(RecapOutcome {
+        summary,
+        action_items,
+    })
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -692,8 +777,31 @@ async fn run_action_item_pass(
     parse_action_items(&text)
 }
 
-/// Extract action items from a finished recap plus the transcript. Strict JSON,
-/// validated locally, one repair retry.
+/// What language the task list is written in.
+///
+/// The recap's language, which is stored on the recap row the moment it is
+/// written — including the meeting's own language when the setting is "same as
+/// the meeting". Re-reading the global setting here got this wrong twice over:
+/// a recap written in Italian could be handed an English task list because
+/// somebody changed the setting in between, and "same as the meeting" lost the
+/// meeting language entirely, because nothing else about the render context was
+/// filled in.
+fn action_item_language(
+    recap_language: Option<&str>,
+    fallback: &SummaryLanguage,
+) -> SummaryLanguage {
+    match recap_language.map(str::trim).filter(|l| !l.is_empty()) {
+        Some(language) => SummaryLanguage::Fixed(language.to_string()),
+        None => fallback.clone(),
+    }
+}
+
+/// Extract action items from a finished recap. Strict JSON, validated locally,
+/// one repair retry.
+///
+/// Prefer [`summarize_meeting_with_actions`], which already does this as part of
+/// writing the recap; this entry point exists for re-running the pass over a
+/// recap that is already stored.
 pub async fn extract_action_items(
     db: &Db,
     meeting_id: &str,
@@ -704,7 +812,25 @@ pub async fn extract_action_items(
         .await
         .map_err(db_err)?
         .ok_or_else(|| SummarizeError::Failed("that recap is gone".into()))?;
+    if summary.meeting_id != meeting_id {
+        return Err(SummarizeError::Failed(
+            "that recap belongs to another meeting".into(),
+        ));
+    }
 
+    let app_settings = settings::load(db).await.map_err(db_err)?;
+    let language =
+        action_item_language(summary.language.as_deref(), &app_settings.summary_language);
+    write_action_items(db, &summary, language, cancel).await
+}
+
+/// The one pass that asks for a task list and stores it.
+async fn write_action_items(
+    db: &Db,
+    summary: &Summary,
+    language: SummaryLanguage,
+    cancel: CancelFlag,
+) -> Result<Vec<ActionItem>, SummarizeError> {
     // The recap's provider, but today's model: `summary.model` says which model
     // wrote that recap, and it may since have been changed or retired. Asking a
     // model that no longer exists for the task list would fail for a reason that
@@ -712,9 +838,8 @@ pub async fn extract_action_items(
     let connector = connector_for(db, summary.provider).await?;
     let json_mode = connector.capabilities().json_mode;
 
-    let app_settings = settings::load(db).await.map_err(db_err)?;
     let ctx = templates::RenderContext {
-        output_language: app_settings.summary_language.clone(),
+        output_language: language,
         ..Default::default()
     };
     let prompt = templates::render_action_items(&summary.content_md, &ctx);
@@ -724,8 +849,15 @@ pub async fn extract_action_items(
         .await
     {
         Ok(items) => items,
-        Err(SummarizeError::Cancelled) => return Err(SummarizeError::Cancelled),
-        Err(_first_err) => {
+        // The repair retry exists for exactly one failure: a reply that came
+        // back and could not be read as the JSON we asked for. Every other
+        // failure — a refused key, a used-up allowance, a safety block, a
+        // rejected schema, a model that is gone — would get the identical
+        // answer a second time, and the repair prompt would tell the service
+        // its last reply was unreadable when it never sent one. Those go
+        // straight back to the caller, which keeps the recap and logs why the
+        // task list is missing.
+        Err(SummarizeError::BadJson) => {
             let repair_prompt = format!(
                 "{prompt}\n\nYour last reply could not be read as that JSON. Reply again with \
                  ONLY the JSON object described above — no markdown fences, no commentary."
@@ -743,17 +875,21 @@ pub async fn extract_action_items(
                 Err(SummarizeError::Cancelled) => return Err(SummarizeError::Cancelled),
                 // Second failure: graceful "no action items found" rather than
                 // losing an already-written recap over this.
-                Err(_second_err) => Vec::new(),
+                Err(second) => {
+                    tracing::warn!(error = %second, "the task list came back unreadable twice");
+                    Vec::new()
+                }
             }
         }
+        Err(other) => return Err(other),
     };
 
     let items: Vec<ActionItem> = raw
         .into_iter()
         .map(|item| ActionItem {
             id: String::new(),
-            meeting_id: meeting_id.to_string(),
-            summary_id: Some(summary_id.to_string()),
+            meeting_id: summary.meeting_id.clone(),
+            summary_id: Some(summary.id.clone()),
             description: item.description,
             owner: item.owner,
             due_hint: item.due_hint,
@@ -762,7 +898,7 @@ pub async fn extract_action_items(
         })
         .collect();
 
-    repo::replace_action_items(db, meeting_id, Some(summary_id), &items)
+    repo::replace_action_items(db, &summary.meeting_id, Some(&summary.id), &items)
         .await
         .map_err(db_err)
 }
@@ -1173,5 +1309,169 @@ mod tests {
             parse_action_items("{\"items\": [ this is not json }"),
             Err(SummarizeError::BadJson)
         ));
+    }
+
+    // -- which language the task list is written in ------------------------
+
+    #[test]
+    fn the_task_list_follows_the_recap_not_todays_setting() {
+        // The recap says Italian, the setting has since been changed to
+        // English. The task list belongs to the recap.
+        assert_eq!(
+            action_item_language(Some("it"), &SummaryLanguage::English),
+            SummaryLanguage::Fixed("it".into())
+        );
+        // "Same as the meeting" was already resolved to a real language when
+        // the recap was written, so nothing has to guess it a second time.
+        assert_eq!(
+            action_item_language(Some("de"), &SummaryLanguage::SameAsMeeting),
+            SummaryLanguage::Fixed("de".into())
+        );
+        // An older recap with no language recorded falls back to the setting.
+        assert_eq!(
+            action_item_language(None, &SummaryLanguage::English),
+            SummaryLanguage::English
+        );
+        assert_eq!(
+            action_item_language(Some("  "), &SummaryLanguage::English),
+            SummaryLanguage::English
+        );
+    }
+
+    // -- one recap, one task-list pass -------------------------------------
+
+    /// A meeting with a couple of final segments, ready to summarise.
+    async fn meeting_with_a_transcript(db: &Db) -> String {
+        use crate::types::{Channel, SegmentDraft};
+
+        let meeting = repo::create_meeting(db, "Weekly sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        let drafts: Vec<SegmentDraft> = ["Spediamo venerdì.", "Ana si occupa della migrazione."]
+            .iter()
+            .enumerate()
+            .map(|(i, text)| SegmentDraft {
+                meeting_id: meeting.id.clone(),
+                t_start_ms: i as i64 * 5_000,
+                t_end_ms: i as i64 * 5_000 + 4_000,
+                channel: Channel::Mic,
+                speaker_id: None,
+                text: (*text).to_string(),
+                language: Some("it".into()),
+                avg_confidence: Some(0.9),
+                revision: 1,
+                is_final: true,
+                model_name: None,
+                model_revision: None,
+            })
+            .collect();
+        repo::insert_segments(db, &drafts).await.unwrap();
+        meeting.id
+    }
+
+    #[tokio::test]
+    async fn a_recap_asks_for_its_task_list_exactly_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // One reply that serves for both passes: readable as a recap, and
+        // readable as the task-list JSON.
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"description\\\":\\\"Send the \
+                 invoice\\\"}]}\"},\"done\":true}\n",
+                "application/x-ndjson",
+            ))
+            .mount(&server)
+            .await;
+
+        let db = crate::db::connect_in_memory().await.unwrap();
+        repo::set_setting(&db, settings::keys::OLLAMA_BASE_URL, &server.uri())
+            .await
+            .unwrap();
+        repo::set_setting(&db, settings::keys::OLLAMA_MODEL, "test-model")
+            .await
+            .unwrap();
+        let meeting_id = meeting_with_a_transcript(&db).await;
+
+        let outcome = summarize_meeting_with_actions(
+            &db,
+            &SummaryReq {
+                meeting_id: meeting_id.clone(),
+                ..Default::default()
+            },
+            CancelFlag::new(),
+        )
+        .await
+        .unwrap();
+
+        // Two calls, not four: one for the recap, one for the task list. The
+        // job used to run the task-list pass again on its own.
+        let calls = server.received_requests().await.unwrap();
+        assert_eq!(calls.len(), 2, "one recap call and one task-list call");
+
+        assert_eq!(outcome.action_items.len(), 1);
+        assert_eq!(outcome.action_items[0].description, "Send the invoice");
+        assert_eq!(
+            outcome.action_items[0].summary_id.as_deref(),
+            Some(outcome.summary.id.as_str())
+        );
+
+        // Stored once, and the stored rows are the ones handed back.
+        let stored = repo::list_action_items(&db, &meeting_id).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, outcome.action_items[0].id);
+
+        // The recap's language came from the meeting, and the task-list prompt
+        // asked for that language by name.
+        assert_eq!(outcome.summary.language.as_deref(), Some("it"));
+        let last: serde_json::Value = serde_json::from_slice(&calls[1].body).unwrap();
+        let prompt = last["messages"][0]["content"].as_str().unwrap_or_default();
+        assert!(prompt.contains("Write every task in Italian."), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn asking_again_for_the_same_recap_costs_nothing_and_still_returns_its_tasks() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"description\\\":\\\"Send the \
+                 invoice\\\"}]}\"},\"done\":true}\n",
+                "application/x-ndjson",
+            ))
+            .mount(&server)
+            .await;
+
+        let db = crate::db::connect_in_memory().await.unwrap();
+        repo::set_setting(&db, settings::keys::OLLAMA_BASE_URL, &server.uri())
+            .await
+            .unwrap();
+        repo::set_setting(&db, settings::keys::OLLAMA_MODEL, "test-model")
+            .await
+            .unwrap();
+        let meeting_id = meeting_with_a_transcript(&db).await;
+        let req = SummaryReq {
+            meeting_id: meeting_id.clone(),
+            ..Default::default()
+        };
+
+        let first = summarize_meeting_with_actions(&db, &req, CancelFlag::new())
+            .await
+            .unwrap();
+        let again = summarize_meeting_with_actions(&db, &req, CancelFlag::new())
+            .await
+            .unwrap();
+
+        assert_eq!(first.summary.id, again.summary.id);
+        assert_eq!(again.action_items.len(), 1);
+        // Still two calls in total: the second request was answered from what
+        // was already written down.
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 }

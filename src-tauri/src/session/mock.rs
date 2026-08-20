@@ -166,20 +166,32 @@ impl CaptureHandle for MockHandle {
 /// is "loaded" so the lazy-lifecycle rule can be asserted.
 pub(crate) struct MockAsr {
     loaded: AtomicBool,
+    /// What the session layer last said about a meeting needing the engine.
+    resident: AtomicBool,
     calls: AtomicU32,
     catch_up_segments: AtomicU32,
     fail_prewarm: AtomicBool,
+    /// How long loading takes, the way a first-ever launch takes minutes.
+    prewarm_takes: std::sync::Mutex<Option<Duration>>,
     text: std::sync::Mutex<String>,
+    /// Rows the next live backlog pass writes: (t_start_ms, t_end_ms, text).
+    backlog_writes: std::sync::Mutex<Vec<(i64, i64, String)>>,
+    /// The `to_ms` each live backlog pass was asked for.
+    backlog_calls: std::sync::Mutex<Vec<i64>>,
 }
 
 impl MockAsr {
     pub(crate) fn new() -> Self {
         Self {
             loaded: AtomicBool::new(false),
+            resident: AtomicBool::new(false),
             calls: AtomicU32::new(0),
             catch_up_segments: AtomicU32::new(0),
             fail_prewarm: AtomicBool::new(false),
+            prewarm_takes: std::sync::Mutex::new(None),
             text: std::sync::Mutex::new("hello there".to_string()),
+            backlog_writes: std::sync::Mutex::new(Vec::new()),
+            backlog_calls: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -192,17 +204,49 @@ impl MockAsr {
     pub(crate) fn fail_prewarm(&self) {
         self.fail_prewarm.store(true, Ordering::SeqCst);
     }
+
+    /// Is a meeting holding the engine right now?
+    pub(crate) fn is_resident(&self) -> bool {
+        self.resident.load(Ordering::SeqCst)
+    }
+
+    /// The weights take this long to come up, so a test can be the person who
+    /// pressed Start while Echo was still getting ready.
+    pub(crate) fn prewarm_takes(&self, how_long: Duration) {
+        *self.prewarm_takes.lock().unwrap() = Some(how_long);
+    }
+
+    /// What the next live backlog pass finds on disk and writes down.
+    pub(crate) fn backlog_writes(&self, rows: &[(i64, i64, &str)]) {
+        *self.backlog_writes.lock().unwrap() = rows
+            .iter()
+            .map(|(from, to, text)| (*from, *to, (*text).to_string()))
+            .collect();
+    }
+
+    /// How far each live backlog pass was asked to read.
+    pub(crate) fn backlog_calls(&self) -> Vec<i64> {
+        self.backlog_calls.lock().unwrap().clone()
+    }
 }
 
 impl AsrPort for MockAsr {
     fn prewarm<'a>(&'a self) -> BoxFuture<'a, Result<(), AsrError>> {
         Box::pin(async move {
+            let takes = *self.prewarm_takes.lock().unwrap();
+            if let Some(takes) = takes {
+                tokio::time::sleep(takes).await;
+            }
             if self.fail_prewarm.load(Ordering::SeqCst) {
                 return Err(AsrError::NotInstalled);
             }
             self.loaded.store(true, Ordering::SeqCst);
             Ok(())
         })
+    }
+
+    fn hold_resident(&self, resident: bool) {
+        self.resident.store(resident, Ordering::SeqCst);
     }
 
     fn transcribe<'a>(
@@ -246,6 +290,66 @@ impl AsrPort for MockAsr {
                 report(1.0);
             }
             Ok(self.catch_up_segments.load(Ordering::SeqCst))
+        })
+    }
+
+    /// Writes whatever the test said is on disk, and remembers how far it was
+    /// asked to read. Only stretches with no final text against them: the real
+    /// pass subtracts the coverage, and a double-transcribing mock would hide
+    /// exactly the bug that matters here.
+    fn catch_up_live<'a>(
+        &'a self,
+        db: &'a Db,
+        meeting_id: &'a str,
+        to_ms: i64,
+        control: crate::session::ports::CatchUpControl,
+    ) -> BoxFuture<'a, Result<u32, AsrError>> {
+        Box::pin(async move {
+            self.backlog_calls.lock().unwrap().push(to_ms);
+            if control.cancel.as_ref().is_some_and(|c| c()) {
+                return Err(AsrError::Cancelled);
+            }
+            let rows = self.backlog_writes.lock().unwrap().clone();
+            let covered = crate::db::repo::get_segments(
+                db,
+                &crate::types::TranscriptQuery {
+                    meeting_id: meeting_id.to_string(),
+                    include_partial: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_default();
+            let mut written = 0;
+            for (from_ms, to, text) in rows {
+                if to > to_ms {
+                    continue;
+                }
+                if covered
+                    .iter()
+                    .any(|s| s.t_end_ms > from_ms && s.t_start_ms < to)
+                {
+                    continue;
+                }
+                let draft = crate::types::SegmentDraft {
+                    meeting_id: meeting_id.to_string(),
+                    t_start_ms: from_ms,
+                    t_end_ms: to,
+                    channel: Channel::Mic,
+                    speaker_id: None,
+                    text,
+                    language: Some("en".into()),
+                    avg_confidence: Some(0.9),
+                    revision: 1,
+                    is_final: true,
+                    model_name: Some("test".into()),
+                    model_revision: Some("1".into()),
+                };
+                if crate::db::repo::insert_segment(db, &draft).await.is_ok() {
+                    written += 1;
+                }
+            }
+            Ok(written)
         })
     }
 
@@ -379,6 +483,19 @@ impl CollectingEvents {
     pub(crate) fn count(&self, name: &str) -> usize {
         self.names().iter().filter(|n| **n == name).count()
     }
+
+    /// The transcript lines that went out, in the order they were sent.
+    pub(crate) fn finals(&self) -> Vec<crate::events::TranscriptFinalPayload> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::TranscriptFinal(payload) => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 impl EventSink for CollectingEvents {
@@ -447,6 +564,11 @@ impl Harness {
             tokio::task::yield_now().await;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Wait for something the spine does on a spawned task.
+    pub(crate) async fn wait_until(&self, what: &str, done: impl FnMut() -> bool) {
+        wait_for(what, done).await;
     }
 
     /// Journal one committed chunk, as the writer would once a piece of audio is

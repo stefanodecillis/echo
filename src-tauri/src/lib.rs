@@ -398,11 +398,7 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(panel::TrayAnimation::new());
 
     app.manage(AppState {
-        session: session::SessionManager::new(
-            db.clone(),
-            app_paths.clone(),
-            loaded.release_after_idle_minutes,
-        ),
+        session: session::SessionManager::new(db.clone(), app_paths.clone()),
         detect: detect::Watcher::new(loaded.detection_enabled),
         db,
         paths: app_paths,

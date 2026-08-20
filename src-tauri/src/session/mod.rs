@@ -15,6 +15,16 @@
 //! Steps 3 and 4 may fail without ending the recording. Step 2 failing on one
 //! source degrades capture; failing on both is a real error.
 //!
+//! The speech engine's lifecycle is scoped to *listening*, not to the last
+//! decode (mantra 1's amendment of 2026-08-20): it is held from the moment a
+//! meeting is detected or started until the last of that meeting's jobs finishes,
+//! and only then does its grace period start. Two lines say the whole rule —
+//! [`engine_is_needed_by_capture`] and [`engine_stays_resident`] — and one method
+//! applies it wherever either fact changes ([`Inner::refresh_engine_residency`]).
+//! If the engine comes up *during* a recording, the backlog on disk is read into
+//! the transcript before live decoding carries on
+//! ([`pipeline::catch_up_backlog`]).
+//!
 //! Every entry point is idempotent: a second Start while recording returns the
 //! meeting already in progress, and a second Stop returns the same result.
 //!
@@ -29,7 +39,7 @@ pub mod recovery;
 #[cfg(test)]
 mod mock;
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -195,9 +205,6 @@ pub(crate) struct Inner {
     pub(crate) tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     /// Utterances waiting for text, for the "catching up" hint.
     pub(crate) pending: AtomicU32,
-    /// Bumped every time the idle timer is re-armed, so an old timer knows it
-    /// has been superseded.
-    idle_generation: AtomicU64,
 }
 
 impl Inner {
@@ -417,6 +424,9 @@ impl Inner {
             ));
         }
         let _ = self.jobs.release().await;
+        // Whatever is left to do for this meeting keeps the engine; if there is
+        // nothing, the grace period starts here.
+        self.refresh_engine_residency().await;
     }
 
     /// Stop anything queued or running for this meeting. Used when a meeting is
@@ -438,29 +448,48 @@ impl Inner {
                 tracing::debug!(%error, "could not stop work for a meeting that is going away");
             }
         }
+        self.refresh_engine_residency().await;
     }
 
-    /// Release the speech engine after a quiet spell (mantra 1).
-    fn arm_idle_release(self: &Arc<Self>) {
-        let generation = self.idle_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let inner = self.clone();
-        tokio::spawn(async move {
-            let minutes = crate::settings::load(&inner.db)
-                .await
-                .map(|s| s.release_after_idle_minutes)
-                .unwrap_or(5)
-                .clamp(1, 24 * 60);
-            tokio::time::sleep(Duration::from_secs(u64::from(minutes) * 60)).await;
-            if inner.idle_generation.load(Ordering::SeqCst) != generation {
-                return;
-            }
-            if is_live(inner.state()) || inner.jobs.running_job().is_some() {
-                return;
-            }
-            tracing::info!("releasing speech understanding after being idle");
-            inner.ports.asr.release().await;
-        });
+    /// Tell the speech engine whether a meeting still needs it.
+    ///
+    /// The whole of the listening-scoped lifecycle on this side: the engine is
+    /// held while audio is being captured **or** any meeting still has work
+    /// running or queued — catch-up, the speaker pass, the recap — and let go
+    /// otherwise. Letting go is not unloading: the engine waits out its own
+    /// grace period ([`crate::asr::engine::IDLE_GRACE`]) in case the next
+    /// meeting starts a minute later.
+    ///
+    /// Cheap and idempotent, so every path that changes either fact can just
+    /// call it: start, stop, a capture that died, a job that finished, a job that
+    /// was queued.
+    pub(crate) async fn refresh_engine_residency(&self) {
+        let capturing = engine_is_needed_by_capture(self.state());
+        let outstanding = jobs::outstanding_meeting_jobs(&self.db).await;
+        self.ports
+            .asr
+            .hold_resident(engine_stays_resident(capturing, outstanding));
     }
+}
+
+/// Does the capture state on its own mean the engine has to stay?
+///
+/// Everything from the click to the last chunk being committed: `Starting` counts
+/// because the weights are being loaded for this meeting right now, and
+/// `Stopping` counts because the pipeline is still writing down what it has.
+pub fn engine_is_needed_by_capture(state: CaptureState) -> bool {
+    is_live(state) || matches!(state, CaptureState::Starting | CaptureState::Stopping)
+}
+
+/// The lifecycle rule, as one line: hold the engine while a meeting is being
+/// listened to or has work outstanding, and only then start counting down.
+///
+/// Deliberately not "is the engine busy right now". A meeting with a long silence
+/// in it, or a gap between catch-up finishing and the recap starting, is still
+/// one conversation, and unloading 1.6 GB in the middle of it only buys a reload
+/// (mantra 1's amendment of 2026-08-20).
+pub fn engine_stays_resident(capturing: bool, outstanding_meeting_jobs: usize) -> bool {
+    capturing || outstanding_meeting_jobs > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -482,11 +511,13 @@ impl SessionManager {
     /// Build the manager. Allocates nothing beyond a few pointers: no device is
     /// opened and no weights are loaded until something asks (mantra 1).
     ///
-    /// `idle_release_minutes` comes from the stored setting, not from the
-    /// default, so someone who chose to hold the speech engine longer gets what
-    /// they asked for. Zero means the speech module's own default.
-    pub fn new(db: Db, paths: AppPaths, idle_release_minutes: u32) -> Self {
-        let ports = Ports::real(db.clone(), idle_release_minutes);
+    /// How long the speech engine is held is deliberately not an argument, and
+    /// not a setting either: it is held for as long as a meeting and its
+    /// follow-up work need it, then released after a fixed grace
+    /// ([`crate::asr::engine::IDLE_GRACE`]) — mantra 1's amendment of
+    /// 2026-08-20.
+    pub fn new(db: Db, paths: AppPaths) -> Self {
+        let ports = Ports::real(db.clone());
         Self::with_ports(db, paths, ports)
     }
 
@@ -504,7 +535,6 @@ impl SessionManager {
             command: tokio::sync::Mutex::new(()),
             tasks: std::sync::Mutex::new(Vec::new()),
             pending: AtomicU32::new(0),
-            idle_generation: AtomicU64::new(0),
         }))
     }
 
@@ -723,20 +753,32 @@ impl SessionManager {
 
         // 4b. The speech engine, last, and off the critical path: failing to
         //     load it must not end a recording. The audio is already on disk.
+        //
+        //     It is also told to stay: from here until this meeting's last job
+        //     finishes, the weights do not go anywhere (mantra 1's amendment of
+        //     2026-08-20).
+        inner.refresh_engine_residency().await;
         let engine = inner.clone();
         let engine_meeting = meeting.id.clone();
         tokio::spawn(async move {
-            if let Err(error) = engine.ports.asr.prewarm().await {
-                tracing::warn!(%error, "speech understanding is not ready");
-                engine.notice(NoticePayload {
-                    level: NoticeLevel::Warning,
-                    message: "Echo is recording, but it can't write the words down yet. It will \
-                              catch up as soon as it can."
-                        .into(),
-                    persistent: true,
-                    meeting_id: Some(engine_meeting),
-                    tag: Some("speechNotReady".into()),
-                });
+            match engine.ports.asr.prewarm().await {
+                // Ready — but possibly minutes after the meeting started, if the
+                // weights had to be read or the graphics compiler had work to do.
+                // Whatever was said in the meantime is on disk, so read it back
+                // into the transcript before carrying on live.
+                Ok(()) => pipeline::catch_up_backlog(engine, engine_meeting).await,
+                Err(error) => {
+                    tracing::warn!(%error, "speech understanding is not ready");
+                    engine.notice(NoticePayload {
+                        level: NoticeLevel::Warning,
+                        message: "Echo is recording, but it can't write the words down yet. It \
+                                  will catch up as soon as it can."
+                            .into(),
+                        persistent: true,
+                        meeting_id: Some(engine_meeting),
+                        tag: Some("speechNotReady".into()),
+                    });
+                }
             }
         });
 
@@ -838,8 +880,10 @@ impl SessionManager {
         inner.ports.events.emit(UiEvent::TrayState(TrayState::Idle));
 
         if discarded {
-            // `queue_finalization` already told the UI the row is gone.
-            inner.arm_idle_release();
+            // `queue_finalization` already told the UI the row is gone, and
+            // there is no work outstanding for it — so this is where the engine
+            // starts its grace period.
+            inner.refresh_engine_residency().await;
             tracing::info!(meeting = %meeting_id, duration_ms, "an empty recording was let go");
             return Ok(None);
         }
@@ -855,7 +899,11 @@ impl SessionManager {
                 deleted: false,
             }));
 
-        inner.arm_idle_release();
+        // The meeting is over but its work is not: catch-up, the speaker pass
+        // and the recap all still want the engine, so this holds it rather than
+        // letting go (mantra 1's amendment). The grace period starts when the
+        // last of those jobs finishes — see `JobRuntime::execute`.
+        inner.refresh_engine_residency().await;
         tracing::info!(meeting = %meeting_id, duration_ms, "recording finished");
         Ok(Some(meeting_id))
     }
@@ -1047,13 +1095,23 @@ impl SessionManager {
         self.0.ports.asr.prewarm().await
     }
 
-    /// Release the speech engine and any idle resources (mantra 1). Called by
-    /// the idle timer and before quitting. Never touches a live recording.
+    /// Release the speech engine and any idle resources (mantra 1). Called
+    /// before quitting, and by the "give the memory back now" action in
+    /// Settings → Advanced.
+    ///
+    /// Explicit, so it does not wait out the grace period — but it never takes
+    /// the engine away from a meeting: not while capture is running, and not
+    /// while a meeting's post-meeting work is still queued or running.
     pub async fn release_idle_resources(&self) {
-        if is_live(self.0.state()) {
+        if engine_is_needed_by_capture(self.0.state()) {
             tracing::debug!("not releasing anything: a recording is running");
             return;
         }
+        if jobs::outstanding_meeting_jobs(&self.0.db).await > 0 {
+            tracing::debug!("not releasing anything: a meeting is still being worked on");
+            return;
+        }
+        self.0.ports.asr.hold_resident(false);
         self.0.ports.asr.release().await;
     }
 
@@ -1701,14 +1759,62 @@ mod tests {
         assert_eq!(repo::list_markers(&h.db, &id).await.unwrap().len(), 1);
     }
 
+    // -----------------------------------------------------------------------
+    // The speech engine's lifecycle: resident while listening
+    // -----------------------------------------------------------------------
+
+    /// Mantra 1's amendment of 2026-08-20, as a rule with no thread and no
+    /// weights in it.
+    #[test]
+    fn the_engine_is_held_while_a_meeting_needs_it_and_not_a_moment_longer() {
+        // Anything from the click to the last committed chunk.
+        assert!(engine_is_needed_by_capture(CaptureState::Starting));
+        assert!(engine_is_needed_by_capture(CaptureState::Recording));
+        assert!(engine_is_needed_by_capture(CaptureState::Degraded));
+        assert!(engine_is_needed_by_capture(CaptureState::Paused));
+        assert!(engine_is_needed_by_capture(CaptureState::Stopping));
+        assert!(!engine_is_needed_by_capture(CaptureState::Idle));
+        assert!(!engine_is_needed_by_capture(CaptureState::Stopped));
+
+        // Held while capturing, whether or not there is other work.
+        assert!(engine_stays_resident(true, 0));
+        assert!(engine_stays_resident(true, 3));
+        // Held between the stop and the last of the meeting's jobs.
+        assert!(engine_stays_resident(false, 1));
+        // And only then does the grace period start.
+        assert!(!engine_stays_resident(false, 0));
+    }
+
     #[tokio::test]
-    async fn the_speech_engine_is_loaded_for_a_recording_and_released_when_idle() {
+    async fn a_recording_holds_the_engine_through_the_work_that_follows_it() {
         let h = Harness::new().await;
         h.session.start(Default::default()).await.unwrap();
         h.settle().await;
         assert!(h.session.speech_loaded(), "a recording loads it");
+        assert!(h.asr.is_resident(), "and holds it while it is listening");
 
+        h.capture.set_elapsed(60_000);
+        h.record_a_minute(h.session.status().await.meeting_id.as_deref().unwrap())
+            .await;
         h.session.stop().await.unwrap();
+        h.settle().await;
+
+        // Catch-up, the speaker pass, the playback file and the recap are all
+        // queued and none of them has run: the meeting is not over yet.
+        assert!(
+            h.asr.is_resident(),
+            "the engine waits for the last of the meeting's work"
+        );
+        h.session.release_idle_resources().await;
+        assert!(
+            h.session.speech_loaded(),
+            "an explicit release must not take the engine off a meeting mid-recap"
+        );
+
+        // Once the queue drains, nothing is holding it any more.
+        h.session.start_job_runner().await.unwrap();
+        h.wait_until("the engine to be let go", || !h.asr.is_resident())
+            .await;
         h.session.release_idle_resources().await;
         assert!(!h.session.speech_loaded(), "idle Echo holds no weights");
     }
@@ -1720,6 +1826,92 @@ mod tests {
         h.settle().await;
         h.session.release_idle_resources().await;
         assert!(h.session.speech_loaded());
+        assert!(h.asr.is_resident());
+    }
+
+    /// Someone pressed Start before Echo could write anything down — the
+    /// first-ever launch, where the weights take minutes to come up. What was
+    /// said in the meantime is on disk, and it has to end up in the transcript.
+    #[tokio::test]
+    async fn what_was_said_before_the_engine_was_ready_is_read_back_into_the_transcript() {
+        let h = Harness::new().await;
+        // Two stretches on disk with no text against them, either side of one the
+        // live pass managed on its own.
+        h.asr
+            .backlog_writes(&[(0, 4_000, "the bit before"), (8_000, 12_000, "and after that")]);
+        h.asr.prewarm_takes(Duration::from_millis(120));
+        // Half a minute of this meeting is already captured.
+        h.capture.set_elapsed(30_000);
+
+        let meeting_id = h.session.start(Default::default()).await.unwrap();
+        // The live pass wrote this stretch down while the backlog was being read.
+        repo::insert_segment(
+            &h.db,
+            &crate::types::SegmentDraft {
+                meeting_id: meeting_id.clone(),
+                t_start_ms: 4_000,
+                t_end_ms: 8_000,
+                channel: Channel::Mic,
+                speaker_id: None,
+                text: "live text".into(),
+                language: Some("en".into()),
+                avg_confidence: Some(0.9),
+                revision: 1,
+                is_final: true,
+                model_name: Some("test".into()),
+                model_revision: Some("1".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        h.wait_until("the backlog to be read back", || {
+            h.events.finals().len() >= 2
+        })
+        .await;
+
+        // Everything captured so far, and nothing that is not.
+        assert_eq!(h.asr.backlog_calls(), vec![30_000]);
+
+        let shown = h.events.finals();
+        assert_eq!(shown.len(), 2, "one line per stretch, and no more: {shown:?}");
+        // In the order they were said.
+        assert_eq!(shown[0].segment.t_start_ms, 0);
+        assert_eq!(shown[1].segment.t_start_ms, 8_000);
+        // The stretch the live pass already wrote down is not sent again, and was
+        // never read a second time.
+        assert!(
+            shown.iter().all(|line| line.segment.text != "live text"),
+            "text already on screen must not be sent twice: {shown:?}"
+        );
+        // These lines replace no live line: there was nothing on screen for them.
+        assert!(shown.iter().all(|line| line.utterance_id.is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_meeting_that_is_over_before_the_engine_arrives_is_left_to_the_catch_up_job() {
+        let h = Harness::new().await;
+        h.asr.backlog_writes(&[(0, 4_000, "too late")]);
+        // Longer than the whole start-record-stop it is racing.
+        h.asr.prewarm_takes(Duration::from_millis(400));
+        h.capture.set_elapsed(30_000);
+
+        let meeting_id = h.session.start(Default::default()).await.unwrap();
+        h.record_a_minute(&meeting_id).await;
+        h.session.stop().await.unwrap();
+        h.settle().await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        assert!(
+            h.asr.backlog_calls().is_empty(),
+            "a live backlog pass must not start under a meeting that has ended"
+        );
+        assert!(
+            h.queued_kinds(&meeting_id)
+                .await
+                .contains(&JobKind::TranscribeCatchup),
+            "the finalize job owns it from there"
+        );
     }
 
     // -----------------------------------------------------------------------

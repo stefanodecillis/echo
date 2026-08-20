@@ -539,7 +539,6 @@ export interface Settings {
   summaryTemplateId?: Id;
   autoSummarize: boolean;
   accuracyLevelId: string;
-  releaseAfterIdleMinutes: number;
   closeToTray: boolean;
   onboardingComplete: boolean;
   showAdvanced: boolean;
@@ -557,7 +556,6 @@ export interface SettingsPatch {
   summaryTemplateId?: Id;
   autoSummarize?: boolean;
   accuracyLevelId?: string;
-  releaseAfterIdleMinutes?: number;
   closeToTray?: boolean;
   onboardingComplete?: boolean;
   showAdvanced?: boolean;

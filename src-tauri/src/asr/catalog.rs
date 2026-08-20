@@ -319,9 +319,16 @@ pub struct DecodeParams {
     pub no_speech_thold: f32,
 }
 
-/// Widest beam a *live* final utterance is allowed. Beam 5 stays in catch-up,
-/// where nobody is watching the caption appear.
-pub const LIVE_MAX_BEAM: u32 = 2;
+/// The beam a live final narrows to when finals are queueing up.
+///
+/// Anything that lands in the transcript now decodes with the preset's own beam,
+/// live or from disk (mantra 1, amendment of 2026-08-20: while Echo is
+/// listening, transcript quality outranks resource thrift). A wide beam over two
+/// channels can still fall behind on a small machine, so this is the safety
+/// valve: while more than [`crate::asr::engine::FINAL_BACKLOG_DEGRADE_AT`]
+/// finished utterances are waiting, new ones decode this narrow until the queue
+/// drains again.
+pub const LIVE_DEGRADED_BEAM: u32 = 2;
 
 /// Temperature step for a live final utterance.
 ///
@@ -353,22 +360,41 @@ impl DecodeParams {
         attempts.max(1)
     }
 
-    /// The same preset, decoding a **final live utterance**: one modest fallback
-    /// at most and no beam wider than [`LIVE_MAX_BEAM`].
+    /// The same preset, decoding a **final live utterance**: the preset's own
+    /// beam, with one modest fallback at most.
     ///
-    /// This is the utterance a person watches land, so it has to be good *and*
-    /// arrive. Nothing else is capped: no token limit, timestamps on, natural
-    /// segments — those are what turn a long sentence into an abrupt ending.
+    /// This is the text a person keeps, so it is decoded at the quality the disk
+    /// pass would give it — the beam is not narrowed for latency any more
+    /// (mantra 1's 2026-08-20 amendment: while Echo is listening, quality
+    /// outranks thrift). The one thing still trimmed is the temperature ladder:
+    /// six decodes of the same audio makes a *caption* unpredictable, and the
+    /// deterministic pass plus one retry is where nearly all of the accuracy is.
+    ///
+    /// [`DecodeParams::live_final_degraded`] is the fallback for a machine that
+    /// cannot keep up at this width.
     pub const fn live_final(mut self) -> Self {
-        if self.beam_size > LIVE_MAX_BEAM {
-            self.beam_size = LIVE_MAX_BEAM;
-        }
-        if self.best_of > LIVE_MAX_BEAM {
-            self.best_of = LIVE_MAX_BEAM;
-        }
         self.temperature = 0.0;
         self.temperature_inc = LIVE_TEMPERATURE_INC;
         self
+    }
+
+    /// A live final on a machine that is falling behind: as
+    /// [`DecodeParams::live_final`], with the beam narrowed to
+    /// [`LIVE_DEGRADED_BEAM`].
+    ///
+    /// The valve, not the setting. Text that arrives after the meeting has moved
+    /// on is worth less than slightly worse text that arrives now, so a queue of
+    /// finished utterances buys itself room by narrowing — and goes back to the
+    /// full width as soon as it has drained.
+    pub const fn live_final_degraded(self) -> Self {
+        let mut params = self.live_final();
+        if params.beam_size > LIVE_DEGRADED_BEAM {
+            params.beam_size = LIVE_DEGRADED_BEAM;
+        }
+        if params.best_of > LIVE_DEGRADED_BEAM {
+            params.best_of = LIVE_DEGRADED_BEAM;
+        }
+        params
     }
 
     /// The same preset, decoding a **speculative caption**: greedy, one attempt,
@@ -718,20 +744,32 @@ mod tests {
         }
     }
 
-    /// The full ladder and the wide beam belong to the disk pass. Live decoding
-    /// borrows the same preset with the expensive parts taken off.
+    /// The full ladder belongs to the disk pass; the beam belongs to anything
+    /// that lands in the transcript, live or not.
     #[test]
-    fn live_decoding_is_the_same_preset_with_the_expensive_parts_taken_off() {
+    fn a_live_final_keeps_the_presets_beam_and_gives_up_only_the_ladder() {
         for p in PRESETS {
             let catchup = p.decode;
             let live = catchup.live_final();
+            let degraded = catchup.live_final_degraded();
             let speculative = catchup.speculative();
 
+            assert_eq!(
+                live.beam_size, catchup.beam_size,
+                "{} decodes finals narrower than the recording",
+                p.id
+            );
             assert!(
-                live.beam_size <= LIVE_MAX_BEAM,
-                "{} searches {} beams live",
+                degraded.beam_size <= LIVE_DEGRADED_BEAM,
+                "{} still searches {} beams with the valve open",
                 p.id,
-                live.beam_size
+                degraded.beam_size
+            );
+            assert_eq!(
+                degraded.max_attempts(),
+                live.max_attempts(),
+                "{} changes more than the beam when it falls behind",
+                p.id
             );
             assert_eq!(
                 live.max_attempts(),
@@ -759,10 +797,15 @@ mod tests {
                 p.id
             );
         }
-        // The everyday preset is the one that gives up beam 5 live.
+        // The everyday preset is the one with a wide beam to keep or give up.
         let everyday = preset("everyday").unwrap().decode;
         assert_eq!(everyday.beam_size, 5, "catch-up keeps the wide beam");
-        assert_eq!(everyday.live_final().beam_size, 2);
+        assert_eq!(
+            everyday.live_final().beam_size,
+            5,
+            "a live final is decoded at catch-up quality"
+        );
+        assert_eq!(everyday.live_final_degraded().beam_size, 2);
         assert_eq!(everyday.max_attempts(), 6, "0.0, 0.2, … 1.0 on disk");
     }
 

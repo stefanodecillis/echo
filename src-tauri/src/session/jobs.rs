@@ -259,6 +259,36 @@ impl JobExecutor for DefaultJobExecutor {
 }
 
 /// How far the committed audio reaches, across channels.
+/// How much work is outstanding for meetings: queued, running or parked.
+///
+/// The other half of the engine's lifecycle rule (see
+/// [`super::engine_stays_resident`]). Only work that belongs to a meeting counts:
+/// a download has nothing to do with the speech engine, and holding 1.6 GB while
+/// one runs would be exactly the waste mantra 1 is about.
+///
+/// Errors count as "there is something": being wrong the other way would unload
+/// the engine in the middle of a meeting's work because one query failed.
+pub async fn outstanding_meeting_jobs(db: &Db) -> usize {
+    match repo::list_jobs(
+        db,
+        &JobQuery {
+            active_only: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Ok(jobs) => jobs
+            .iter()
+            .filter(|job| job.meeting_id.is_some())
+            .count(),
+        Err(error) => {
+            tracing::debug!(%error, "could not read the work queue; assuming there is work");
+            1
+        }
+    }
+}
+
 pub async fn committed_end_ms(db: &Db, meeting_id: &str) -> Result<i64, DbError> {
     let mic = repo::last_committed_offset_ms(db, meeting_id, Channel::Mic).await?;
     let system = repo::last_committed_offset_ms(db, meeting_id, Channel::System).await?;
@@ -532,44 +562,42 @@ async fn summarize(ctx: &JobContext) -> Result<(), JobFailure> {
     }
 
     ctx.progress.set(0.1).await;
-    let summary = match crate::summarize::summarize_meeting(&ctx.db, &req, ctx.cancel.as_flag()).await
-    {
-        Ok(summary) => summary,
-        // A meeting with nothing written down cannot have a recap. When nobody
-        // asked for one, that is simply the end of it.
-        Err(crate::summarize::SummarizeError::NoTranscript) if !asked_for_by_hand => {
-            tracing::info!(meeting = %meeting_id, "no words to write a recap from");
-            ctx.progress.set(1.0).await;
-            return Ok(());
-        }
-        Err(error) => return Err(summarize_failure(&ctx.cancel, error)),
-    };
-
-    ctx.progress.set(0.8).await;
-    match crate::summarize::extract_action_items(
-        &ctx.db,
-        &meeting_id,
-        &summary.id,
-        ctx.cancel.as_flag(),
-    )
-    .await
-    {
-        Ok(items) => {
-            match repo::replace_action_items(&ctx.db, &meeting_id, Some(&summary.id), &items).await
-            {
-                Ok(stored) => ctx.events.emit(UiEvent::ActionItemsUpdated(
-                    crate::events::ActionItemsUpdatedPayload {
-                        meeting_id: meeting_id.clone(),
-                        items: stored,
-                    },
-                )),
-                Err(error) => tracing::warn!(%error, "could not store the task list"),
+    // The recap and its task list are written together, in one place
+    // (`summarize_meeting_with_actions`). This job used to ask for the recap and
+    // then run the extraction pass again itself, which meant two model calls —
+    // four when both took their repair retry — and a second, worse task list
+    // overwriting the first.
+    let outcome =
+        match crate::summarize::summarize_meeting_with_actions(&ctx.db, &req, ctx.cancel.as_flag())
+            .await
+        {
+            Ok(outcome) => outcome,
+            // A meeting with nothing written down cannot have a recap. When
+            // nobody asked for one, that is simply the end of it.
+            Err(crate::summarize::SummarizeError::NoTranscript) if !asked_for_by_hand => {
+                tracing::info!(meeting = %meeting_id, "no words to write a recap from");
+                ctx.progress.set(1.0).await;
+                return Ok(());
             }
-        }
-        Err(error) => {
-            // A recap without a task list is still a good recap.
-            tracing::warn!(error = %error, "no task list came back");
-        }
+            Err(error) => return Err(summarize_failure(&ctx.cancel, error)),
+        };
+    let summary = outcome.summary;
+
+    ctx.progress.set(0.9).await;
+    // Read the list back rather than forwarding the one in hand. An extraction
+    // that fell over hands back an empty list while the previous revision's
+    // items are still in the table, and telling the screen "no tasks" when there
+    // are some is worse than telling it nothing. The recap itself is never
+    // failed over its task list — `summarize_meeting_with_actions` logs why one
+    // is missing.
+    match repo::list_action_items(&ctx.db, &meeting_id).await {
+        Ok(items) => ctx.events.emit(UiEvent::ActionItemsUpdated(
+            crate::events::ActionItemsUpdatedPayload {
+                meeting_id: meeting_id.clone(),
+                items,
+            },
+        )),
+        Err(error) => tracing::warn!(%error, "could not read the task list back"),
     }
 
     ctx.events
@@ -724,6 +752,13 @@ fn asr_failure(cancel: &Cancel, error: crate::asr::AsrError) -> JobFailure {
 
 fn summarize_failure(cancel: &Cancel, error: crate::summarize::SummarizeError) -> JobFailure {
     use crate::summarize::SummarizeError as S;
+    // One line for every recap that did not finish, before the taxonomy below
+    // turns it into a sentence for the screen. The screen copy is deliberately
+    // free of the service's own words, so this is the only place the internal
+    // reason is written down — and every arm needs it, not just the catch-all.
+    if !matches!(error, S::Cancelled) {
+        tracing::warn!(error = %error, "the recap stopped");
+    }
     match error {
         S::Cancelled => {
             if cancel.is_preempted() {
@@ -739,13 +774,34 @@ fn summarize_failure(cancel: &Cancel, error: crate::summarize::SummarizeError) -
         S::Unreachable(_) => JobFailure::failed(
             "Echo couldn't reach the place that writes your recaps. Check it's running.",
         ),
+        // Same taxonomy as the command path (`UiError::from<SummarizeError>`), in
+        // job-sized sentences. Every one of these used to land on "Echo couldn't
+        // write the recap this time", which is true of all of them and useful
+        // about none of them.
+        S::Rejected(_) => JobFailure::failed(
+            "That service wouldn't accept the key Echo has saved for it. Open Settings and paste \
+             it again.",
+        ),
+        S::QuotaExhausted => JobFailure::failed(
+            "That service won't take any more requests just now. Your recording and transcript \
+             are safe — try the recap again later.",
+        ),
+        S::Blocked { .. } => JobFailure::failed(
+            "That service wouldn't write a recap from this meeting. Your transcript is safe, and \
+             you can pick something else to write recaps in Settings.",
+        ),
+        S::EmptyReply => {
+            JobFailure::failed("That service sent back an empty recap. You can try again.")
+        }
+        S::MalformedReply => JobFailure::failed(
+            "Echo couldn't make sense of what that service sent back. You can try again.",
+        ),
         S::Timeout => JobFailure::failed("That took too long. You can try writing it again."),
         // Already a finished sentence naming the model and what to do about it,
         // and "try again" would be a lie: the same setting would pick the same
         // retired model. It goes on the job as written.
         ref not_found @ S::ModelNotFound { .. } => JobFailure::failed(not_found.to_string()),
-        other => {
-            tracing::warn!(error = %other, "the recap stopped");
+        _ => {
             JobFailure::failed("Echo couldn't write the recap this time. You can try again.")
         }
     }
@@ -811,8 +867,25 @@ impl JobRuntime {
     ) -> Result<Job, DbError> {
         let job = repo::ensure_job_with_payload(&self.db, meeting_id, kind, payload).await?;
         self.announce(&job);
+        // Work for a meeting is a reason to keep the speech engine, whether or
+        // not this loop gets to it in the next second.
+        self.refresh_engine_residency().await;
         self.wake.notify_one();
         Ok(job)
+    }
+
+    /// Hold the speech engine while a recording or a meeting's work is
+    /// outstanding, and let the grace period start once neither is true.
+    ///
+    /// Called on every edge this loop knows about: work queued, work finished.
+    /// `blocked` is the recording's own flag, set for the whole of a capture, so
+    /// nothing here has to reach into the capture state machine.
+    pub(crate) async fn refresh_engine_residency(&self) {
+        let capturing = self.blocked.load(Ordering::SeqCst);
+        let outstanding = outstanding_meeting_jobs(&self.db).await;
+        self.ports
+            .asr
+            .hold_resident(super::engine_stays_resident(capturing, outstanding));
     }
 
     /// Cancel a job. Already finished is success.
@@ -877,6 +950,9 @@ impl JobRuntime {
         if resumed > 0 {
             tracing::info!(resumed, "background work picked back up");
         }
+        // Also the launch path, where work left over from a crash is un-parked:
+        // whatever is outstanding now decides whether the engine is held.
+        self.refresh_engine_residency().await;
         self.wake.notify_one();
         Ok(())
     }
@@ -1021,6 +1097,10 @@ impl JobRuntime {
         if let Ok(Some(finished)) = repo::get_job(&self.db, &job.id).await {
             self.announce(&finished);
         }
+        // This may have been the meeting's last job. If it was, and nothing is
+        // being recorded, this is the moment the engine's grace period starts
+        // (mantra 1's amendment of 2026-08-20).
+        self.refresh_engine_residency().await;
         if matches!(status, JobStatus::Done) {
             if let Some(meeting_id) = job.meeting_id.as_deref() {
                 self.settle_meeting(meeting_id).await;
@@ -1120,6 +1200,159 @@ mod tests {
             .await
             .unwrap();
         assert!(recap_backend_ready(&db, crate::types::Provider::OnThisComputer).await);
+    }
+
+    /// Build a `JobContext` around a real database and a stub speech engine, so
+    /// a handler can be run on its own without the whole runtime.
+    async fn context_for(db: &Db, job: Job) -> (JobContext, Arc<super::super::mock::CollectingEvents>)
+    {
+        let events = crate::session::ports::EventBus::new();
+        let seen = Arc::new(super::super::mock::CollectingEvents::default());
+        events.set(seen.clone());
+        let progress = Arc::new(Progress::new(db.clone(), job.clone(), events.clone()));
+        (
+            JobContext {
+                job,
+                db: db.clone(),
+                paths: crate::paths::AppPaths::rooted_at(std::env::temp_dir().join("echo-jobs"), None),
+                asr: Arc::new(super::super::mock::MockAsr::new()),
+                events,
+                cancel: Cancel::new(),
+                progress,
+            },
+            seen,
+        )
+    }
+
+    /// The regression this batch was for: the summarize job asked for the recap,
+    /// which writes the task list, and then ran the task-list pass *again*
+    /// itself. Two model calls became four (each pass has a repair retry), and
+    /// the second, worse list overwrote the first. One recap call, one task-list
+    /// call, and that is all.
+    #[tokio::test]
+    async fn the_summarize_job_asks_for_the_task_list_exactly_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // One reply that reads as a recap and as the task-list JSON, so the
+        // count is the only thing under test.
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"description\\\":\\\"Send the \
+                 invoice\\\"}]}\"},\"done\":true}\n",
+                "application/x-ndjson",
+            ))
+            .mount(&server)
+            .await;
+
+        let db = crate::db::connect_in_memory().await.unwrap();
+        repo::set_setting(&db, crate::settings::keys::OLLAMA_BASE_URL, &server.uri())
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::settings::keys::OLLAMA_MODEL, "test-model")
+            .await
+            .unwrap();
+
+        let meeting = repo::create_meeting(&db, "Weekly sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[crate::types::SegmentDraft {
+                meeting_id: meeting.id.clone(),
+                t_start_ms: 0,
+                t_end_ms: 4_000,
+                channel: crate::types::Channel::Mic,
+                speaker_id: None,
+                text: "We ship on Friday.".into(),
+                language: Some("en".into()),
+                avg_confidence: Some(0.9),
+                revision: 1,
+                is_final: true,
+                model_name: None,
+                model_revision: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let job = repo::ensure_job(&db, Some(&meeting.id), JobKind::Summarize)
+            .await
+            .unwrap();
+        let (ctx, seen) = context_for(&db, job).await;
+        summarize(&ctx).await.expect("the recap should be written");
+
+        let calls = server.received_requests().await.unwrap();
+        assert_eq!(
+            calls.len(),
+            2,
+            "one recap call and one task-list call, not two of each"
+        );
+
+        // Stored once, and the screen was told about it once.
+        let stored = repo::list_action_items(&db, &meeting.id).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].description, "Send the invoice");
+        assert_eq!(seen.count(crate::events::ACTION_ITEMS_UPDATED), 1);
+        assert_eq!(seen.count(crate::events::SUMMARY_READY), 1);
+    }
+
+    /// Every reason a recap can fail says something different, and none of them
+    /// says "something went wrong". Each of these used to collapse into the
+    /// catch-all sentence, which told the person nothing they could act on.
+    #[test]
+    fn each_way_a_recap_can_fail_says_its_own_thing() {
+        use crate::summarize::SummarizeError as S;
+
+        let cancel = Cancel::new();
+        let sentences: Vec<String> = [
+            S::Rejected("401".into()),
+            S::QuotaExhausted,
+            S::Blocked {
+                reason: "SAFETY".into(),
+            },
+            S::EmptyReply,
+            S::MalformedReply,
+            S::Timeout,
+            S::Unreachable("connection refused".into()),
+            S::MissingCredential,
+            S::NoTranscript,
+        ]
+        .into_iter()
+        .map(|error| match summarize_failure(&cancel, error) {
+            JobFailure::Failed(message) => message,
+            other => panic!("expected a failure sentence, got {other:?}"),
+        })
+        .collect();
+
+        for sentence in &sentences {
+            assert!(
+                !sentence.contains("Echo couldn't write the recap this time"),
+                "still falling through to the catch-all: {sentence}"
+            );
+        }
+        let mut unique = sentences.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            sentences.len(),
+            "two different failures are telling the person the same thing"
+        );
+
+        // The service's own word for a block never reaches the screen (mantra 2).
+        let blocked = match summarize_failure(
+            &cancel,
+            S::Blocked {
+                reason: "RECITATION".into(),
+            },
+        ) {
+            JobFailure::Failed(message) => message,
+            other => panic!("{other:?}"),
+        };
+        assert!(!blocked.contains("RECITATION"), "{blocked}");
     }
 
     #[test]

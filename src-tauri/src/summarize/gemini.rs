@@ -106,12 +106,32 @@ struct GenerateChunk {
     candidates: Vec<Candidate>,
     #[serde(rename = "promptFeedback", default)]
     prompt_feedback: Option<PromptFeedback>,
+    /// Counts only, never content. Logged so a field failure can be read off
+    /// the log line alone.
+    #[serde(rename = "usageMetadata", default)]
+    usage: Option<UsageMetadata>,
+    #[serde(rename = "modelVersion", default)]
+    model_version: Option<String>,
+    #[serde(rename = "responseId", default)]
+    response_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PromptFeedback {
     #[serde(rename = "blockReason", default)]
     block_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UsageMetadata {
+    #[serde(rename = "promptTokenCount", default)]
+    prompt_tokens: Option<u64>,
+    #[serde(rename = "candidatesTokenCount", default)]
+    candidate_tokens: Option<u64>,
+    #[serde(rename = "thoughtsTokenCount", default)]
+    thought_tokens: Option<u64>,
+    #[serde(rename = "totalTokenCount", default)]
+    total_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +152,11 @@ struct Content {
 struct Part {
     #[serde(default)]
     text: String,
+    /// Recent models can return their own reasoning as a part marked this way.
+    /// It is not recap text and must never be pasted into one, so it is counted
+    /// and dropped.
+    #[serde(default)]
+    thought: bool,
 }
 
 /// Families that exist to make pictures, video, speech or vectors. None of them
@@ -142,15 +167,7 @@ struct Part {
 /// substring, so a fragment as short as `tts` can never knock out a model whose
 /// name merely happens to contain those letters.
 const NON_TEXT_NAME_PARTS: &[&str] = &[
-    "imagen",
-    "veo",
-    "tts",
-    "audio",
-    "aqa",
-    "embed",
-    "image",
-    "images",
-    "video",
+    "imagen", "veo", "tts", "audio", "aqa", "embed", "image", "images", "video",
     "banana", // "nano-banana", Google's picture model nickname
 ];
 
@@ -179,7 +196,10 @@ fn supports_generate_content(methods: &[String]) -> bool {
 /// exact model they were looking for.
 fn is_text_model_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    let collapsed: String = lower.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let collapsed: String = lower
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
     if NON_TEXT_COLLAPSED
         .iter()
         .any(|marker| collapsed.contains(marker))
@@ -230,7 +250,10 @@ fn is_model_not_found(status: reqwest::StatusCode, body: &str) -> bool {
 fn classify_status(status: reqwest::StatusCode, body: &str) -> SummarizeError {
     match status.as_u16() {
         401 | 403 => SummarizeError::Rejected("the saved key was refused".into()),
-        429 => SummarizeError::Rejected("their usage limit was reached; try again later".into()),
+        // Not a bad key: the key worked and the allowance behind it is spent.
+        // Told apart because the two need opposite advice — re-check the key,
+        // versus wait or raise the limit.
+        429 => SummarizeError::QuotaExhausted,
         400..=499 => SummarizeError::Rejected(truncate(body, 200)),
         _ => SummarizeError::Failed(format!("http {status}: {}", truncate(body, 200))),
     }
@@ -238,20 +261,316 @@ fn classify_status(status: reqwest::StatusCode, body: &str) -> SummarizeError {
 
 /// `SAFETY`, `RECITATION` and friends mean the model refused to answer; only
 /// `STOP` (and `MAX_TOKENS`, a truncation, not a refusal) mean it actually
-/// wrote something.
+/// wrote something. An unspecified reason is not a refusal either — it is a
+/// shape we do not recognise, and calling that a block would blame the person's
+/// meeting for our own blind spot.
 fn is_blocked_finish_reason(reason: &str) -> bool {
-    !matches!(reason, "STOP" | "MAX_TOKENS" | "")
+    !matches!(
+        reason,
+        "STOP" | "MAX_TOKENS" | "FINISH_REASON_UNSPECIFIED" | ""
+    )
 }
 
-/// Parse one Server-Sent-Events response (`alt=sse`) into the events it
-/// describes, accumulating the full reply as it goes.
-async fn drain_sse(
-    mut resp: reqwest::Response,
+/// Where the one structured line per Gemini call goes. Counters only: never
+/// prompt, transcript or recap text.
+const TELEMETRY_TARGET: &str = "echo::recap";
+
+/// A UTF-8 byte-order mark. Some proxies prepend one to a text/event-stream
+/// body; left in place it becomes part of the first field name and every event
+/// in the response fails to parse.
+const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// Everything worth knowing about one Gemini reply, and nothing that could be
+/// content.
+///
+/// This exists because the field failure it was written for ("the reply came
+/// back empty", three times running) left no evidence at all: the old parser
+/// dropped every event it could not deserialize and then reported the same
+/// sentence whether Google had sent nothing, sent a refusal, or sent a perfectly
+/// good reply in a frame shape Echo could not split. Each of those needs a
+/// different fix, so each of them now has a number next to it in the log.
+#[derive(Debug, Default)]
+struct CallTally {
+    /// Event blocks that carried a `data:` payload.
+    events: usize,
+    /// Blocks that carried none — comments, keep-alives.
+    keepalives: usize,
+    /// Payloads that deserialized into a reply chunk.
+    parsed: usize,
+    /// Payloads that did not. The number that tells a framing bug from an
+    /// empty answer.
+    parse_failures: usize,
+    /// The first deserialization failure's own words. Serde reports a position
+    /// and an expectation, never the document, so this carries no content.
+    first_parse_error: Option<String>,
+    candidates: usize,
+    parts: usize,
+    text_parts: usize,
+    thought_parts: usize,
+    /// Length of the assembled reply. A length is not content.
+    text_chars: usize,
+    finish_reasons: Vec<String>,
+    block_reason: Option<String>,
+    blocking_finish_reason: Option<String>,
+    prompt_tokens: Option<u64>,
+    candidate_tokens: Option<u64>,
+    thought_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    model_version: Option<String>,
+    response_id: Option<String>,
+    /// Bytes still in the buffer when the body ended — an event that never got
+    /// its blank line. Parsed anyway; counted so a truncated stream shows up.
+    leftover_bytes: usize,
+    saw_crlf: bool,
+    saw_lf: bool,
+    saw_cr: bool,
+    bom: bool,
+    done_marker: bool,
+}
+
+/// Note which line endings some part of the reply used. The one field that says
+/// straight out whether a framing bug is what went wrong.
+fn note_line_endings(bytes: &[u8], tally: &mut CallTally) {
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
+                tally.saw_crlf = true;
+                i += 2;
+            }
+            b'\r' => {
+                tally.saw_cr = true;
+                i += 1;
+            }
+            b'\n' => {
+                tally.saw_lf = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+impl CallTally {
+    fn line_endings(&self) -> &'static str {
+        match (self.saw_crlf, self.saw_lf, self.saw_cr) {
+            (true, false, false) => "crlf",
+            (false, true, false) => "lf",
+            (false, false, true) => "cr",
+            (false, false, false) => "none",
+            _ => "mixed",
+        }
+    }
+
+    fn note_finish_reason(&mut self, reason: &str) {
+        if reason.is_empty() {
+            return;
+        }
+        if !self.finish_reasons.iter().any(|seen| seen == reason) {
+            self.finish_reasons.push(reason.to_string());
+        }
+        if is_blocked_finish_reason(reason) && self.blocking_finish_reason.is_none() {
+            self.blocking_finish_reason = Some(reason.to_string());
+        }
+    }
+
+    /// One line per call, always, whatever the outcome. The next field failure
+    /// has to be diagnosable from this alone.
+    fn log(&self, model: &str) {
+        tracing::info!(
+            target: TELEMETRY_TARGET,
+            model = %model,
+            events = self.events,
+            keepalives = self.keepalives,
+            parsed = self.parsed,
+            parse_failures = self.parse_failures,
+            candidates = self.candidates,
+            parts = self.parts,
+            text_parts = self.text_parts,
+            thought_parts = self.thought_parts,
+            text_chars = self.text_chars,
+            finish_reasons = %self.finish_reasons.join("|"),
+            block_reason = self.block_reason.as_deref().unwrap_or("-"),
+            prompt_tokens = self.prompt_tokens.unwrap_or_default(),
+            candidate_tokens = self.candidate_tokens.unwrap_or_default(),
+            thought_tokens = self.thought_tokens.unwrap_or_default(),
+            total_tokens = self.total_tokens.unwrap_or_default(),
+            model_version = self.model_version.as_deref().unwrap_or("-"),
+            response_id = self.response_id.as_deref().unwrap_or("-"),
+            leftover_bytes = self.leftover_bytes,
+            line_endings = self.line_endings(),
+            bom = self.bom,
+            done_marker = self.done_marker,
+            "gemini reply"
+        );
+        if self.parse_failures > 0 {
+            tracing::warn!(
+                target: TELEMETRY_TARGET,
+                model = %model,
+                events = self.events,
+                parsed = self.parsed,
+                parse_failures = self.parse_failures,
+                line_endings = self.line_endings(),
+                bom = self.bom,
+                reason = self.first_parse_error.as_deref().unwrap_or("-"),
+                "some of Google's reply could not be read"
+            );
+        }
+    }
+}
+
+/// How long the line terminator at `at` is, or `None` if there isn't one there.
+///
+/// A server-sent-events line ends with CRLF, LF **or** a bare CR. A trailing CR
+/// at the very end of what we have received so far is deliberately reported as
+/// "not a terminator": it may be the first half of a CRLF still in flight, and
+/// splitting there would cut an event in two.
+fn terminator_len(buf: &[u8], at: usize) -> Option<usize> {
+    match buf.get(at)? {
+        b'\r' => match buf.get(at + 1) {
+            Some(b'\n') => Some(2),
+            // Nothing after it yet: wait for the other half.
+            None => None,
+            _ => Some(1),
+        },
+        b'\n' => Some(1),
+        _ => None,
+    }
+}
+
+/// The next complete event in `buf`: how many bytes belong to the event, and how
+/// many to drop from the front of the buffer (the event plus its blank line).
+///
+/// Events are separated by a blank line, and each of the two line terminators
+/// may independently be CRLF, LF or CR — Google's streaming responses have been
+/// seen using `\r\n\r\n` where the same endpoint documents `\n\n`. Splitting on
+/// `\n\n` alone silently reads a whole CRLF response as one unterminated event,
+/// which is exactly the "empty reply" this function was rewritten for.
+fn next_event(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < buf.len() {
+        match terminator_len(buf, i) {
+            Some(first) => match terminator_len(buf, i + first) {
+                Some(second) => return Some((i, i + first + second)),
+                None => i += first,
+            },
+            None => i += 1,
+        }
+    }
+    None
+}
+
+/// Fold one event block into the tally and the reply being assembled.
+fn absorb_event(
+    block: &[u8],
+    tally: &mut CallTally,
+    events: &mut Vec<GenerateEvent>,
+    full: &mut String,
+) {
+    let text = String::from_utf8_lossy(block);
+    note_line_endings(block, tally);
+
+    // Every `data:` line of one event belongs to the same payload, joined with
+    // a newline — that is what the spec says, and a JSON object split across
+    // two data lines (which a long recap chunk can be) only survives if it is
+    // rejoined that way. The old parser concatenated them with nothing in
+    // between, which quietly corrupted exactly those payloads.
+    let mut data = String::new();
+    let mut saw_data = false;
+    for line in text.split(['\r', '\n']) {
+        let Some(rest) = line.strip_prefix("data:") else {
+            continue;
+        };
+        // Exactly one optional space after the colon is part of the framing;
+        // anything more is payload.
+        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+        if saw_data {
+            data.push('\n');
+        }
+        data.push_str(rest);
+        saw_data = true;
+    }
+
+    if !saw_data || data.trim().is_empty() {
+        tally.keepalives += 1;
+        return;
+    }
+    tally.events += 1;
+
+    if data.trim() == "[DONE]" {
+        tally.done_marker = true;
+        return;
+    }
+
+    let chunk: GenerateChunk = match serde_json::from_str(&data) {
+        Ok(chunk) => {
+            tally.parsed += 1;
+            chunk
+        }
+        Err(e) => {
+            tally.parse_failures += 1;
+            if tally.first_parse_error.is_none() {
+                tally.first_parse_error = Some(e.to_string());
+            }
+            return;
+        }
+    };
+
+    if let Some(reason) = chunk.prompt_feedback.and_then(|f| f.block_reason) {
+        if tally.block_reason.is_none() {
+            tally.block_reason = Some(reason);
+        }
+    }
+    if let Some(usage) = chunk.usage {
+        tally.prompt_tokens = usage.prompt_tokens.or(tally.prompt_tokens);
+        tally.candidate_tokens = usage.candidate_tokens.or(tally.candidate_tokens);
+        tally.thought_tokens = usage.thought_tokens.or(tally.thought_tokens);
+        tally.total_tokens = usage.total_tokens.or(tally.total_tokens);
+    }
+    if let Some(version) = chunk.model_version {
+        tally.model_version = Some(version);
+    }
+    if let Some(id) = chunk.response_id {
+        tally.response_id = Some(id);
+    }
+
+    for candidate in &chunk.candidates {
+        tally.candidates += 1;
+        if let Some(reason) = &candidate.finish_reason {
+            tally.note_finish_reason(reason);
+        }
+        let Some(content) = &candidate.content else {
+            continue;
+        };
+        for part in &content.parts {
+            tally.parts += 1;
+            if part.thought {
+                tally.thought_parts += 1;
+                continue;
+            }
+            if part.text.is_empty() {
+                continue;
+            }
+            tally.text_parts += 1;
+            full.push_str(&part.text);
+            events.push(GenerateEvent::Text(part.text.clone()));
+        }
+    }
+}
+
+/// Read the whole body, folding each complete event into the tally as it
+/// arrives. Bytes are buffered as bytes, not as lossy text: a chunk boundary
+/// falls mid-character often enough in any language with accents, and decoding
+/// each chunk on its own turns that character into a replacement mark.
+async fn read_sse_body(
+    resp: &mut reqwest::Response,
     cancel: &CancelFlag,
-) -> Result<Vec<GenerateEvent>, SummarizeError> {
-    let mut buf = String::new();
-    let mut full = String::new();
-    let mut events = Vec::new();
+    tally: &mut CallTally,
+    events: &mut Vec<GenerateEvent>,
+    full: &mut String,
+) -> Result<(), SummarizeError> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut bom_checked = false;
 
     loop {
         if cancel.is_cancelled() {
@@ -259,45 +578,23 @@ async fn drain_sse(
         }
         match resp.chunk().await {
             Ok(Some(bytes)) => {
-                buf.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(pos) = buf.find("\n\n") {
-                    let event_block = buf[..pos].to_string();
-                    buf.drain(..pos + 2);
-                    let data: String = event_block
-                        .lines()
-                        .filter_map(|line| line.strip_prefix("data:"))
-                        .map(|rest| rest.trim_start())
-                        .collect::<Vec<_>>()
-                        .join("");
-                    if data.is_empty() || data == "[DONE]" {
-                        continue;
+                buf.extend_from_slice(&bytes);
+                if !bom_checked && buf.len() >= BOM.len() {
+                    if buf.starts_with(&BOM) {
+                        buf.drain(..BOM.len());
+                        tally.bom = true;
                     }
-                    let chunk: GenerateChunk = match serde_json::from_str(&data) {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-                    if let Some(reason) = chunk.prompt_feedback.and_then(|f| f.block_reason) {
-                        return Err(SummarizeError::Rejected(format!(
-                            "blocked before it could answer ({reason})"
-                        )));
-                    }
-                    for candidate in &chunk.candidates {
-                        if let Some(reason) = &candidate.finish_reason {
-                            if is_blocked_finish_reason(reason) {
-                                return Err(SummarizeError::Rejected(format!(
-                                    "the reply was blocked ({reason})"
-                                )));
-                            }
-                        }
-                        if let Some(content) = &candidate.content {
-                            for part in &content.parts {
-                                if !part.text.is_empty() {
-                                    full.push_str(&part.text);
-                                    events.push(GenerateEvent::Text(part.text.clone()));
-                                }
-                            }
-                        }
-                    }
+                    bom_checked = true;
+                }
+                while let Some((end, consumed)) = next_event(&buf) {
+                    // The blank line between events is where the framing shows
+                    // itself, and it is about to be thrown away, so read it
+                    // first: `crlf` in the log line is the whole diagnosis.
+                    let separator = buf[end..consumed].to_vec();
+                    let block = buf[..end].to_vec();
+                    buf.drain(..consumed);
+                    note_line_endings(&separator, tally);
+                    absorb_event(&block, tally, events, full);
                 }
             }
             Ok(None) => break,
@@ -305,11 +602,147 @@ async fn drain_sse(
         }
     }
 
-    if full.is_empty() {
-        return Err(SummarizeError::Failed("the reply came back empty".into()));
+    // A last event with no blank line after it is still an event. Google's
+    // stream normally ends with the separator, but a proxy that closes the
+    // connection promptly does not have to, and dropping the final chunk means
+    // dropping the end of the recap — or, when the whole reply arrives as one
+    // unterminated block, the entire thing.
+    tally.leftover_bytes = buf.len();
+    if !buf.is_empty() {
+        absorb_event(&buf, tally, events, full);
     }
+    Ok(())
+}
+
+/// Parse one Server-Sent-Events response (`alt=sse`) into the events it
+/// describes, accumulating the full reply as it goes.
+///
+/// Every path through here logs exactly one telemetry line first, then decides
+/// what the outcome was. The three failures are told apart on purpose:
+///
+/// * **blocked** — Google answered and refused. Nothing to retry.
+/// * **empty** — Google answered, Echo read it, there was no text in it.
+/// * **malformed** — events arrived and none of them parsed. Echo's bug, not
+///   the meeting's, and the counters in the log line say which one.
+async fn drain_sse(
+    mut resp: reqwest::Response,
+    cancel: &CancelFlag,
+    model: &str,
+) -> Result<Vec<GenerateEvent>, SummarizeError> {
+    let mut tally = CallTally::default();
+    let mut events = Vec::new();
+    let mut full = String::new();
+
+    let transport = read_sse_body(&mut resp, cancel, &mut tally, &mut events, &mut full).await;
+    tally.text_chars = full.chars().count();
+    tally.log(model);
+    transport?;
+
+    if let Some(reason) = tally
+        .block_reason
+        .clone()
+        .or_else(|| tally.blocking_finish_reason.clone())
+    {
+        return Err(SummarizeError::Blocked { reason });
+    }
+    if full.is_empty() {
+        if tally.parse_failures > 0 {
+            return Err(SummarizeError::MalformedReply);
+        }
+        return Err(SummarizeError::EmptyReply);
+    }
+
     events.push(GenerateEvent::Done { text: full });
     Ok(events)
+}
+
+/// The keys Google's `Schema` actually defines. Everything else in a JSON
+/// Schema — `additionalProperties`, `minLength`, `$schema`, `title` — is not
+/// part of it, and sending one is a 400 for the whole request.
+const SCHEMA_KEYS_KEPT: &[&str] = &[
+    "description",
+    "enum",
+    "format",
+    "maxItems",
+    "minItems",
+    "nullable",
+    "required",
+];
+
+/// Translate a JSON Schema into the `Schema` shape Google's `responseSchema`
+/// takes.
+///
+/// Two fields can carry a schema. `responseJsonSchema` accepts JSON Schema as
+/// written, but only on the newest model families — and Echo lets a person pick
+/// any model from Google's catalogue, including the older ones, where that field
+/// is not recognised and the request fails. `responseSchema` is understood by
+/// every model that can do structured output at all, so that is the one Echo
+/// sends, with the schema translated to its shape:
+///
+/// * a type is a single value, uppercase (`"OBJECT"`), never a list
+/// * nullability is `nullable: true`, not `"type": ["string", "null"]`
+/// * keys Google does not define are dropped rather than sent and rejected
+///
+/// Nothing is lost by dropping them: the reply is validated locally against the
+/// real schema either way ([`crate::summarize`] parses it with unknown fields
+/// denied), which is what actually enforces strictness. The provider schema only
+/// has to be good enough to shape the reply.
+fn to_gemini_schema(schema: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = schema.as_object() else {
+        // Not a schema object we understand; send it as it came rather than
+        // inventing something.
+        return schema.clone();
+    };
+
+    let mut out = serde_json::Map::new();
+    let mut nullable = false;
+
+    if let Some(ty) = object.get("type") {
+        match ty {
+            serde_json::Value::Array(members) => {
+                for member in members {
+                    match member.as_str() {
+                        Some("null") => nullable = true,
+                        Some(name) => {
+                            out.entry("type")
+                                .or_insert_with(|| gemini_type_name(name).into());
+                        }
+                        None => {}
+                    }
+                }
+            }
+            serde_json::Value::String(name) => {
+                out.insert("type".into(), gemini_type_name(name).into());
+            }
+            _ => {}
+        }
+    }
+
+    for key in SCHEMA_KEYS_KEPT {
+        if let Some(value) = object.get(*key) {
+            out.insert((*key).to_string(), value.clone());
+        }
+    }
+    if nullable {
+        out.insert("nullable".into(), true.into());
+    }
+    if let Some(items) = object.get("items") {
+        out.insert("items".into(), to_gemini_schema(items));
+    }
+    if let Some(serde_json::Value::Object(properties)) = object.get("properties") {
+        let translated: serde_json::Map<String, serde_json::Value> = properties
+            .iter()
+            .map(|(name, value)| (name.clone(), to_gemini_schema(value)))
+            .collect();
+        out.insert("properties".into(), translated.into());
+    }
+
+    out.into()
+}
+
+/// Google's `Type` enum spells its members in capitals.
+fn gemini_type_name(name: &str) -> String {
+    name.to_ascii_uppercase()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -321,7 +754,6 @@ async fn run_generate_content(
     system: Option<String>,
     prompt: String,
     json_schema: Option<serde_json::Value>,
-    temperature: Option<f32>,
     timeout: Duration,
     cancel: CancelFlag,
 ) -> Result<Vec<GenerateEvent>, SummarizeError> {
@@ -332,17 +764,27 @@ async fn run_generate_content(
     let base = api_base.trim_end_matches('/');
     let url = format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse");
 
-    let mut generation_config = serde_json::json!({ "temperature": temperature.unwrap_or(0.2) });
-    if let Some(schema) = json_schema {
-        generation_config["responseMimeType"] =
-            serde_json::Value::String("application/json".into());
-        generation_config["responseSchema"] = schema;
+    // No sampling settings at all. Echo used to force temperature 0.2 on every
+    // request; Google asks that recent Gemini models be left at their defaults
+    // and warns that a low temperature is a cause of degraded, looping or empty
+    // replies. What Echo wants — a factual recap — is the model's default
+    // behaviour, not something to be dialled in. (Ollama still takes the number;
+    // that is its own backend's setting.)
+    let mut generation_config = serde_json::Map::new();
+    if let Some(schema) = &json_schema {
+        generation_config.insert(
+            "responseMimeType".into(),
+            serde_json::Value::String("application/json".into()),
+        );
+        generation_config.insert("responseSchema".into(), to_gemini_schema(schema));
     }
 
     let mut body = serde_json::json!({
         "contents": [{ "role": "user", "parts": [{ "text": prompt }] }],
-        "generationConfig": generation_config,
     });
+    if !generation_config.is_empty() {
+        body["generationConfig"] = generation_config.into();
+    }
     if let Some(sys) = &system {
         body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": sys }] });
     }
@@ -360,16 +802,32 @@ async fn run_generate_content(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        // One line for a call that never got as far as a reply, so the log
+        // still accounts for every request. The status, not the body: an error
+        // body is Google's prose, and this line is for counting.
+        tracing::info!(
+            target: TELEMETRY_TARGET,
+            model = %model,
+            status = status.as_u16(),
+            json_mode = json_schema.is_some(),
+            "gemini refused the call"
+        );
         // The saved model is gone or was never right. Say so in words the person
         // can act on instead of handing them Google's sentence about API
         // versions and generation methods.
         if is_model_not_found(status, &text) {
+            tracing::warn!(
+                target: TELEMETRY_TARGET,
+                model = %model,
+                status = status.as_u16(),
+                "the saved model is not one Google answers for"
+            );
             return Err(SummarizeError::ModelNotFound { model });
         }
         return Err(classify_status(status, &text));
     }
 
-    drain_sse(resp, &cancel).await
+    drain_sse(resp, &cancel, &model).await
 }
 
 impl Connector for GeminiConnector {
@@ -439,6 +897,18 @@ impl Connector for GeminiConnector {
                     models: Vec::new(),
                     leaves_machine: true,
                 }),
+                // The key is fine. Saying "that key wasn't accepted" here sent
+                // people to re-paste a key that was never the problem — what
+                // ran out was the allowance behind it.
+                Err(SummarizeError::QuotaExhausted) => Ok(ProviderTestResult {
+                    ok: false,
+                    message: "That key works, but Google says it has no room left right now. \
+                              Try again later."
+                        .into(),
+                    caps,
+                    models: Vec::new(),
+                    leaves_machine: true,
+                }),
                 Err(SummarizeError::Unreachable(_)) => Ok(ProviderTestResult {
                     ok: false,
                     message: "Echo couldn't reach Google. Check your internet connection.".into(),
@@ -466,7 +936,7 @@ impl Connector for GeminiConnector {
         let system = req.system.clone();
         let prompt = req.prompt.clone();
         let json_schema = req.json_schema.clone();
-        let temperature = req.temperature;
+        // `req.temperature` is deliberately not read: see `run_generate_content`.
         let timeout = req.timeout;
         let cancel = req.cancel.clone();
 
@@ -478,7 +948,6 @@ impl Connector for GeminiConnector {
             system,
             prompt,
             json_schema,
-            temperature,
             timeout,
             cancel,
         );
@@ -875,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_status_maps_auth_and_quota_errors() {
+    fn classify_status_tells_a_refused_key_from_a_used_up_allowance() {
         assert!(matches!(
             classify_status(reqwest::StatusCode::UNAUTHORIZED, "{}"),
             SummarizeError::Rejected(_)
@@ -884,9 +1353,10 @@ mod tests {
             classify_status(reqwest::StatusCode::FORBIDDEN, "{}"),
             SummarizeError::Rejected(_)
         ));
+        // 429 is its own thing: the key was accepted, the allowance was not.
         assert!(matches!(
             classify_status(reqwest::StatusCode::TOO_MANY_REQUESTS, "{}"),
-            SummarizeError::Rejected(_)
+            SummarizeError::QuotaExhausted
         ));
         assert!(matches!(
             classify_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "{}"),
@@ -895,101 +1365,476 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_sse_accumulates_text_across_events_and_emits_done() {
+    async fn a_used_up_allowance_is_never_reported_as_a_bad_key() {
         let server = MockServer::start().await;
-        let body = concat!(
-            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}]}\n\n",
-            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\", world\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}]}\n\n",
-        );
         Mock::given(method("GET"))
-            .and(path("/stream"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_raw(body.as_bytes(), "text/event-stream"),
-            )
+            .and(path("/v1beta/models"))
+            .respond_with(ResponseTemplate::new(429).set_body_string(
+                "{\"error\":{\"code\":429,\"message\":\"Resource has been exhausted\",\
+                 \"status\":\"RESOURCE_EXHAUSTED\"}}",
+            ))
             .mount(&server)
             .await;
 
+        let connector = GeminiConnector::new("good-key", None).with_api_base(server.uri());
+        let result = connector.check().await.unwrap();
+        assert!(!result.ok);
+        let lower = result.message.to_lowercase();
+        assert!(
+            !lower.contains("wasn't accepted") && !lower.contains("check it"),
+            "quota exhaustion must not blame the key: {}",
+            result.message
+        );
+        assert!(lower.contains("no room left"), "{}", result.message);
+    }
+
+    // -- SSE framing -------------------------------------------------------
+    //
+    // The bug these were written for: a reply that arrived framed with `\r\n\r\n`
+    // was never split into events at all, every event was dropped without a
+    // word, and the person was told "the reply came back empty" three times in
+    // a row with nothing in the log to say otherwise.
+
+    /// Serve `body` once as a `text/event-stream` and drain it the way a real
+    /// call does, over a real socket.
+    async fn drain(body: &[u8]) -> Result<Vec<GenerateEvent>, SummarizeError> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/stream"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(body.to_vec(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
         let resp = reqwest::Client::new()
             .get(format!("{}/stream", server.uri()))
             .send()
             .await
             .unwrap();
-        let events = drain_sse(resp, &CancelFlag::new()).await.unwrap();
-        let texts: Vec<String> = events
+        drain_sse(resp, &CancelFlag::new(), "test-model").await
+    }
+
+    fn done_text(events: &[GenerateEvent]) -> String {
+        match events.last() {
+            Some(GenerateEvent::Done { text }) => text.clone(),
+            other => panic!("expected a Done event last, got {other:?}"),
+        }
+    }
+
+    fn streamed_text(events: &[GenerateEvent]) -> Vec<String> {
+        events
             .iter()
             .filter_map(|e| match e {
                 GenerateEvent::Text(t) => Some(t.clone()),
                 _ => None,
             })
-            .collect();
-        assert_eq!(texts, vec!["Hello".to_string(), ", world".to_string()]);
+            .collect()
+    }
+
+    fn text_event(text: &str) -> String {
+        format!(
+            "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{text}\"}}]}}}}]}}"
+        )
+    }
+
+    #[test]
+    fn event_boundaries_are_found_for_every_line_ending() {
+        // LF, CRLF, CR, and the mixed pairs a proxy can produce.
+        for sep in ["\n\n", "\r\n\r\n", "\r\r", "\n\r\n", "\r\n\n"] {
+            let body = format!("data: one{sep}data: two\n\n");
+            let (end, consumed) = next_event(body.as_bytes()).expect("an event should be found");
+            assert_eq!(&body.as_bytes()[..end], b"data: one", "separator {sep:?}");
+            assert_eq!(consumed, end + sep.len(), "separator {sep:?}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_cr_waits_for_the_rest_of_its_line_ending() {
+        // "…\n\r" could be a blank line ending in CRLF whose LF is still in
+        // flight. Splitting there would cut the next event in half.
+        assert!(next_event(b"data: one\n\r").is_none());
+        assert!(next_event(b"data: one\n").is_none());
+        assert!(next_event(b"data: one").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reply_framed_with_crlf_is_read_end_to_end() {
+        let body = format!(
+            "{}\r\n\r\ndata: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\", world\"}}],\
+             \"role\":\"model\"}},\"finishReason\":\"STOP\"}}],\"usageMetadata\":\
+             {{\"promptTokenCount\":11,\"candidatesTokenCount\":3,\"totalTokenCount\":14}},\
+             \"modelVersion\":\"gemini-3.7-flash\"}}\r\n\r\n",
+            text_event("Hello")
+        );
+        let events = drain(body.as_bytes()).await.unwrap();
+        assert_eq!(streamed_text(&events), vec!["Hello", ", world"]);
+        assert_eq!(done_text(&events), "Hello, world");
+    }
+
+    #[tokio::test]
+    async fn a_reply_framed_with_lf_still_works() {
+        let body = format!("{}\n\n{}\n\n", text_event("Hello"), text_event(" again"));
+        let events = drain(body.as_bytes()).await.unwrap();
+        assert_eq!(done_text(&events), "Hello again");
+    }
+
+    #[tokio::test]
+    async fn the_last_event_is_read_even_without_its_blank_line() {
+        // The body simply stops after the final event. Everything still in the
+        // buffer at that point is an event, not rubbish to throw away.
+        let body = format!(
+            "{}\r\n\r\n{}",
+            text_event("first half "),
+            text_event("second half")
+        );
+        let events = drain(body.as_bytes()).await.unwrap();
+        assert_eq!(done_text(&events), "first half second half");
+    }
+
+    #[tokio::test]
+    async fn a_whole_reply_that_never_gets_a_blank_line_is_still_read() {
+        let events = drain(text_event("all of it").as_bytes()).await.unwrap();
+        assert_eq!(done_text(&events), "all of it");
+    }
+
+    #[tokio::test]
+    async fn a_byte_order_mark_in_front_of_the_stream_is_ignored() {
+        let mut body = BOM.to_vec();
+        body.extend_from_slice(format!("{}\n\n", text_event("with a mark")).as_bytes());
+        let events = drain(&body).await.unwrap();
+        assert_eq!(done_text(&events), "with a mark");
+    }
+
+    #[tokio::test]
+    async fn several_data_lines_in_one_event_are_joined_with_a_newline() {
+        // One JSON object split across two `data:` lines, which is what the
+        // spec says to expect. Concatenating them with nothing in between (the
+        // old behaviour) leaves valid-looking JSON only by luck.
+        let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"line one\\nline two\"}]}}]}\n\n";
+        let events = drain(body.as_bytes()).await.unwrap();
+        assert_eq!(done_text(&events), "line one\nline two");
+
+        let split = "data: {\"candidates\":[{\"content\":\ndata: {\"parts\":[{\"text\":\"joined\"}]}}]}\n\n";
+        let events = drain(split.as_bytes()).await.unwrap();
+        assert_eq!(done_text(&events), "joined");
+    }
+
+    #[tokio::test]
+    async fn comments_and_keep_alives_are_not_mistaken_for_data() {
+        let body = format!(": keep-alive\n\nevent: message\n{}\n\n", text_event("hi"));
+        let events = drain(body.as_bytes()).await.unwrap();
+        assert_eq!(done_text(&events), "hi");
+    }
+
+    #[tokio::test]
+    async fn a_done_marker_is_not_an_empty_reply() {
+        let body = format!("{}\n\ndata: [DONE]\n\n", text_event("finished"));
+        let events = drain(body.as_bytes()).await.unwrap();
+        assert_eq!(done_text(&events), "finished");
+    }
+
+    // -- the three ways a reply can come back with no recap in it -----------
+
+    #[tokio::test]
+    async fn a_blocked_prompt_is_blocked_not_empty() {
+        let body = "data: {\"candidates\":[],\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n";
+        let err = drain(body.as_bytes()).await.unwrap_err();
         assert!(
-            matches!(events.last(), Some(GenerateEvent::Done { text }) if text == "Hello, world")
+            matches!(&err, SummarizeError::Blocked { reason } if reason == "SAFETY"),
+            "{err:?}"
         );
     }
 
     #[tokio::test]
-    async fn drain_sse_maps_a_safety_block_to_rejected() {
-        let server = MockServer::start().await;
-        let body = "data: {\"candidates\":[{\"finishReason\":\"SAFETY\"}]}\n\n";
-        Mock::given(method("GET"))
-            .and(path("/stream"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_raw(body.as_bytes(), "text/event-stream"),
-            )
-            .mount(&server)
-            .await;
-
-        let resp = reqwest::Client::new()
-            .get(format!("{}/stream", server.uri()))
-            .send()
-            .await
-            .unwrap();
-        let err = drain_sse(resp, &CancelFlag::new()).await.unwrap_err();
-        assert!(matches!(err, SummarizeError::Rejected(_)));
+    async fn a_blocked_answer_is_blocked_not_empty() {
+        for reason in ["SAFETY", "RECITATION", "PROHIBITED_CONTENT"] {
+            let body = format!("data: {{\"candidates\":[{{\"finishReason\":\"{reason}\"}}]}}\n\n");
+            let err = drain(body.as_bytes()).await.unwrap_err();
+            assert!(
+                matches!(&err, SummarizeError::Blocked { reason: r } if r == reason),
+                "{err:?}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn drain_sse_maps_a_blocked_prompt_to_rejected() {
-        let server = MockServer::start().await;
-        let body = "data: {\"candidates\":[],\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n";
-        Mock::given(method("GET"))
-            .and(path("/stream"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_raw(body.as_bytes(), "text/event-stream"),
-            )
-            .mount(&server)
-            .await;
+    async fn a_reply_with_no_text_in_it_is_empty() {
+        // Read cleanly, nothing in it: candidates with no parts, then none at
+        // all. Both are "Google had nothing to say", not a framing bug.
+        let bodies = [
+            "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n",
+            "data: {\"candidates\":[]}\n\n",
+            "",
+        ];
+        for body in bodies {
+            let err = drain(body.as_bytes()).await.unwrap_err();
+            assert!(
+                matches!(err, SummarizeError::EmptyReply),
+                "{body:?} gave {err:?}"
+            );
+        }
+    }
 
-        let resp = reqwest::Client::new()
-            .get(format!("{}/stream", server.uri()))
-            .send()
-            .await
-            .unwrap();
-        let err = drain_sse(resp, &CancelFlag::new()).await.unwrap_err();
-        assert!(matches!(err, SummarizeError::Rejected(_)));
+    #[tokio::test]
+    async fn events_that_none_of_them_parse_are_a_malformed_reply_not_an_empty_one() {
+        // Events arrived and Echo could not read one of them. That is Echo's
+        // bug to fix, and it must not look like the model having nothing to say.
+        let body = "data: <html>gateway error</html>\n\ndata: also not json\n\n";
+        let err = drain(body.as_bytes()).await.unwrap_err();
+        assert!(matches!(err, SummarizeError::MalformedReply), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_event_does_not_lose_the_rest_of_the_reply() {
+        let body = format!("data: not json\n\n{}\n\n", text_event("the recap"));
+        let events = drain(body.as_bytes()).await.unwrap();
+        assert_eq!(done_text(&events), "the recap");
+    }
+
+    #[tokio::test]
+    async fn a_models_own_reasoning_never_lands_in_the_recap() {
+        let body = "data: {\"candidates\":[{\"content\":{\"parts\":[\
+                    {\"text\":\"thinking out loud\",\"thought\":true},\
+                    {\"text\":\"the recap\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        let events = drain(body.as_bytes()).await.unwrap();
+        assert_eq!(done_text(&events), "the recap");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_reply_is_kept_rather_than_thrown_away() {
+        let body =
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"as far as it got\"}]},\
+                    \"finishReason\":\"MAX_TOKENS\"}]}\n\n";
+        let events = drain(body.as_bytes()).await.unwrap();
+        assert_eq!(done_text(&events), "as far as it got");
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_finish_reason_is_not_treated_as_a_refusal() {
+        let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"fine\"}]},\
+                    \"finishReason\":\"FINISH_REASON_UNSPECIFIED\"}]}\n\n";
+        let events = drain(body.as_bytes()).await.unwrap();
+        assert_eq!(done_text(&events), "fine");
     }
 
     #[tokio::test]
     async fn drain_sse_respects_cancellation() {
+        let cancel = CancelFlag::new();
+        cancel.cancel();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(format!("{}\n\n", text_event("hi")), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let resp = reqwest::Client::new()
+            .get(format!("{}/stream", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        let err = drain_sse(resp, &cancel, "test-model").await.unwrap_err();
+        assert!(matches!(err, SummarizeError::Cancelled));
+    }
+
+    // -- what the tally counts --------------------------------------------
+
+    #[test]
+    fn the_tally_separates_events_from_the_ones_that_parsed() {
+        let mut tally = CallTally::default();
+        let mut events = Vec::new();
+        let mut full = String::new();
+
+        absorb_event(b": keep-alive", &mut tally, &mut events, &mut full);
+        absorb_event(b"data: not json", &mut tally, &mut events, &mut full);
+        absorb_event(
+            text_event("hi").as_bytes(),
+            &mut tally,
+            &mut events,
+            &mut full,
+        );
+
+        assert_eq!(tally.keepalives, 1);
+        assert_eq!(tally.events, 2);
+        assert_eq!(tally.parsed, 1);
+        assert_eq!(tally.parse_failures, 1);
+        assert!(tally.first_parse_error.is_some());
+        assert_eq!(tally.candidates, 1);
+        assert_eq!(tally.parts, 1);
+        assert_eq!(tally.text_parts, 1);
+        assert_eq!(full, "hi");
+    }
+
+    #[test]
+    fn the_tally_reports_which_line_endings_the_reply_used() {
+        let mut tally = CallTally::default();
+        let (mut events, mut full) = (Vec::new(), String::new());
+        absorb_event(b"data: not json\r\n", &mut tally, &mut events, &mut full);
+        assert_eq!(tally.line_endings(), "crlf");
+
+        let mut tally = CallTally::default();
+        absorb_event(b"data: not json\n", &mut tally, &mut events, &mut full);
+        assert_eq!(tally.line_endings(), "lf");
+    }
+
+    #[test]
+    fn the_framing_itself_is_what_the_line_ending_field_reports() {
+        // An event can contain no line ending at all — the framing is the blank
+        // line between events, which is exactly the byte run that gets thrown
+        // away. Reading it is what makes "crlf" show up in the log next to a
+        // reply that came back empty.
+        for (body, expected) in [
+            (&b"data: one\r\n\r\ndata: two\r\n\r\n"[..], "crlf"),
+            (&b"data: one\n\ndata: two\n\n"[..], "lf"),
+            (&b"data: one\r\rdata: two\r\r"[..], "cr"),
+            (&b"data: one\r\n\ndata: two\n\n"[..], "mixed"),
+        ] {
+            let mut tally = CallTally::default();
+            let mut buf = body.to_vec();
+            while let Some((end, consumed)) = next_event(&buf) {
+                let separator = buf[end..consumed].to_vec();
+                note_line_endings(&separator, &mut tally);
+                buf.drain(..consumed);
+            }
+            assert_eq!(tally.line_endings(), expected, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn the_tally_keeps_counts_and_never_content() {
+        let mut tally = CallTally::default();
+        let (mut events, mut full) = (Vec::new(), String::new());
+        absorb_event(
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"secret meeting words\"}]},\
+              \"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":7,\
+              \"candidatesTokenCount\":2,\"thoughtsTokenCount\":1,\"totalTokenCount\":10},\
+              \"modelVersion\":\"gemini-3.7-flash\",\"responseId\":\"abc123\"}",
+            &mut tally,
+            &mut events,
+            &mut full,
+        );
+        assert_eq!(tally.prompt_tokens, Some(7));
+        assert_eq!(tally.candidate_tokens, Some(2));
+        assert_eq!(tally.thought_tokens, Some(1));
+        assert_eq!(tally.total_tokens, Some(10));
+        assert_eq!(tally.model_version.as_deref(), Some("gemini-3.7-flash"));
+        assert_eq!(tally.response_id.as_deref(), Some("abc123"));
+        assert_eq!(tally.finish_reasons, vec!["STOP".to_string()]);
+        // Nothing the model wrote is in the tally; the length of it is.
+        let printed = format!("{tally:?}");
+        assert!(!printed.contains("secret meeting words"), "{printed}");
+    }
+
+    // -- the JSON-mode request shape ---------------------------------------
+
+    #[test]
+    fn a_json_schema_becomes_the_shape_google_documents() {
+        let translated = to_gemini_schema(&crate::summarize::templates::action_item_schema());
+        let expected = serde_json::json!({
+            "type": "OBJECT",
+            "required": ["items"],
+            "properties": {
+                "items": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "required": ["description"],
+                        "properties": {
+                            "description": { "type": "STRING" },
+                            // `["string","null"]` is not a type Google accepts.
+                            "owner": { "type": "STRING", "nullable": true },
+                            "dueHint": { "type": "STRING", "nullable": true }
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(translated, expected);
+        // The keys that made the whole request a 400 are gone.
+        let printed = translated.to_string();
+        assert!(!printed.contains("additionalProperties"), "{printed}");
+        assert!(!printed.contains("minLength"), "{printed}");
+    }
+
+    #[tokio::test]
+    async fn a_json_mode_call_sends_a_schema_google_accepts_and_no_sampling_settings() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1beta/models/{DEFAULT_MODEL}:streamGenerateContent"
+            )))
             .respond_with(ResponseTemplate::new(200).set_body_raw(
-                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n",
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"{\\\"items\\\":[]}\"}]},\
+                 \"finishReason\":\"STOP\"}]}\r\n\r\n",
                 "text/event-stream",
             ))
             .mount(&server)
             .await;
 
-        let resp = reqwest::Client::new()
-            .get(format!("{}/stream", server.uri()))
-            .send()
-            .await
-            .unwrap();
-        let cancel = CancelFlag::new();
-        cancel.cancel();
-        let err = drain_sse(resp, &cancel).await.unwrap_err();
-        assert!(matches!(err, SummarizeError::Cancelled));
+        let connector = GeminiConnector::new("test-key", None).with_api_base(server.uri());
+        let events: Vec<_> = connector
+            .generate(GenerateRequest {
+                prompt: "list the tasks".into(),
+                json_schema: Some(crate::summarize::templates::action_item_schema()),
+                ..Default::default()
+            })
+            .collect()
+            .await;
+        assert_eq!(
+            done_text(&events.into_iter().map(|e| e.unwrap()).collect::<Vec<_>>()),
+            "{\"items\":[]}"
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let config = &body["generationConfig"];
+        assert_eq!(config["responseMimeType"], "application/json");
+        assert_eq!(config["responseSchema"]["type"], "OBJECT");
+        assert_eq!(
+            config["responseSchema"]["properties"]["items"]["items"]["properties"]["owner"]
+                ["nullable"],
+            true
+        );
+        // The legacy field, not the JSON-Schema one: every model that can do
+        // structured output understands this one.
+        assert!(config.get("responseJsonSchema").is_none(), "{config}");
+        // Sampling is the model's business (Google's own guidance for 3.x).
+        assert!(config.get("temperature").is_none(), "{config}");
+        assert!(config.get("topP").is_none(), "{config}");
+        assert!(config.get("topK").is_none(), "{config}");
+    }
+
+    #[tokio::test]
+    async fn a_plain_recap_call_sends_no_generation_config_at_all() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1beta/models/{DEFAULT_MODEL}:streamGenerateContent"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"recap\"}]},\
+                 \"finishReason\":\"STOP\"}]}\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+
+        let connector = GeminiConnector::new("test-key", None).with_api_base(server.uri());
+        let _: Vec<_> = connector
+            .generate(GenerateRequest {
+                prompt: "write a recap".into(),
+                // Even when a caller passes one, Gemini does not send it.
+                temperature: Some(0.2),
+                ..Default::default()
+            })
+            .collect()
+            .await;
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(body.get("generationConfig").is_none(), "{body}");
     }
 }

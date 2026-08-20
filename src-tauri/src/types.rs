@@ -1178,9 +1178,6 @@ pub struct Settings {
     pub auto_summarize: bool,
     /// Quality preset id.
     pub accuracy_level_id: String,
-    /// Minutes of idleness after which speech understanding is released from
-    /// memory (mantra 1).
-    pub release_after_idle_minutes: u32,
     /// Close the window to the tray instead of quitting.
     pub close_to_tray: bool,
     pub onboarding_complete: bool,
@@ -1204,7 +1201,6 @@ impl Default for Settings {
             // decide recaps are off.
             auto_summarize: crate::settings::DEFAULT_AUTO_SUMMARIZE,
             accuracy_level_id: "everyday".to_string(),
-            release_after_idle_minutes: 10,
             close_to_tray: true,
             onboarding_complete: false,
             show_advanced: false,
@@ -1226,7 +1222,6 @@ pub struct SettingsPatch {
     pub summary_template_id: Option<Id>,
     pub auto_summarize: Option<bool>,
     pub accuracy_level_id: Option<String>,
-    pub release_after_idle_minutes: Option<u32>,
     pub close_to_tray: Option<bool>,
     pub onboarding_complete: Option<bool>,
     pub show_advanced: Option<bool>,

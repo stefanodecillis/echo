@@ -290,9 +290,6 @@ export const settings = {
   summaryLanguageMeeting: "Same as the meeting",
   summaryLanguageEnglish: "English",
   summaryLanguageFixed: "Always this language",
-  accuracyLevelLabel: "How carefully Echo listens",
-  accuracyLevelDescription:
-    "A more careful setting takes a little longer but hears more correctly.",
   summaryProviderOnDevice: "On this computer",
   summaryProviderOnDeviceDescription:
     "Runs an AI model on this Mac through the Ollama app. Nothing leaves your computer.",
@@ -321,13 +318,17 @@ export const settings = {
   summaryLanguageCustomPlaceholder: "e.g. French",
 
   // Speech
-  speechCurrentBadge: "Current",
-  speechRecommendedBadge: "Recommended",
+  speechReadyTitle: "Echo can understand speech",
+  speechReadyDescription: "It's ready to listen whenever you record.",
+  speechReadyBadge: "Ready to use",
+  speechNotReadyTitle: "Not set up yet",
+  speechNotReadyDescription:
+    "Echo needs a one-time download before it can understand speech.",
+  speechStorageLabel: "Storage used",
   speechDownloadButton: "Download",
+  speechResumeButton: "Resume download",
   speechRemoveButton: "Remove",
   speechCancelButton: "Cancel",
-  speechUseButton: "Use this",
-  speechInstalledNote: "Ready to use",
   speechDownloadError:
     "That download didn't finish. Check your connection and try again.",
 
@@ -433,7 +434,6 @@ export const onboarding = {
   stepDownloadSize: "1.6 GB, one time",
   stepDownloadDescription:
     "This happens once. After that, Echo works without sending anything anywhere.",
-  chooseSmallerButton: "Use a smaller, faster download instead",
   downloadRetryButton: "Try downloading again",
   stepSummariesTitle: "Who writes your recaps?",
   summariesIntro:

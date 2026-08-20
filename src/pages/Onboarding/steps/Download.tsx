@@ -1,15 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Button } from "../../../components/Button";
 import { ProgressBar } from "../../../components/ProgressBar";
 import { DownloadIcon } from "../../../components/icons";
 import { formatBytes } from "../../../components/lib/format";
 import { useDownloadProgress } from "../../../hooks/useDownloadProgress";
-import {
-  cancelSpeechDownload,
-  downloadSpeechAssets,
-  listAccuracyLevels,
-} from "../../../lib/ipc";
+import { downloadSpeechAssets, listAccuracyLevels } from "../../../lib/ipc";
 import { anchors, common, onboarding as copy } from "../../../lib/copy";
 import type { AccuracyLevel, Id } from "../../../lib/types";
 
@@ -21,8 +17,7 @@ export interface DownloadStepProps {
 /** Step 3 of 4: the one-time download, started automatically so a person who
  * just clicks "Continue" through onboarding ends up ready to record. */
 export function DownloadStep({ onNext, onBack }: DownloadStepProps) {
-  const [levels, setLevels] = useState<AccuracyLevel[] | null>(null);
-  const [levelId, setLevelId] = useState<string | null>(null);
+  const [level, setLevel] = useState<AccuracyLevel | null>(null);
   const [assetId, setAssetId] = useState<Id | null>(null);
   const [error, setError] = useState<string | null>(null);
   const progress = useDownloadProgress(assetId ?? undefined);
@@ -30,7 +25,6 @@ export function DownloadStep({ onNext, onBack }: DownloadStepProps) {
   useEffect(() => {
     listAccuracyLevels()
       .then((all) => {
-        setLevels(all);
         const preferred = all.find((l) => l.recommended) ?? all[0];
         if (preferred) beginDownload(preferred);
       })
@@ -38,43 +32,23 @@ export function DownloadStep({ onNext, onBack }: DownloadStepProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function beginDownload(level: AccuracyLevel) {
+  async function beginDownload(preferred: AccuracyLevel) {
     setError(null);
-    setLevelId(level.id);
-    if (level.installed) return;
+    setLevel(preferred);
+    if (preferred.installed) return;
     try {
-      const id = await downloadSpeechAssets(level.id);
+      const id = await downloadSpeechAssets(preferred.id);
       setAssetId(id);
     } catch (err) {
       setError((err as { message: string }).message);
     }
   }
 
-  const currentLevel = useMemo(
-    () => levels?.find((l) => l.id === levelId) ?? null,
-    [levels, levelId],
-  );
-  const smaller = useMemo(() => {
-    if (!levels || !currentLevel) return null;
-    return (
-      levels
-        .filter((l) => l.id !== currentLevel.id && l.downloadBytes < currentLevel.downloadBytes)
-        .sort((a, b) => b.downloadBytes - a.downloadBytes)[0] ?? null
-    );
-  }, [levels, currentLevel]);
-
-  async function useSmaller() {
-    if (!smaller) return;
-    if (assetId) await cancelSpeechDownload(assetId).catch(() => {});
-    setAssetId(null);
-    beginDownload(smaller);
-  }
-
   async function retry() {
-    if (currentLevel) beginDownload(currentLevel);
+    if (level) beginDownload(level);
   }
 
-  const done = currentLevel?.installed || progress?.done;
+  const done = level?.installed || progress?.done;
   const fraction =
     progress && progress.totalBytes > 0 ? progress.receivedBytes / progress.totalBytes : undefined;
 
@@ -109,12 +83,6 @@ export function DownloadStep({ onNext, onBack }: DownloadStepProps) {
             {copy.downloadRetryButton}
           </button>
         </div>
-      )}
-
-      {smaller && !done && (
-        <button type="button" onClick={useSmaller} className="text-xs font-medium text-ink-soft underline underline-offset-2 hover:text-ink">
-          {copy.chooseSmallerButton}
-        </button>
       )}
 
       {!done && !error && (

@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-        let worker = echo_lib::asr::engine::EngineWorker::new(10);
+        let worker = echo_lib::asr::engine::EngineWorker::new();
         worker.configure_from_settings(&db).await?;
         let report = worker.load_now().await?;
         println!(

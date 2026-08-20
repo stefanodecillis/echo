@@ -99,18 +99,112 @@ pub struct RenderContext {
     pub chunk_count: u32,
 }
 
+/// The languages Echo can name outright, by the code speech detection reports.
+///
+/// Whisper reports a language as a two-letter code, and a code is what gets
+/// stored on a segment and on a recap. An instruction that says "write this in
+/// (it)" is asking a model to guess; "write this in Italian" is not. This is the
+/// list of codes worth spelling out — the common ones plus the ones Whisper
+/// detects most often. Anything not here falls back to the code itself, which is
+/// still better than nothing and never lies about what was asked for.
+const LANGUAGE_NAMES: &[(&str, &str)] = &[
+    ("ar", "Arabic"),
+    ("bg", "Bulgarian"),
+    ("ca", "Catalan"),
+    ("cs", "Czech"),
+    ("da", "Danish"),
+    ("de", "German"),
+    ("el", "Greek"),
+    ("en", "English"),
+    ("es", "Spanish"),
+    ("et", "Estonian"),
+    ("fa", "Persian"),
+    ("fi", "Finnish"),
+    ("fr", "French"),
+    ("he", "Hebrew"),
+    ("hi", "Hindi"),
+    ("hr", "Croatian"),
+    ("hu", "Hungarian"),
+    ("id", "Indonesian"),
+    ("is", "Icelandic"),
+    ("it", "Italian"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("lt", "Lithuanian"),
+    ("lv", "Latvian"),
+    ("ms", "Malay"),
+    ("nb", "Norwegian"),
+    ("nl", "Dutch"),
+    ("nn", "Norwegian"),
+    ("no", "Norwegian"),
+    ("pl", "Polish"),
+    ("pt", "Portuguese"),
+    ("ro", "Romanian"),
+    ("ru", "Russian"),
+    ("sk", "Slovak"),
+    ("sl", "Slovenian"),
+    ("sr", "Serbian"),
+    ("sv", "Swedish"),
+    ("th", "Thai"),
+    ("tr", "Turkish"),
+    ("uk", "Ukrainian"),
+    ("vi", "Vietnamese"),
+    ("zh", "Chinese"),
+];
+
+/// The few region-tagged codes where the region is the point: a recap asked for
+/// in `pt-BR` should not come back in European Portuguese.
+const REGIONAL_LANGUAGE_NAMES: &[(&str, &str)] = &[
+    ("pt-br", "Brazilian Portuguese"),
+    ("pt-pt", "European Portuguese"),
+    ("zh-tw", "Traditional Chinese"),
+    ("zh-hant", "Traditional Chinese"),
+    ("zh-hk", "Traditional Chinese"),
+    ("zh-cn", "Simplified Chinese"),
+    ("zh-hans", "Simplified Chinese"),
+];
+
+/// The name of a language, given whatever Echo has: a code (`it`), a
+/// region-tagged code (`pt-BR`), or a name somebody typed themselves
+/// ("Italian", "Bavarian German").
+///
+/// A value that is already a name comes back untouched — the point is only to
+/// stop a bare code reaching a prompt as if it were a word.
+pub fn language_name(language: &str) -> String {
+    let trimmed = language.trim();
+    let lower = trimmed.to_ascii_lowercase().replace('_', "-");
+
+    if let Some((_, name)) = REGIONAL_LANGUAGE_NAMES.iter().find(|(c, _)| *c == lower) {
+        return (*name).to_string();
+    }
+    // A region we have no special name for ("de-AT") still names its language.
+    let base = lower.split('-').next().unwrap_or(&lower);
+    if let Some((_, name)) = LANGUAGE_NAMES.iter().find(|(c, _)| *c == base) {
+        return (*name).to_string();
+    }
+    trimmed.to_string()
+}
+
 /// Plain-English instruction for what language to write in. No jargon here
 /// either — this text can end up quoted in a diagnostics export.
 fn language_directive(ctx: &RenderContext) -> String {
+    language_directive_for(ctx, "the recap")
+}
+
+/// The same instruction about `what` to write — a recap, or a task list.
+fn language_directive_for(ctx: &RenderContext, what: &str) -> String {
     match &ctx.output_language {
         SummaryLanguage::SameAsMeeting => match &ctx.meeting_language {
-            Some(lang) => {
-                format!("Write the recap in the same language the meeting was held in ({lang}).")
-            }
-            None => "Write the recap in the same language the meeting was held in.".to_string(),
+            Some(lang) => format!(
+                "Write {what} in the same language the meeting was held in, {}.",
+                language_name(lang)
+            ),
+            None => format!("Write {what} in the same language the meeting was held in."),
         },
-        SummaryLanguage::English => "Write the recap in English.".to_string(),
-        SummaryLanguage::Fixed(lang) => format!("Write the recap in {lang}."),
+        SummaryLanguage::English => format!("Write {what} in English."),
+        SummaryLanguage::Fixed(lang) => {
+            format!("Write {what} in {}.", language_name(lang))
+        }
     }
 }
 
@@ -200,7 +294,7 @@ pub fn render_action_items(recap_md: &str, ctx: &RenderContext) -> String {
          If there are no tasks, reply with {{\"items\": []}}.\n\n\
          Recap:\n---\n{recap}\n---\n",
         schema = schema_text,
-        due_hint_language = language_directive(ctx),
+        due_hint_language = language_directive_for(ctx, "every task"),
         recap = recap_md,
     )
 }
@@ -381,6 +475,87 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(language_directive(&ctx), "Write the recap in Italian.");
+    }
+
+    // -- language names, not language codes --------------------------------
+    //
+    // Speech detection reports "it"; a prompt that says "write this in (it)"
+    // is asking the model to guess what that means.
+
+    #[test]
+    fn a_language_code_is_spelled_out_as_its_name() {
+        for (code, name) in [
+            ("it", "Italian"),
+            ("IT", "Italian"),
+            (" it ", "Italian"),
+            ("en", "English"),
+            ("de", "German"),
+            ("pt", "Portuguese"),
+            ("zh", "Chinese"),
+            ("nb", "Norwegian"),
+        ] {
+            assert_eq!(language_name(code), name, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_region_is_kept_when_it_changes_the_answer_and_dropped_when_it_does_not() {
+        assert_eq!(language_name("pt-BR"), "Brazilian Portuguese");
+        assert_eq!(language_name("pt_BR"), "Brazilian Portuguese");
+        assert_eq!(language_name("zh-TW"), "Traditional Chinese");
+        assert_eq!(language_name("zh-Hans"), "Simplified Chinese");
+        // No special name for Austrian German; it is still German.
+        assert_eq!(language_name("de-AT"), "German");
+    }
+
+    #[test]
+    fn something_that_is_already_a_language_name_is_left_alone() {
+        assert_eq!(language_name("Italian"), "Italian");
+        assert_eq!(language_name("Swiss German"), "Swiss German");
+        // An unknown code is no worse off than before: it goes through as-is
+        // rather than being turned into a guess.
+        assert_eq!(language_name("xx"), "xx");
+        assert_eq!(language_name(""), "");
+    }
+
+    #[test]
+    fn a_recap_prompt_asks_for_a_named_language_never_a_code() {
+        let ctx = RenderContext {
+            output_language: SummaryLanguage::Fixed("it".into()),
+            ..Default::default()
+        };
+        assert_eq!(language_directive(&ctx), "Write the recap in Italian.");
+        assert!(!render(&general_recap(), &ctx).contains("(it)"));
+
+        let same = RenderContext {
+            output_language: SummaryLanguage::SameAsMeeting,
+            meeting_language: Some("it".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            language_directive(&same),
+            "Write the recap in the same language the meeting was held in, Italian."
+        );
+
+        let unknown = RenderContext {
+            output_language: SummaryLanguage::SameAsMeeting,
+            ..Default::default()
+        };
+        assert_eq!(
+            language_directive(&unknown),
+            "Write the recap in the same language the meeting was held in."
+        );
+    }
+
+    #[test]
+    fn the_task_list_prompt_asks_for_the_same_language_by_name() {
+        let ctx = RenderContext {
+            output_language: SummaryLanguage::Fixed("it".into()),
+            ..Default::default()
+        };
+        let prompt = render_action_items("## Decisioni\n\n- Spedire il venerdì.", &ctx);
+        assert!(prompt.contains("Write every task in Italian."), "{prompt}");
+        assert!(!prompt.contains("(it)"), "{prompt}");
     }
 
     #[test]

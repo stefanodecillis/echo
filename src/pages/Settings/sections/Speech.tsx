@@ -5,146 +5,147 @@ import { Chip } from "../../../components/Chip";
 import { ProgressBar } from "../../../components/ProgressBar";
 import { formatBytes } from "../../../components/lib/format";
 import { useDownloadProgress } from "../../../hooks/useDownloadProgress";
+import { useSpeechReadiness } from "../../../hooks/useSpeechReadiness";
 import {
   cancelSpeechDownload,
   downloadSpeechAssets,
+  getStorageReport,
   listAccuracyLevels,
-  selectAccuracyLevel,
+  removeSpeechAsset,
 } from "../../../lib/ipc";
-import { settings as copy } from "../../../lib/copy";
+import { common, settings as copy } from "../../../lib/copy";
 import type { AccuracyLevel, Id } from "../../../lib/types";
 import type { SectionProps } from "../types";
 
-/** Speech: the "how carefully Echo listens" presets. Each one is a plain
- * sentence plus a size, never a model name — that lives in Advanced.
+/**
+ * Speech: a status card, nothing to choose. Echo always downloads and uses
+ * the best fit for this computer (docs/DESIGN.md mantra 1's 2026-08-20
+ * amendment) — this screen just says whether that's done, the one-time
+ * download's state, and how much room it takes. Model names stay in
+ * Settings > Advanced, never here.
  *
- * Selecting a level goes through `select_accuracy_level` directly rather than
- * the generic `patch`, since the result also carries `accuracyLevelId` back
- * onto the shared `Settings` the other sections read — `index.tsx`'s own
- * fetch on next visit picks that up, so no local prop is needed here. */
+ * `listAccuracyLevels` is only consulted internally for the one asset id to
+ * download or remove; there is nothing here for the person to pick between.
+ */
 export function Speech(_props: SectionProps) {
-  const [levels, setLevels] = useState<AccuracyLevel[] | null>(null);
+  const readiness = useSpeechReadiness();
+  const progress = useDownloadProgress();
+  const [level, setLevel] = useState<AccuracyLevel | null>(null);
+  const [storageBytes, setStorageBytes] = useState<number | null>(null);
+  const [assetId, setAssetId] = useState<Id | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [downloadingAssetId, setDownloadingAssetId] = useState<Id | null>(null);
-  const [downloadingLevelId, setDownloadingLevelId] = useState<string | null>(null);
-  const progress = useDownloadProgress(downloadingAssetId ?? undefined);
 
   useEffect(() => {
     refresh();
   }, []);
 
-  function refresh() {
-    listAccuracyLevels()
-      .then(setLevels)
-      .catch((err) => setError(err.message));
-  }
-
   useEffect(() => {
     if (progress?.done) {
-      setDownloadingAssetId(null);
-      setDownloadingLevelId(null);
+      setAssetId(null);
       refresh();
     }
   }, [progress?.done]);
 
-  async function startDownload(level: AccuracyLevel) {
+  function refresh() {
+    listAccuracyLevels()
+      .then((all) => setLevel(all.find((l) => l.recommended) ?? all[0] ?? null))
+      .catch((err) => setError(err.message));
+    getStorageReport()
+      .then((report) => setStorageBytes(report.speechAssetBytes))
+      .catch(() => {
+        // The status card still works without a storage figure.
+      });
+  }
+
+  async function startDownload() {
+    if (!level) return;
     setError(null);
-    setDownloadingLevelId(level.id);
     try {
-      const assetId = await downloadSpeechAssets(level.id);
-      setDownloadingAssetId(assetId);
+      const id = await downloadSpeechAssets(level.id);
+      setAssetId(id);
     } catch (err) {
-      setDownloadingLevelId(null);
       setError((err as { message: string }).message);
     }
   }
 
   async function cancel() {
-    if (!downloadingAssetId) return;
-    await cancelSpeechDownload(downloadingAssetId);
-    setDownloadingAssetId(null);
-    setDownloadingLevelId(null);
+    const id = assetId ?? progress?.assetId;
+    if (!id) return;
+    await cancelSpeechDownload(id);
+    setAssetId(null);
   }
 
-  async function use(level: AccuracyLevel) {
-    const updated = await selectAccuracyLevel(level.id);
-    setLevels(
-      (prev) =>
-        prev?.map((l) => ({ ...l, selected: l.id === updated.accuracyLevelId })) ?? prev,
-    );
+  async function remove() {
+    if (!level) return;
+    for (const id of level.assetIds) {
+      await removeSpeechAsset(id).catch(() => {});
+    }
+    refresh();
   }
+
+  const ready = readiness?.ready ?? level?.installed ?? false;
+  const downloading = readiness?.downloading ?? false;
+  const resuming =
+    !ready && !downloading && level !== null && (readiness?.remainingBytes ?? 0) > 0 &&
+    (readiness?.remainingBytes ?? 0) < level.downloadBytes;
+  const fraction =
+    progress && progress.totalBytes > 0 ? progress.receivedBytes / progress.totalBytes : undefined;
 
   return (
     <div className="flex flex-col gap-4">
-      <p className="text-sm text-ink-faint">{copy.accuracyLevelDescription}</p>
-      {error && <p className="text-sm text-live">{error}</p>}
-      {!levels && !error && <p className="text-sm text-ink-faint">Loading…</p>}
+      <Card className="flex flex-col gap-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <p className="text-sm font-semibold text-ink">
+                {ready ? copy.speechReadyTitle : copy.speechNotReadyTitle}
+              </p>
+              {ready && <Chip variant="solid">{copy.speechReadyBadge}</Chip>}
+            </div>
+            <p className="mt-1 text-sm text-ink-soft">
+              {ready ? copy.speechReadyDescription : copy.speechNotReadyDescription}
+            </p>
+            {ready && storageBytes !== null && (
+              <p className="mt-1 text-xs text-ink-faint">
+                {copy.speechStorageLabel} · {formatBytes(storageBytes)}
+              </p>
+            )}
+          </div>
+          <div className="flex shrink-0 flex-col items-end gap-2">
+            {!ready && !downloading && (
+              <button type="button" onClick={startDownload} className="echo-pill-quiet">
+                {resuming ? copy.speechResumeButton : copy.speechDownloadButton}
+              </button>
+            )}
+            {downloading && (
+              <button type="button" onClick={cancel} className="echo-pill-quiet">
+                {copy.speechCancelButton}
+              </button>
+            )}
+            {ready && (
+              <button type="button" onClick={remove} className="echo-pill-quiet">
+                {copy.speechRemoveButton}
+              </button>
+            )}
+          </div>
+        </div>
 
-      <div className="flex flex-col gap-3">
-        {levels?.map((level) => {
-          const isDownloadingThis = downloadingLevelId === level.id;
-          return (
-            <Card key={level.id} className="flex flex-col gap-3">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <p className="text-sm font-semibold text-ink">{level.name}</p>
-                    {level.selected && <Chip variant="solid">{copy.speechCurrentBadge}</Chip>}
-                    {level.recommended && !level.selected && (
-                      <Chip>{copy.speechRecommendedBadge}</Chip>
-                    )}
-                  </div>
-                  <p className="mt-1 text-sm text-ink-soft">{level.description}</p>
-                  <p className="mt-1 text-xs text-ink-faint">
-                    {formatBytes(level.downloadBytes)}
-                    {level.installed ? ` · ${copy.speechInstalledNote}` : ""}
-                  </p>
-                </div>
-                <div className="flex shrink-0 flex-col items-end gap-2">
-                  {!level.installed && !isDownloadingThis && (
-                    <button
-                      type="button"
-                      onClick={() => startDownload(level)}
-                      className="echo-pill-quiet"
-                    >
-                      {copy.speechDownloadButton}
-                    </button>
-                  )}
-                  {isDownloadingThis && (
-                    <button type="button" onClick={cancel} className="echo-pill-quiet">
-                      {copy.speechCancelButton}
-                    </button>
-                  )}
-                  {level.installed && !level.selected && (
-                    <button
-                      type="button"
-                      onClick={() => use(level)}
-                      className="echo-pill-quiet"
-                    >
-                      {copy.speechUseButton}
-                    </button>
-                  )}
-                </div>
-              </div>
-              {isDownloadingThis && (
-                <div className="flex flex-col gap-1">
-                  <ProgressBar
-                    value={
-                      progress && progress.totalBytes > 0
-                        ? progress.receivedBytes / progress.totalBytes
-                        : undefined
-                    }
-                    label={copy.speechDownloadButton}
-                  />
-                  {progress?.error && (
-                    <p className="text-xs text-live">{copy.speechDownloadError}</p>
-                  )}
-                </div>
-              )}
-            </Card>
-          );
-        })}
-      </div>
+        {downloading && (
+          <div className="flex flex-col gap-1">
+            <ProgressBar value={fraction} label={copy.speechDownloadButton} />
+            {progress?.error && <p className="text-xs text-live">{copy.speechDownloadError}</p>}
+          </div>
+        )}
+
+        {error && (
+          <div className="flex flex-col items-start gap-2">
+            <p className="text-xs text-live">{error}</p>
+            <button type="button" onClick={startDownload} className="echo-pill-quiet text-xs">
+              {common.retry}
+            </button>
+          </div>
+        )}
+      </Card>
     </div>
   );
 }

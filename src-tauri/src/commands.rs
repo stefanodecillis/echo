@@ -143,6 +143,50 @@ impl From<summarize::SummarizeError> for UiError {
                 "Echo needs a key for that service before it can write recaps with it.",
             )
             .with_action(UiErrorAction::OpenSummarySettings),
+            // The key reached the service and the service said no to it. Sending
+            // them to re-paste it is the one thing that can fix it, so say that
+            // rather than "something went wrong".
+            S::Rejected(detail) => UiError::new(
+                UiErrorKind::Credential,
+                "That service wouldn't accept the key Echo has saved for it. Open Settings and \
+                 paste it again.",
+            )
+            .with_detail(detail)
+            .with_action(UiErrorAction::OpenSummarySettings),
+            // Not a bad key — the key worked and the allowance behind it is
+            // spent. Folded in with a refused key this sent people off to
+            // re-paste something that was never the problem.
+            S::QuotaExhausted => UiError::new(
+                UiErrorKind::Network,
+                "That service won't take any more requests just now. Your recording and \
+                 transcript are safe — try the recap again later.",
+            )
+            .with_action(UiErrorAction::Retry),
+            // A definitive no, not a hiccup: the same text gets the same answer,
+            // so this offers a different writer instead of a retry button. The
+            // service's own word for it stays in `detail` (Advanced only).
+            S::Blocked { reason } => UiError::new(
+                UiErrorKind::Network,
+                "That service wouldn't write a recap from this meeting. Your transcript is safe, \
+                 and you can pick something else to write recaps in Settings.",
+            )
+            .with_detail(reason)
+            .with_action(UiErrorAction::OpenSummarySettings),
+            // The call worked and the answer had nothing in it. Worth another go.
+            S::EmptyReply => UiError::new(
+                UiErrorKind::Network,
+                "That service sent back an empty recap. Try writing it again.",
+            )
+            .with_action(UiErrorAction::Retry),
+            // Echo and the service disagree about the shape of an answer — Echo's
+            // bug, not the person's. Still worth a retry, and it must not hide
+            // behind "something went wrong": the log line beside it says which.
+            S::MalformedReply => UiError::new(
+                UiErrorKind::Unexpected,
+                "Echo couldn't make sense of what that service sent back. Try writing the recap \
+                 again.",
+            )
+            .with_action(UiErrorAction::Retry),
             S::Timeout => UiError::new(
                 UiErrorKind::Network,
                 "That took too long. Try again, or pick something else to write the recap.",
@@ -1405,6 +1449,14 @@ mod tests {
             diarize::DiarizeError::NotInstalled.into(),
             summarize::SummarizeError::MissingCredential.into(),
             summarize::SummarizeError::NoTranscript.into(),
+            summarize::SummarizeError::Rejected("401".into()).into(),
+            summarize::SummarizeError::QuotaExhausted.into(),
+            summarize::SummarizeError::Blocked {
+                reason: "SAFETY".into(),
+            }
+            .into(),
+            summarize::SummarizeError::EmptyReply.into(),
+            summarize::SummarizeError::MalformedReply.into(),
             export::ExportError::Empty.into(),
             session::SessionError::NoAudioSources("x".into()).into(),
             DbError::NotFound("meeting".into()).into(),
@@ -1435,6 +1487,73 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    /// A recap can fail in half a dozen distinguishable ways, and until this
+    /// batch five of them arrived as "Something went wrong" — the one sentence
+    /// that tells the person nothing and offers them no button. Each one now
+    /// says what happened and, where there is one, what to press.
+    #[test]
+    fn every_way_a_recap_can_fail_reaches_the_person_as_itself() {
+        use summarize::SummarizeError as S;
+
+        let cases: Vec<(UiError, Option<UiErrorAction>)> = vec![
+            // The key was refused: the only fix is a new one.
+            (
+                S::Rejected("401 unauthorized".into()).into(),
+                Some(UiErrorAction::OpenSummarySettings),
+            ),
+            // The key is fine and the allowance is not: never send them to
+            // re-paste something that was never the problem.
+            (S::QuotaExhausted.into(), Some(UiErrorAction::Retry)),
+            // A definitive no. Retrying the same text gets the same answer, so
+            // the button offers a different writer instead.
+            (
+                S::Blocked {
+                    reason: "SAFETY".into(),
+                }
+                .into(),
+                Some(UiErrorAction::OpenSummarySettings),
+            ),
+            (S::EmptyReply.into(), Some(UiErrorAction::Retry)),
+            (S::MalformedReply.into(), Some(UiErrorAction::Retry)),
+        ];
+
+        let mut messages = Vec::new();
+        for (err, expected_action) in &cases {
+            assert!(
+                !err.message.starts_with("Something went wrong"),
+                "still falling through to the catch-all: {:?}",
+                err.message
+            );
+            assert_eq!(err.action, *expected_action, "{:?}", err.message);
+            messages.push(err.message.clone());
+        }
+
+        let mut unique = messages.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            messages.len(),
+            "two different failures are telling the person the same thing"
+        );
+
+        // A refused key and a used-up allowance are the pair that used to be
+        // confused for each other, so they get their own assertion.
+        let refused: UiError = S::Rejected("401".into()).into();
+        let spent: UiError = S::QuotaExhausted.into();
+        assert_eq!(refused.kind, UiErrorKind::Credential);
+        assert_ne!(spent.kind, UiErrorKind::Credential);
+
+        // The service's own word for a block is diagnostic, not screen copy: it
+        // belongs in `detail`, which only Settings → Advanced renders.
+        let blocked: UiError = S::Blocked {
+            reason: "RECITATION".into(),
+        }
+        .into();
+        assert!(!blocked.message.contains("RECITATION"), "{blocked:?}");
+        assert_eq!(blocked.detail.as_deref(), Some("RECITATION"));
     }
 
     #[test]

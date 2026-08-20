@@ -9,9 +9,13 @@
 //! * [`language`] decides when the meeting's language is settled.
 //! * [`catchup`] transcribes from disk whatever the live pass missed.
 //!
-//! Lifecycle (mantra 1): the engine loads when a recording starts or when the
-//! person asks for it, and unloads after
-//! `settings.release_after_idle_minutes` of quiet. Idle Echo holds no weights.
+//! Lifecycle (mantra 1, as amended 2026-08-20): the engine loads the moment a
+//! meeting is detected or started and stays resident for the whole conversation
+//! *and* its follow-up jobs — while Echo is listening, transcript quality
+//! outranks resource thrift. Residency is held by the session
+//! ([`crate::session`] calls `hold_resident`), never by a timer over the last
+//! decode; once nothing needs it, [`engine::IDLE_GRACE`] of quiet unloads it.
+//! There is no setting behind that number. Idle Echo holds no weights.
 
 pub mod catalog;
 pub mod catchup;

@@ -25,7 +25,6 @@ pub mod keys {
     pub const SUMMARY_TEMPLATE_ID: &str = "summary_template_id";
     pub const AUTO_SUMMARIZE: &str = "auto_summarize";
     pub const ACCURACY_LEVEL_ID: &str = "accuracy_level_id";
-    pub const RELEASE_AFTER_IDLE_MINUTES: &str = "release_after_idle_minutes";
     pub const CLOSE_TO_TRAY: &str = "close_to_tray";
     pub const ONBOARDING_COMPLETE: &str = "onboarding_complete";
     pub const SHOW_ADVANCED: &str = "show_advanced";
@@ -75,9 +74,6 @@ pub async fn load(db: &Db) -> Result<Settings, DbError> {
     }
     if let Some(v) = get(keys::SHOW_ADVANCED) {
         s.show_advanced = parse_bool(v, s.show_advanced);
-    }
-    if let Some(v) = get(keys::RELEASE_AFTER_IDLE_MINUTES) {
-        s.release_after_idle_minutes = v.parse().unwrap_or(s.release_after_idle_minutes);
     }
     if let Some(v) = get(keys::ACCURACY_LEVEL_ID).filter(|v| !v.is_empty()) {
         s.accuracy_level_id = v.to_string();
@@ -129,9 +125,6 @@ pub async fn apply(db: &Db, patch: &SettingsPatch) -> Result<Settings, DbError> 
     }
     if let Some(v) = patch.show_advanced {
         put(keys::SHOW_ADVANCED, v.to_string());
-    }
-    if let Some(v) = patch.release_after_idle_minutes {
-        put(keys::RELEASE_AFTER_IDLE_MINUTES, v.to_string());
     }
     if let Some(v) = &patch.accuracy_level_id {
         put(keys::ACCURACY_LEVEL_ID, v.clone());
@@ -203,7 +196,6 @@ mod tests {
         assert_eq!(s.accuracy_level_id, "everyday");
         assert_eq!(s.summary_provider, Provider::OnThisComputer);
         assert_eq!(s.summary_language, SummaryLanguage::SameAsMeeting);
-        assert_eq!(s.release_after_idle_minutes, 10);
         assert!(
             s.auto_summarize,
             "a recap is written on its own unless someone turned that off"
@@ -295,7 +287,10 @@ mod tests {
         repo::set_setting(&db, keys::DETECTION_ENABLED, "banana")
             .await
             .unwrap();
-        repo::set_setting(&db, keys::RELEASE_AFTER_IDLE_MINUTES, "soon")
+        // A row left behind by a setting that no longer exists: every install
+        // that ran a build before mantra 1's 2026-08-20 amendment has one of
+        // these. An unrecognised key is ignored, never a reason to fail.
+        repo::set_setting(&db, "release_after_idle_minutes", "soon")
             .await
             .unwrap();
         repo::set_setting(&db, keys::SUMMARY_LANGUAGE, "{not json")
@@ -307,7 +302,6 @@ mod tests {
 
         let s = load(&db).await.unwrap();
         assert!(s.detection_enabled);
-        assert_eq!(s.release_after_idle_minutes, 10);
         assert_eq!(s.summary_language, SummaryLanguage::SameAsMeeting);
         assert_eq!(s.summary_provider, Provider::OnThisComputer);
     }

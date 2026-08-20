@@ -209,6 +209,15 @@ pub trait AsrPort: Send + Sync + 'static {
         self.transcribe(job, on_partial)
     }
 
+    /// Say whether a meeting still needs the engine: audio is being captured, or
+    /// its post-meeting work is running or queued.
+    ///
+    /// While this is true the weights stay in memory however quiet the room gets
+    /// (mantra 1's amendment of 2026-08-20). When it goes false the engine's own
+    /// grace period starts, and after [`crate::asr::engine::IDLE_GRACE`] with
+    /// nothing new the memory goes back. Default: nothing to hold.
+    fn hold_resident(&self, _resident: bool) {}
+
     /// Throw away captions of speech that is still going. Default: nothing to
     /// throw away.
     fn abandon_speculative(&self, _meeting_id: &str) {}
@@ -234,6 +243,32 @@ pub trait AsrPort: Send + Sync + 'static {
         not_before_ms: Option<i64>,
         control: CatchUpControl,
     ) -> BoxFuture<'a, Result<u32, AsrError>>;
+
+    /// [`AsrPort::catch_up`] for a meeting that is **still being recorded**:
+    /// everything already on disk up to `to_ms` that has no text against it yet.
+    ///
+    /// This is what happens when the engine comes up mid-meeting — somebody
+    /// pressed Start before the weights were ready, which on a first-ever launch
+    /// is minutes of a real conversation. Capture never waits for the engine
+    /// (mantra 3), so those minutes are on disk; this reads them back and puts
+    /// them in the transcript while the meeting carries on.
+    ///
+    /// Same code path and the same honest coverage spans as the post-meeting
+    /// pass, so a stretch live already wrote down is not read twice. It never
+    /// pauses for the recording it belongs to, and its work sits in the engine's
+    /// catch-up lane, behind live finals.
+    ///
+    /// Default: [`AsrPort::catch_up`] over the whole meeting, which is the same
+    /// answer for a test double.
+    fn catch_up_live<'a>(
+        &'a self,
+        db: &'a Db,
+        meeting_id: &'a str,
+        _to_ms: i64,
+        control: CatchUpControl,
+    ) -> BoxFuture<'a, Result<u32, AsrError>> {
+        self.catch_up(db, meeting_id, None, control)
+    }
 
     /// Give the memory back (mantra 1).
     fn release<'a>(&'a self) -> BoxFuture<'a, ()>;
@@ -268,9 +303,9 @@ pub struct EngineAsr {
 
 impl EngineAsr {
     /// Creates the worker but loads nothing.
-    pub fn new(db: Db, idle_release_minutes: u32) -> Self {
+    pub fn new(db: Db) -> Self {
         Self {
-            worker: EngineWorker::new(idle_release_minutes),
+            worker: EngineWorker::new(),
             db,
         }
     }
@@ -306,6 +341,10 @@ impl AsrPort for EngineAsr {
         Box::pin(async move { self.worker.submit_with(job, plan, on_partial).await })
     }
 
+    fn hold_resident(&self, resident: bool) {
+        self.worker.set_resident(resident);
+    }
+
     fn abandon_speculative(&self, meeting_id: &str) {
         self.worker.abandon_speculative(meeting_id);
     }
@@ -328,6 +367,42 @@ impl AsrPort for EngineAsr {
             // for the whole meeting (mantra 1).
             let options = crate::asr::catchup::CatchUpOptions {
                 from_ms: not_before_ms.map(|ms| ms.max(0)),
+                cancel: control.cancel,
+                on_progress: control.on_progress,
+                ..Default::default()
+            };
+            let report = crate::asr::catchup::run(
+                &self.worker,
+                db,
+                meeting_id,
+                options,
+                &crate::asr::catchup::DiskAudio,
+            )
+            .await?;
+            Ok(report.segments_written)
+        })
+    }
+
+    fn catch_up_live<'a>(
+        &'a self,
+        db: &'a Db,
+        meeting_id: &'a str,
+        to_ms: i64,
+        control: CatchUpControl,
+    ) -> BoxFuture<'a, Result<u32, AsrError>> {
+        Box::pin(async move {
+            let options = crate::asr::catchup::CatchUpOptions {
+                // No floor: a hole is a hole wherever it is, and the whole point
+                // of this pass is the stretch before the engine was ready.
+                from_ms: None,
+                // Everything captured so far, and nothing the live pass is
+                // decoding right now.
+                to_ms: Some(to_ms.max(0)),
+                // `pause_while` stays unset on purpose. The post-meeting pass
+                // yields to a live recording; this one *is* the live recording,
+                // and yielding to itself would mean never running. It stays out
+                // of the way through the queue instead: its jobs are catch-up
+                // work, which the engine serves after live finals.
                 cancel: control.cancel,
                 on_progress: control.on_progress,
                 ..Default::default()
@@ -527,10 +602,10 @@ pub struct Ports {
 
 impl Ports {
     /// The real thing: devices, whisper, the default job handlers.
-    pub fn real(db: Db, idle_release_minutes: u32) -> Self {
+    pub fn real(db: Db) -> Self {
         Self {
             capture: Arc::new(DeviceCapture::new(db.clone())),
-            asr: Arc::new(EngineAsr::new(db, idle_release_minutes)),
+            asr: Arc::new(EngineAsr::new(db)),
             executor: Arc::new(super::jobs::DefaultJobExecutor),
             events: EventBus::new(),
         }

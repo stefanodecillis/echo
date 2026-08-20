@@ -23,6 +23,13 @@
 //! cannot keep up, utterances are dropped on the floor: the audio is already
 //! committed to disk and the catch-up job reads it back afterwards.
 //!
+//! There is a fourth thing, which runs once per meeting rather than per
+//! utterance: [`catch_up_backlog`]. Capture starts at t=0 whether or not the
+//! engine is ready, so when the engine *does* come up — seconds later on a warm
+//! machine, minutes on a first-ever launch — the start of the meeting is on disk
+//! with nothing written down against it. That pass reads it back into the live
+//! transcript, at lower priority than new speech, and then gets out of the way.
+//!
 //! ## Why a caption task at all
 //!
 //! Whisper cannot transcribe speech that has not finished, so text used to
@@ -57,7 +64,7 @@ use crate::audio::vad::Utterance;
 use crate::audio::writer::CommittedChunk;
 use crate::db::repo;
 use crate::events::{NoticeLevel, NoticePayload, TranscriptFinalPayload, TranscriptPartialPayload};
-use crate::session::ports::{CaptureFeed, CaptureSignal, EventSink, UiEvent};
+use crate::session::ports::{CaptureFeed, CaptureSignal, CatchUpControl, EventSink, UiEvent};
 use crate::session::Inner;
 use crate::types::{Channel, Id, Segment, SegmentDraft};
 
@@ -288,6 +295,194 @@ pub(crate) fn spawn_with_captions(
         .await
     }));
     tasks
+}
+
+// ---------------------------------------------------------------------------
+// The backlog: what was said before the engine was ready
+// ---------------------------------------------------------------------------
+
+/// Backlog shorter than this is not worth a pass.
+///
+/// The engine was ready before the meeting really started — the pre-warm on
+/// detection usually gets there first — and the live pass has these two seconds
+/// or is about to. Below the bar, reading them back would only cost a decode and
+/// blank the caption on screen for a moment.
+const BACKLOG_WORTH_READING_MS: i64 = 2_000;
+
+/// How often newly written backlog text is pushed to the live transcript.
+///
+/// The pass writes rows as it goes, so this is only how promptly they appear.
+/// Often enough that the transcript visibly fills in, rare enough to be free.
+const BACKLOG_EMIT_INTERVAL: Duration = Duration::from_millis(750);
+
+/// Read this meeting's already-captured backlog into the transcript, then leave
+/// the live pass to it.
+///
+/// Called once the engine reports ready, which on a first-ever launch can be
+/// minutes after Start: the weights have to be read and the graphics compiler
+/// has work to do, and capture never waits for any of it (mantra 3). Everything
+/// said in the meantime is on disk, and this is what puts it in the transcript
+/// while the meeting is still going — the same pass, the same coverage spans and
+/// the same code path the post-meeting catch-up job uses, scoped to what has been
+/// captured so far.
+///
+/// Three things make it safe to run underneath a live meeting:
+/// * it asks only for stretches with no text against them, so nothing the live
+///   pass already wrote down is read twice;
+/// * its decodes are catch-up work, which the engine serves *after* live finals,
+///   so new speech never waits behind old;
+/// * it stops the moment this meeting is no longer the one being recorded — from
+///   there the finalize job owns the meeting, and two passes filling the same
+///   holes is how a stretch gets transcribed twice.
+pub(crate) async fn catch_up_backlog(inner: Arc<Inner>, meeting_id: Id) {
+    let Some(to_ms) = backlog_end_ms(&inner, &meeting_id).await else {
+        return;
+    };
+    if to_ms < BACKLOG_WORTH_READING_MS {
+        tracing::debug!(
+            to_ms,
+            "speech understanding was ready in time; nothing to read back"
+        );
+        return;
+    }
+
+    // Everything that already has text: these lines are on screen and must not
+    // be sent again.
+    let mut emitted = final_segment_ids(&inner, &meeting_id, to_ms).await;
+    tracing::info!(
+        meeting = %meeting_id,
+        to_ms,
+        "reading back what was said before Echo could write it down"
+    );
+
+    let watcher = inner.clone();
+    let watched = meeting_id.clone();
+    let control = CatchUpControl {
+        // Between windows, not mid-decode: the pass stops as soon as this
+        // meeting is no longer the live one.
+        cancel: Some(Arc::new(move || !is_recording_this(&watcher, &watched))),
+        on_progress: None,
+    };
+
+    let pass = inner
+        .ports
+        .asr
+        .catch_up_live(&inner.db, &meeting_id, to_ms, control);
+    tokio::pin!(pass);
+    let outcome = loop {
+        tokio::select! {
+            done = &mut pass => break done,
+            _ = tokio::time::sleep(BACKLOG_EMIT_INTERVAL) => {
+                emit_new_finals(&inner, &meeting_id, to_ms, &mut emitted).await;
+            }
+        }
+    };
+    // Whatever the last windows wrote, cancelled or not: the rows are there and
+    // the person should see them.
+    let shown = emit_new_finals(&inner, &meeting_id, to_ms, &mut emitted).await;
+
+    match outcome {
+        Ok(written) => tracing::info!(
+            meeting = %meeting_id,
+            written,
+            shown,
+            "the start of the meeting is in the transcript; live text takes over"
+        ),
+        // Not a failure: the recording ended, and the finalize job owns the rest.
+        Err(AsrError::Cancelled) => {
+            tracing::debug!(shown, "the recording ended while its backlog was being read")
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            shown,
+            "could not read the start of this meeting back; the catch-up job will"
+        ),
+    }
+}
+
+/// Is this meeting the one being recorded right now?
+fn is_recording_this(inner: &Arc<Inner>, meeting_id: &str) -> bool {
+    let live = inner.live.lock().expect("capture state lock");
+    crate::session::is_live(live.state) && live.meeting_id.as_deref() == Some(meeting_id)
+}
+
+/// How much of this meeting has been captured so far, or `None` when it is not
+/// being recorded any more.
+async fn backlog_end_ms(inner: &Arc<Inner>, meeting_id: &str) -> Option<i64> {
+    if !is_recording_this(inner, meeting_id) {
+        return None;
+    }
+    let elapsed = inner
+        .capture
+        .lock()
+        .await
+        .as_ref()
+        .map(|handle| handle.elapsed_ms())
+        .unwrap_or(0);
+    let live = inner.live.lock().expect("capture state lock").elapsed_ms;
+    Some(elapsed.max(live).max(0))
+}
+
+/// The final segments this meeting already has up to `to_ms`.
+async fn final_segment_ids(
+    inner: &Arc<Inner>,
+    meeting_id: &str,
+    to_ms: i64,
+) -> std::collections::HashSet<Id> {
+    read_finals(inner, meeting_id, to_ms)
+        .await
+        .into_iter()
+        .map(|segment| segment.id)
+        .collect()
+}
+
+/// Push whatever the pass has written since the last look, oldest first. Returns
+/// how many lines went out.
+async fn emit_new_finals(
+    inner: &Arc<Inner>,
+    meeting_id: &str,
+    to_ms: i64,
+    emitted: &mut std::collections::HashSet<Id>,
+) -> usize {
+    let mut shown = 0;
+    for segment in read_finals(inner, meeting_id, to_ms).await {
+        if !emitted.insert(segment.id.clone()) {
+            continue;
+        }
+        inner
+            .ports
+            .events
+            .emit(UiEvent::TranscriptFinal(TranscriptFinalPayload {
+                meeting_id: meeting_id.to_string(),
+                // No live line to replace: this stretch happened before there
+                // was anything on screen for it.
+                utterance_id: None,
+                segment,
+            }));
+        shown += 1;
+    }
+    shown
+}
+
+/// This meeting's final segments up to `to_ms`, in the order they were said.
+async fn read_finals(inner: &Arc<Inner>, meeting_id: &str, to_ms: i64) -> Vec<Segment> {
+    match repo::get_segments(
+        &inner.db,
+        &crate::types::TranscriptQuery {
+            meeting_id: meeting_id.to_string(),
+            include_partial: Some(false),
+            to_ms: Some(to_ms),
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Ok(segments) => segments,
+        Err(error) => {
+            tracing::debug!(%error, "could not read the transcript back");
+            Vec::new()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1911,6 +2106,166 @@ mod tests {
         assert!(
             !run.should_tell_them(),
             "a working utterance in between means live text is not stuck"
+        );
+    }
+    // -----------------------------------------------------------------------
+    // The backlog pass, through the real catch-up code
+    // -----------------------------------------------------------------------
+
+    /// Audio that is always there and always speech: the point of these tests is
+    /// which stretches get read, not what is in them.
+    struct FakeAudio;
+
+    struct FakeStream {
+        channel: Channel,
+    }
+
+    impl crate::asr::catchup::AudioSource for FakeAudio {
+        type Stream = FakeStream;
+
+        async fn read_window(
+            &self,
+            _chunks: &[crate::audio::ChunkRef],
+            from_ms: i64,
+            to_ms: i64,
+        ) -> Result<Vec<f32>, AsrError> {
+            let samples =
+                ((to_ms - from_ms).max(0) * i64::from(crate::audio::TARGET_SAMPLE_RATE)) / 1_000;
+            Ok(vec![0.2; samples as usize])
+        }
+
+        fn open_stream(
+            &self,
+            _detector: Option<&std::path::Path>,
+            channel: Channel,
+        ) -> FakeStream {
+            FakeStream { channel }
+        }
+    }
+
+    impl crate::asr::catchup::SpeechStream for FakeStream {
+        async fn push(
+            &mut self,
+            samples: Vec<f32>,
+            t_start_ms: i64,
+        ) -> Result<Vec<Utterance>, AsrError> {
+            let duration =
+                (samples.len() as i64 * 1_000) / i64::from(crate::audio::TARGET_SAMPLE_RATE);
+            Ok(vec![Utterance {
+                channel: self.channel,
+                t_start_ms,
+                t_end_ms: t_start_ms + duration,
+                samples,
+                truncated: false,
+            }])
+        }
+
+        async fn finish(&mut self) -> Result<Vec<Utterance>, AsrError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Remembers every stretch it was asked to read.
+    #[derive(Default)]
+    struct Recorder {
+        asked: Mutex<Vec<(i64, i64)>>,
+    }
+
+    impl crate::asr::catchup::Transcriber for Recorder {
+        async fn transcribe(&self, job: TranscribeJob) -> Result<Transcription, AsrError> {
+            let span = (job.t_start_ms, job.t_end_ms());
+            self.asked.lock().expect("recorder").push(span);
+            Ok(Transcription {
+                channel: job.channel,
+                t_start_ms: span.0,
+                t_end_ms: span.1,
+                text: format!("read {}..{}", span.0, span.1),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// The pass the live backlog uses is the post-meeting one, and it reads what
+    /// has no text against it — never what the live pass already wrote down.
+    #[tokio::test]
+    async fn the_backlog_pass_reads_only_the_stretches_with_no_text_against_them() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let meeting = repo::create_meeting(&db, "First ever launch", "/tmp", None)
+            .await
+            .unwrap();
+        // Twenty seconds of committed audio on the microphone.
+        let chunk = repo::insert_chunk(
+            &db,
+            &meeting.id,
+            Channel::Mic,
+            0,
+            "/tmp/mic-000000.flac",
+            0,
+            20_000,
+        )
+        .await
+        .unwrap();
+        repo::commit_chunk(&db, &chunk, 20_000).await.unwrap();
+        // The live pass got the middle of it: [4s, 12s].
+        repo::insert_segment(
+            &db,
+            &SegmentDraft {
+                meeting_id: meeting.id.clone(),
+                t_start_ms: 4_000,
+                t_end_ms: 12_000,
+                channel: Channel::Mic,
+                speaker_id: None,
+                text: "live text".into(),
+                language: Some("en".into()),
+                avg_confidence: Some(0.9),
+                revision: 1,
+                is_final: true,
+                model_name: Some("test".into()),
+                model_revision: Some("1".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let recorder = Recorder::default();
+        let report = crate::asr::catchup::run(
+            &recorder,
+            &db,
+            &meeting.id,
+            crate::asr::catchup::CatchUpOptions {
+                to_ms: Some(20_000),
+                ..Default::default()
+            },
+            &FakeAudio,
+        )
+        .await
+        .unwrap();
+
+        let asked = recorder.asked.lock().unwrap().clone();
+        assert!(!asked.is_empty(), "the holes either side have to be read");
+        for (from_ms, to_ms) in &asked {
+            assert!(
+                *to_ms <= 4_000 || *from_ms >= 12_000,
+                "{from_ms}..{to_ms} overlaps text that already exists"
+            );
+        }
+        assert_eq!(report.segments_written as usize, asked.len());
+        // And the stretch that already had text still has exactly one line.
+        let lines = repo::get_segments(
+            &db,
+            &crate::types::TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                from_ms: Some(4_000),
+                to_ms: Some(11_999),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            lines.iter().filter(|s| s.text == "live text").count(),
+            1,
+            "the live line must not be duplicated"
         );
     }
 }
