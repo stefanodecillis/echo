@@ -1250,7 +1250,10 @@ mod tests {
 
         let interval = VIDEO_FRAME_INTERVAL;
         assert!(interval.timescale > 0, "a zero timescale is not a duration");
-        assert!(interval.value > 0, "a zero interval means as fast as possible");
+        assert!(
+            interval.value > 0,
+            "a zero interval means as fast as possible"
+        );
         assert!(
             interval.value / i64::from(interval.timescale) <= 60,
             "an interval measured in minutes is not a documented configuration"

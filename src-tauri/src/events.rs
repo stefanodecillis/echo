@@ -183,11 +183,20 @@ pub struct DownloadProgressPayload {
 pub type DetectionPayload = DetectionStatus;
 
 /// `SPEAKERS_UPDATED`
+///
+/// Carries the people count alongside the rows, because the two always change
+/// together: the speaker pass finishing is exactly the moment the answer to "how
+/// many people were in this meeting" can move, and a UI that had to ask for it
+/// separately would show the new chips next to the old number.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeakersUpdatedPayload {
     pub meeting_id: Id,
     pub speakers: Vec<Speaker>,
+    /// People in the meeting, counting the person at this computer.
+    pub people_count: u32,
+    /// True when the count is the person's correction, not Echo's.
+    pub people_count_is_override: bool,
 }
 
 /// `SUMMARY_READY`

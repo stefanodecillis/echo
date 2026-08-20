@@ -553,7 +553,10 @@ pub(crate) async fn catch_up_backlog(inner: Arc<Inner>, meeting_id: Id, backlog:
         ),
         // Not a failure: the recording ended, and the finalize job owns the rest.
         Err(AsrError::Cancelled) => {
-            tracing::debug!(shown, "the recording ended while its backlog was being read")
+            tracing::debug!(
+                shown,
+                "the recording ended while its backlog was being read"
+            )
         }
         Err(error) => tracing::warn!(
             %error,
@@ -888,9 +891,7 @@ fn stop_captions(inner: &Arc<Inner>, meeting_id: &str, stopping: &AtomicBool, li
 fn hand_over(inner: &Arc<Inner>, meeting_id: &str, stopping: &AtomicBool, lines: &LiveLines) {
     stop_captions(inner, meeting_id, stopping, lines);
     inner.ports.asr.abandon_live(meeting_id);
-    tracing::debug!(
-        "the live pass handed this meeting over; the rest comes off the recording"
-    );
+    tracing::debug!("the live pass handed this meeting over; the rest comes off the recording");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1029,7 +1030,9 @@ async fn speech_loop(
 /// post-meeting catch-up job fills from the recording — a gap Echo closes later
 /// rather than the same words written twice.
 fn below_the_floor(backlog: &Backlog, t_start_ms: i64) -> bool {
-    backlog.floor().is_some_and(|floor_ms| t_start_ms < floor_ms)
+    backlog
+        .floor()
+        .is_some_and(|floor_ms| t_start_ms < floor_ms)
 }
 
 /// Await one live decode, honouring the stop handoff.
@@ -1177,12 +1180,26 @@ async fn transcribe(
         // lost: it is on disk, and catch-up reads it from there (mantra 3).
         Err(error) if error.is_deferred_to_catchup() => {
             tracing::debug!("an utterance was dropped; the catch-up pass will get it from disk");
-            close_partial(inner, meeting_id, &utterance_id, channel, t_start_ms, t_end_ms);
+            close_partial(
+                inner,
+                meeting_id,
+                &utterance_id,
+                channel,
+                t_start_ms,
+                t_end_ms,
+            );
             return None;
         }
         Err(AsrError::Cancelled) => {
             tracing::debug!("the meeting went away mid-utterance");
-            close_partial(inner, meeting_id, &utterance_id, channel, t_start_ms, t_end_ms);
+            close_partial(
+                inner,
+                meeting_id,
+                &utterance_id,
+                channel,
+                t_start_ms,
+                t_end_ms,
+            );
             return None;
         }
         Err(error) => {
@@ -1207,7 +1224,14 @@ async fn transcribe(
                     tag: Some("liveTextTrouble".into()),
                 });
             }
-            close_partial(inner, meeting_id, &utterance_id, channel, t_start_ms, t_end_ms);
+            close_partial(
+                inner,
+                meeting_id,
+                &utterance_id,
+                channel,
+                t_start_ms,
+                t_end_ms,
+            );
             return None;
         }
     };
@@ -1224,7 +1248,14 @@ async fn transcribe(
     let text = text.trim();
     if text.is_empty() {
         carry.forget(channel);
-        close_partial(inner, meeting_id, &utterance_id, channel, t_start_ms, t_end_ms);
+        close_partial(
+            inner,
+            meeting_id,
+            &utterance_id,
+            channel,
+            t_start_ms,
+            t_end_ms,
+        );
         return None;
     }
 
@@ -1466,7 +1497,10 @@ fn tail_words(text: &str, count: usize) -> String {
 fn looks_repetitive(text: &str) -> bool {
     let words: Vec<String> = text
         .split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
         .filter(|w| !w.is_empty())
         .collect();
     if words.len() < 4 {
@@ -1980,7 +2014,10 @@ mod tests {
         // The two decodes saw different context, so they punctuated the shared
         // words differently. It is still the same join.
         assert_eq!(
-            strip_overlap("Della riunione, è il bilancio", "il primo punto della riunione"),
+            strip_overlap(
+                "Della riunione, è il bilancio",
+                "il primo punto della riunione"
+            ),
             "è il bilancio"
         );
     }
@@ -2121,8 +2158,7 @@ mod tests {
         let long = trim_to_window(snapshot(Channel::Mic, 0, 0, 26_000));
         assert_eq!(long.duration_ms(), CAPTION_WINDOW_MS);
         assert_eq!(
-            long.window_start_ms,
-            16_000,
+            long.window_start_ms, 16_000,
             "the window moves with the speech, so its timestamps stay the meeting's"
         );
         assert_eq!(long.window_end_ms(), 26_000);
@@ -2212,7 +2248,14 @@ mod tests {
         let mut carry = ContextCarry::default();
 
         // An utterance that ended in silence is finished: nothing is carried.
-        carry.remember(Channel::Mic, false, "e quindi ci siamo", Some("it"), Some(0.9), 8_000);
+        carry.remember(
+            Channel::Mic,
+            false,
+            "e quindi ci siamo",
+            Some("it"),
+            Some(0.9),
+            8_000,
+        );
         assert!(carry.prompt_for(Channel::Mic, 8_200, Some("it")).is_none());
 
         // One cut short by the hard cap hands its tail to the continuation.
@@ -2235,7 +2278,14 @@ mod tests {
     #[test]
     fn the_carried_context_is_dropped_the_moment_it_stops_applying() {
         let cut = |carry: &mut ContextCarry| {
-            carry.remember(Channel::Mic, true, "e il secondo punto invece", Some("it"), Some(0.9), 28_000);
+            carry.remember(
+                Channel::Mic,
+                true,
+                "e il secondo punto invece",
+                Some("it"),
+                Some(0.9),
+                28_000,
+            );
         };
 
         // A silence longer than a breath: this is not that sentence any more.
@@ -2253,29 +2303,55 @@ mod tests {
         // The other channel is somebody else talking.
         let mut carry = ContextCarry::default();
         cut(&mut carry);
-        assert!(carry.prompt_for(Channel::System, 28_000, Some("it")).is_none());
+        assert!(carry
+            .prompt_for(Channel::System, 28_000, Some("it"))
+            .is_none());
         assert!(carry.prompt_for(Channel::Mic, 28_000, Some("it")).is_some());
 
         // Text the engine was not sure about is not context.
         let mut carry = ContextCarry::default();
-        carry.remember(Channel::Mic, true, "forse qualcosa cosi", Some("it"), Some(0.2), 28_000);
+        carry.remember(
+            Channel::Mic,
+            true,
+            "forse qualcosa cosi",
+            Some("it"),
+            Some(0.2),
+            28_000,
+        );
         assert!(carry.prompt_for(Channel::Mic, 28_000, Some("it")).is_none());
 
         // Neither is a decoder that has started looping.
         let mut carry = ContextCarry::default();
-        carry.remember(Channel::Mic, true, "sì sì sì sì", Some("it"), Some(0.95), 28_000);
+        carry.remember(
+            Channel::Mic,
+            true,
+            "sì sì sì sì",
+            Some("it"),
+            Some(0.95),
+            28_000,
+        );
         assert!(carry.prompt_for(Channel::Mic, 28_000, Some("it")).is_none());
 
         // An unknown language on either side is not a mismatch; the gap rule
         // still applies.
         let mut carry = ContextCarry::default();
-        carry.remember(Channel::Mic, true, "e il secondo punto invece", None, None, 28_000);
+        carry.remember(
+            Channel::Mic,
+            true,
+            "e il secondo punto invece",
+            None,
+            None,
+            28_000,
+        );
         assert!(carry.prompt_for(Channel::Mic, 28_100, Some("it")).is_some());
     }
 
     #[test]
     fn only_the_tail_of_the_previous_sentence_travels() {
-        let long = (1..=60).map(|i| format!("parola{i}")).collect::<Vec<_>>().join(" ");
+        let long = (1..=60)
+            .map(|i| format!("parola{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let tail = tail_words(&long, CARRY_WORDS);
         assert_eq!(tail.split_whitespace().count(), CARRY_WORDS);
         assert!(tail.ends_with("parola60"));
@@ -2299,7 +2375,10 @@ mod tests {
     fn the_handoff_window_starts_once_and_then_runs_out() {
         let mut handoff = Handoff::default();
         assert!(!handoff.started());
-        assert!(!handoff.expired(), "nothing is expired before capture stops");
+        assert!(
+            !handoff.expired(),
+            "nothing is expired before capture stops"
+        );
 
         assert!(handoff.begin());
         assert!(handoff.started());
@@ -2309,8 +2388,9 @@ mod tests {
         );
         assert!(!handoff.expired());
         assert!(
-            handoff.deadline().is_some_and(|at| at
-                <= tokio::time::Instant::now() + LIVE_HANDOFF),
+            handoff
+                .deadline()
+                .is_some_and(|at| at <= tokio::time::Instant::now() + LIVE_HANDOFF),
             "the window is bounded, and inside the session layer's own drain wait"
         );
 
@@ -2420,11 +2500,7 @@ mod tests {
             Ok(vec![0.2; samples as usize])
         }
 
-        fn open_stream(
-            &self,
-            _detector: Option<&std::path::Path>,
-            channel: Channel,
-        ) -> FakeStream {
+        fn open_stream(&self, _detector: Option<&std::path::Path>, channel: Channel) -> FakeStream {
             FakeStream { channel }
         }
     }

@@ -862,7 +862,10 @@ mod tests {
         assert_eq!(committed.len(), 2, "{committed:#?}");
         assert_eq!(committed[0].t_start_ms, 0);
         assert_eq!(committed[0].t_end_ms, 1_000);
-        assert_eq!(committed[1].t_start_ms, 300_000, "placed at the real offset");
+        assert_eq!(
+            committed[1].t_start_ms, 300_000,
+            "placed at the real offset"
+        );
         assert_eq!(committed[1].t_end_ms, 301_000);
         // Two seconds of audio on disk, not five minutes of silence.
         let bytes: u64 = committed

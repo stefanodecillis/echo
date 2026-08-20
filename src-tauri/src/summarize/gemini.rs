@@ -1809,12 +1809,10 @@ mod tests {
         assert!(shape.contains("wrong shape"), "{shape}");
         assert!(shape.contains("line"), "{shape}");
 
-        assert!(
-            parse_failure_shape(
-                &serde_json::from_str::<GenerateChunk>("<html>nope</html>").unwrap_err()
-            )
-            .contains("not json")
-        );
+        assert!(parse_failure_shape(
+            &serde_json::from_str::<GenerateChunk>("<html>nope</html>").unwrap_err()
+        )
+        .contains("not json"));
         assert!(parse_failure_shape(
             &serde_json::from_str::<GenerateChunk>("{\"candidates\":[").unwrap_err()
         )

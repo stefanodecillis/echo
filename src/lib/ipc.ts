@@ -218,6 +218,26 @@ export const unmergeSpeaker = (speakerId: Id) =>
 export const refineSpeakers = (meetingId: Id) =>
   call<Id>("refine_speakers", { meetingId });
 
+/**
+ * "There were four of us": correct how many people were in this meeting.
+ *
+ * `count` is the total, **including** whoever was at this computer — that is
+ * what the question means to the person answering it. `null` clears the
+ * correction and puts the number back to Echo's own count.
+ *
+ * Setting it works out who said what again, looking for exactly that many
+ * voices, which separates them better than any automatic guess. Nothing else
+ * changes: the words, the recording and the recap stay as they are. Progress
+ * arrives on `jobProgress`, and the new answer — speaker chips and
+ * `peopleCount` together — on `speakersUpdated`.
+ *
+ * Safe to call twice: asking again for the same number changes nothing. Rejects
+ * while this meeting is being recorded, while Echo is still working on it, and
+ * for a number outside 1–12.
+ */
+export const setSpeakerCount = (meetingId: Id, count: number | null) =>
+  call<void>("set_speaker_count", { meetingId, count });
+
 // ---------------------------------------------------------------------------
 // Speech assets
 // ---------------------------------------------------------------------------

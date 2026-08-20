@@ -40,6 +40,7 @@ pub mod pipeline;
 pub mod ports;
 pub mod recovery;
 pub mod retranscribe;
+pub mod speaker_count;
 
 #[cfg(test)]
 mod mock;
@@ -83,6 +84,10 @@ pub enum SessionError {
     /// back off disk. The person deleted the recording and kept the words.
     #[error("no recorded audio for this meeting")]
     NoRecordedAudio,
+    /// Work is already running for this meeting and the request would change
+    /// what that work is doing. Not a fault, and worth trying again in a moment.
+    #[error("this meeting is still being worked on")]
+    MeetingBusy,
     #[error("storage problem: {0}")]
     Storage(String),
     #[error("database problem: {0}")]
@@ -433,15 +438,15 @@ impl Inner {
             // deleted) because a capture that fell over is worth having in the
             // diagnostics log, and there are no files to reclaim.
             let _ = repo::soft_delete_meeting(&self.db, meeting_id).await;
-            self.ports.events.emit(UiEvent::MeetingUpdated(
-                MeetingUpdatedPayload {
+            self.ports
+                .events
+                .emit(UiEvent::MeetingUpdated(MeetingUpdatedPayload {
                     meeting_id: meeting_id.to_string(),
                     status: MeetingStatus::Failed,
                     title: None,
                     duration_ms: 0,
                     deleted: true,
-                },
-            ));
+                }));
         }
         let _ = self.jobs.release().await;
         // Whatever is left to do for this meeting keeps the engine; if there is
@@ -486,16 +491,15 @@ impl Inner {
     /// the task cancels it at its next await, which is inside the engine queue,
     /// so nothing is left decoding either.
     pub(crate) async fn join_backlog_pass(&self) {
-        let task = self
-            .backlog_task
-            .lock()
-            .expect("backlog task lock")
-            .take();
+        let task = self.backlog_task.lock().expect("backlog task lock").take();
         *self.backlog.lock().expect("backlog lock") = None;
         let Some(mut task) = task else {
             return;
         };
-        if tokio::time::timeout(DRAIN_TIMEOUT, &mut task).await.is_err() {
+        if tokio::time::timeout(DRAIN_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
             tracing::warn!("the backlog pass took too long to stop; dropping it");
             task.abort();
         }
@@ -1144,6 +1148,26 @@ impl SessionManager {
         retranscribe::run(&inner, meeting_id).await
     }
 
+    /// "There were four of us": store the person's own count of how many people
+    /// were in this meeting and work out who said what again, cut to exactly
+    /// that many voices. `None` puts it back to Echo's own count.
+    ///
+    /// The number includes whoever was at this computer. Turned down while this
+    /// meeting is being recorded, and while the speaker pass or a listen again is
+    /// already working on it; asking twice for the same number changes nothing.
+    /// See [`speaker_count`].
+    pub async fn set_speaker_count(
+        &self,
+        meeting_id: &str,
+        count: Option<u32>,
+    ) -> Result<speaker_count::SpeakerCountSet, SessionError> {
+        let inner = self.0.clone();
+        // The same lock start and stop take: the answer to "is this meeting being
+        // recorded" must not change while it is being acted on.
+        let _command = inner.command.lock().await;
+        speaker_count::run(&inner, meeting_id, count).await
+    }
+
     /// Queue background work. Deduplicated per meeting and kind.
     pub async fn queue_job(
         &self,
@@ -1768,9 +1792,15 @@ mod tests {
                 .unwrap();
             writer.finish().unwrap();
         }
-        assert!(repo::list_chunks(&h.db, &id, None).await.unwrap().is_empty());
+        assert!(repo::list_chunks(&h.db, &id, None)
+            .await
+            .unwrap()
+            .is_empty());
 
-        assert_eq!(h.session.stop().await.unwrap().as_deref(), Some(id.as_str()));
+        assert_eq!(
+            h.session.stop().await.unwrap().as_deref(),
+            Some(id.as_str())
+        );
         assert!(repo::get_meeting(&h.db, &id).await.unwrap().is_some());
         assert!(dir.exists());
     }
@@ -1792,11 +1822,17 @@ mod tests {
         let id = h.session.start(Default::default()).await.unwrap();
         h.commit_chunk(&id, 0, 45_000).await;
 
-        assert_eq!(h.session.stop().await.unwrap().as_deref(), Some(id.as_str()));
+        assert_eq!(
+            h.session.stop().await.unwrap().as_deref(),
+            Some(id.as_str())
+        );
         let kept = repo::get_meeting(&h.db, &id).await.unwrap().unwrap();
         assert_eq!(kept.status, MeetingStatus::Processing);
         assert!(kept.deleted_at.is_none());
-        assert!(h.queued_kinds(&id).await.contains(&JobKind::TranscribeCatchup));
+        assert!(h
+            .queued_kinds(&id)
+            .await
+            .contains(&JobKind::TranscribeCatchup));
         assert_eq!(
             repo::count_final_segments(&h.db, &id).await.unwrap(),
             0,
@@ -1820,7 +1856,10 @@ mod tests {
         h.settle().await;
         h.commit_chunk(&id, 0, 1_500).await;
 
-        assert_eq!(h.session.stop().await.unwrap().as_deref(), Some(id.as_str()));
+        assert_eq!(
+            h.session.stop().await.unwrap().as_deref(),
+            Some(id.as_str())
+        );
         assert!(repo::get_meeting(&h.db, &id).await.unwrap().is_some());
         assert!(repo::count_final_segments(&h.db, &id).await.unwrap() > 0);
     }
@@ -1836,18 +1875,32 @@ mod tests {
             .unwrap();
         // Just under a second of audio: enough for the scan to offer it, not
         // enough to be worth keeping.
-        let chunk = repo::insert_chunk(&h.db, &meeting.id, Channel::Mic, 0, "/tmp/mic-0.flac", 0, 900)
-            .await
-            .unwrap();
+        let chunk = repo::insert_chunk(
+            &h.db,
+            &meeting.id,
+            Channel::Mic,
+            0,
+            "/tmp/mic-0.flac",
+            0,
+            900,
+        )
+        .await
+        .unwrap();
         repo::commit_chunk(&h.db, &chunk, 900).await.unwrap();
 
-        assert_eq!(h.session.find_interrupted().await.unwrap(), vec![meeting.id.clone()]);
+        assert_eq!(
+            h.session.find_interrupted().await.unwrap(),
+            vec![meeting.id.clone()]
+        );
         h.session
             .resolve_interrupted(&meeting.id, RecoveryAction::Finish)
             .await
             .unwrap();
 
-        assert!(repo::get_meeting(&h.db, &meeting.id).await.unwrap().is_none());
+        assert!(repo::get_meeting(&h.db, &meeting.id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(h.queued_kinds(&meeting.id).await.is_empty());
         assert_eq!(h.session.status().await.state, CaptureState::Idle);
     }
@@ -2069,8 +2122,10 @@ mod tests {
         let h = Harness::new().await;
         // Two stretches on disk with no text against them, either side of one the
         // live pass managed on its own.
-        h.asr
-            .backlog_writes(&[(0, 4_000, "the bit before"), (8_000, 12_000, "and after that")]);
+        h.asr.backlog_writes(&[
+            (0, 4_000, "the bit before"),
+            (8_000, 12_000, "and after that"),
+        ]);
         h.asr.prewarm_takes(Duration::from_millis(120));
         // Half a minute of this meeting is already captured.
         h.capture.set_elapsed(30_000);
@@ -2106,7 +2161,11 @@ mod tests {
         assert_eq!(h.asr.backlog_calls(), vec![30_000]);
 
         let shown = h.events.finals();
-        assert_eq!(shown.len(), 2, "one line per stretch, and no more: {shown:?}");
+        assert_eq!(
+            shown.len(),
+            2,
+            "one line per stretch, and no more: {shown:?}"
+        );
         // In the order they were said.
         assert_eq!(shown[0].segment.t_start_ms, 0);
         assert_eq!(shown[1].segment.t_start_ms, 8_000);
@@ -2468,7 +2527,10 @@ mod tests {
         // Running the scan again must not journal the same audio twice.
         h.session.find_interrupted().await.unwrap();
         assert_eq!(
-            repo::list_chunks(&h.db, &meeting.id, None).await.unwrap().len(),
+            repo::list_chunks(&h.db, &meeting.id, None)
+                .await
+                .unwrap()
+                .len(),
             1
         );
     }

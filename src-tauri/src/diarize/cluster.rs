@@ -6,6 +6,9 @@
 //! * [`cluster`] decides how many people spoke and which fingerprint belongs to
 //!   whom. Agglomerative, centroid linkage, cosine distance, one calibrated
 //!   stopping threshold — see [`DISTANCE_THRESHOLD`] for why that number.
+//! * [`cluster_fixed`] is the same hierarchy cut at a count the person gave us
+//!   instead of at a distance. A number a human states is better evidence than
+//!   any threshold, so this path ignores the threshold entirely.
 //! * [`align_permutation`] lines up one window's local speaker labels with the
 //!   previous window's, using the audio the two windows share. Clustering owns
 //!   the final identity; alignment is what keeps a speaker who talks too little
@@ -180,18 +183,27 @@ fn cluster_exact(items: &[ClusterItem], embeddings: &[Vec<f32>], threshold: f32)
 /// The pre-pass uses half the threshold, so it only ever groups fingerprints
 /// that the exact pass would certainly have grouped anyway.
 fn cluster_pooled(items: &[ClusterItem], embeddings: &[Vec<f32>], threshold: f32) -> Clustering {
+    let mut pools = pool(items, embeddings, threshold / 2.0);
+    merge_loop(&mut pools, threshold, MAX_SPEAKERS);
+    absorb_fragments(&mut pools);
+    finish(pools, items.len(), threshold)
+}
+
+/// Group fingerprints that are within `radius` of each other into single nodes,
+/// so the all-pairs merge loop runs over pools rather than over every window.
+fn pool(items: &[ClusterItem], embeddings: &[Vec<f32>], radius: f32) -> Vec<Node> {
     let mut pools: Vec<Node> = Vec::new();
     for (i, e) in embeddings.iter().enumerate() {
         let mut best: Option<(usize, f32)> = None;
-        for (p, pool) in pools.iter().enumerate() {
-            let d = cosine_distance(e, &pool.centroid);
+        for (p, existing) in pools.iter().enumerate() {
+            let d = cosine_distance(e, &existing.centroid);
             match best {
                 Some((_, bd)) if d >= bd => {}
                 _ => best = Some((p, d)),
             }
         }
         match best {
-            Some((p, d)) if d < threshold / 2.0 => {
+            Some((p, d)) if d < radius => {
                 let w = items[i].weight_ms.max(1) as f64;
                 for (slot, x) in pools[p].sum.iter_mut().zip(e.iter()) {
                     *slot += x * w as f32;
@@ -204,52 +216,153 @@ fn cluster_pooled(items: &[ClusterItem], embeddings: &[Vec<f32>], threshold: f32
             _ => pools.push(Node::leaf(i, e, items[i].weight_ms)),
         }
     }
+    pools
+}
 
-    merge_loop(&mut pools, threshold, MAX_SPEAKERS);
-    absorb_fragments(&mut pools);
-    finish(pools, items.len(), threshold)
+/// The same hierarchy, cut at exactly `k` clusters instead of at a distance.
+///
+/// This is what an override runs: the person has told Echo how many people were
+/// in the meeting, and a number a human states about a conversation they were in
+/// beats any threshold measured on somebody else's corpus. So the calibrated
+/// distance is not consulted at all — the closest pair keeps merging until `k`
+/// are left, however near or far the last merge was.
+///
+/// Two things this deliberately does *not* do, both because they would quietly
+/// overrule the person:
+///
+/// * **No fragment absorption.** [`absorb_fragments`] exists to stop a sliver of
+///   speech becoming a "Speaker 5" nobody asked for. Here somebody *did* ask:
+///   a person who only says "morning" is still one of the four people in the
+///   room, and folding them away would hand back three.
+/// * **No ceiling below `k`.** `k` is clamped into `1..=`[`MAX_SPEAKERS`] by the
+///   caller and again here, and nothing else shrinks it.
+///
+/// Honest about not being able to deliver: with fewer fingerprints than `k`
+/// there is no way to show `k` distinct voices, so it returns as many as it
+/// actually has rather than inventing the rest.
+pub fn cluster_fixed(items: &[ClusterItem], k: usize) -> Clustering {
+    let k = k.clamp(1, MAX_SPEAKERS);
+    if items.is_empty() {
+        return Clustering {
+            labels: Vec::new(),
+            cluster_count: 0,
+            threshold: 0.0,
+        };
+    }
+
+    let mut embeddings: Vec<Vec<f32>> = items.iter().map(|i| i.embedding.clone()).collect();
+    for e in embeddings.iter_mut() {
+        l2_normalize(e);
+    }
+    let dim = embeddings[0].len();
+    if dim == 0 || embeddings.iter().any(|e| e.len() != dim) {
+        // Nothing usable to measure with: one speaker rather than a crash, the
+        // same answer `cluster` gives.
+        return Clustering {
+            labels: vec![0; items.len()],
+            cluster_count: 1,
+            threshold: 0.0,
+        };
+    }
+
+    // Fewer voices to hand out than the person asked for: give back what exists.
+    if items.len() <= k {
+        return Clustering {
+            labels: (0..items.len()).collect(),
+            cluster_count: items.len(),
+            threshold: 0.0,
+        };
+    }
+
+    let mut nodes: Vec<Node> = if items.len() > MAX_EXACT_ITEMS {
+        // Same pre-pass as the automatic path, and for the same reason: an exact
+        // all-pairs loop over a two-hour meeting is expensive. Pooling at half
+        // the calibrated distance only ever groups fingerprints the exact pass
+        // would certainly have grouped, so it cannot change where the cut lands.
+        pool(items, &embeddings, DISTANCE_THRESHOLD / 2.0)
+    } else {
+        embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, e)| Node::leaf(i, e, items[i].weight_ms))
+            .collect()
+    };
+    let cut = merge_to_k(&mut nodes, k);
+    finish(nodes, items.len(), cut)
+}
+
+fn alive_count(nodes: &[Node]) -> usize {
+    nodes.iter().filter(|n| n.alive).count()
+}
+
+/// The two closest live clusters and how far apart they are. `None` once fewer
+/// than two are left.
+fn closest_pair(nodes: &[Node]) -> Option<(usize, usize, f32)> {
+    let alive: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].alive).collect();
+    if alive.len() < 2 {
+        return None;
+    }
+    let mut best: Option<(usize, usize, f32)> = None;
+    for (a_pos, &a) in alive.iter().enumerate() {
+        for &b in &alive[a_pos + 1..] {
+            let d = cosine_distance(&nodes[a].centroid, &nodes[b].centroid);
+            match best {
+                Some((_, _, bd)) if d >= bd => {}
+                _ => best = Some((a, b, d)),
+            }
+        }
+    }
+    best
+}
+
+/// Fold `b` into `a`: `a` keeps every member of both and moves to their shared
+/// weighted centroid, `b` stops existing.
+fn fold(nodes: &mut [Node], a: usize, b: usize) {
+    let (sum_b, weight_b, ms_b, members_b) = {
+        let nb = &mut nodes[b];
+        nb.alive = false;
+        (
+            std::mem::take(&mut nb.sum),
+            nb.weight,
+            nb.weight_ms,
+            std::mem::take(&mut nb.members),
+        )
+    };
+    let na = &mut nodes[a];
+    for (slot, x) in na.sum.iter_mut().zip(sum_b.iter()) {
+        *slot += x;
+    }
+    na.weight += weight_b;
+    na.weight_ms += ms_b;
+    na.members.extend(members_b);
+    na.recentre();
 }
 
 fn merge_loop(nodes: &mut [Node], threshold: f32, max_clusters: usize) {
-    loop {
-        let alive: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].alive).collect();
-        if alive.len() < 2 {
+    while let Some((a, b, d)) = closest_pair(nodes) {
+        if d >= threshold && alive_count(nodes) <= max_clusters {
             return;
         }
-        let mut best: Option<(usize, usize, f32)> = None;
-        for (a_pos, &a) in alive.iter().enumerate() {
-            for &b in &alive[a_pos + 1..] {
-                let d = cosine_distance(&nodes[a].centroid, &nodes[b].centroid);
-                match best {
-                    Some((_, _, bd)) if d >= bd => {}
-                    _ => best = Some((a, b, d)),
-                }
-            }
-        }
-        let Some((a, b, d)) = best else { return };
-        if d >= threshold && alive.len() <= max_clusters {
-            return;
-        }
-        // Fold b into a.
-        let (sum_b, weight_b, ms_b, members_b) = {
-            let nb = &mut nodes[b];
-            nb.alive = false;
-            (
-                std::mem::take(&mut nb.sum),
-                nb.weight,
-                nb.weight_ms,
-                std::mem::take(&mut nb.members),
-            )
-        };
-        let na = &mut nodes[a];
-        for (slot, x) in na.sum.iter_mut().zip(sum_b.iter()) {
-            *slot += x;
-        }
-        na.weight += weight_b;
-        na.weight_ms += ms_b;
-        na.members.extend(members_b);
-        na.recentre();
+        fold(nodes, a, b);
     }
+}
+
+/// Merge the closest pair over and over until exactly `k` clusters are left,
+/// however far apart they end up being.
+///
+/// Returns the distance of the last merge — the height the dendrogram was cut
+/// at, which is the useful diagnostic here in place of a threshold. `0.0` when
+/// nothing had to be merged at all.
+fn merge_to_k(nodes: &mut [Node], k: usize) -> f32 {
+    let mut cut = 0.0f32;
+    while alive_count(nodes) > k {
+        let Some((a, b, d)) = closest_pair(nodes) else {
+            break;
+        };
+        cut = d;
+        fold(nodes, a, b);
+    }
+    cut
 }
 
 /// Hand every fragment's fingerprints to the cluster they most resemble.
@@ -557,6 +670,148 @@ mod tests {
         let loose = cluster(&items, 1.9);
         assert!(tight.cluster_count >= loose.cluster_count);
         assert_eq!(loose.cluster_count, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cutting at a count the person gave us
+    // -----------------------------------------------------------------------
+
+    /// Four voices, four fingerprints each. The automatic pass finds four; the
+    /// person can have any number they ask for out of the same hierarchy.
+    fn four_voices() -> Vec<ClusterItem> {
+        let dim = 32;
+        let mut items = Vec::new();
+        for id in [3usize, 11, 20, 28] {
+            for j in 0..4 {
+                items.push(item(voice(dim, id, j), 4_000));
+            }
+        }
+        items
+    }
+
+    #[test]
+    fn left_alone_the_same_fingerprints_come_out_as_four_people() {
+        // The baseline the two cuts below are a correction of.
+        assert_eq!(cluster(&four_voices(), DISTANCE_THRESHOLD).cluster_count, 4);
+    }
+
+    #[test]
+    fn asked_for_two_it_gives_exactly_two() {
+        let items = four_voices();
+        let c = cluster_fixed(&items, 2);
+        assert_eq!(c.cluster_count, 2, "labels {:?}", c.labels);
+        assert_eq!(c.labels.len(), items.len());
+        assert!(c.labels.iter().all(|l| *l < 2));
+        // Fusing happens between whole voices, never inside one: each group of
+        // four still shares a label.
+        for g in 0..4 {
+            let group = &c.labels[g * 4..(g + 1) * 4];
+            assert!(
+                group.iter().all(|l| *l == group[0]),
+                "voice {g} was split to make the count: {group:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn asked_for_six_it_gives_exactly_six() {
+        let items = four_voices();
+        let c = cluster_fixed(&items, 6);
+        assert_eq!(c.cluster_count, 6, "labels {:?}", c.labels);
+        assert_eq!(c.labels.len(), items.len());
+        assert!(c.labels.iter().all(|l| *l < 6));
+    }
+
+    /// The whole point of this path: the calibrated distance does not get a vote.
+    #[test]
+    fn the_calibrated_threshold_does_not_override_the_count() {
+        let items = four_voices();
+        for k in 1..=8 {
+            let c = cluster_fixed(&items, k);
+            assert_eq!(c.cluster_count, k, "asked for {k}, got {}", c.cluster_count);
+        }
+    }
+
+    /// A sliver of speech is a person too, when somebody has said so. The
+    /// automatic path folds it away; this one must not.
+    #[test]
+    fn a_short_speaker_is_kept_when_the_count_asks_for_them() {
+        let dim = 32;
+        let mut items = vec![
+            item(voice(dim, 2, 0), 20_000),
+            item(voice(dim, 2, 1), 20_000),
+            item(voice(dim, 25, 0), 20_000),
+        ];
+        let mut sliver = vec![0.0f32; dim];
+        sliver[2] = 0.2;
+        sliver[15] = 0.7;
+        sliver[16] = 0.7;
+        l2_normalize(&mut sliver);
+        items.push(item(sliver, 300));
+
+        // Left to itself the sliver is absorbed and two people come out.
+        assert_eq!(cluster(&items, DISTANCE_THRESHOLD).cluster_count, 2);
+        // Asked for three, the sliver stays a person of its own.
+        let c = cluster_fixed(&items, 3);
+        assert_eq!(c.cluster_count, 3, "labels {:?}", c.labels);
+        assert_ne!(
+            c.labels[3], c.labels[0],
+            "the short speaker was folded away anyway"
+        );
+    }
+
+    #[test]
+    fn fewer_fingerprints_than_asked_for_gives_back_what_exists() {
+        let dim = 16;
+        let items: Vec<_> = (0..3).map(|i| item(voice(dim, i * 5, 0), 5_000)).collect();
+        let c = cluster_fixed(&items, 6);
+        assert_eq!(c.cluster_count, 3, "there were only three to hand out");
+        assert_eq!(c.labels, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn a_count_outside_what_echo_can_do_is_pulled_into_range() {
+        let items = four_voices();
+        assert_eq!(cluster_fixed(&items, 0).cluster_count, 1);
+        assert_eq!(
+            cluster_fixed(&items, 999).cluster_count,
+            items.len().min(MAX_SPEAKERS)
+        );
+    }
+
+    #[test]
+    fn no_fingerprints_stays_no_speakers_whatever_the_count_says() {
+        let c = cluster_fixed(&[], 4);
+        assert_eq!(c.cluster_count, 0);
+        assert!(c.labels.is_empty());
+    }
+
+    #[test]
+    fn the_recorded_number_is_the_height_the_hierarchy_was_cut_at() {
+        let items = four_voices();
+        let tight = cluster_fixed(&items, 4);
+        let loose = cluster_fixed(&items, 2);
+        // Cutting lower down the tree means the last merge was a closer pair.
+        assert!(
+            loose.threshold > tight.threshold,
+            "cut heights {} then {}",
+            tight.threshold,
+            loose.threshold
+        );
+        // Nothing had to be merged, so there is no cut to report.
+        assert_eq!(cluster_fixed(&items[..2], 4).threshold, 0.0);
+    }
+
+    #[test]
+    fn the_pooling_path_still_hits_the_count_exactly() {
+        // Enough items to trip MAX_EXACT_ITEMS, drawn from three voices.
+        let dim = 48;
+        let items: Vec<_> = (0..(MAX_EXACT_ITEMS + 60))
+            .map(|i| item(voice(dim, [4usize, 17, 33][i % 3], i % 3), 4_000))
+            .collect();
+        let c = cluster_fixed(&items, 2);
+        assert_eq!(c.cluster_count, 2);
+        assert_eq!(c.labels.len(), items.len());
     }
 
     #[test]

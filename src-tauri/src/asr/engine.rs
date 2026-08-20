@@ -1154,9 +1154,9 @@ impl QueueState {
             pending.abandon();
         }
 
-        self.running.as_ref().is_some_and(|running| {
-            running.meeting_id == meeting_id && what.takes(running.kind)
-        })
+        self.running
+            .as_ref()
+            .is_some_and(|running| running.meeting_id == meeting_id && what.takes(running.kind))
     }
 }
 
@@ -1577,11 +1577,7 @@ impl EngineWorker {
     /// Called when a recording stops, before the disk pass is allowed to think
     /// about holes.
     pub fn abandon_speculative(&self, meeting_id: &str) {
-        if self
-            .shared
-            .queue
-            .abandon(meeting_id, Abandon::Speculative)
-        {
+        if self.shared.queue.abandon(meeting_id, Abandon::Speculative) {
             self.shared.abort.store(true, Ordering::SeqCst);
         }
     }
@@ -2333,7 +2329,10 @@ mod tests {
             reply: control_reply,
         });
 
-        assert!(matches!(queue.next(), Some(Task::Control(_))), "control first");
+        assert!(
+            matches!(queue.next(), Some(Task::Control(_))),
+            "control first"
+        );
         assert_eq!(
             taken(queue.next()).plan.kind,
             JobKind::Final,
@@ -2401,12 +2400,7 @@ mod tests {
             .collect();
         assert_eq!(
             order,
-            vec![
-                Channel::Mic,
-                Channel::System,
-                Channel::Mic,
-                Channel::Mic
-            ],
+            vec![Channel::Mic, Channel::System, Channel::Mic, Channel::Mic],
             "the system channel gets its turn instead of waiting out the monologue"
         );
     }
@@ -2420,8 +2414,13 @@ mod tests {
         queue.push(caption).unwrap();
         let mut waiting = Vec::new();
         while queue.waiting() < QUEUE_CAPACITY {
-            let (utterance, answer) =
-                queued("m", Channel::Mic, JobKind::Final, queue.waiting() as i64 * 1_000, 900);
+            let (utterance, answer) = queued(
+                "m",
+                Channel::Mic,
+                JobKind::Final,
+                queue.waiting() as i64 * 1_000,
+                900,
+            );
             queue.push(utterance).unwrap();
             waiting.push(answer);
         }
@@ -2431,16 +2430,16 @@ mod tests {
             queue.push(newest).is_ok(),
             "new speech is kept; the old guess is what goes"
         );
-        assert!(matches!(guess.blocking_recv(), Ok(Err(AsrError::Cancelled))));
+        assert!(matches!(
+            guess.blocking_recv(),
+            Ok(Err(AsrError::Cancelled))
+        ));
         assert!(queue.speculative.is_empty());
 
         // With nothing left to give up, the queue says so and the audio on disk
         // becomes catch-up's problem instead.
         let (one_too_many, _b) = queued("m", Channel::Mic, JobKind::Final, 10_000, 900);
-        assert!(matches!(
-            queue.push(one_too_many),
-            Err(PushError::Full(_)),
-        ));
+        assert!(matches!(queue.push(one_too_many), Err(PushError::Full(_)),));
         // …and a caption offered to a full queue simply does not happen.
         let (late_caption, dropped) = queued("m", Channel::Mic, JobKind::Speculative, 9_000, 3_000);
         assert!(queue.push(late_caption).is_ok());
@@ -2508,7 +2507,11 @@ mod tests {
         assert!(matches!(a.blocking_recv(), Ok(Err(AsrError::Cancelled))));
         assert!(matches!(b.blocking_recv(), Ok(Err(AsrError::Cancelled))));
         assert_eq!(queue.catchup.len(), 1, "the disk pass is authoritative now");
-        assert_eq!(queue.finals.len(), 1, "another meeting is none of our business");
+        assert_eq!(
+            queue.finals.len(),
+            1,
+            "another meeting is none of our business"
+        );
         drop((c, d));
 
         // Only the captions, for a meeting that is still recording.
@@ -2591,7 +2594,11 @@ mod tests {
         assert!(behind.timestamps, "a degraded final is still a final");
 
         let caption = Decoding::for_job(JobKind::Speculative, &preset, true);
-        assert_eq!(caption.params, preset.speculative(), "captions are untouched");
+        assert_eq!(
+            caption.params,
+            preset.speculative(),
+            "captions are untouched"
+        );
         let disk = Decoding::for_job(JobKind::CatchUp, &preset, true);
         assert_eq!(disk.params, preset, "the disk pass is untouched");
     }
@@ -2606,7 +2613,10 @@ mod tests {
             queue.push_job(caption).ok();
             answers.push(a);
         }
-        assert!(!falling_behind(queue.finals_waiting()), "captions are not a backlog");
+        assert!(
+            !falling_behind(queue.finals_waiting()),
+            "captions are not a backlog"
+        );
 
         for i in 0..FINAL_BACKLOG_DEGRADE_AT as i64 {
             let (utterance, a) = queued("m", Channel::Mic, JobKind::Final, i * 2_000, 2_000);

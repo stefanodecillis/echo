@@ -134,12 +134,20 @@ pub(crate) async fn run(
     // And the speaker chips, whose rows are gone. Said out loud rather than left
     // for the speaker pass to correct at the end, or the transcript would spend
     // the whole pass pointing at people who no longer exist.
+    // The person's own count of how many people were here is theirs and survives
+    // the wipe — it is a fact about the meeting, not something derived from the
+    // transcript — so it is read back rather than zeroed. Without one there is
+    // nobody left to count until the pass runs again.
+    let (people_count, people_count_is_override) =
+        repo::people_count(&inner.db, meeting_id).await?;
     inner
         .ports
         .events
         .emit(UiEvent::SpeakersUpdated(SpeakersUpdatedPayload {
             meeting_id: meeting_id.to_string(),
             speakers: Vec::new(),
+            people_count,
+            people_count_is_override,
         }));
 
     // Back to Processing while the work runs. This is also what lets the meeting

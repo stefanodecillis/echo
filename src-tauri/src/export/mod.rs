@@ -935,7 +935,10 @@ Good meeting.
 
         let bytes = copy_recording(&source, &destination).await.unwrap();
         assert_eq!(bytes, std::fs::metadata(&destination).unwrap().len());
-        assert_eq!(std::fs::read(&destination).unwrap(), std::fs::read(&source).unwrap());
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            std::fs::read(&source).unwrap()
+        );
     }
 
     #[tokio::test]

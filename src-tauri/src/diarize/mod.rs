@@ -30,6 +30,39 @@
 //! Everything runs through `ort` on CPU. Sessions are created for the pass and
 //! dropped at the end (mantra 1) — nothing here stays loaded while Echo is idle,
 //! and a recording starting stops the pass mid-window.
+//!
+//! ## How many people were in the meeting
+//!
+//! The pass answers this itself — the number of clusters it ends up with, plus
+//! the person at the keyboard — and the answer is shown as "detected". The
+//! person can correct it, and a correction is better evidence than any threshold
+//! (DESIGN §1), so it re-runs the pass cut to exactly that many voices.
+//!
+//! **The number is the total, including whoever was at this computer.** That is
+//! what "people in this meeting" means to a human, and the UI asks the question
+//! in those words, so an override of 3 on a meeting where the microphone caught
+//! speech asks the clustering for 2 remote voices — see [`remote_target`], which
+//! owns that arithmetic and is the only place it is done.
+//!
+//! What survives a change of count, honestly stated:
+//!
+//! * **"You" always survives.** The microphone is the person at the keyboard by
+//!   construction; no count changes that, and a rename of it is keyed on a
+//!   cluster key that never moves.
+//! * **A rename survives when the cluster does.** Speaker rows are keyed
+//!   `speaker-01`, `speaker-02`, … in the order people first speak, so cutting a
+//!   meeting from 4 voices to 3 keeps the first three rows and the names on them
+//!   — but the *voice* behind `speaker-02` may not be the same person it was,
+//!   because a different cut splits and fuses different pairs. A name on a
+//!   cluster that no longer exists is dropped with the row
+//!   ([`crate::db::repo::prune_speakers_except`]), because there is nothing left
+//!   for it to be the name of.
+//! * **A merge survives while both rows do**, and is released when the row it
+//!   pointed at stops existing.
+//!
+//! That is the trade the alias/cluster-key machinery buys: re-running never
+//! duplicates a speaker and never rewrites a transcript line, and in exchange a
+//! rename is attached to a cluster rather than to a voice.
 
 pub mod cluster;
 pub mod embedding;
@@ -47,8 +80,31 @@ use crate::types::{Id, Speaker};
 
 pub use cluster::DISTANCE_THRESHOLD;
 pub use pipeline::{
-    cluster_key, display_name, DiarizeControl, SELF_CLUSTER_KEY, SELF_DISPLAY_NAME,
+    cluster_key, display_name, remote_target, DiarizeControl, SELF_CLUSTER_KEY, SELF_DISPLAY_NAME,
 };
+
+/// Fewest people a meeting can be said to have had in it. One: the person
+/// talking to themselves, or reading a voice note back.
+pub const MIN_PEOPLE: u32 = 1;
+
+/// Most people Echo will try to tell apart in one meeting, counting the person
+/// at this computer.
+///
+/// The same number as [`cluster::MAX_SPEAKERS`], and for the same reason: past a
+/// dozen voices the fingerprints are noise, and a wrong-but-short list of chips
+/// is far kinder than a wall of them. An all-hands with forty attendees is not a
+/// thing per-speaker attribution can do anything useful with.
+pub const MAX_PEOPLE: u32 = cluster::MAX_SPEAKERS as u32;
+
+/// Pull a people count into the range Echo can actually work with.
+///
+/// A guard rail, not a validator: commands turn an out-of-range request down
+/// with a sentence (so nobody's number is silently changed), and this is what
+/// keeps a hand-edited database or an older row from reaching the clustering
+/// loop with something absurd in it.
+pub fn clamp_people(count: u32) -> u32 {
+    count.clamp(MIN_PEOPLE, MAX_PEOPLE)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiarizeError {
@@ -103,12 +159,20 @@ impl SpeakerTurn {
 pub struct DiarizationResult {
     pub turns: Vec<SpeakerTurn>,
     /// How many distinct people the pass believes were on the system channel.
+    /// Remote voices only — the microphone is not one of them.
     pub speaker_count: u32,
-    /// Clustering threshold used, for diagnostics.
+    /// Clustering threshold used, for diagnostics. In fixed-count mode there is
+    /// no threshold, so this is the distance the hierarchy was cut at instead.
     pub threshold: f32,
     /// The speaker rows as they now stand, ready for
     /// [`crate::events::SPEAKERS_UPDATED`].
     pub speakers: Vec<Speaker>,
+    /// How many people were in the meeting, counting whoever was at this
+    /// computer. This is the number the UI shows.
+    pub people_count: u32,
+    /// True when [`Self::people_count`] is the person's own correction rather
+    /// than Echo's count.
+    pub people_count_is_override: bool,
 }
 
 /// Where live clustering would plug in, if the M0-S4 gate ever passes.
@@ -145,8 +209,8 @@ pub async fn ensure_channel_speakers(
 ///
 /// Reads the system channel from disk, runs segmentation and fingerprinting
 /// with a sliding window, decodes overlaps, clusters with a calibrated
-/// threshold, then writes speakers and re-points segments at them with a fresh
-/// revision.
+/// threshold — or with the count the person gave us, if they gave us one — then
+/// writes speakers and re-points segments at them with a fresh revision.
 ///
 /// Not cancellable on its own — use [`refine_speakers_with`] or [`job::run`] for
 /// that. This shape exists for callers that already know the pass should run to

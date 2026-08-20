@@ -257,6 +257,19 @@ export const meeting = {
   listenAgainConfirmTitle: "Rewrite the transcript from the recording?",
   listenAgainConfirmDescription: "The current one is replaced — the recap stays.",
   listenAgainConfirmButton: "Rewrite",
+
+  // People count (Transcript tab)
+  peopleCountSingular: "person",
+  peopleCountPlural: "people",
+  peopleCountDetectedSuffix: "detected",
+  peopleCountTriggerTitle: "Change how many people were in this meeting",
+  peopleCountEditTitle: "How many people were in this meeting?",
+  peopleCountEditDescription: "Echo uses this to work out who said what.",
+  peopleCountFewer: "Fewer people",
+  peopleCountMore: "More people",
+  peopleCountBackToAutomatic: "Back to automatic",
+  peopleCountConfirmDescription: "Names you gave speakers may need redoing.",
+  peopleCountRedoButton: "Redo",
 } as Record<string, string>;
 
 /** History and search. */
@@ -514,6 +527,24 @@ export const panel = {
   detectedMeta: (ago: string, appName?: string) => (appName ? `${appName} · ${ago}` : ago),
   /** Paused, where the elapsed clock would be a lie: say what is true instead. */
   pausedHint: "Not listening right now",
+} as const;
+
+/**
+ * The quiet "N people" control on the Transcript tab: the trigger's label and
+ * the one confirmation before a redo. Split out from `meeting` because these
+ * two need a number folded in, not just a fixed sentence.
+ */
+export const peopleCount = {
+  /** "3 people", or "3 people (detected)" when nobody has overridden it. */
+  triggerLabel: (n: number, detected: boolean) =>
+    `${n} ${n === 1 ? meeting.peopleCountSingular : meeting.peopleCountPlural}${
+      detected ? ` (${meeting.peopleCountDetectedSuffix})` : ""
+    }`,
+  /** `null` means "back to automatic" — there is no fixed number to name yet. */
+  confirmTitle: (n: number | null) =>
+    n === null
+      ? "Redo who said what automatically?"
+      : `Redo who said what for ${n} ${n === 1 ? meeting.peopleCountSingular : meeting.peopleCountPlural}?`,
 } as const;
 
 /** Words for the two microphone-versus-computer channels. */

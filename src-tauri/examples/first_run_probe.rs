@@ -48,7 +48,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let watcher = detect::Watcher::new(true);
     for i in 0..3 {
         let signals = watcher.poll_once().await?;
-        println!("      poll {} -> {} signal(s): {:?}", i + 1, signals.len(), signals);
+        println!(
+            "      poll {} -> {} signal(s): {:?}",
+            i + 1,
+            signals.len(),
+            signals
+        );
     }
     ok("detection poll (sysinfo + CoreAudio FFI) three times without incident");
 
@@ -81,16 +86,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    real downloader, then a real ONNX session and inference: one second
     //    of silence must not read as speech, and a spoken-band tone must not
     //    crash the engine.
-    let info = models::download_asset(&db, &app_paths, &catalog::ids::DETECTOR.to_string(), Box::new(|_| {})).await?;
+    let info = models::download_asset(
+        &db,
+        &app_paths,
+        &catalog::ids::DETECTOR.to_string(),
+        Box::new(|_| {}),
+    )
+    .await?;
     println!("      downloaded {} ({} bytes)", info.name, info.bytes);
     let path = models::installed_path(&db, AssetKind::SpeechDetector)
         .await?
         .expect("detector just downloaded");
     let mut detector = SpeechDetector::load(&path, Channel::Mic)?;
-    assert!(detector.uses_model(), "must run the ONNX engine, not the fallback");
+    assert!(
+        detector.uses_model(),
+        "must run the ONNX engine, not the fallback"
+    );
     let silence = vec![0.0f32; 16_000];
     let utterances = detector.push(&silence, 0);
-    assert!(utterances.is_empty(), "silence must not produce an utterance");
+    assert!(
+        utterances.is_empty(),
+        "silence must not produce an utterance"
+    );
     let tone: Vec<f32> = (0..16_000)
         .map(|i| (i as f32 * 220.0 * std::f32::consts::TAU / 16_000.0).sin() * 0.4)
         .collect();

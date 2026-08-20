@@ -144,6 +144,14 @@ export interface MeetingDetail {
   audioBytes: number;
   segmentCount: number;
   capturedChannels: Channel[];
+  /**
+   * How many people were in this meeting, counting whoever was at this
+   * computer. Echo's own count unless the person corrected it with
+   * `setSpeakerCount`.
+   */
+  peopleCount: number;
+  /** True when `peopleCount` is the person's correction rather than Echo's. */
+  peopleCountIsOverride: boolean;
 }
 
 export interface MeetingQuery {
@@ -646,9 +654,18 @@ export interface DownloadProgressPayload {
 
 export type DetectionPayload = DetectionStatus;
 
+/**
+ * The speaker list changed — and with it, possibly, how many people Echo thinks
+ * were in the meeting. The count travels with the rows because the two always
+ * move together: the pass finishing is the moment both change.
+ */
 export interface SpeakersUpdatedPayload {
   meetingId: Id;
   speakers: Speaker[];
+  /** People in the meeting, counting whoever was at this computer. */
+  peopleCount: number;
+  /** True when the count is the person's correction, not Echo's. */
+  peopleCountIsOverride: boolean;
 }
 
 export interface SummaryReadyPayload {

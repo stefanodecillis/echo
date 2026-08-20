@@ -4,6 +4,8 @@ import { EVENTS, getMeeting, listSummaries, toUiError } from "@/lib/ipc";
 import { useEvent } from "@/hooks/useEvent";
 import type { Id, MeetingDetail, UiError } from "@/lib/types";
 
+import type { MeetingDetailWithPeopleCount, SpeakersUpdatedPayloadWithPeopleCount } from "../lib/peopleCount";
+
 export interface UseMeetingDetailResult {
   detail: MeetingDetail | undefined;
   loading: boolean;
@@ -65,7 +67,19 @@ export function useMeetingDetail(meetingId: Id | undefined): UseMeetingDetailRes
 
   useEvent(EVENTS.speakersUpdated, (payload) => {
     if (payload.meetingId !== meetingIdRef.current) return;
-    setDetail((prev) => ({ ...prev, speakers: payload.speakers }));
+    // A redo of who-said-what (the Transcript tab's people-count control) can
+    // also change the detected count or clear an override; pick that up here
+    // too, if the payload carries it, alongside the refreshed speaker list.
+    const withPeopleCount = payload as SpeakersUpdatedPayloadWithPeopleCount;
+    setDetail((prev) => {
+      const prevWithPeopleCount = prev as MeetingDetailWithPeopleCount;
+      return {
+        ...prev,
+        speakers: payload.speakers,
+        peopleCount: withPeopleCount.peopleCount ?? prevWithPeopleCount.peopleCount,
+        peopleCountIsOverride: withPeopleCount.peopleCountIsOverride ?? prevWithPeopleCount.peopleCountIsOverride,
+      };
+    });
   });
 
   useEvent(EVENTS.actionItemsUpdated, (payload) => {

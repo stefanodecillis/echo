@@ -296,6 +296,14 @@ impl From<session::SessionError> for UiError {
                 "The recording for this meeting isn't on this computer any more, so Echo can't \
                  listen to it again.",
             ),
+            // Asked to change something a running pass is in the middle of. It
+            // will be over in a moment, so this is a "try again", not a failure —
+            // and nothing was changed on the way to saying so.
+            S::MeetingBusy => UiError::new(
+                UiErrorKind::NotReady,
+                "Echo is still working on this meeting. Try again in a moment.",
+            )
+            .with_action(UiErrorAction::Retry),
             S::Storage(detail) => UiError::new(
                 UiErrorKind::Storage,
                 "Echo couldn't save to the place you chose for recordings.",
@@ -502,7 +510,10 @@ pub async fn delete_meeting(
     state.session.drop_work_for_meeting(&meeting_id).await;
     // Read before removing: the announcement below needs the name and length,
     // and after a full delete there is no row left to ask.
-    let before = repo::get_meeting(&state.db, &meeting_id).await.ok().flatten();
+    let before = repo::get_meeting(&state.db, &meeting_id)
+        .await
+        .ok()
+        .flatten();
     let dir = meeting_audio_dir(&state, &meeting_id).await;
     let orphaned = match mode {
         DeleteMode::AudioOnly => repo::forget_audio(&state.db, &meeting_id).await?,
@@ -753,6 +764,52 @@ pub async fn refine_speakers(state: State<'_, AppState>, meeting_id: Id) -> CmdR
         .session
         .queue_job(Some(&meeting_id), JobKind::Diarize)
         .await?)
+}
+
+/// "There were four of us": correct how many people were in this meeting.
+///
+/// `count` is the total, **including** whoever was at this computer, because that
+/// is what the question means to the person answering it. `null` clears the
+/// correction and puts the number back to Echo's own.
+///
+/// Storing it re-runs the pass that works out who said what, cut to exactly that
+/// many voices — which separates voices better than any automatic threshold can,
+/// and is the only thing that changes: the words, the recording and the recap are
+/// untouched. Progress arrives on the job-progress event and the new answer on
+/// the speakers-updated one.
+///
+/// Turned down while this meeting is being recorded, and while that pass is
+/// already running for it. Asking twice for the same number changes nothing.
+#[tauri::command]
+pub async fn set_speaker_count(
+    state: State<'_, AppState>,
+    meeting_id: Id,
+    count: Option<i64>,
+) -> CmdResult<()> {
+    check_id(&meeting_id)?;
+    let count = checked_people_count(count)?;
+    state.session.set_speaker_count(&meeting_id, count).await?;
+    Ok(())
+}
+
+/// Turn what the webview sent into a people count, or say why not.
+///
+/// Out of range is refused with a sentence rather than quietly rounded: a control
+/// that shows a different number than the one typed into it is worse than one
+/// that says no. `i64` on the way in so a stray negative gets that sentence too,
+/// instead of a deserialization error the person cannot act on.
+fn checked_people_count(count: Option<i64>) -> CmdResult<Option<u32>> {
+    match count {
+        None => Ok(None),
+        Some(n) if n < i64::from(diarize::MIN_PEOPLE) => {
+            Err(UiError::invalid("A meeting has at least one person in it."))
+        }
+        Some(n) if n > i64::from(diarize::MAX_PEOPLE) => Err(UiError::invalid(format!(
+            "Echo can tell up to {} people apart in one meeting.",
+            diarize::MAX_PEOPLE
+        ))),
+        Some(n) => Ok(Some(n as u32)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1180,17 +1237,21 @@ pub async fn update_settings(
             state.paths.set_storage_root(&wanted);
             let _ = state.paths.ensure();
             use crate::session::ports::EventSink;
-            state.session.events().emit(
-                crate::session::ports::UiEvent::Notice(crate::events::NoticePayload {
-                    level: crate::events::NoticeLevel::Info,
-                    message: "New recordings will be saved here. The ones you already have stay \
+            state
+                .session
+                .events()
+                .emit(crate::session::ports::UiEvent::Notice(
+                    crate::events::NoticePayload {
+                        level: crate::events::NoticeLevel::Info,
+                        message:
+                            "New recordings will be saved here. The ones you already have stay \
                               where they are."
-                        .into(),
-                    persistent: false,
-                    meeting_id: None,
-                    tag: Some("storageMoved".into()),
-                }),
-            );
+                                .into(),
+                        persistent: false,
+                        meeting_id: None,
+                        tag: Some("storageMoved".into()),
+                    },
+                ));
         }
     }
     // Closing to the tray is decided synchronously by the window handler, so it
@@ -1420,6 +1481,7 @@ macro_rules! echo_command_handler {
             $crate::commands::merge_speakers,
             $crate::commands::unmerge_speaker,
             $crate::commands::refine_speakers,
+            $crate::commands::set_speaker_count,
             // speech assets
             $crate::commands::list_accuracy_levels,
             $crate::commands::select_accuracy_level,
@@ -1497,6 +1559,39 @@ mod tests {
             "not-a-uuid-at-all-but-36-chars-long!",
         ] {
             assert!(check_id(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    /// The number the person types is stored exactly or refused exactly —
+    /// never rounded into range behind their back.
+    #[test]
+    fn a_people_count_is_taken_as_typed_or_turned_down_with_a_sentence() {
+        assert_eq!(checked_people_count(None).unwrap(), None);
+        assert_eq!(checked_people_count(Some(1)).unwrap(), Some(1));
+        assert_eq!(
+            checked_people_count(Some(i64::from(diarize::MAX_PEOPLE))).unwrap(),
+            Some(diarize::MAX_PEOPLE)
+        );
+
+        for absurd in [
+            0,
+            -1,
+            i64::MIN,
+            i64::from(diarize::MAX_PEOPLE) + 1,
+            i64::MAX,
+        ] {
+            let error = checked_people_count(Some(absurd))
+                .unwrap_err()
+                .message
+                .clone();
+            assert!(!error.is_empty(), "{absurd} was refused without a reason");
+            // Zero jargon in anything a person reads (mantra 2).
+            for banned in ["cluster", "diariz", "threshold", "override"] {
+                assert!(
+                    !error.to_lowercase().contains(banned),
+                    "{error:?} leaks jargon"
+                );
+            }
         }
     }
 

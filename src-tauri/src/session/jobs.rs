@@ -25,9 +25,7 @@ use crate::db::{repo, Db, DbError};
 use crate::events::{JobProgressPayload, NoticeLevel};
 use crate::paths::AppPaths;
 use crate::session::ports::{AsrPort, EventBus, EventSink, Ports, UiEvent};
-use crate::types::{
-    Channel, Id, Job, JobKind, JobQuery, JobStatus, MeetingStatus, SummaryReq,
-};
+use crate::types::{Channel, Id, Job, JobKind, JobQuery, JobStatus, MeetingStatus, SummaryReq};
 
 /// How long the loop waits before looking at the table again when it has
 /// nothing to do.
@@ -285,10 +283,7 @@ pub async fn outstanding_meeting_jobs(db: &Db) -> usize {
     )
     .await
     {
-        Ok(jobs) => jobs
-            .iter()
-            .filter(|job| job.meeting_id.is_some())
-            .count(),
+        Ok(jobs) => jobs.iter().filter(|job| job.meeting_id.is_some()).count(),
         Err(error) => {
             tracing::debug!(%error, "could not read the work queue; assuming there is work");
             1
@@ -425,6 +420,10 @@ async fn diarize(ctx: &JobContext) -> Result<(), JobFailure> {
         crate::events::SpeakersUpdatedPayload {
             meeting_id: meeting_id.clone(),
             speakers: result.speakers.clone(),
+            // The pass has just decided this, so it comes from the pass rather
+            // than from a second query that could disagree with it.
+            people_count: result.people_count,
+            people_count_is_override: result.people_count_is_override,
         },
     ));
     // The pass re-points segments at new speakers, so anything showing the
@@ -552,17 +551,19 @@ async fn summarize(ctx: &JobContext) -> Result<(), JobFailure> {
             "skipping the automatic recap: nothing is set up to write one"
         );
         if !RECAP_SETUP_NOTICE_SENT.swap(true, Ordering::SeqCst) {
-            ctx.events.emit(UiEvent::Notice(crate::events::NoticePayload {
-                level: NoticeLevel::Info,
-                message: "Echo can write recaps of your meetings once you pick who writes them, \
+            ctx.events
+                .emit(UiEvent::Notice(crate::events::NoticePayload {
+                    level: NoticeLevel::Info,
+                    message:
+                        "Echo can write recaps of your meetings once you pick who writes them, \
                           in Settings."
-                    .into(),
-                persistent: false,
-                // Deliberately no meeting: the UI turns a notice that names one
-                // into a link to it, and what this one asks for is in Settings.
-                meeting_id: None,
-                tag: Some("recapNeedsSetup".into()),
-            }));
+                            .into(),
+                    persistent: false,
+                    // Deliberately no meeting: the UI turns a notice that names one
+                    // into a link to it, and what this one asks for is in Settings.
+                    meeting_id: None,
+                    tag: Some("recapNeedsSetup".into()),
+                }));
         }
         ctx.progress.set(1.0).await;
         return Ok(());
@@ -614,13 +615,14 @@ async fn summarize(ctx: &JobContext) -> Result<(), JobFailure> {
         }));
     // The recap arrives minutes after the meeting ended, when the person has
     // moved on to something else, so it says so out loud once.
-    ctx.events.emit(UiEvent::Notice(crate::events::NoticePayload {
-        level: NoticeLevel::Info,
-        message: "Your recap is ready.".into(),
-        persistent: false,
-        meeting_id: Some(meeting_id),
-        tag: Some("recapReady".into()),
-    }));
+    ctx.events
+        .emit(UiEvent::Notice(crate::events::NoticePayload {
+            level: NoticeLevel::Info,
+            message: "Your recap is ready.".into(),
+            persistent: false,
+            meeting_id: Some(meeting_id),
+            tag: Some("recapReady".into()),
+        }));
     ctx.progress.set(1.0).await;
     Ok(())
 }
@@ -814,9 +816,7 @@ fn summarize_failure(cancel: &Cancel, error: crate::summarize::SummarizeError) -
         // and "try again" would be a lie: the same setting would pick the same
         // retired model. It goes on the job as written.
         ref not_found @ S::ModelNotFound { .. } => JobFailure::failed(not_found.to_string()),
-        _ => {
-            JobFailure::failed("Echo couldn't write the recap this time. You can try again.")
-        }
+        _ => JobFailure::failed("Echo couldn't write the recap this time. You can try again."),
     }
 }
 
@@ -1324,8 +1324,10 @@ mod tests {
 
     /// Build a `JobContext` around a real database and a stub speech engine, so
     /// a handler can be run on its own without the whole runtime.
-    async fn context_for(db: &Db, job: Job) -> (JobContext, Arc<super::super::mock::CollectingEvents>)
-    {
+    async fn context_for(
+        db: &Db,
+        job: Job,
+    ) -> (JobContext, Arc<super::super::mock::CollectingEvents>) {
         let events = crate::session::ports::EventBus::new();
         let seen = Arc::new(super::super::mock::CollectingEvents::default());
         events.set(seen.clone());
@@ -1334,7 +1336,10 @@ mod tests {
             JobContext {
                 job,
                 db: db.clone(),
-                paths: crate::paths::AppPaths::rooted_at(std::env::temp_dir().join("echo-jobs"), None),
+                paths: crate::paths::AppPaths::rooted_at(
+                    std::env::temp_dir().join("echo-jobs"),
+                    None,
+                ),
                 asr: Arc::new(super::super::mock::MockAsr::new()),
                 events,
                 cancel: Cancel::new(),

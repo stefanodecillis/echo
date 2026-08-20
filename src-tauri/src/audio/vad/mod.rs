@@ -1738,7 +1738,10 @@ mod tests {
         // stretch is still open when the snapshot is taken. This is the whole
         // point — text on screen while someone is still talking.
         let out = feed(&mut d, &audio, 0);
-        assert!(out.is_empty(), "the utterance should still be open: {out:#?}");
+        assert!(
+            out.is_empty(),
+            "the utterance should still be open: {out:#?}"
+        );
 
         let snap = d.snapshot().expect("speech is open");
         assert_eq!(snap.channel, Channel::Mic);
@@ -1763,8 +1766,14 @@ mod tests {
         let before = snap.t_start_ms;
         feed(&mut d, &tone(2_000, 300.0, 0.3), 4_500);
         let later = d.snapshot().expect("still open");
-        assert_eq!(later.t_start_ms, before, "the line changed identity mid-word");
-        assert!(later.window_end_ms() > snap.window_end_ms(), "it did not advance");
+        assert_eq!(
+            later.t_start_ms, before,
+            "the line changed identity mid-word"
+        );
+        assert!(
+            later.window_end_ms() > snap.window_end_ms(),
+            "it did not advance"
+        );
 
         let finished = d.finish().expect("the stretch closes");
         assert_eq!(

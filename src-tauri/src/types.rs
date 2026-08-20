@@ -343,6 +343,13 @@ pub struct MeetingDetail {
     pub segment_count: u32,
     /// Which channels were actually captured.
     pub captured_channels: Vec<Channel>,
+    /// How many people were in this meeting, counting the person at this
+    /// computer. Echo's own count unless the person corrected it.
+    pub people_count: u32,
+    /// True when [`Self::people_count`] is the person's correction rather than
+    /// Echo's count. The UI says "detected" for the one and nothing for the
+    /// other.
+    pub people_count_is_override: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

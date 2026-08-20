@@ -27,8 +27,10 @@ import type { Id, MeetingDetail, Segment } from "@/lib/types";
 import { ExportMenu } from "./components/ExportMenu";
 import { IconButton } from "./components/IconButton";
 import { MergeSpeakersModal } from "./components/MergeSpeakersModal";
+import { PeopleCountControl } from "./components/PeopleCountControl";
 import { SpeakerChip } from "./components/SpeakerChip";
 import { formatTimestamp } from "./lib/date";
+import type { MeetingDetailWithPeopleCount } from "./lib/peopleCount";
 import { resolveSpeaker } from "./lib/speakers";
 import { buildTranscriptText } from "./lib/transcriptText";
 
@@ -192,6 +194,12 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
 
   const hasAudio = detail.audioBytes > 0 && !detail.meeting.deletedAt;
 
+  // `getMeeting` gains these two alongside `speakers` (see `lib/peopleCount`);
+  // widened locally rather than in the shared type until that lands.
+  const detailWithPeopleCount = detail as MeetingDetailWithPeopleCount;
+  const rewriteRunning = retranscribing || !!transcribeJob;
+  const peopleCountDisabled = detail.meeting.status === "recording" || rewriteRunning;
+
   if (segments === undefined) {
     return <div className="px-8 py-6 text-sm text-ink-faint">{common.loading}</div>;
   }
@@ -205,6 +213,14 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
           placeholder={copy.transcriptFilterPlaceholder}
           containerClassName="max-w-sm"
         />
+        {typeof detailWithPeopleCount.peopleCount === "number" && (
+          <PeopleCountControl
+            meetingId={meetingId}
+            peopleCount={detailWithPeopleCount.peopleCount}
+            isOverride={!!detailWithPeopleCount.peopleCountIsOverride}
+            disabled={peopleCountDisabled}
+          />
+        )}
         <div className="ml-auto flex items-center gap-1">
           {detail.speakers.length > 1 && (
             <IconButton

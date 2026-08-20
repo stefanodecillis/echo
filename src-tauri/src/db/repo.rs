@@ -84,8 +84,11 @@ pub async fn get_meeting(db: &Db, id: &str) -> Result<Option<Meeting>, DbError> 
 pub async fn list_meetings(db: &Db, q: &MeetingQuery) -> Result<Vec<MeetingSummary>, DbError> {
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
         "SELECT m.id, m.title, m.started_at, m.duration_ms, m.status, m.language,
-                (SELECT COUNT(*) FROM speakers s
-                   WHERE s.meeting_id = m.id AND s.alias_of IS NULL) AS speaker_count,
+                -- The person's own count of who was there wins over Echo's, so
+                -- the list and the meeting itself never disagree about it.
+                COALESCE(m.speaker_count_override,
+                         (SELECT COUNT(*) FROM speakers s
+                            WHERE s.meeting_id = m.id AND s.alias_of IS NULL)) AS speaker_count,
                 (SELECT COUNT(*) FROM action_items a WHERE a.meeting_id = m.id) AS action_item_count,
                 (SELECT COUNT(*) FROM summaries su WHERE su.meeting_id = m.id) AS summary_count,
                 (SELECT COUNT(*) FROM audio_chunks c
@@ -205,6 +208,66 @@ pub async fn set_meeting_language(db: &Db, id: &str, language: &str) -> Result<(
     Ok(())
 }
 
+/// Store the person's own answer to "how many people were in this meeting", or
+/// clear it back to automatic with `None`.
+///
+/// The number is the total, counting whoever was at this computer — see
+/// [`crate::diarize::remote_target`] for the arithmetic that turns it into a
+/// number of remote voices, and the `0003` migration for why it is stored that
+/// way round.
+pub async fn set_speaker_count_override(
+    db: &Db,
+    id: &str,
+    count: Option<u32>,
+) -> Result<(), DbError> {
+    let res = sqlx::query("UPDATE meetings SET speaker_count_override = ?2 WHERE id = ?1")
+        .bind(id)
+        .bind(count.map(i64::from))
+        .execute(db)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(DbError::NotFound(format!("meeting {id}")));
+    }
+    Ok(())
+}
+
+/// The person's correction, if they made one. `None` means automatic.
+pub async fn speaker_count_override(db: &Db, id: &str) -> Result<Option<u32>, DbError> {
+    let row: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT speaker_count_override FROM meetings WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(db)
+            .await?;
+    let Some((stored,)) = row else {
+        return Err(DbError::NotFound(format!("meeting {id}")));
+    };
+    Ok(stored.map(|n| crate::diarize::clamp_people(n.clamp(0, i64::from(u32::MAX)) as u32)))
+}
+
+/// How many people Echo currently believes were in this meeting, and whether
+/// that is the person's own answer.
+///
+/// Echo's own count is every speaker row that has not been merged into another
+/// one: "You" plus each voice the pass separated out. An override replaces it
+/// wholesale, because the control in the UI has to read back the number the
+/// person typed into it.
+pub async fn people_count(db: &Db, meeting_id: &str) -> Result<(u32, bool), DbError> {
+    if let Some(count) = speaker_count_override(db, meeting_id).await? {
+        return Ok((count, true));
+    }
+    Ok((count_people(db, meeting_id).await?, false))
+}
+
+/// Speaker rows for this meeting that are not merged into another one.
+pub async fn count_people(db: &Db, meeting_id: &str) -> Result<u32, DbError> {
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM speakers WHERE meeting_id = ?1 AND alias_of IS NULL")
+            .bind(meeting_id)
+            .fetch_one(db)
+            .await?;
+    Ok(n as u32)
+}
+
 pub async fn set_meeting_duration(db: &Db, id: &str, duration_ms: i64) -> Result<(), DbError> {
     sqlx::query("UPDATE meetings SET duration_ms = ?2 WHERE id = ?1")
         .bind(id)
@@ -270,13 +333,14 @@ pub async fn soft_delete_meeting(db: &Db, id: &str) -> Result<(), DbError> {
 /// * `jobs` rows are removed with the meeting, so nothing is left queued
 ///   against something that no longer exists.
 pub async fn delete_meeting(db: &Db, id: &str) -> Result<Vec<String>, DbError> {
-    let mut paths: Vec<String> = sqlx::query_as("SELECT path FROM audio_chunks WHERE meeting_id = ?1")
-        .bind(id)
-        .fetch_all(db)
-        .await?
-        .into_iter()
-        .map(|(p,): (String,)| p)
-        .collect();
+    let mut paths: Vec<String> =
+        sqlx::query_as("SELECT path FROM audio_chunks WHERE meeting_id = ?1")
+            .bind(id)
+            .fetch_all(db)
+            .await?
+            .into_iter()
+            .map(|(p,): (String,)| p)
+            .collect();
     let mixed: Option<(Option<String>,)> =
         sqlx::query_as("SELECT mixed_path FROM meetings WHERE id = ?1")
             .bind(id)
@@ -318,8 +382,9 @@ pub async fn delete_meeting(db: &Db, id: &str) -> Result<Vec<String>, DbError> {
 /// put out of the way. Used by delete-all so it can remove exactly the folders
 /// Echo created and nothing else.
 pub async fn all_meeting_audio_dirs(db: &Db) -> Result<Vec<(Id, String)>, DbError> {
-    let rows: Vec<(String, Option<String>)> =
-        sqlx::query_as("SELECT id, audio_dir FROM meetings").fetch_all(db).await?;
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as("SELECT id, audio_dir FROM meetings")
+        .fetch_all(db)
+        .await?;
     Ok(rows
         .into_iter()
         .map(|(id, dir)| (id, dir.unwrap_or_default()))
@@ -397,8 +462,12 @@ pub async fn get_meeting_detail(db: &Db, id: &str) -> Result<MeetingDetail, DbEr
         }
     }
 
+    let (people_count, people_count_is_override) = people_count(db, id).await?;
+
     Ok(MeetingDetail {
         speakers: list_speakers(db, id).await?,
+        people_count,
+        people_count_is_override,
         markers: list_markers(db, id).await?,
         summaries: list_summaries(db, id).await?,
         action_items: list_action_items(db, id).await?,
@@ -765,6 +834,29 @@ pub async fn count_final_segments(db: &Db, meeting_id: &str) -> Result<u32, DbEr
 
 /// Languages seen in this meeting with how much time each covers, used to
 /// pick the dominant meeting language.
+/// Did this channel produce any words at all?
+///
+/// Not "was the channel recorded": the microphone is open for every meeting, so
+/// the presence of mic audio says nothing about whether the person spoke. A
+/// final segment with text in it does.
+pub async fn has_channel_speech(
+    db: &Db,
+    meeting_id: &str,
+    channel: Channel,
+) -> Result<bool, DbError> {
+    let (found,): (i64,) = sqlx::query_as(
+        "SELECT EXISTS (
+             SELECT 1 FROM segments
+             WHERE meeting_id = ?1 AND channel = ?2 AND is_final = 1 AND TRIM(text) <> ''
+         )",
+    )
+    .bind(meeting_id)
+    .bind(channel.as_str())
+    .fetch_one(db)
+    .await?;
+    Ok(found != 0)
+}
+
 pub async fn language_histogram(db: &Db, meeting_id: &str) -> Result<Vec<(String, i64)>, DbError> {
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT language, SUM(t_end_ms - t_start_ms) AS ms
@@ -934,6 +1026,50 @@ pub async fn unmerge_speaker(db: &Db, id: &str) -> Result<(), DbError> {
         .execute(db)
         .await?;
     Ok(())
+}
+
+/// Forget the speakers of this meeting whose cluster keys are not in `keep`.
+///
+/// What the speaker pass calls after it has re-pointed the transcript: the keys
+/// it produced this time, plus the microphone. Anything else is a voice a
+/// previous run believed in and this one does not — a fourth person who turns
+/// out to have been the second one twice, or the tail of a meeting the person has
+/// since re-cut to fewer people.
+///
+/// Deliberately a delete rather than a soft flag, and safe because the schema
+/// says what happens to everything that pointed at the row:
+///
+/// * `segments.speaker_id` is `ON DELETE SET NULL`, so a line that still carried
+///   the old label goes back to unattributed. Honest: the voice it was given no
+///   longer exists, and an unattributed line reads as one.
+/// * `speakers.alias_of` is `ON DELETE SET NULL`, so a merge into a vanished
+///   person is released rather than left dangling.
+///
+/// A name the person typed onto one of these rows goes with it. There is nothing
+/// left for it to be the name of; the alternative — keeping empty rows so a name
+/// has somewhere to live — is the ghost chip this exists to prevent.
+///
+/// Passing an empty `keep` would delete every speaker, so it does nothing
+/// instead: that shape only ever arrives from a caller with a bug, and the honest
+/// response to it is not to wipe a meeting's speakers.
+pub async fn prune_speakers_except(
+    db: &Db,
+    meeting_id: &str,
+    keep: &[String],
+) -> Result<u64, DbError> {
+    if keep.is_empty() {
+        return Ok(0);
+    }
+    let mut qb: QueryBuilder<Sqlite> =
+        QueryBuilder::new("DELETE FROM speakers WHERE meeting_id = ");
+    qb.push_bind(meeting_id.to_string());
+    qb.push(" AND cluster_key NOT IN (");
+    let mut separated = qb.separated(", ");
+    for key in keep {
+        separated.push_bind(key.clone());
+    }
+    qb.push(")");
+    Ok(qb.build().execute(db).await?.rows_affected())
 }
 
 /// Follow `alias_of` to the speaker that should actually be displayed.
@@ -2198,9 +2334,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = merge_speakers(&db, &mine.id, &theirs.id)
-            .await
-            .unwrap_err();
+        let err = merge_speakers(&db, &mine.id, &theirs.id).await.unwrap_err();
         assert!(matches!(err, DbError::Invalid(_)), "{err:?}");
         assert!(get_speaker(&db, &mine.id)
             .await
@@ -2231,6 +2365,259 @@ mod tests {
             .unwrap();
         assert_eq!(first.id, again.id);
         assert_eq!(again.display_name, "You");
+    }
+
+    // -----------------------------------------------------------------------
+    // How many people were in the meeting
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_fresh_meeting_has_no_correction_and_so_counts_its_speakers() {
+        let (db, m) = seeded().await;
+        assert_eq!(speaker_count_override(&db, &m.id).await.unwrap(), None);
+        assert_eq!(people_count(&db, &m.id).await.unwrap(), (0, false));
+
+        upsert_speaker(&db, &m.id, "you", "You", true)
+            .await
+            .unwrap();
+        upsert_speaker(&db, &m.id, "speaker-01", "Speaker 1", false)
+            .await
+            .unwrap();
+        assert_eq!(people_count(&db, &m.id).await.unwrap(), (2, false));
+    }
+
+    /// A meeting that existed before the column did. `ALTER TABLE ADD COLUMN`
+    /// with no default leaves NULL on every row it finds, and NULL is exactly the
+    /// behaviour those meetings already had: automatic.
+    #[tokio::test]
+    async fn a_meeting_written_without_the_column_reads_back_as_automatic() {
+        let (db, _) = seeded().await;
+        let id = new_id();
+        sqlx::query(
+            "INSERT INTO meetings (id, title, started_at, status, audio_dir, duration_ms)
+             VALUES (?1, 'Older meeting', '2026-01-01T00:00:00Z', 'complete', '/tmp/old', 60000)",
+        )
+        .bind(&id)
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(speaker_count_override(&db, &id).await.unwrap(), None);
+        assert_eq!(people_count(&db, &id).await.unwrap(), (0, false));
+    }
+
+    #[tokio::test]
+    async fn a_correction_is_stored_read_back_and_cleared() {
+        let (db, m) = seeded().await;
+        set_speaker_count_override(&db, &m.id, Some(5))
+            .await
+            .unwrap();
+        assert_eq!(speaker_count_override(&db, &m.id).await.unwrap(), Some(5));
+        assert_eq!(
+            people_count(&db, &m.id).await.unwrap(),
+            (5, true),
+            "the person's answer is the one the UI shows"
+        );
+
+        // Null is automatic, and it really does go back to counting.
+        set_speaker_count_override(&db, &m.id, None).await.unwrap();
+        assert_eq!(speaker_count_override(&db, &m.id).await.unwrap(), None);
+        assert_eq!(people_count(&db, &m.id).await.unwrap(), (0, false));
+    }
+
+    /// Merging two chips is the person saying "those two were one person", so it
+    /// has to move Echo's count as well as the transcript.
+    #[tokio::test]
+    async fn merging_two_speakers_takes_one_off_echos_count() {
+        let (db, m) = seeded().await;
+        let a = upsert_speaker(&db, &m.id, "speaker-01", "Speaker 1", false)
+            .await
+            .unwrap();
+        let b = upsert_speaker(&db, &m.id, "speaker-02", "Speaker 2", false)
+            .await
+            .unwrap();
+        assert_eq!(count_people(&db, &m.id).await.unwrap(), 2);
+        merge_speakers(&db, &b.id, &a.id).await.unwrap();
+        assert_eq!(count_people(&db, &m.id).await.unwrap(), 1);
+    }
+
+    /// A number nobody could act on cannot come back out of the database, however
+    /// it got in.
+    #[tokio::test]
+    async fn a_stored_number_out_of_range_is_read_back_inside_it() {
+        let (db, m) = seeded().await;
+        sqlx::query("UPDATE meetings SET speaker_count_override = 900 WHERE id = ?1")
+            .bind(&m.id)
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            speaker_count_override(&db, &m.id).await.unwrap(),
+            Some(crate::diarize::MAX_PEOPLE)
+        );
+        sqlx::query("UPDATE meetings SET speaker_count_override = 0 WHERE id = ?1")
+            .bind(&m.id)
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            speaker_count_override(&db, &m.id).await.unwrap(),
+            Some(crate::diarize::MIN_PEOPLE)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_correction_for_a_meeting_that_does_not_exist_is_not_found() {
+        let (db, _) = seeded().await;
+        let err = set_speaker_count_override(&db, &new_id(), Some(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::NotFound(_)), "{err:?}");
+        let err = speaker_count_override(&db, &new_id()).await.unwrap_err();
+        assert!(matches!(err, DbError::NotFound(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn the_meeting_detail_carries_the_count_and_where_it_came_from() {
+        let (db, m) = seeded().await;
+        upsert_speaker(&db, &m.id, "you", "You", true)
+            .await
+            .unwrap();
+        let detail = get_meeting_detail(&db, &m.id).await.unwrap();
+        assert_eq!(detail.people_count, 1);
+        assert!(!detail.people_count_is_override);
+
+        set_speaker_count_override(&db, &m.id, Some(3))
+            .await
+            .unwrap();
+        let detail = get_meeting_detail(&db, &m.id).await.unwrap();
+        assert_eq!(detail.people_count, 3);
+        assert!(detail.people_count_is_override);
+    }
+
+    /// The history list and the meeting itself must never disagree about how many
+    /// people were there.
+    #[tokio::test]
+    async fn the_history_list_shows_the_persons_count_when_there_is_one() {
+        let (db, m) = seeded().await;
+        upsert_speaker(&db, &m.id, "you", "You", true)
+            .await
+            .unwrap();
+
+        let listed = list_meetings(&db, &MeetingQuery::default()).await.unwrap();
+        assert_eq!(listed[0].speaker_count, 1);
+
+        set_speaker_count_override(&db, &m.id, Some(4))
+            .await
+            .unwrap();
+        let listed = list_meetings(&db, &MeetingQuery::default()).await.unwrap();
+        let detail = get_meeting_detail(&db, &m.id).await.unwrap();
+        assert_eq!(listed[0].speaker_count, 4);
+        assert_eq!(listed[0].speaker_count, detail.people_count);
+    }
+
+    /// The microphone is always recorded, so only words tell you whether the
+    /// person actually spoke.
+    #[tokio::test]
+    async fn a_channel_has_speech_when_it_has_words_not_when_it_has_audio() {
+        let (db, m) = seeded().await;
+        let chunk = insert_chunk(&db, &m.id, Channel::Mic, 0, "/tmp/mic-0.flac", 0, 30_000)
+            .await
+            .unwrap();
+        commit_chunk(&db, &chunk, 30_000).await.unwrap();
+        assert!(
+            !has_channel_speech(&db, &m.id, Channel::Mic).await.unwrap(),
+            "an open microphone is not somebody speaking"
+        );
+
+        insert_segments(&db, &[draft(&m.id, 0, "   ")])
+            .await
+            .unwrap();
+        assert!(
+            !has_channel_speech(&db, &m.id, Channel::Mic).await.unwrap(),
+            "an empty line is not somebody speaking either"
+        );
+
+        insert_segments(&db, &[draft(&m.id, 2_000, "morning")])
+            .await
+            .unwrap();
+        assert!(has_channel_speech(&db, &m.id, Channel::Mic).await.unwrap());
+        assert!(!has_channel_speech(&db, &m.id, Channel::System)
+            .await
+            .unwrap());
+    }
+
+    /// Pruning is how a re-run stops leaving ghosts behind. Everything that
+    /// pointed at the row it removes has to end up somewhere honest.
+    #[tokio::test]
+    async fn pruning_forgets_the_voices_a_new_pass_did_not_produce() {
+        let (db, m) = seeded().await;
+        let me = upsert_speaker(&db, &m.id, "you", "You", true)
+            .await
+            .unwrap();
+        let first = upsert_speaker(&db, &m.id, "speaker-01", "Speaker 1", false)
+            .await
+            .unwrap();
+        let second = upsert_speaker(&db, &m.id, "speaker-02", "Dana", false)
+            .await
+            .unwrap();
+        let third = upsert_speaker(&db, &m.id, "speaker-03", "Speaker 3", false)
+            .await
+            .unwrap();
+        // Somebody merged the third voice into the second.
+        merge_speakers(&db, &third.id, &second.id).await.unwrap();
+        // And a line is still attributed to the second one.
+        let ids = insert_segments(&db, &[draft(&m.id, 0, "we ship on Friday")])
+            .await
+            .unwrap();
+        assign_speaker(&db, &ids, &second.id, 2).await.unwrap();
+
+        let removed =
+            prune_speakers_except(&db, &m.id, &["you".to_string(), "speaker-01".to_string()])
+                .await
+                .unwrap();
+        assert_eq!(removed, 2);
+
+        let left = list_speakers(&db, &m.id).await.unwrap();
+        let ids_left: Vec<&str> = left.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids_left.len(), 2);
+        assert!(ids_left.contains(&me.id.as_str()));
+        assert!(ids_left.contains(&first.id.as_str()));
+
+        // The line that pointed at a voice which no longer exists reads as
+        // unattributed rather than as somebody who was never there.
+        let segment = get_segment(&db, &ids[0]).await.unwrap().unwrap();
+        assert_eq!(segment.speaker_id, None);
+        assert_eq!(segment.text, "we ship on Friday", "the words are untouched");
+    }
+
+    #[tokio::test]
+    async fn pruning_with_nothing_to_keep_refuses_to_wipe_the_meeting() {
+        let (db, m) = seeded().await;
+        upsert_speaker(&db, &m.id, "you", "You", true)
+            .await
+            .unwrap();
+        assert_eq!(prune_speakers_except(&db, &m.id, &[]).await.unwrap(), 0);
+        assert_eq!(count_people(&db, &m.id).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn pruning_never_reaches_into_another_meeting() {
+        let (db, m) = seeded().await;
+        let other = create_meeting(&db, "Retro", "/tmp/audio/m2", None)
+            .await
+            .unwrap();
+        upsert_speaker(&db, &m.id, "speaker-01", "Speaker 1", false)
+            .await
+            .unwrap();
+        upsert_speaker(&db, &other.id, "speaker-01", "Speaker 1", false)
+            .await
+            .unwrap();
+
+        prune_speakers_except(&db, &m.id, &["you".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(count_people(&db, &m.id).await.unwrap(), 0);
+        assert_eq!(count_people(&db, &other.id).await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -2270,7 +2657,9 @@ mod tests {
         set_job_status(&db, &parked.id, JobStatus::Paused, None)
             .await
             .unwrap();
-        let done = create_job(&db, Some(&m.id), JobKind::Mixdown).await.unwrap();
+        let done = create_job(&db, Some(&m.id), JobKind::Mixdown)
+            .await
+            .unwrap();
         set_job_status(&db, &done.id, JobStatus::Done, None)
             .await
             .unwrap();
@@ -2720,7 +3109,9 @@ mod tests {
         insert_chunk(&db, &m.id, Channel::System, 0, "/a/s0.flac", 0, 1_000)
             .await
             .unwrap();
-        set_meeting_mixed_path(&db, &m.id, "/a/mixed.flac").await.unwrap();
+        set_meeting_mixed_path(&db, &m.id, "/a/mixed.flac")
+            .await
+            .unwrap();
 
         let paths = delete_meeting(&db, &m.id).await.unwrap();
         assert!(get_meeting(&db, &m.id).await.unwrap().is_none());
@@ -2750,7 +3141,9 @@ mod tests {
         insert_segments(&db, &[draft(&other.id, 0, "quince season")])
             .await
             .unwrap();
-        let speaker = upsert_speaker(&db, &m.id, "mic", "You", true).await.unwrap();
+        let speaker = upsert_speaker(&db, &m.id, "mic", "You", true)
+            .await
+            .unwrap();
         let mine = get_segments(
             &db,
             &TranscriptQuery {
@@ -2796,7 +3189,9 @@ mod tests {
         )
         .await
         .unwrap();
-        create_job(&db, Some(&m.id), JobKind::Summarize).await.unwrap();
+        create_job(&db, Some(&m.id), JobKind::Summarize)
+            .await
+            .unwrap();
 
         delete_meeting(&db, &m.id).await.unwrap();
 

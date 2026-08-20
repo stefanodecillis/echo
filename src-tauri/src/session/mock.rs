@@ -544,6 +544,21 @@ impl CollectingEvents {
             .collect()
     }
 
+    /// The speaker-list announcements, in order. Each carries how many people
+    /// Echo believes were in the meeting at that moment.
+    #[allow(dead_code)]
+    pub(crate) fn speaker_updates(&self) -> Vec<crate::events::SpeakersUpdatedPayload> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::SpeakersUpdated(payload) => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The transcript lines that went out, in the order they were sent.
     pub(crate) fn finals(&self) -> Vec<crate::events::TranscriptFinalPayload> {
         self.seen
@@ -635,16 +650,15 @@ impl Harness {
     /// Journal one committed chunk, as the writer would once a piece of audio is
     /// flushed and fsynced.
     pub(crate) async fn commit_chunk(&self, meeting_id: &str, t_start_ms: i64, t_end_ms: i64) {
-        self.capture
-            .send(CaptureSignal::ChunkCommitted(
-                crate::audio::writer::CommittedChunk {
-                    channel: Channel::Mic,
-                    seq: 0,
-                    path: self.paths.chunk_path(meeting_id, Channel::Mic, 0),
-                    t_start_ms,
-                    t_end_ms,
-                },
-            ));
+        self.capture.send(CaptureSignal::ChunkCommitted(
+            crate::audio::writer::CommittedChunk {
+                channel: Channel::Mic,
+                seq: 0,
+                path: self.paths.chunk_path(meeting_id, Channel::Mic, 0),
+                t_start_ms,
+                t_end_ms,
+            },
+        ));
         self.settle().await;
     }
 

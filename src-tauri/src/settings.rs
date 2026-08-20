@@ -337,6 +337,9 @@ mod tests {
             PathBuf::from("/Volumes/Big/EchoRecordings")
         );
         let p = app_paths(&db).await.unwrap();
-        assert_eq!(p.storage_root(), PathBuf::from("/Volumes/Big/EchoRecordings"));
+        assert_eq!(
+            p.storage_root(),
+            PathBuf::from("/Volumes/Big/EchoRecordings")
+        );
     }
 }

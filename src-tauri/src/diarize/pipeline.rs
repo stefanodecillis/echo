@@ -6,7 +6,9 @@
 //!                            ├─ segmentation → powerset decode → local turns
 //!                            ├─ line up local labels with the previous window
 //!                            └─ single-voice audio → fingerprint
-//!   all fingerprints ─────────► agglomerative clustering (calibrated threshold)
+//!   all fingerprints ─────────► agglomerative clustering — cut at the
+//!                               calibrated threshold, or at the count the
+//!                               person gave us if they gave us one
 //!   labels ───────────────────► per-person timeline → speakers rows
 //!   final segments ───────────► speaker_id by time overlap, new revision
 //! ```
@@ -177,14 +179,23 @@ pub async fn refine(
     // loaded, which is the point of checking first (mantra 1).
     if pcm.is_empty() {
         let speakers = pin_channel_speakers(db, meeting_id).await?;
+        let (people_count, people_count_is_override) = people_count(db, meeting_id).await?;
         control.report(1.0);
         return Ok(DiarizationResult {
             turns: Vec::new(),
             speaker_count: 0,
             threshold: cluster::DISTANCE_THRESHOLD,
             speakers,
+            people_count,
+            people_count_is_override,
         });
     }
+
+    // How many voices to look for. `None` is the automatic pass and the common
+    // case; `Some` is the person having corrected the count, and it is read
+    // before any model loads so a correction can never be lost to a pass that
+    // was already deciding for itself.
+    let target = remote_cluster_target(db, meeting_id).await?;
 
     let threads = inference_threads();
     let mut segmenter = Segmenter::load(segmenter_path, threads)?;
@@ -238,7 +249,10 @@ pub async fn refine(
     control.checkpoint()?;
     control.report(0.85);
 
-    let clustering = cluster::cluster(&items, cluster::DISTANCE_THRESHOLD);
+    let clustering = match target {
+        Some(k) => cluster::cluster_fixed(&items, k),
+        None => cluster::cluster(&items, cluster::DISTANCE_THRESHOLD),
+    };
     let labelled = label_windows(&windows, &clustering.labels);
     let (mut tracks, mut confidence) = build_tracks(&windows, &labelled, clustering.cluster_count);
 
@@ -260,6 +274,7 @@ pub async fn refine(
     control.report(0.9);
 
     let speakers = persist(db, meeting_id, &tracks).await?;
+    let (people_count, people_count_is_override) = people_count(db, meeting_id).await?;
     control.report(1.0);
 
     Ok(DiarizationResult {
@@ -267,7 +282,65 @@ pub async fn refine(
         turns,
         threshold: clustering.threshold,
         speakers,
+        people_count,
+        people_count_is_override,
     })
+}
+
+/// How many remote voices this meeting's clustering should aim for, or `None`
+/// for "let the calibrated threshold decide".
+async fn remote_cluster_target(db: &Db, meeting_id: &str) -> Result<Option<usize>, DiarizeError> {
+    let Some(people) = repo::speaker_count_override(db, meeting_id)
+        .await
+        .map_err(db_failed)?
+    else {
+        return Ok(None);
+    };
+    // "Did the person at this computer say anything" is a question about the
+    // transcript, not about the devices: the microphone is always open, so
+    // asking whether mic audio exists would subtract a person from every
+    // meeting, including the ones the person only listened to.
+    let mic_has_speech = repo::has_channel_speech(db, meeting_id, Channel::Mic)
+        .await
+        .map_err(db_failed)?;
+    Ok(Some(remote_target(people, mic_has_speech)))
+}
+
+/// Turn "there were N people in this meeting" into "look for this many remote
+/// voices".
+///
+/// The person counts themselves — "people in this meeting" includes the one
+/// reading the question — and the microphone is a separate, certain speaker that
+/// no clustering is involved in. So a count of N asks the clustering for N-1
+/// when this computer's microphone caught speech, and for N when it did not
+/// (a meeting the person only listened to).
+///
+/// Never zero: a meeting with remote audio in it has at least one remote voice,
+/// whatever the arithmetic says, and returning zero would leave every remote
+/// line unattributed to make a subtraction come out right.
+pub fn remote_target(people: u32, mic_has_speech: bool) -> usize {
+    let people = super::clamp_people(people);
+    let remote = if mic_has_speech {
+        people.saturating_sub(1)
+    } else {
+        people
+    };
+    remote.max(1) as usize
+}
+
+/// The number the UI shows, and whether it is the person's or Echo's.
+///
+/// An override wins whenever there is one — it is the person's answer to the
+/// question the UI asked, and the control has to read back what they typed. The
+/// pass produces *at most* that many voices and may produce fewer when the
+/// meeting does not contain that much distinguishable speech; that is a quality
+/// shortfall in the transcript, not a reason to argue with the person about how
+/// many people were in their meeting.
+///
+/// Without an override it is Echo's own count: every speaker row that is not
+/// merged into another one, which is "You" plus the voices the pass found.
+async fn people_count(db: &Db, meeting_id: &str) -> Result<(u32, bool), DiarizeError> {
+    repo::people_count(db, meeting_id).await.map_err(db_failed)
 }
 
 /// Segment one window, line its labels up with the previous one, and fingerprint
@@ -483,6 +556,13 @@ fn turns_from_tracks(tracks: &[Vec<Span>], confidence: &[f32]) -> Vec<SpeakerTur
 /// segment goes to the person who was talking over most of it. Segments nothing
 /// covers are left alone rather than guessed at, so an unattributed line stays
 /// honestly unattributed.
+///
+/// **Reuse, never duplicate.** Rows are keyed by cluster key, so running the
+/// pass again lands on the rows that are already there — which is what lets a
+/// rename survive a re-run — and the last thing it does is forget the rows this
+/// run no longer produced. Without that a meeting re-cut from four voices to two
+/// would keep two ghost chips with nothing behind them, and Echo's own count of
+/// how many people were in the meeting would still say four.
 async fn persist(
     db: &Db,
     meeting_id: &str,
@@ -545,6 +625,18 @@ async fn persist(
             .await
             .map_err(db_failed)?;
     }
+
+    // Whoever this run did not produce is no longer one of the people in this
+    // meeting. Their rows go, which releases any line still pointing at them
+    // back to unattributed rather than leaving it labelled with a voice the pass
+    // no longer believes in.
+    let mut keep: Vec<String> = Vec::with_capacity(tracks.len() + 1);
+    keep.push(SELF_CLUSTER_KEY.to_string());
+    keep.extend((0..tracks.len()).map(cluster_key));
+    repo::prune_speakers_except(db, meeting_id, &keep)
+        .await
+        .map_err(db_failed)?;
+
     repo::recompute_speaking_time(db, meeting_id)
         .await
         .map_err(db_failed)?;
@@ -802,5 +894,191 @@ mod tests {
     fn the_thread_budget_leaves_the_machine_room() {
         let t = inference_threads();
         assert!((1..=4).contains(&t), "{t} threads");
+    }
+
+    // -----------------------------------------------------------------------
+    // "There were four of us"
+    // -----------------------------------------------------------------------
+
+    /// The arithmetic the whole feature turns on: the number the person gives
+    /// counts them, and the microphone is not one of the voices being clustered.
+    #[test]
+    fn the_person_counts_themselves_so_the_microphone_comes_off_the_total() {
+        assert_eq!(remote_target(4, true), 3);
+        assert_eq!(remote_target(2, true), 1);
+        // A meeting the person only listened to: nobody to subtract.
+        assert_eq!(remote_target(4, false), 4);
+        assert_eq!(remote_target(1, false), 1);
+    }
+
+    /// "Just me" on a meeting with remote audio in it. Zero remote voices would
+    /// leave every remote line unattributed to make the subtraction come out
+    /// right, which is worse than one voice too many.
+    #[test]
+    fn a_count_of_one_still_leaves_a_voice_for_the_far_end() {
+        assert_eq!(remote_target(1, true), 1);
+    }
+
+    #[test]
+    fn a_count_outside_what_echo_can_do_is_pulled_into_range() {
+        assert_eq!(remote_target(0, false), 1);
+        assert_eq!(
+            remote_target(9_999, false),
+            super::super::MAX_PEOPLE as usize
+        );
+        assert_eq!(
+            remote_target(9_999, true),
+            super::super::MAX_PEOPLE as usize - 1
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Running the pass again
+    // -----------------------------------------------------------------------
+
+    async fn db() -> Db {
+        let db = crate::db::connect_in_memory().await.expect("in-memory db");
+        crate::db::migrate(&db).await.expect("migrations");
+        db
+    }
+
+    fn remote_line(meeting_id: &str, from: i64, to: i64) -> crate::types::SegmentDraft {
+        crate::types::SegmentDraft {
+            meeting_id: meeting_id.to_string(),
+            t_start_ms: from,
+            t_end_ms: to,
+            channel: Channel::System,
+            text: "hello".into(),
+            revision: 1,
+            is_final: true,
+            ..Default::default()
+        }
+    }
+
+    /// The property the whole re-run rests on: a second pass lands on the rows
+    /// the first one made, moves the transcript onto them, and leaves nothing
+    /// behind. Not one duplicate row, and no ghost of a voice this cut does not
+    /// believe in.
+    #[tokio::test]
+    async fn running_the_pass_again_with_fewer_people_reassigns_instead_of_duplicating() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Team sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                remote_line(&meeting.id, 0, 4_000),
+                remote_line(&meeting.id, 5_000, 9_000),
+                remote_line(&meeting.id, 10_000, 14_000),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // First pass: three voices.
+        let three = vec![
+            vec![(0i64, 4_000i64)],
+            vec![(5_000, 9_000)],
+            vec![(10_000, 14_000)],
+        ];
+        let after_first = persist(&db, &meeting.id, &three).await.unwrap();
+        assert_eq!(after_first.len(), 4, "You and three voices");
+        assert_eq!(repo::count_people(&db, &meeting.id).await.unwrap(), 4);
+
+        // The person renames the second one before deciding there were fewer
+        // people than that.
+        let dana = after_first
+            .iter()
+            .find(|s| s.cluster_key == cluster_key(1))
+            .expect("the second voice");
+        repo::rename_speaker(&db, &dana.id, "Dana").await.unwrap();
+
+        // Second pass, cut to one voice covering the same speech.
+        let one = vec![vec![(0i64, 14_000i64)]];
+        let after_second = persist(&db, &meeting.id, &one).await.unwrap();
+
+        // Two rows, not five: the first pass's rows were reused and the two the
+        // second pass no longer produces are gone.
+        assert_eq!(after_second.len(), 2, "{after_second:?}");
+        let keys: Vec<&str> = after_second
+            .iter()
+            .map(|s| s.cluster_key.as_str())
+            .collect();
+        assert_eq!(keys, vec![SELF_CLUSTER_KEY, cluster_key(0).as_str()]);
+        assert_eq!(repo::count_people(&db, &meeting.id).await.unwrap(), 2);
+
+        // Every line is on the surviving voice, and none is left pointing at a
+        // row that no longer exists.
+        let survivor = after_second
+            .iter()
+            .find(|s| s.cluster_key == cluster_key(0))
+            .expect("the one voice");
+        let segments = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(segments.len(), 3, "the words themselves are untouched");
+        assert!(segments
+            .iter()
+            .all(|s| s.speaker_id.as_deref() == Some(survivor.id.as_str())));
+        assert!(segments.iter().all(|s| s.text == "hello"));
+    }
+
+    /// A rename survives a re-run for the cluster it was on. The honest other
+    /// half: a name on a voice the new cut does not produce goes with the row.
+    #[tokio::test]
+    async fn a_rename_survives_a_re_run_of_the_cluster_it_was_on() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "One to one", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(&db, &[remote_line(&meeting.id, 0, 4_000)])
+            .await
+            .unwrap();
+
+        let first = persist(&db, &meeting.id, &[vec![(0i64, 4_000i64)]])
+            .await
+            .unwrap();
+        let voice = first
+            .iter()
+            .find(|s| s.cluster_key == cluster_key(0))
+            .unwrap();
+        repo::rename_speaker(&db, &voice.id, "Ada").await.unwrap();
+        // And "You" is renamed too, which must survive everything.
+        let me = first.iter().find(|s| s.is_self).unwrap();
+        repo::rename_speaker(&db, &me.id, "Stefano").await.unwrap();
+
+        let second = persist(&db, &meeting.id, &[vec![(0i64, 4_000i64)]])
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 2);
+        let names: Vec<&str> = second.iter().map(|s| s.display_name.as_str()).collect();
+        assert!(names.contains(&"Ada"), "{names:?}");
+        assert!(names.contains(&"Stefano"), "{names:?}");
+        // Same rows, so the ids the UI is holding are still good.
+        assert_eq!(second.iter().find(|s| s.is_self).unwrap().id, me.id);
+    }
+
+    /// The microphone is never one of the rows a cut can take away.
+    #[tokio::test]
+    async fn you_survive_a_cut_that_produces_no_remote_voices_at_all() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Voice note", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::upsert_speaker(&db, &meeting.id, &cluster_key(0), "Speaker 1", false)
+            .await
+            .unwrap();
+
+        let speakers = persist(&db, &meeting.id, &[]).await.unwrap();
+        assert_eq!(speakers.len(), 1);
+        assert_eq!(speakers[0].cluster_key, SELF_CLUSTER_KEY);
+        assert!(speakers[0].is_self);
     }
 }

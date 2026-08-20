@@ -1,0 +1,20 @@
+-- The person gets to correct how many people were in the meeting.
+--
+-- The offline speaker pass works out the number on its own, and it is right
+-- often enough to be the default and wrong often enough to need a correction:
+-- one voice split in two, two quiet people fused into one. Rather than exposing
+-- a distance threshold nobody outside a lab could reason about (mantra 2), the
+-- person says "there were four of us" and the pass runs again cut to exactly
+-- that many.
+--
+-- NULL means automatic — Echo's own count, shown as "detected". A number is the
+-- person's answer, and it is the TOTAL number of people in the meeting,
+-- INCLUDING whoever was at this computer. That is what "people in this meeting"
+-- means to a human, and it is what the UI asks for; the pass subtracts the
+-- microphone itself before it cuts the remote voices (see
+-- `diarize::pipeline::remote_target`).
+--
+-- Plain ADD COLUMN with no default and no rewrite, so an install that already
+-- has meetings in it gets NULL on every existing row — which is exactly
+-- "automatic", the behaviour those meetings already had.
+ALTER TABLE meetings ADD COLUMN speaker_count_override INTEGER;
