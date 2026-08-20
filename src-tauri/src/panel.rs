@@ -648,24 +648,14 @@ fn ensure_window(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
     .focused(false)
     .visible(false);
 
-    // Rounded corners need a see-through window. On macOS that sits behind a
-    // private API Tauri gates at compile time, and a crate cannot read its
-    // dependency's feature flags — switching it on means adding
-    // `macos-private-api = ["tauri/macos-private-api"]` to Cargo.toml,
-    // `"macOSPrivateApi": true` to tauri.conf.json, and this platform to the
-    // line below. Until then the panel is a plain rectangle on macOS: it works,
-    // it is just squarer.
-    #[cfg(not(target_os = "macos"))]
-    {
-        builder = builder.transparent(true);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // The panel's own page makes itself see-through, expecting the window
-        // behind it to be too. Until it can be, paint that window Echo's own
-        // white rather than leaving it whatever grey the platform picks.
-        builder = builder.background_color(tauri::window::Color(255, 255, 255, 255));
-    }
+    // Rounded corners need a see-through window. On macOS that sits behind
+    // Tauri's `macos-private-api` feature, which IS enabled (Cargo.toml +
+    // `"macOSPrivateApi": true` in tauri.conf.json), so every platform gets a
+    // transparent window and the card inside is the only thing anyone sees.
+    // History: before the feature was on, macOS was painted opaque white here
+    // as a stopgap — that was the "square white rectangle behind the panel"
+    // bug, twice.
+    builder = builder.transparent(true);
 
     // A click on a window that is not focused should press the button, not just
     // raise the window: Start has to work on the first click.
