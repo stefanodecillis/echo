@@ -58,6 +58,12 @@ pub const MIN_GAP_MS: i64 = 800;
 /// How long to wait before looking again, while a recording has priority.
 const YIELD_INTERVAL: Duration = Duration::from_millis(500);
 
+/// After the first stretch the engine could not read, log only every Nth.
+///
+/// A pass over a two-hour meeting with a broken engine is thousands of identical
+/// lines. One at the start and one summary at the end say the same thing.
+const SKIP_LOG_EVERY: u32 = 25;
+
 /// Asked between windows: `true` means stop.
 pub type CancelCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 /// Asked between windows: `true` means a recording is live, so wait.
@@ -307,6 +313,7 @@ where
     }
     let mut done_ms: i64 = 0;
     let window = options.window();
+    let mut skipped: u32 = 0;
 
     for (channel, chunks, start, end) in plan {
         report.from_ms = report.from_ms.min(start);
@@ -369,8 +376,19 @@ where
                         report.finish(transcriber, meeting_id, &options, done_ms, total_ms);
                         return Ok(report);
                     }
-                    // One bad window must not abandon the rest of the meeting.
-                    Err(e) => tracing::warn!(%e, cursor, "skipped a stretch that would not decode"),
+                    // One bad window must not abandon the rest of the meeting —
+                    // nor fill the log with one line per window while it does.
+                    Err(e) => {
+                        skipped += 1;
+                        if skipped == 1 || skipped.is_multiple_of(SKIP_LOG_EVERY) {
+                            tracing::warn!(
+                                %e,
+                                cursor,
+                                count = skipped,
+                                "skipped a stretch that would not decode"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -380,6 +398,13 @@ where
         }
     }
 
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            written = report.segments_written,
+            "some stretches of this recording would not decode"
+        );
+    }
     report.finish(transcriber, meeting_id, &options, total_ms, total_ms);
     Ok(report)
 }
@@ -515,6 +540,16 @@ mod tests {
         fn reads(&self) -> Vec<(Channel, i64, i64)> {
             self.reads.lock().unwrap().clone()
         }
+    }
+
+    /// An utterance the live pass could not write down leaves a hole exactly its
+    /// own width. If that width were under [`MIN_GAP_MS`] this pass would step
+    /// straight over it and the words would be gone for good, audio on disk or
+    /// not — so the shortest thing the segmenter emits has to be wider than the
+    /// shortest hole this pass will look at.
+    #[test]
+    fn every_utterance_the_live_pass_loses_leaves_a_hole_this_pass_will_look_at() {
+        const { assert!(crate::audio::vad::MIN_UTTERANCE_MS > MIN_GAP_MS) };
     }
 
     impl FakeAudio {

@@ -47,6 +47,20 @@ const PARTIAL_INTERVAL: Duration = Duration::from_millis(200);
 /// Loudness for the recording indicator: at most ten a second.
 const LEVELS_INTERVAL: Duration = Duration::from_millis(100);
 
+/// After the first engine failure, log only every Nth.
+///
+/// A backed-up queue draining against a broken engine is dozens of identical
+/// lines a second. The first one is the diagnosis; the rest are noise that
+/// buries whatever else the log had to say.
+const FAILURE_LOG_EVERY: u32 = 25;
+
+/// Consecutive failures before the person is told, once.
+///
+/// One utterance the engine could not read is not worth interrupting anybody
+/// over — it is on disk and catch-up will get it. Ten in a row means live text
+/// is not working, and *that* is worth one sentence.
+const FAILURES_BEFORE_TELLING: u32 = 10;
+
 /// Start the two tasks for one recording. They end on their own when the
 /// capture feed closes, which is what stopping a capture does.
 pub(crate) fn spawn(inner: Arc<Inner>, meeting_id: Id, feed: CaptureFeed) -> Vec<JoinHandle<()>> {
@@ -189,11 +203,50 @@ fn due(last: &mut Option<Instant>, interval: Duration) -> bool {
 // Speech
 // ---------------------------------------------------------------------------
 
+/// How live transcription is going, so a broken engine is reported once instead
+/// of once per utterance.
+///
+/// Nothing here changes what is recoverable: every failed utterance is still on
+/// disk and still picked up by the catch-up pass (mantra 3). This is only about
+/// what the log and the person are told.
+#[derive(Debug, Default)]
+struct FailureRun {
+    /// Failures since the last success. Reset by any utterance that works.
+    consecutive: u32,
+    /// Failures for the whole recording, for the every-Nth log line.
+    total: u32,
+    /// The person has already been told about this recording.
+    told_them: bool,
+}
+
+impl FailureRun {
+    /// Record a failure. Returns whether this one is worth a log line.
+    fn note_failure(&mut self) -> bool {
+        self.consecutive += 1;
+        self.total += 1;
+        self.total == 1 || self.total.is_multiple_of(FAILURE_LOG_EVERY)
+    }
+
+    fn note_success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Is it time to say something out loud, exactly once?
+    fn should_tell_them(&mut self) -> bool {
+        if self.told_them || self.consecutive < FAILURES_BEFORE_TELLING {
+            return false;
+        }
+        self.told_them = true;
+        true
+    }
+}
+
 async fn speech_loop(inner: Arc<Inner>, meeting_id: Id, mut utterances: mpsc::Receiver<Utterance>) {
     let mut batch: Vec<(String, SegmentDraft)> = Vec::new();
     let mut last_flush = Instant::now();
     let mut language: Option<String> = None;
     let mut speakers = SpeakerCache::default();
+    let mut failures = FailureRun::default();
 
     loop {
         let until_flush = BATCH_INTERVAL.saturating_sub(last_flush.elapsed());
@@ -207,6 +260,7 @@ async fn speech_loop(inner: Arc<Inner>, meeting_id: Id, mut utterances: mpsc::Re
                             utterance,
                             &mut language,
                             &mut speakers,
+                            &mut failures,
                         )
                         .await
                         {
@@ -245,6 +299,7 @@ async fn transcribe(
     utterance: Utterance,
     language: &mut Option<String>,
     speakers: &mut SpeakerCache,
+    failures: &mut FailureRun,
 ) -> Option<(String, SegmentDraft)> {
     let utterance_id = repo::new_id();
     let channel = utterance.channel;
@@ -287,11 +342,32 @@ async fn transcribe(
             return None;
         }
         Err(error) => {
-            tracing::warn!(%error, "could not write down an utterance live");
+            // One line for the first, then one every Nth: a queue draining
+            // against a broken engine used to write the same sentence dozens of
+            // times a second and drown the log it was supposed to explain.
+            if failures.note_failure() {
+                tracing::warn!(
+                    %error,
+                    count = failures.total,
+                    "could not write down an utterance live"
+                );
+            }
+            if failures.should_tell_them() {
+                inner.notice(NoticePayload {
+                    level: NoticeLevel::Warning,
+                    message: "Echo is having trouble writing things down — it will catch up from \
+                              the recording afterwards."
+                        .into(),
+                    persistent: false,
+                    meeting_id: Some(meeting_id.to_string()),
+                    tag: Some("liveTextTrouble".into()),
+                });
+            }
             close_partial(inner, meeting_id, &utterance_id, channel, t_start_ms, t_end_ms);
             return None;
         }
     };
+    failures.note_success();
 
     let text = transcription.text.trim();
     if text.is_empty() {
@@ -505,5 +581,65 @@ fn segment_of(id: Id, draft: SegmentDraft) -> Segment {
         is_final: draft.is_final,
         model_name: draft.model_name,
         model_revision: draft.model_revision,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_bad_utterance_is_logged_once_and_told_to_nobody() {
+        let mut run = FailureRun::default();
+        assert!(run.note_failure(), "the first one always gets a line");
+        assert!(
+            !run.should_tell_them(),
+            "one utterance the engine could not read is not worth interrupting anybody"
+        );
+        // And an utterance that works clears the run.
+        run.note_success();
+        assert_eq!(run.consecutive, 0);
+        assert!(!run.should_tell_them());
+    }
+
+    #[test]
+    fn a_broken_engine_writes_one_line_then_every_nth() {
+        let mut run = FailureRun::default();
+        let logged = (1..=100).filter(|_| run.note_failure()).count();
+        // The first, then every FAILURE_LOG_EVERY-th: 1, 25, 50, 75, 100.
+        assert_eq!(logged, 1 + 100 / FAILURE_LOG_EVERY as usize);
+        assert_eq!(run.total, 100);
+    }
+
+    #[test]
+    fn after_a_run_of_failures_the_person_is_told_exactly_once() {
+        let mut run = FailureRun::default();
+        for i in 1..FAILURES_BEFORE_TELLING {
+            run.note_failure();
+            assert!(!run.should_tell_them(), "too early at {i}");
+        }
+        run.note_failure();
+        assert!(run.should_tell_them(), "ten in a row is worth one sentence");
+        // Never twice, however long it goes on.
+        for _ in 0..500 {
+            run.note_failure();
+            assert!(!run.should_tell_them());
+        }
+    }
+
+    #[test]
+    fn a_recovery_in_the_middle_resets_the_run_without_re_notifying() {
+        let mut run = FailureRun::default();
+        for _ in 0..FAILURES_BEFORE_TELLING - 1 {
+            run.note_failure();
+        }
+        run.note_success();
+        for _ in 0..FAILURES_BEFORE_TELLING - 1 {
+            run.note_failure();
+        }
+        assert!(
+            !run.should_tell_them(),
+            "a working utterance in between means live text is not stuck"
+        );
     }
 }

@@ -478,6 +478,9 @@ pub struct Watcher {
     /// True while a notification is on screen waiting to be clicked, so a run of
     /// detections cannot pile up threads.
     notification_in_flight: Arc<AtomicBool>,
+    /// True while a pre-warm started by this watcher is still running, so two
+    /// detections cannot ask for the weights twice.
+    prewarm_in_flight: Arc<AtomicBool>,
     source: Box<dyn SignalSource>,
 }
 
@@ -507,6 +510,7 @@ impl Watcher {
             task: Mutex::new(None),
             requested_notification_permission: AtomicBool::new(false),
             notification_in_flight: Arc::new(AtomicBool::new(false)),
+            prewarm_in_flight: Arc::new(AtomicBool::new(false)),
             source,
         }
     }
@@ -822,6 +826,14 @@ impl Watcher {
                     .unwrap_or(false),
                 None => false,
             };
+            // Noticing a meeting is the strongest hint there is that somebody is
+            // about to press Start (mantra 1: "or on an explicit pre-warm").
+            // Reading the weights takes seconds on a warm machine and minutes
+            // the very first time, when the graphics compiler has work to do —
+            // and that first time is exactly the meeting that loses its opening
+            // minutes if we wait for the click.
+            self.prewarm_speech_in_the_background(&app, speech_ready);
+
             if speech_ready && !self.episode_dismissed() {
                 let detected_app = new_status
                     .signals
@@ -830,6 +842,47 @@ impl Watcher {
                 self.nudge_about_the_meeting(&app, detected_app).await;
             }
         }
+    }
+
+    /// Start loading speech understanding, without waiting for it.
+    ///
+    /// Deliberately fire-and-forget: this runs inside the 5-second poll, and a
+    /// tick that blocks for a two-minute first load would stop the watcher
+    /// noticing the meeting had ended. Failure is not reported anywhere — the
+    /// person has not asked for anything yet, and pressing Start does its own
+    /// pre-warm with its own message (see `session::SessionManager::start`).
+    fn prewarm_speech_in_the_background(&self, app: &AppHandle, speech_ready: bool) {
+        let Some(state) = app.try_state::<crate::AppState>() else {
+            return;
+        };
+        if !should_prewarm(
+            speech_ready,
+            state.session.speech_loaded(),
+            self.prewarm_in_flight.load(Ordering::SeqCst),
+        ) {
+            return;
+        }
+        // Claim the slot before spawning, so two ticks cannot both start one.
+        if self.prewarm_in_flight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let in_flight = self.prewarm_in_flight.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            if let Some(state) = app.try_state::<crate::AppState>() {
+                match state.session.prewarm_speech().await {
+                    Ok(()) => tracing::info!(
+                        "a meeting was detected, so speech understanding is ready early"
+                    ),
+                    // Nothing to say to anybody: nobody asked for this yet.
+                    Err(error) => tracing::debug!(
+                        %error,
+                        "could not get speech understanding ready ahead of time"
+                    ),
+                }
+            }
+            in_flight.store(false, Ordering::SeqCst);
+        });
     }
 
     /// One nudge per meeting, and only one.
@@ -993,6 +1046,15 @@ fn open_echo_ready_to_start(app: &AppHandle, detected_app: Option<String>) {
             detected_app,
         },
     );
+}
+
+/// Should noticing a meeting load speech understanding now?
+///
+/// Only when there is something to load (the one-time download has finished),
+/// only when it is not already in memory — re-loading would throw away the very
+/// thing we are trying to have ready — and only one at a time.
+fn should_prewarm(speech_ready: bool, already_loaded: bool, in_flight: bool) -> bool {
+    speech_ready && !already_loaded && !in_flight
 }
 
 fn initial_state(enabled: bool) -> DetectionState {
@@ -1726,5 +1788,19 @@ mod tests {
         // A diagnostic "check now" is not the watcher deciding a meeting
         // was detected; status is untouched without a real tick.
         assert_eq!(watcher.status().state, DetectionState::Idle);
+    }
+
+    #[test]
+    fn noticing_a_meeting_gets_speech_understanding_ready_but_only_when_it_helps() {
+        // The case worth having: assets on disk, nothing loaded, nothing running.
+        assert!(should_prewarm(true, false, false));
+
+        // Before the one-time download finishes there is nothing to load, and
+        // recording is locked anyway.
+        assert!(!should_prewarm(false, false, false));
+        // Already in memory: loading again would drop the thing we want ready.
+        assert!(!should_prewarm(true, true, false));
+        // One at a time, however many meetings get noticed.
+        assert!(!should_prewarm(true, false, true));
     }
 }

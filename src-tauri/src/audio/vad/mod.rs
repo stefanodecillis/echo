@@ -8,7 +8,9 @@
 //!
 //! What this module hands the speech engine is an *utterance*: a stretch of
 //! speech padded on both sides, capped at [`MAX_UTTERANCE_MS`] so one long
-//! monologue cannot stall the queue (review finding 20).
+//! monologue cannot stall the queue (review finding 20), and never shorter than
+//! [`MIN_UTTERANCE_MS`], because a window under a second is one the engine
+//! cannot read at all.
 //!
 //! ## Two detectors, one behaviour
 //!
@@ -44,6 +46,23 @@ pub const MAX_UTTERANCE_MS: i64 = 28_000;
 
 /// Silence this long ends an utterance.
 pub const SILENCE_TAIL_MS: i64 = 600;
+
+/// Shortest utterance handed downstream.
+///
+/// The speech engine cannot read a window under a second — whisper.cpp fails to
+/// encode it and answers an error instead of text. That is not a reason to throw
+/// the words away: a meeting is full of short answers ("yeah", "no, Tuesday"),
+/// and each one is a line of the transcript.
+///
+/// So an utterance that would come out shorter than this is not trimmed back to
+/// [`PAD_MS`]. It keeps the silence it already has around it — audio that was
+/// captured, held, and until now discarded by [`Segmenter::close`] — until the
+/// window is long enough to be read. Nothing is invented and nothing is lost.
+///
+/// The one case that can still come out shorter is the very end of a recording,
+/// where there is no more audio to keep; the engine zero-pads that last window
+/// itself.
+pub const MIN_UTTERANCE_MS: i64 = 1_100;
 
 /// Silero's window at 16 kHz. Everything here works in whole windows.
 pub const WINDOW_SAMPLES: usize = 512;
@@ -161,8 +180,20 @@ impl Segmenter {
         self.origin_ms + samples_to_ms(self.pos as usize)
     }
 
+    /// Is someone talking *now*?
+    ///
+    /// Not the same as "an utterance is open": once the silence tail has run out
+    /// the utterance may stay open a little longer, waiting for enough audio to
+    /// be readable (see [`MIN_UTTERANCE_MS`]). The indicator, and the hysteresis
+    /// in the per-window decision, both want the honest answer.
     pub fn is_speaking(&self) -> bool {
-        self.in_speech
+        self.in_speech && !self.tail_run_out()
+    }
+
+    /// Has the run of silence since the last voiced window reached
+    /// [`SILENCE_TAIL_MS`]?
+    fn tail_run_out(&self) -> bool {
+        self.silence_windows as i64 * WINDOW_MS >= SILENCE_TAIL_MS
     }
 
     /// Anchor the timeline. Called before the first window, and again after a
@@ -233,17 +264,23 @@ impl Segmenter {
             }
         }
 
-        let tail_reached = self.silence_windows as i64 * WINDOW_MS >= SILENCE_TAIL_MS;
         let too_long = self
             .open
             .as_ref()
             .is_some_and(|o| o.samples.len() >= max_samples);
+        // Speech is over, but the window may still be too short for the engine
+        // to read. Hold it open and keep the silence that is arriving anyway
+        // rather than emitting a sliver nothing can transcribe.
+        let ready = self
+            .open
+            .as_ref()
+            .is_some_and(|o| o.samples.len() >= ms_to_samples(MIN_UTTERANCE_MS));
 
         if too_long {
             if let Some(u) = self.force_cut() {
                 out.push(u);
             }
-        } else if tail_reached {
+        } else if self.tail_run_out() && ready {
             if let Some(u) = self.close(false) {
                 out.push(u);
             }
@@ -252,13 +289,20 @@ impl Segmenter {
     }
 
     /// Close the open utterance at its natural end: the last voiced window plus
-    /// the trailing pad.
+    /// the trailing pad — or more of that trailing silence, when trimming to the
+    /// pad would leave a window the engine cannot read ([`MIN_UTTERANCE_MS`]).
     fn close(&mut self, truncated: bool) -> Option<Utterance> {
         let open = self.open.take()?;
         self.in_speech = false;
         self.silence_windows = 0;
 
-        let keep = (open.voiced_len + PAD_SAMPLES).min(open.samples.len());
+        // Normally: the speech plus a trailing pad. But never trim a window back
+        // below what the engine can read when the audio to fill it is already in
+        // hand — that is the whole reason short answers used to come out as
+        // errors instead of text.
+        let keep = (open.voiced_len + PAD_SAMPLES)
+            .max(ms_to_samples(MIN_UTTERANCE_MS))
+            .min(open.samples.len());
         let mut samples = open.samples;
         // Whatever is trimmed off is silence that may lead into the next
         // utterance; keep the last pad of it as look-behind.
@@ -310,6 +354,10 @@ impl Segmenter {
         let rest = open.samples.split_off(cut);
         let emitted = std::mem::take(&mut open.samples);
         let start_pos = open.start_pos;
+        // The silence the cut was aimed at went out with the piece just emitted.
+        // Carrying its count over would close the continuation immediately, as a
+        // fragment of a sentence nobody can read.
+        self.silence_windows = 0;
 
         // Carry on from the cut with whatever came after it.
         let rest_len = rest.len();
@@ -328,6 +376,10 @@ impl Segmenter {
     }
 
     /// End of stream: emit whatever is still open.
+    ///
+    /// This is the one exit that may produce something shorter than
+    /// [`MIN_UTTERANCE_MS`], because there is no more audio to hold out for. The
+    /// engine pads that last window itself.
     pub fn finish(&mut self) -> Option<Utterance> {
         self.open.as_ref()?;
         self.close(false)
@@ -920,6 +972,125 @@ mod tests {
         let mut out = feed(&mut d, &audio, 0);
         out.extend(d.finish());
         assert_eq!(out.len(), 1, "{out:#?}");
+    }
+
+    /// The regression test for the meeting that produced no transcript at all.
+    ///
+    /// Every utterance handed downstream has to be a window the speech engine
+    /// can read. The old segmenter could emit as little as
+    /// `2 * PAD_SAMPLES + WINDOW_SAMPLES` — 608 ms — which whisper.cpp refuses
+    /// to encode, and every short answer in the meeting landed there.
+    #[test]
+    fn a_short_answer_is_still_long_enough_for_the_engine_to_read() {
+        for burst_ms in [32usize, 100, 200, 300, 400, 700] {
+            let mut d = SpeechDetector::without_model(Channel::Mic);
+            let mut audio = room_noise(600);
+            audio.extend(tone(burst_ms, 300.0, 0.3));
+            // Long enough after it for the segmenter to notice speech ended.
+            audio.extend(room_noise(2_500));
+
+            let mut out = feed(&mut d, &audio, 0);
+            out.extend(d.finish());
+
+            assert_eq!(out.len(), 1, "a {burst_ms} ms answer: {out:#?}");
+            let u = &out[0];
+            // One second is whisper.cpp's own floor, spelled out here rather
+            // than read from MIN_UTTERANCE_MS: the point of the test is that the
+            // constant clears the engine's requirement, so it cannot be the
+            // thing the requirement is measured against.
+            assert!(
+                u.duration_ms() >= 1_000,
+                "a {burst_ms} ms answer became a {} ms utterance, which the engine cannot read",
+                u.duration_ms()
+            );
+            assert_eq!(
+                u.samples.len(),
+                ms_to_samples(u.duration_ms()),
+                "the audio handed over must match the window it claims"
+            );
+            // The words themselves are in there, not just the silence we kept.
+            assert!(rms(&u.samples) > 0.0, "the utterance came back empty");
+        }
+    }
+
+    #[test]
+    fn the_shortest_window_the_segmenter_can_emit_is_one_the_engine_can_read() {
+        // A single voiced window used to be the worst case: one pad either side
+        // and 32 ms of speech.
+        let floor_ms = samples_to_ms(PAD_SAMPLES * 2 + WINDOW_SAMPLES);
+        assert!(
+            floor_ms < 1_000,
+            "this test exists because the natural floor ({floor_ms} ms) is under a second"
+        );
+        const {
+            assert!(
+                MIN_UTTERANCE_MS > 1_000,
+                "the floor has to clear whisper.cpp's one-second window, not just touch it"
+            )
+        };
+    }
+
+    #[test]
+    fn five_seconds_of_talking_is_one_utterance_not_a_hundred() {
+        let mut d = SpeechDetector::without_model(Channel::Mic);
+        let mut audio = room_noise(500);
+        audio.extend(tone(5_000, 300.0, 0.3));
+        audio.extend(room_noise(1_500));
+
+        let mut out = feed(&mut d, &audio, 0);
+        out.extend(d.finish());
+
+        assert_eq!(out.len(), 1, "{out:#?}");
+        assert!(
+            out[0].duration_ms() >= 5_000,
+            "five seconds of speech came back as {} ms",
+            out[0].duration_ms()
+        );
+        assert!(!out[0].truncated);
+    }
+
+    #[test]
+    fn micro_pauses_between_words_do_not_shred_a_sentence() {
+        let mut d = SpeechDetector::without_model(Channel::Mic);
+        let mut audio = room_noise(500);
+        // Six words with 300 ms of breath between them: half the silence tail,
+        // so none of them is an utterance of its own.
+        for _ in 0..6 {
+            audio.extend(tone(400, 300.0, 0.3));
+            audio.extend(room_noise(300));
+        }
+        audio.extend(room_noise(1_500));
+
+        let mut out = feed(&mut d, &audio, 0);
+        out.extend(d.finish());
+
+        assert_eq!(out.len(), 1, "{out:#?}");
+        assert!(
+            out[0].duration_ms() >= 4_000,
+            "the sentence came back as {} ms",
+            out[0].duration_ms()
+        );
+    }
+
+    #[test]
+    fn a_blip_on_its_own_is_never_handed_over_as_an_unreadable_sliver() {
+        // A door, a keystroke, one syllable: whatever it is, the segmenter must
+        // hand over a readable window or nothing at all.
+        let mut d = SpeechDetector::without_model(Channel::Mic);
+        let mut audio = room_noise(400);
+        audio.extend(tone(200, 300.0, 0.3));
+
+        // Nothing after it: the recording ends right there.
+        let mut out = feed(&mut d, &audio, 0);
+        out.extend(d.finish());
+
+        assert!(out.len() <= 1, "{out:#?}");
+        for u in &out {
+            assert_eq!(u.samples.len(), ms_to_samples(u.duration_ms()));
+            // End-of-stream is the one exit that can be short, and the engine
+            // pads it: what must never happen is a *silent* zero-length window.
+            assert!(!u.samples.is_empty());
+        }
     }
 
     #[test]

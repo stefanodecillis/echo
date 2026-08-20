@@ -25,6 +25,7 @@
 //! pre-warm, and dropped again after
 //! [`EngineWorker`]'s idle period with no work.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -72,9 +73,28 @@ const MAX_DECODE_THREADS: usize = 8;
 /// Never fewer than this, however small the computer.
 const MIN_DECODE_THREADS: usize = 2;
 
-/// Audio shorter than this is not worth a decode: whisper pads it out to a full
-/// window and invents words to fill the space.
-const MIN_JOB_MS: i64 = 200;
+/// Below this there is no speech to find, only a click or a keystroke. Skipped
+/// as "nothing was said", which is an answer, not a failure.
+const MIN_JOB_MS: i64 = 80;
+
+/// Shortest window whisper.cpp will actually encode, plus a margin.
+///
+/// whisper.cpp's own guard only rejects audio under 100 ms outright
+/// (`whisper_full_with_state`: *"input is too short — %d ms < 100 ms. consider
+/// padding the input audio with silence"*). Between that and a second, the mel
+/// it builds is short enough that `whisper_encode_internal` fails, and
+/// `whisper_full_with_state` turns that into `return -6` — the
+/// `Generic whisper error … Error code: -6` a real meeting produced dozens of
+/// times. Taking whisper.cpp's own advice and padding the tail out to this
+/// length makes that return unreachable for any non-empty input.
+///
+/// Timestamps are never taken from the padding: [`Engine::transcribe`] clamps
+/// whisper's end-of-speech to the real audio it was handed.
+const MIN_DECODE_MS: i64 = 1_100;
+
+/// [`MIN_DECODE_MS`] in 16 kHz mono samples.
+const MIN_DECODE_SAMPLES: usize =
+    (MIN_DECODE_MS as usize) * (crate::audio::TARGET_SAMPLE_RATE as usize) / 1_000;
 
 /// Whisper reports timestamps in centiseconds.
 const CS_TO_MS: i64 = 10;
@@ -454,12 +474,22 @@ impl Engine {
         let abort = self.abort.clone();
         params.set_abort_callback_safe(move || abort.load(Ordering::Relaxed));
 
-        let outcome = self.state.full(params, &job.samples);
+        // Never the raw utterance: whisper.cpp cannot encode a sub-second window
+        // and answers -6 instead of text.
+        let audio = padded_for_decode(&job.samples);
+        let outcome = self.state.full(params, audio.as_ref());
         self.sink.end();
         if self.abort.load(Ordering::SeqCst) {
             return Err(AsrError::Cancelled);
         }
-        outcome.map_err(|e| AsrError::Transcribe(e.to_string()))?;
+        if let Err(e) = outcome {
+            // A failed encode leaves whisper.cpp's state half-built, and this
+            // engine keeps one state for its whole life. Without this, the first
+            // bad utterance made every later one fail the same way — which is
+            // exactly how one meeting ended up with zero segments.
+            self.reset_state();
+            return Err(AsrError::Transcribe(e.to_string()));
+        }
 
         // --- collect ------------------------------------------------------
         let mut text = String::new();
@@ -518,13 +548,20 @@ impl Engine {
     /// (review finding 21).
     pub fn detect_language(&mut self, samples: &[f32]) -> Result<(String, f32), AsrError> {
         let threads = self.backend.threads as usize;
+        // Same window rule as decoding: `whisper_lang_auto_detect_with_state`
+        // runs the encoder too, and answers -6 on a window that is too short.
+        let audio = padded_for_decode(samples);
         self.state
-            .pcm_to_mel(samples, threads)
+            .pcm_to_mel(audio.as_ref(), threads)
             .map_err(|e| AsrError::Transcribe(e.to_string()))?;
-        let (id, probabilities) = self
-            .state
-            .lang_detect(0, threads)
-            .map_err(|e| AsrError::Transcribe(e.to_string()))?;
+        let detected = self.state.lang_detect(0, threads);
+        let (id, probabilities) = match detected {
+            Ok(answer) => answer,
+            Err(e) => {
+                self.reset_state();
+                return Err(AsrError::Transcribe(e.to_string()));
+            }
+        };
         let language = whisper_rs::get_lang_str(id)
             .ok_or_else(|| AsrError::Transcribe(format!("unknown language id {id}")))?;
         let confidence = probabilities
@@ -532,6 +569,25 @@ impl Engine {
             .copied()
             .unwrap_or(0.0);
         Ok((language.to_string(), confidence))
+    }
+
+    /// Throw away the decoder scratch state and build a fresh one.
+    ///
+    /// The weights are in the context and are not touched, so this is cheap — no
+    /// re-read from disk, no second GPU init. Only the per-decode buffers go.
+    ///
+    /// Called after any failed decode. whisper.cpp does not unwind a half-built
+    /// graph, so a state that has failed once tends to fail for ever, and this
+    /// engine holds one state for its whole life. Failing to rebuild is not
+    /// fatal: the old state is kept and the next utterance gets one more try.
+    fn reset_state(&mut self) {
+        match self.ctx.create_state() {
+            Ok(fresh) => {
+                self.state = fresh;
+                tracing::debug!("rebuilt the speech engine's working state after a failed decode");
+            }
+            Err(e) => tracing::warn!(%e, "could not rebuild the speech engine's working state"),
+        }
     }
 
     pub fn backend(&self) -> BackendReport {
@@ -555,6 +611,25 @@ impl Engine {
     pub fn is_multilingual(&self) -> bool {
         self.ctx.is_multilingual()
     }
+}
+
+/// Zero-pad the tail so whisper.cpp always gets a window it can encode.
+///
+/// Silence at the end costs nothing: the decoder is told to suppress blanks, and
+/// the caller clamps whisper's timestamps to the real audio. Handing it a
+/// half-second of speech, on the other hand, is how a meeting ends up with
+/// nothing written down at all (see [`MIN_DECODE_MS`]).
+///
+/// Borrows when the audio is already long enough, so the common case does not
+/// copy a 28-second utterance.
+fn padded_for_decode(samples: &[f32]) -> Cow<'_, [f32]> {
+    if samples.len() >= MIN_DECODE_SAMPLES {
+        return Cow::Borrowed(samples);
+    }
+    let mut padded = Vec::with_capacity(MIN_DECODE_SAMPLES);
+    padded.extend_from_slice(samples);
+    padded.resize(MIN_DECODE_SAMPLES, 0.0);
+    Cow::Owned(padded)
 }
 
 /// A `.mlmodelc` is a directory bundle, so "the file exists" is the wrong check.
@@ -1125,6 +1200,76 @@ mod tests {
             assert_eq!(compiled, "vulkan");
             assert_eq!(gpu_backend_name(), Some("vulkan"));
         }
+    }
+
+    /// whisper.cpp answers `-6` rather than text when it cannot encode the
+    /// window it was handed, and a window under a second is one it cannot
+    /// encode. Nothing that reaches `whisper_full` may be shorter than
+    /// [`MIN_DECODE_MS`], whichever path it came in on.
+    #[test]
+    fn nothing_reaches_the_decoder_shorter_than_it_can_read() {
+        const RATE: usize = crate::audio::TARGET_SAMPLE_RATE as usize;
+        const {
+            assert!(
+                MIN_DECODE_MS > 1_000,
+                "the floor has to clear whisper.cpp's window, not sit on it"
+            )
+        };
+
+        for ms in [1usize, 10, 80, 200, 608, 640, 999, 1_000, 1_099] {
+            let short = vec![0.25f32; RATE * ms / 1_000];
+            let padded = padded_for_decode(&short);
+            assert!(
+                padded.len() >= MIN_DECODE_SAMPLES,
+                "{ms} ms went to the decoder as {} samples",
+                padded.len()
+            );
+            // The audio itself is untouched; only the tail is added.
+            assert_eq!(&padded[..short.len()], &short[..]);
+            assert!(padded[short.len()..].iter().all(|s| *s == 0.0));
+        }
+    }
+
+    #[test]
+    fn audio_long_enough_to_read_is_handed_over_without_copying_it() {
+        let long = vec![0.5f32; MIN_DECODE_SAMPLES + 1];
+        let same = padded_for_decode(&long);
+        assert!(
+            matches!(same, Cow::Borrowed(_)),
+            "a 28-second utterance must not be cloned to check its length"
+        );
+        assert_eq!(same.len(), long.len());
+
+        // Exactly at the floor is already readable.
+        let exact = vec![0.5f32; MIN_DECODE_SAMPLES];
+        assert!(matches!(padded_for_decode(&exact), Cow::Borrowed(_)));
+    }
+
+    /// The catch-up pass reads whole holes off disk, and the smallest hole it
+    /// bothers with is [`crate::asr::catchup::MIN_GAP_MS`]. That is under a
+    /// second, so the live path is not the only one that needs the padding.
+    #[test]
+    fn the_smallest_catch_up_window_is_padded_too() {
+        const RATE: usize = crate::audio::TARGET_SAMPLE_RATE as usize;
+        let smallest_hole = crate::asr::catchup::MIN_GAP_MS as usize;
+        assert!(
+            smallest_hole < 1_000,
+            "this test exists because catch-up can hand over a {smallest_hole} ms window"
+        );
+        let window = vec![0.1f32; RATE * smallest_hole / 1_000];
+        assert!(padded_for_decode(&window).len() >= MIN_DECODE_SAMPLES);
+    }
+
+    #[test]
+    fn a_click_or_a_keystroke_is_nothing_said_rather_than_a_failure() {
+        // Below the speech floor the engine answers "nothing was said" without
+        // troubling the decoder at all.
+        const { assert!(MIN_JOB_MS <= 100, "a short answer is still an answer") };
+        let job = TranscribeJob {
+            samples: vec![0.0; 16 * 40], // 40 ms
+            ..Default::default()
+        };
+        assert!(job.duration_ms() < MIN_JOB_MS);
     }
 
     #[test]
