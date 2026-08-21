@@ -758,20 +758,34 @@ pub async fn rename_speaker(
     let name = trim_limited(&display_name, 80, "A name")?;
     // Through `diarize`, not straight to the table: that is where the alias graph
     // and the empty-name rule live.
-    Ok(diarize::rename(&state.db, &speaker_id, &name).await?)
+    diarize::rename(&state.db, &speaker_id, &name).await?;
+    // Say so, or every open view keeps the old name and the rename looks like it
+    // never saved (field report of 2026-08-21: it saved; nobody was told).
+    if let Ok(Some(speaker)) = repo::get_speaker(&state.db, &speaker_id).await {
+        announce_speakers(&state, &speaker.meeting_id).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn merge_speakers(state: State<'_, AppState>, from_id: Id, into_id: Id) -> CmdResult<()> {
     check_id(&from_id)?;
     check_id(&into_id)?;
-    Ok(diarize::merge(&state.db, &from_id, &into_id).await?)
+    diarize::merge(&state.db, &from_id, &into_id).await?;
+    if let Ok(Some(speaker)) = repo::get_speaker(&state.db, &into_id).await {
+        announce_speakers(&state, &speaker.meeting_id).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn unmerge_speaker(state: State<'_, AppState>, speaker_id: Id) -> CmdResult<()> {
     check_id(&speaker_id)?;
-    Ok(diarize::unmerge(&state.db, &speaker_id).await?)
+    diarize::unmerge(&state.db, &speaker_id).await?;
+    if let Ok(Some(speaker)) = repo::get_speaker(&state.db, &speaker_id).await {
+        announce_speakers(&state, &speaker.meeting_id).await;
+    }
+    Ok(())
 }
 
 /// A few seconds of one speaker's voice, so a name can be put to it.
