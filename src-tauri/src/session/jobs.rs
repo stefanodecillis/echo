@@ -467,6 +467,23 @@ async fn diarize(ctx: &JobContext) -> Result<(), JobFailure> {
             people_count_is_override: result.people_count_is_override,
         },
     ));
+    // The pass is the one thing that changes the remembered voices without
+    // anybody clicking: it links a voice (so somebody was "last heard" just
+    // now), and it re-embeds a profile the network moved on from (so the quiet
+    // "Echo is refreshing" note has stopped being true). Settings > People is
+    // event-driven and would otherwise sit on a stale answer until something
+    // else happened to it. Silent when nobody is enrolled, which is every
+    // machine until somebody says "remember this voice".
+    match crate::diarize::people::list_people(&ctx.db).await {
+        Ok(people) if !people.is_empty() => {
+            ctx.events.emit(UiEvent::PeopleUpdated(
+                crate::events::PeopleUpdatedPayload { people },
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => tracing::debug!(%error, "could not read back the remembered voices"),
+    }
+
     // The pass re-points segments at new speakers, so anything showing the
     // transcript has to refetch.
     if let Ok(revision) = repo::transcript_revision(&ctx.db, &meeting_id).await {

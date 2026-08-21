@@ -8,15 +8,17 @@ import { common, settings as copy } from "../../lib/copy";
 import type { Settings, SettingsPatch } from "../../lib/types";
 import { Data } from "./sections/Data";
 import { General } from "./sections/General";
+import { People } from "./sections/People";
 import { Recaps } from "./sections/Recaps";
 import { Speech } from "./sections/Speech";
 import { Templates } from "./sections/Templates";
 
-type SectionId = "general" | "speech" | "recaps" | "templates" | "data";
+type SectionId = "general" | "speech" | "people" | "recaps" | "templates" | "data";
 
 const sections: { id: SectionId; label: string }[] = [
   { id: "general", label: copy.sectionGeneral },
   { id: "speech", label: copy.sectionSpeech },
+  { id: "people", label: copy.sectionPeople },
   { id: "recaps", label: copy.sectionSummaries },
   { id: "templates", label: copy.sectionTemplates },
   { id: "data", label: copy.sectionData },
@@ -82,6 +84,7 @@ export default function SettingsPage() {
         <div className="pb-10">
           {active === "general" && <General settings={settings} patch={patch} />}
           {active === "speech" && <Speech settings={settings} patch={patch} />}
+          {active === "people" && <People />}
           {active === "recaps" && <Recaps settings={settings} patch={patch} />}
           {active === "templates" && <Templates settings={settings} patch={patch} />}
           {active === "data" && <Data />}

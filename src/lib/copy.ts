@@ -313,6 +313,22 @@ export const meeting = {
   speakersDialogStopLabel: "Stop",
   speakersDialogSampleError: "Echo couldn't play a sample for this voice.",
   speakersDialogEmpty: "Echo hasn't worked out who's speaking yet.",
+
+  // Known people (voice enrollment), inside "Name your speakers": the
+  // suggestion chip, the known-people combo on the name field, "remember
+  // this voice" enrollment, and a linked row's mark/unlink/local-rename hint.
+  speakersDialogSuggestionPrefix: "Looks like",
+  speakersDialogSuggestionConfirm: "Confirm",
+  speakersDialogKnownPersonHint: "Echo recognizes this voice",
+  speakersDialogRowMenuLabel: "More options",
+  /** Mantra 2: "Unlink" names the link, which is Echo's idea, not the person's.
+   * What they mean is that Echo got the voice wrong. */
+  speakersDialogUnlinkAction: "This isn't them",
+  /** Shown under the name field while editing a row already linked to a known
+   * person — renaming here only relabels this meeting, it doesn't rename the
+   * person, and that has to be said plainly rather than discovered later. */
+  speakersDialogLocalRenameHint: "Just for this meeting",
+  speakersDialogRememberVoice: "Remember this voice",
 } as Record<string, string>;
 
 /** History and search. */
@@ -447,6 +463,38 @@ export const settings = {
   dataDeleteAllTypePrompt: 'Type "delete everything" below to confirm.',
   dataDeleteAllTypePlaceholder: "delete everything",
   dataDeleteAllTypeWord: "delete everything",
+
+  // People (known voices)
+  sectionPeople: "People",
+  /** Mantra 2: "profile" is a word about how this is built, not about what it
+   * is. What it is, is a bit of somebody's voice, kept here, deletable — and
+   * DESIGN §1 asks for exactly those three things in one plain sentence. */
+  peopleIntro:
+    "Echo keeps a little of these voices on this Mac so it can recognize them again. You can delete any of them at any time.",
+  peopleSavedEmptyTitle: "No voices saved yet",
+  peopleSavedEmptyDescription:
+    "Save someone's voice from a meeting's transcript, and Echo will remember it here.",
+  peopleListenLabel: "Listen",
+  peopleStopLabel: "Stop",
+  peopleSampleError: "Echo couldn't play a sample for this voice.",
+  peopleNamePlaceholder: "Name",
+  peopleForgetButton: "Forget",
+  peopleDeleteConfirmTitle: "Forget this voice?",
+  peopleDeleteConfirmDescription: "The saved samples are deleted too.",
+  /** `needsRefresh` on a saved person: never actionable, just said once and
+   * quietly — Echo runs the refresh itself. */
+  peopleRefreshingNote: "Echo is refreshing how it recognizes voices.",
+  peopleSuggestedTitle: "People Echo keeps hearing",
+  peopleSuggestedDescription:
+    "Voices that keep turning up in your meetings, without a name yet.",
+  peopleSuggestedEmptyTitle: "Nothing recurring yet",
+  peopleSuggestedEmptyDescription:
+    "Once the same voice turns up in a few meetings, it'll show up here.",
+  peopleSuggestedUnnamed: "Unnamed voice",
+  /** The field, not the button: a placeholder says what to type, and "Save as…"
+   * next to a Save button said what the button does twice instead. */
+  peopleSaveAsPlaceholder: "Their name",
+  peopleSaveAsButton: "Save",
 } as Record<string, string>;
 
 /**
@@ -614,6 +662,21 @@ export const peopleCount = {
     n === null
       ? "Redo who said what automatically?"
       : `Redo who said what for ${n} ${n === 1 ? meeting.peopleCountSingular : meeting.peopleCountPlural}?`,
+} as const;
+
+/**
+ * Settings > People: the two bits of copy that need a value folded in — how
+ * long since Echo last matched a saved voice, and how many samples it's
+ * built from. Split out from `settings` for the same reason `peopleCount`
+ * is: those live in a `Record<string, string>` and these are functions.
+ */
+export const knownPeople = {
+  lastHeard: (relative: string) => `Last heard ${relative}`,
+  neverHeard: "Hasn't been heard again yet",
+  sampleCount: (n: number) => `${n} ${n === 1 ? "sample" : "samples"}`,
+  /** A recurring unnamed voice: how many meetings it has turned up in. Without
+   * this, two rows of "Unnamed voice" give nobody anything to decide with. */
+  heardIn: (n: number) => `Heard in ${n} ${n === 1 ? "meeting" : "meetings"}`,
 } as const;
 
 /** Words for the two microphone-versus-computer channels. */

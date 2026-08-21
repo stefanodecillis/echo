@@ -579,6 +579,10 @@ pub async fn delete_all_data(state: State<'_, AppState>) -> CmdResult<()> {
     let meetings = repo::all_meeting_audio_dirs(&state.db).await?;
     let files = repo::all_audio_file_paths(&state.db).await?;
     repo::delete_all_meetings(&state.db).await?;
+    // The people are Echo's too, and their samples hold audio of their own —
+    // clips that would survive every recording being deleted (DESIGN §1:
+    // "`delete_all_data` includes people").
+    repo::delete_all_people(&state.db).await?;
 
     let mut removed: Vec<PathBuf> = Vec::new();
     let mut remove_meeting_dir = |candidate: PathBuf, meeting_id: &str| {
@@ -846,6 +850,194 @@ fn checked_people_count(count: Option<i64>) -> CmdResult<Option<u32>> {
         ))),
         Some(n) => Ok(Some(n as u32)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Known people (DESIGN §1)
+//
+// Enrollment is per-person opt-in and every one of these commands is something a
+// person clicked. Nothing here runs on its own, and nothing here is reachable
+// from the offline pass: profiles change only on confirmation, which is what
+// keeps them from drifting (see `diarize::people`).
+// ---------------------------------------------------------------------------
+
+/// Everybody Echo remembers, for Settings → People and for the
+/// choose-a-known-person control on a speaker row.
+#[tauri::command]
+pub async fn list_people(state: State<'_, AppState>) -> CmdResult<Vec<PersonInfo>> {
+    Ok(diarize::people::list_people(&state.db).await?)
+}
+
+/// Forget a voice: the profile, its samples and their clips.
+///
+/// Speaker links go with it, and the names already copied onto those speaker rows
+/// stay as plain text — a meeting somebody has read does not rewrite itself
+/// (DESIGN §1).
+#[tauri::command]
+pub async fn delete_person(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    person_id: Id,
+) -> CmdResult<()> {
+    check_id(&person_id)?;
+    repo::delete_person(&state.db, &person_id).await?;
+    announce_people(&app, &state).await;
+    Ok(())
+}
+
+/// Rename a remembered person. Meeting-local speaker names already copied from
+/// them are left alone; this is the name future links will use.
+#[tauri::command]
+pub async fn rename_person(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    person_id: Id,
+    name: String,
+) -> CmdResult<()> {
+    check_id(&person_id)?;
+    let name = trim_limited(&name, 80, "A name")?;
+    repo::rename_person(&state.db, &person_id, &name).await?;
+    announce_people(&app, &state).await;
+    Ok(())
+}
+
+/// A few seconds of a remembered voice, base64 WAV — the freshest clip kept.
+///
+/// Comes out of the profile, so it works whether or not the meeting it came from
+/// still exists: that is what keeping the clips buys. Play it from a `blob:` URL,
+/// exactly like [`speaker_sample`].
+#[tauri::command]
+pub async fn person_sample_audio(
+    state: State<'_, AppState>,
+    person_id: Id,
+) -> CmdResult<String> {
+    check_id(&person_id)?;
+    Ok(diarize::people::person_sample_audio(&state.db, &person_id).await?)
+}
+
+/// "This is Marco" — or "actually, this is nobody I have named".
+///
+/// Linking is a **confirmation**: it copies the person's name onto the speaker
+/// row (only over a label Echo made up, never over one somebody typed) and
+/// teaches the profile from this meeting's audio. Renaming that speaker
+/// afterwards does not rename the person; the two are deliberately separate
+/// (DESIGN §1).
+///
+/// `personId: null` releases the link and leaves the name where it is.
+#[tauri::command]
+pub async fn link_speaker_person(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    meeting_id: Id,
+    speaker_id: Id,
+    person_id: Option<Id>,
+) -> CmdResult<()> {
+    check_id(&meeting_id)?;
+    check_id(&speaker_id)?;
+    if let Some(person_id) = &person_id {
+        check_id(person_id)?;
+    }
+    diarize::people::link(
+        &state.db,
+        &meeting_id,
+        &speaker_id,
+        person_id.as_deref(),
+    )
+    .await?;
+    announce_people(&app, &state).await;
+    announce_speakers(&state, &meeting_id).await;
+    Ok(())
+}
+
+/// "Remember this voice": create a person from one of a meeting's speakers.
+///
+/// Creates, links, and learns, in that order — and undoes itself if there is
+/// nothing to learn from, because a remembered voice with no voice behind it is
+/// not what was asked for. Turned down in plain words when this speaker never
+/// talks on their own for long enough to be recognisable, and when the recording
+/// has been deleted.
+#[tauri::command]
+pub async fn enroll_speaker_as_person(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    meeting_id: Id,
+    speaker_id: Id,
+    name: String,
+) -> CmdResult<PersonInfo> {
+    check_id(&meeting_id)?;
+    check_id(&speaker_id)?;
+    let name = trim_limited(&name, 80, "A name")?;
+    let person =
+        diarize::people::enroll(&state.db, &meeting_id, &speaker_id, &name).await?;
+    announce_people(&app, &state).await;
+    announce_speakers(&state, &meeting_id).await;
+    Ok(person)
+}
+
+/// Voices that keep turning up without a name.
+///
+/// Built from the per-meeting voice prints the offline pass already stored, so it
+/// costs no audio reads and no model load. Each one carries a representative
+/// meeting and speaker, for Listen ([`speaker_sample`]) and for
+/// [`enroll_speaker_as_person`].
+#[tauri::command]
+pub async fn suggested_people(state: State<'_, AppState>) -> CmdResult<Vec<SuggestedPerson>> {
+    Ok(diarize::people::suggested_people(&state.db).await?)
+}
+
+/// Accept one of those suggestions under a name.
+///
+/// The same thing as [`enroll_speaker_as_person`] on the representative speaker,
+/// which is exactly what accepting means: nothing about a suggestion is stored
+/// until somebody names it.
+#[tauri::command]
+pub async fn accept_suggested_person(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    meeting_id: Id,
+    speaker_id: Id,
+    name: String,
+) -> CmdResult<PersonInfo> {
+    enroll_speaker_as_person(app, state, meeting_id, speaker_id, name).await
+}
+
+/// Say who Echo remembers, on the one channel every list listens to.
+async fn announce_people(app: &AppHandle, state: &AppState) {
+    use tauri::Emitter;
+    let people = match diarize::people::list_people(&state.db).await {
+        Ok(people) => people,
+        Err(error) => {
+            tracing::debug!(%error, "could not read back the remembered voices");
+            return;
+        }
+    };
+    let _ = app.emit(
+        crate::events::PEOPLE_UPDATED,
+        crate::events::PeopleUpdatedPayload { people },
+    );
+}
+
+/// The speaker rows changed shape without the pass running — a link, a copied
+/// name. Same event the pass emits, so every open view lands on the same answer.
+async fn announce_speakers(state: &AppState, meeting_id: &str) {
+    use crate::session::ports::EventSink;
+    let Ok(speakers) = repo::list_speakers(&state.db, meeting_id).await else {
+        return;
+    };
+    let (people_count, is_override) = repo::people_count(&state.db, meeting_id)
+        .await
+        .unwrap_or((speakers.len() as u32, false));
+    state
+        .session
+        .events()
+        .emit(crate::session::ports::UiEvent::SpeakersUpdated(
+            crate::events::SpeakersUpdatedPayload {
+                meeting_id: meeting_id.to_string(),
+                speakers,
+                people_count,
+                people_count_is_override: is_override,
+            },
+        ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1525,6 +1717,15 @@ macro_rules! echo_command_handler {
             $crate::commands::speaker_sample,
             $crate::commands::refine_speakers,
             $crate::commands::set_speaker_count,
+            // known people
+            $crate::commands::list_people,
+            $crate::commands::delete_person,
+            $crate::commands::rename_person,
+            $crate::commands::person_sample_audio,
+            $crate::commands::link_speaker_person,
+            $crate::commands::enroll_speaker_as_person,
+            $crate::commands::suggested_people,
+            $crate::commands::accept_suggested_person,
             // speech assets
             $crate::commands::list_accuracy_levels,
             $crate::commands::select_accuracy_level,

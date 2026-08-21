@@ -471,6 +471,11 @@ pub enum UiEvent {
     JobProgress(events::JobProgressPayload),
     DownloadProgress(events::DownloadProgressPayload),
     SpeakersUpdated(events::SpeakersUpdatedPayload),
+    /// The people Echo remembers changed without anybody clicking anything —
+    /// the offline pass linked a voice, so somebody was last heard just now, or
+    /// it brought a profile up to date with the network in use. Carries the whole
+    /// list, like the commands do.
+    PeopleUpdated(events::PeopleUpdatedPayload),
     SummaryReady(events::SummaryReadyPayload),
     ActionItemsUpdated(events::ActionItemsUpdatedPayload),
     MeetingUpdated(events::MeetingUpdatedPayload),
@@ -494,6 +499,7 @@ impl UiEvent {
             UiEvent::JobProgress(_) => events::JOB_PROGRESS,
             UiEvent::DownloadProgress(_) => events::DOWNLOAD_PROGRESS,
             UiEvent::SpeakersUpdated(_) => events::SPEAKERS_UPDATED,
+            UiEvent::PeopleUpdated(_) => events::PEOPLE_UPDATED,
             UiEvent::SummaryReady(_) => events::SUMMARY_READY,
             UiEvent::ActionItemsUpdated(_) => events::ACTION_ITEMS_UPDATED,
             UiEvent::MeetingUpdated(_) => events::MEETING_UPDATED,
@@ -578,6 +584,7 @@ impl EventSink for TauriEvents {
             UiEvent::JobProgress(p) => self.app.emit(name, p),
             UiEvent::DownloadProgress(p) => self.app.emit(name, p),
             UiEvent::SpeakersUpdated(p) => self.app.emit(name, p),
+            UiEvent::PeopleUpdated(p) => self.app.emit(name, p),
             UiEvent::SummaryReady(p) => self.app.emit(name, p),
             UiEvent::ActionItemsUpdated(p) => self.app.emit(name, p),
             UiEvent::MeetingUpdated(p) => self.app.emit(name, p),

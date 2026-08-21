@@ -473,6 +473,76 @@ pub struct Speaker {
     pub is_self: bool,
     /// Total speaking time, for the Info tab.
     pub speaking_ms: i64,
+    /// The known person this voice was matched to, when Echo is sure enough to
+    /// say so (`diarize::people::TAU_LINK` plus the margin rule).
+    ///
+    /// `display_name` was copied from the person when the link was made and is
+    /// meeting-local from then on: renaming this speaker does **not** rename the
+    /// person, and deleting the person does not rewrite this meeting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub person_id: Option<Id>,
+    /// "Looks like Marco — confirm?" — a match that cleared the suggestion bar
+    /// but not the linking one. Never an assignment; the person confirms it or
+    /// it stays a chip. Look the name up in `listPeople`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_person_id: Option<Id>,
+    /// How alike the two voices were, `0.0..=1.0`. Kept so the suggestion can be
+    /// re-decided if the thresholds move; not for showing to anybody (mantra 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion_score: Option<f32>,
+}
+
+// ---------------------------------------------------------------------------
+// Known people (voice enrollment) — DESIGN §1
+// ---------------------------------------------------------------------------
+
+/// One remembered voice, as Settings → People shows it.
+///
+/// Deliberately not a profile: no centroid, no clips, no embedder tag. What
+/// leaves the core is a name, when the voice was last heard, how much of it Echo
+/// has kept, and whether that material is currently usable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonInfo {
+    pub id: Id,
+    pub name: String,
+    /// How many samples of this voice Echo is keeping (capped — see
+    /// `diarize::people::MAX_SAMPLES`).
+    pub sample_count: u32,
+    /// When this voice was last heard in a meeting, RFC3339. Absent for a person
+    /// who has been enrolled but not met since.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_heard_at: Option<Timestamp>,
+    /// The stored numbers belong to an older way of listening, so this voice is
+    /// not being matched at the moment. Echo redoes it from the clips it kept;
+    /// nothing is lost and nobody has to re-enroll. The UI says something calm,
+    /// or nothing at all — never a technical reason (mantra 2).
+    pub needs_refresh: bool,
+}
+
+/// A voice that keeps turning up without a name, offered as "shall I remember
+/// this one?".
+///
+/// Built by cross-matching the per-meeting voice prints the offline pass stores
+/// on `speakers`, so it costs no audio reads. `meeting_id` + `speaker_id` are a
+/// representative appearance, for Listen (`speaker_sample`) and for enrolling
+/// with `enrollSpeakerAsPerson`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestedPerson {
+    /// Stable for as long as the same appearances are grouped; not a row id.
+    pub id: String,
+    /// How many meetings this voice has been in.
+    pub appearances: u32,
+    /// The most recent of those meetings, RFC3339.
+    pub last_heard_at: Timestamp,
+    /// Total speech Echo has of this voice across those meetings.
+    pub speaking_ms: i64,
+    /// A representative appearance: the meeting where this voice said the most.
+    pub meeting_id: Id,
+    pub speaker_id: Id,
+    /// That meeting's title, so the UI can say where the voice is from.
+    pub meeting_title: String,
 }
 
 // ---------------------------------------------------------------------------

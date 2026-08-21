@@ -104,6 +104,7 @@ pub mod embedding;
 pub mod features;
 pub mod job;
 pub mod pcm;
+pub mod people;
 pub mod pipeline;
 pub mod sample;
 pub mod segmentation;

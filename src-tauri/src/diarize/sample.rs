@@ -75,13 +75,21 @@ impl Pick {
     }
 }
 
-/// The one moment to cut, or `None` when this person never talks alone for long
-/// enough to be worth hearing.
+/// Least distance in time between two clips of the same voice before they stop
+/// counting as separate moments.
 ///
-/// `theirs` is every speaker id that resolves to this person, merges included.
-/// `segments` is the whole meeting, not just theirs — the other people's
-/// segments are what "alone" is judged against.
-pub fn pick_window(segments: &[Segment], theirs: &BTreeSet<String>) -> Option<Pick> {
+/// Only used when several samples are being kept ([`pick_windows`]). Two clips
+/// cut from ten seconds apart are the same sentence, the same sound of the room
+/// and very nearly the same fingerprint; a profile made of those has one
+/// observation in it however many rows it has.
+pub const MIN_SPACING_MS: i64 = 10_000;
+
+/// The candidate segments of one voice, best first.
+///
+/// "Best" is the ordering [`pick_window`] has always used: alone beats
+/// overlapped, longer beats shorter, more confident beats less, and the earliest
+/// of equals wins so the same meeting always answers the same way.
+fn ranked_candidates<'a>(segments: &'a [Segment], theirs: &BTreeSet<String>) -> Vec<&'a Segment> {
     let final_with_speaker = |s: &&Segment| -> bool {
         s.is_final && s.speaker_id.is_some() && s.t_end_ms > s.t_start_ms
     };
@@ -97,6 +105,9 @@ pub fn pick_window(segments: &[Segment], theirs: &BTreeSet<String>) -> Option<Pi
         .filter(|s| !is_theirs(s))
         .collect();
 
+    // "Alone" is judged per channel: someone on the far end talking at the same
+    // time as the person at the keyboard is on a different recording and cannot
+    // be heard in this one.
     let alone = |s: &Segment| -> bool {
         !others.iter().any(|other| {
             other.channel == s.channel
@@ -105,23 +116,96 @@ pub fn pick_window(segments: &[Segment], theirs: &BTreeSet<String>) -> Option<Pi
         })
     };
 
-    // Longest, alone, confident — in that order of importance, and the earliest
-    // of equals so the same meeting always gives back the same clip.
-    let best = segments
+    let mut out: Vec<&Segment> = segments
         .iter()
         .filter(final_with_speaker)
         .filter(|s| is_theirs(s))
         .filter(|s| s.t_end_ms - s.t_start_ms >= MIN_CLIP_MS)
-        .max_by_key(|s| {
-            (
-                alone(s),
-                s.t_end_ms - s.t_start_ms,
-                (s.avg_confidence.unwrap_or(0.0) * 1_000.0) as i64,
-                -s.t_start_ms,
-            )
-        })?;
+        .collect();
+    out.sort_by_key(|s| {
+        std::cmp::Reverse((
+            alone(s),
+            s.t_end_ms - s.t_start_ms,
+            (s.avg_confidence.unwrap_or(0.0) * 1_000.0) as i64,
+            -s.t_start_ms,
+        ))
+    });
+    out
+}
 
-    Some(window_within(best))
+/// The one moment to cut, or `None` when this person never talks alone for long
+/// enough to be worth hearing.
+///
+/// `theirs` is every speaker id that resolves to this person, merges included.
+/// `segments` is the whole meeting, not just theirs — the other people's
+/// segments are what "alone" is judged against.
+pub fn pick_window(segments: &[Segment], theirs: &BTreeSet<String>) -> Option<Pick> {
+    ranked_candidates(segments, theirs)
+        .first()
+        .map(|best| window_within(best))
+}
+
+/// Up to `max` moments of this voice, chosen to be *different* moments.
+///
+/// [`pick_window`] answers "let me hear this person"; this answers "keep enough
+/// of this voice to recognise it again", which is a different question and wants
+/// a different answer. What Echo remembers of a voice has to span the ways that
+/// voice arrives, so:
+///
+/// * **Both conditions first.** The best candidate on each channel is taken
+///   before anything else, because the same person in the room and the same
+///   person down a call are two different sounds and a profile that only knows
+///   one of them is half a profile (DESIGN §1: "keeping samples from different
+///   conditions").
+/// * **Then spread through the meeting.** The rest are filled in best-first,
+///   skipping anything within [`MIN_SPACING_MS`] of a moment already taken.
+/// * **Then, only if that left too few, close together.** A short meeting with
+///   one long turn in it should still contribute something.
+///
+/// Deterministic: the same meeting always yields the same picks in the same
+/// order, which is what makes the adaptation tests possible at all.
+pub fn pick_windows(segments: &[Segment], theirs: &BTreeSet<String>, max: usize) -> Vec<Pick> {
+    if max == 0 {
+        return Vec::new();
+    }
+    /// Take this segment's window unless we are full, have it already, or it
+    /// sits on top of a moment already taken.
+    fn take<'a>(
+        seg: &'a Segment,
+        max: usize,
+        spacing: i64,
+        picked: &mut Vec<Pick>,
+        taken: &mut Vec<&'a str>,
+    ) {
+        if picked.len() >= max || taken.contains(&seg.id.as_str()) {
+            return;
+        }
+        let window = window_within(seg);
+        let crowded = picked
+            .iter()
+            .any(|p| p.channel == window.channel && (p.from_ms - window.from_ms).abs() < spacing);
+        if crowded {
+            return;
+        }
+        picked.push(window);
+        taken.push(seg.id.as_str());
+    }
+
+    let ranked = ranked_candidates(segments, theirs);
+    let mut picked: Vec<Pick> = Vec::new();
+    let mut taken: Vec<&str> = Vec::new();
+
+    for channel in [Channel::Mic, Channel::System] {
+        if let Some(best) = ranked.iter().find(|s| s.channel == channel) {
+            take(best, max, MIN_SPACING_MS, &mut picked, &mut taken);
+        }
+    }
+    for spacing in [MIN_SPACING_MS, 0] {
+        for seg in &ranked {
+            take(seg, max, spacing, &mut picked, &mut taken);
+        }
+    }
+    picked
 }
 
 /// The middle of a stretch, minus its opening, capped at [`CLIP_MS`].
@@ -220,6 +304,88 @@ pub fn encode_wav_16k_mono(samples: &[f32]) -> Result<Vec<u8>, DiarizeError> {
             .map_err(|e| DiarizeError::Failed(format!("could not finish a clip: {e}")))?;
     }
     Ok(cursor.into_inner())
+}
+
+/// Read a 16 kHz mono WAV back out of memory.
+///
+/// The inverse of [`encode_wav_16k_mono`], for the clips kept on a person's
+/// samples: they went into the database as files and come back out as audio to
+/// be fingerprinted again when the network changes. Written here rather than
+/// through `audio::writer::read_wav_16k_mono` because there is no file — the
+/// bytes never touch the disk on the way through.
+pub fn decode_wav_16k_mono(bytes: &[u8]) -> Result<Vec<f32>, DiarizeError> {
+    let mut reader = hound::WavReader::new(Cursor::new(bytes))
+        .map_err(|e| DiarizeError::Failed(format!("could not read a stored clip: {e}")))?;
+    let spec = reader.spec();
+    let raw: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| DiarizeError::Failed(format!("could not read a stored clip: {e}")))?,
+        hound::SampleFormat::Int => {
+            let scale = 1.0 / (1i64 << (spec.bits_per_sample.max(1) - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DiarizeError::Failed(format!("could not read a stored clip: {e}")))?
+                .into_iter()
+                .map(|s| s as f32 * scale)
+                .collect()
+        }
+    };
+    let channels = usize::from(spec.channels.max(1));
+    if channels == 1 {
+        return Ok(raw);
+    }
+    Ok(raw
+        .chunks(channels)
+        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .collect())
+}
+
+/// Cut the audio for several picks, opening each channel's recording once.
+///
+/// Picks whose audio is no longer on disk, or which read back as silence, are
+/// dropped rather than returned as broken clips — the same judgement
+/// [`speaker_sample`] makes, applied per pick, because one missing chunk in the
+/// middle of a meeting should not cost the other three samples.
+pub async fn clips_for(
+    db: &Db,
+    meeting_id: &str,
+    picks: &[Pick],
+) -> Result<Vec<(Pick, Vec<f32>)>, DiarizeError> {
+    let mut out: Vec<(Pick, Vec<f32>)> = Vec::with_capacity(picks.len());
+    for channel in [Channel::Mic, Channel::System] {
+        if !picks.iter().any(|p| p.channel == channel) {
+            continue;
+        }
+        let chunks = repo::list_chunks(db, meeting_id, Some(channel))
+            .await
+            .map_err(|e| DiarizeError::Failed(e.to_string()))?;
+        let mut pcm = ChunkPcm::new(chunks);
+        if pcm.is_empty() {
+            continue;
+        }
+        for pick in picks.iter().filter(|p| p.channel == channel) {
+            let Ok(samples) = pcm.window(pick.from_ms, pick.duration_ms()).await else {
+                continue;
+            };
+            let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            if peak < SILENCE_FLOOR {
+                continue;
+            }
+            out.push((*pick, samples));
+        }
+        pcm.release();
+    }
+    // Back into the order they were asked for, so "the best moment" stays first.
+    out.sort_by_key(|(pick, _)| {
+        picks
+            .iter()
+            .position(|p| p == pick)
+            .unwrap_or(usize::MAX)
+    });
+    Ok(out)
 }
 
 /// Clamped, so a sum that went past full scale distorts rather than wrapping
@@ -361,6 +527,9 @@ mod tests {
             alias_of: alias_of.map(|s| s.to_string()),
             is_self: false,
             speaking_ms: 0,
+            person_id: None,
+            suggested_person_id: None,
+            suggestion_score: None,
         }
     }
 
@@ -713,6 +882,132 @@ mod tests {
             .await
             .expect_err("nothing is attributed to this speaker");
         assert!(matches!(err, DiarizeError::NoVoiceSample), "{err:?}");
+    }
+
+    // -- keeping several moments, for a profile ----------------------------
+
+    #[test]
+    fn a_confirmation_keeps_a_few_different_moments_and_no_more() {
+        // Six clean turns spread through the meeting; four are kept, and no two
+        // of them are the same moment.
+        let segments: Vec<Segment> = (0..6)
+            .map(|i| {
+                segment(
+                    &format!("s{i}"),
+                    "s1",
+                    Channel::Mic,
+                    i * 60_000,
+                    i * 60_000 + 20_000,
+                )
+            })
+            .collect();
+        let picks = pick_windows(&segments, &theirs(&["s1"]), 4);
+        assert_eq!(picks.len(), 4);
+        for (i, a) in picks.iter().enumerate() {
+            for b in picks.iter().skip(i + 1) {
+                assert!(
+                    (a.from_ms - b.from_ms).abs() >= MIN_SPACING_MS,
+                    "{a:?} and {b:?} are the same moment"
+                );
+            }
+        }
+        // And the best moment is still first, so "the freshest clip" means
+        // something.
+        assert_eq!(picks[0], pick_window(&segments, &theirs(&["s1"])).unwrap());
+    }
+
+    #[test]
+    fn a_voice_heard_both_ways_contributes_both() {
+        // The three longest turns are on the microphone and there is one shorter
+        // one down the call. A profile that only knew the room would be half a
+        // profile, so the call one is taken before the third microphone one.
+        let mut segments: Vec<Segment> = (0..3)
+            .map(|i| {
+                segment(
+                    &format!("mic{i}"),
+                    "s1",
+                    Channel::Mic,
+                    i * 60_000,
+                    i * 60_000 + 30_000,
+                )
+            })
+            .collect();
+        segments.push(segment("call", "s1", Channel::System, 200_000, 203_000));
+
+        let picks = pick_windows(&segments, &theirs(&["s1"]), 2);
+        assert_eq!(picks.len(), 2);
+        assert!(
+            picks.iter().any(|p| p.channel == Channel::System),
+            "{picks:?}"
+        );
+        assert!(picks.iter().any(|p| p.channel == Channel::Mic), "{picks:?}");
+    }
+
+    #[test]
+    fn one_long_turn_is_better_than_nothing() {
+        let segments = vec![segment("a", "s1", Channel::Mic, 0, 30_000)];
+        assert_eq!(pick_windows(&segments, &theirs(&["s1"]), 4).len(), 1);
+    }
+
+    #[test]
+    fn moments_close_together_are_only_taken_when_there_is_nothing_else() {
+        // Two turns three seconds apart. Spread out they are one moment; asked for
+        // two, a short meeting still gets to contribute both.
+        let segments = vec![
+            segment("a", "s1", Channel::Mic, 0, 2_000),
+            segment("b", "s1", Channel::Mic, 3_000, 5_000),
+        ];
+        assert_eq!(pick_windows(&segments, &theirs(&["s1"]), 2).len(), 2);
+    }
+
+    #[test]
+    fn asking_for_no_moments_reads_no_audio() {
+        let segments = vec![segment("a", "s1", Channel::Mic, 0, 30_000)];
+        assert!(pick_windows(&segments, &theirs(&["s1"]), 0).is_empty());
+        assert!(pick_windows(&[], &theirs(&["s1"]), 4).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_clips_come_back_in_the_order_they_were_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, meeting_id, _) = meeting_with_one_voice(dir.path(), true).await;
+        let picks = vec![
+            Pick {
+                channel: Channel::Mic,
+                from_ms: 12_000,
+                to_ms: 18_000,
+            },
+            Pick {
+                channel: Channel::Mic,
+                from_ms: 30_000,
+                to_ms: 36_000,
+            },
+            // Past the end of the recording: dropped rather than returned as six
+            // seconds of silence.
+            Pick {
+                channel: Channel::Mic,
+                from_ms: 900_000,
+                to_ms: 906_000,
+            },
+        ];
+        let clips = clips_for(&db, &meeting_id, &picks).await.unwrap();
+        assert_eq!(clips.len(), 2, "{:?}", clips.iter().map(|c| c.0).collect::<Vec<_>>());
+        assert_eq!(clips[0].0, picks[0]);
+        assert_eq!(clips[1].0, picks[1]);
+        let expected = (6_000 * TARGET_SAMPLE_RATE as usize) / 1_000;
+        assert_eq!(clips[0].1.len(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_meeting_whose_audio_is_gone_hands_back_nothing_rather_than_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, meeting_id, _) = meeting_with_one_voice(dir.path(), false).await;
+        let picks = vec![Pick {
+            channel: Channel::Mic,
+            from_ms: 12_000,
+            to_ms: 18_000,
+        }];
+        assert!(clips_for(&db, &meeting_id, &picks).await.unwrap().is_empty());
     }
 
     #[tokio::test]

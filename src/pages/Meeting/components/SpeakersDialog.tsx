@@ -1,11 +1,21 @@
 import { useEffect, useRef, useState } from "react";
 
 import { Button, Modal, ProgressBar } from "@/components";
-import { renameSpeaker, setSpeakerCount, speakerSample, toUiError } from "@/lib/ipc";
+import { useEvent } from "@/hooks/useEvent";
+import {
+  EVENTS,
+  enrollSpeakerAsPerson,
+  linkSpeakerPerson,
+  listPeople,
+  renameSpeaker,
+  setSpeakerCount,
+  speakerSample,
+  toUiError,
+} from "@/lib/ipc";
 import { common, jobLine, meeting as copy, peopleCount as peopleCountCopy } from "@/lib/copy";
 import { presentJob } from "@/lib/jobs";
 import { useEchoStore } from "@/lib/store";
-import type { Id, Job, Speaker } from "@/lib/types";
+import type { Id, Job, PersonInfo, Speaker } from "@/lib/types";
 
 import { IconButton } from "./IconButton";
 import { SpeakerRow, type ListenState } from "./SpeakerRow";
@@ -60,11 +70,19 @@ export function SpeakersDialog({
   const [playingId, setPlayingId] = useState<string>();
   const [loadingId, setLoadingId] = useState<string>();
   const [rowError, setRowError] = useState<{ id: string; message: string }>();
+  const [people, setPeople] = useState<PersonInfo[]>([]);
+  // Session-scoped, not dialog-scoped: it survives a close/reopen of this
+  // same meeting's dialog (this component stays mounted, see the effect
+  // below), and only clears for a genuinely different meeting or a fresh
+  // page load — matching "hides the chip this session".
+  const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<string>>(new Set());
+  const [pendingPersonId, setPendingPersonId] = useState<string>();
   const sampleCache = useRef<Map<string, string>>(new Map());
   const audioRef = useRef<HTMLAudioElement>(null);
   const addToast = useEchoStore((s) => s.addToast);
 
   const rows = canonicalSpeakers(speakers);
+  const peopleById = new Map(people.map((p) => [p.id, p]));
   const canRerun = !disabled;
   const shown = job ? presentJob(job) : undefined;
 
@@ -88,16 +106,45 @@ export function SpeakersDialog({
 
   // Samples belong to one meeting's speakers; a different meeting means
   // starting the cache over, and nothing should keep the old blob URLs alive.
+  // Dismissed suggestions start over too — "this session" means this
+  // meeting's dialog, not forever.
   useEffect(() => {
     const cache = sampleCache.current;
     setPlayingId(undefined);
     setLoadingId(undefined);
     setRowError(undefined);
+    setDismissedSuggestions(new Set());
+    setPendingPersonId(undefined);
     return () => {
       cache.forEach((url) => URL.revokeObjectURL(url));
       cache.clear();
     };
   }, [meetingId]);
+
+  // Known people, for the name field's combo and for naming a suggestion
+  // chip. Loaded once the dialog is actually open, and kept fresh from
+  // wherever the list can change — this meeting's own enroll/link/unlink,
+  // Settings > People, another meeting entirely.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    listPeople()
+      .then((list) => {
+        if (!cancelled) setPeople(list);
+      })
+      .catch(() => {
+        // A stale or empty list just means no suggestion names and an empty
+        // combo — free typing still works, so this fails quietly.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, meetingId]);
+
+  // Wherever the list changed — this meeting's own enroll/link/unlink,
+  // Settings > People, another meeting entirely — the event carries the whole
+  // list, so there is nothing to ask for.
+  useEvent(EVENTS.peopleUpdated, ({ people: updated }) => setPeople(updated));
 
   const commitCount = async () => {
     if (!pending) return;
@@ -117,6 +164,43 @@ export function SpeakersDialog({
     renameSpeaker(speakerId, name).catch((err) => {
       addToast({ level: "problem", message: toUiError(err).message });
     });
+  };
+
+  const handleEnroll = (speakerId: string, name: string) => {
+    enrollSpeakerAsPerson(meetingId, speakerId, name).catch((err) => {
+      addToast({ level: "problem", message: toUiError(err).message });
+    });
+  };
+
+  const handleLinkPerson = (speakerId: string, personId: Id) => {
+    linkSpeakerPerson(meetingId, speakerId, personId).catch((err) => {
+      addToast({ level: "problem", message: toUiError(err).message });
+    });
+  };
+
+  const handleConfirmSuggestion = (speaker: Speaker) => {
+    if (!speaker.suggestedPersonId || pendingPersonId) return;
+    const personId = speaker.suggestedPersonId;
+    setPendingPersonId(speaker.id);
+    linkSpeakerPerson(meetingId, speaker.id, personId)
+      .catch((err) => {
+        addToast({ level: "problem", message: toUiError(err).message });
+      })
+      .finally(() => setPendingPersonId((id) => (id === speaker.id ? undefined : id)));
+  };
+
+  const handleDismissSuggestion = (speakerId: string) => {
+    setDismissedSuggestions((prev) => new Set(prev).add(speakerId));
+  };
+
+  const handleUnlink = (speakerId: string) => {
+    if (pendingPersonId) return;
+    setPendingPersonId(speakerId);
+    linkSpeakerPerson(meetingId, speakerId, null)
+      .catch((err) => {
+        addToast({ level: "problem", message: toUiError(err).message });
+      })
+      .finally(() => setPendingPersonId((id) => (id === speakerId ? undefined : id)));
   };
 
   const play = (url: string, speakerId: string) => {
@@ -245,17 +329,31 @@ export function SpeakersDialog({
         </p>
       ) : (
         <div className="flex flex-col gap-2">
-          {rows.map((speaker) => (
-            <SpeakerRow
-              key={speaker.id}
-              speaker={speaker}
-              listenState={listenStateFor(speaker.id)}
-              error={rowError?.id === speaker.id ? rowError.message : undefined}
-              nameDisabled={!!job}
-              onListen={() => handleListen(speaker)}
-              onRename={(name) => handleRename(speaker.id, name)}
-            />
-          ))}
+          {rows.map((speaker) => {
+            const suggested =
+              speaker.suggestedPersonId && !dismissedSuggestions.has(speaker.id)
+                ? peopleById.get(speaker.suggestedPersonId)
+                : undefined;
+            return (
+              <SpeakerRow
+                key={speaker.id}
+                speaker={speaker}
+                listenState={listenStateFor(speaker.id)}
+                error={rowError?.id === speaker.id ? rowError.message : undefined}
+                nameDisabled={!!job}
+                people={people}
+                suggestionName={suggested?.name}
+                personActionPending={pendingPersonId === speaker.id}
+                onListen={() => handleListen(speaker)}
+                onRename={(name) => handleRename(speaker.id, name)}
+                onEnroll={(name) => handleEnroll(speaker.id, name)}
+                onConfirmSuggestion={() => handleConfirmSuggestion(speaker)}
+                onDismissSuggestion={() => handleDismissSuggestion(speaker.id)}
+                onLinkPerson={(personId) => handleLinkPerson(speaker.id, personId)}
+                onUnlink={() => handleUnlink(speaker.id)}
+              />
+            );
+          })}
         </div>
       )}
 

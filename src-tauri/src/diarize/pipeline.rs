@@ -76,6 +76,7 @@ use crate::types::{Channel, Id, Speaker, TranscriptQuery};
 use super::cluster::{self, ClusterItem};
 use super::embedding::{self, Embedder};
 use super::pcm::ChunkPcm;
+use super::people;
 use super::segmentation::{self, Segmenter};
 use super::split;
 use super::timeline::{self, Span};
@@ -235,7 +236,8 @@ pub struct Scan {
     covered: Vec<Span>,
 }
 
-/// One clustering cut of a [`Scan`]: who spoke when, and how many people that is.
+/// One clustering cut of a [`Scan`]: who spoke when, how many people that is,
+/// and which of them Echo already knows.
 #[derive(Debug, Clone, Default)]
 pub struct ScanCut {
     /// Per person, the stretches they were talking, ordered by who spoke first.
@@ -250,6 +252,17 @@ pub struct ScanCut {
     /// that arrived at it. `None` for a count the person gave us and for a cut
     /// at a distance a sweep chose.
     pub choice: Option<cluster::CountChoice>,
+    /// Per person, the voice print of everything they said in this meeting.
+    ///
+    /// Stored on the speaker row by [`persist`], which is what makes "this
+    /// unnamed voice has now been in four meetings" and "does this voice belong
+    /// to somebody enrolled last week" answerable without reading a second of
+    /// audio back (DESIGN §1).
+    pub centroids: Vec<Vec<f32>>,
+    /// Per person, the known person this voice turned out to be — or might be.
+    /// Filled by [`Scan::cut_guided`] for the voices recognised before
+    /// clustering and by [`people::match_remaining`] for the rest.
+    pub matches: Vec<Option<people::Match>>,
 }
 
 impl Scan {
@@ -298,6 +311,50 @@ impl Scan {
         out
     }
 
+    /// Which fingerprints belong to somebody Echo already knows, before
+    /// anything is counted or clustered.
+    ///
+    /// This is the step that makes enrollment worth having (DESIGN §1: "enrolled
+    /// voices are matched BEFORE the count question, so blind counting applies
+    /// only to strangers"). A meeting with two known people and one stranger asks
+    /// the merge tree about one voice instead of three, and the part of the
+    /// pipeline that gets meetings wrong — deciding how many people there were
+    /// from the shape of a tree — is asked a much easier question.
+    ///
+    /// A person whose pre-assigned fingerprints add up to less than
+    /// [`people::MIN_GUIDED_MS`] is released back to the clustering: one strong
+    /// fingerprint of a cough is not somebody being in the meeting.
+    pub fn guide(&self, enrolled: &[people::Enrolled]) -> Guided {
+        let prints: Vec<&[f32]> = self.items.iter().map(|i| i.embedding.as_slice()).collect();
+        let mut assignment = people::pre_assign(&prints, enrolled);
+
+        let mut speech: Vec<i64> = vec![0; enrolled.len()];
+        for (i, slot) in assignment.iter().enumerate() {
+            if let Some(who) = slot {
+                speech[*who] += self.items[i].weight_ms.max(0);
+            }
+        }
+        for slot in assignment.iter_mut() {
+            if slot.is_some_and(|who| speech[who] < people::MIN_GUIDED_MS) {
+                *slot = None;
+            }
+        }
+
+        // Group order is the order these voices are first heard, which is the
+        // same rule `build_tracks` applies to everybody else.
+        let mut groups: Vec<usize> = Vec::new();
+        for who in assignment.iter().flatten() {
+            if !groups.contains(who) {
+                groups.push(*who);
+            }
+        }
+        Guided {
+            assignment,
+            groups,
+            people: enrolled.to_vec(),
+        }
+    }
+
     /// Cut at one distance, which is what the calibration tools sweep.
     ///
     /// The app does not take this path any more: the count it would produce is
@@ -307,9 +364,10 @@ impl Scan {
     /// same tree the old measurements were made against. `Some(k)` cuts at a
     /// count and ignores the distance entirely.
     pub fn cut(&self, threshold: f32, target: Option<usize>) -> ScanCut {
+        let nobody = Guided::default();
         match target {
-            Some(k) => self.tracks_of(cluster::cluster_fixed(&self.items, k), None),
-            None => self.tracks_of(cluster::cluster(&self.items, threshold), None),
+            Some(k) => self.tracks_of(cluster::cluster_fixed(&self.items, k), None, &nobody),
+            None => self.tracks_of(cluster::cluster(&self.items, threshold), None, &nobody),
         }
     }
 
@@ -317,13 +375,96 @@ impl Scan {
     /// outright; `None` is the automatic count, read out of the shape of the
     /// merge tree ([`cluster::cluster_auto`]).
     pub fn cut_for(&self, target: Option<usize>) -> ScanCut {
-        match target {
-            Some(k) => self.tracks_of(cluster::cluster_fixed(&self.items, k), None),
-            None => {
-                let (clustering, choice) = cluster::cluster_auto(&self.items);
-                self.tracks_of(clustering, Some(choice))
+        self.cut_guided(&Guided::default(), target)
+    }
+
+    /// [`Self::cut_for`] with the voices Echo already knows taken out first.
+    ///
+    /// Every fingerprint [`Self::guide`] recognised is held aside as a
+    /// ready-made group, and **only the remainder is counted and clustered**.
+    /// `target` is still the whole channel's worth of voices — the count the
+    /// person gave us, meaning the same thing it always meant — and the known
+    /// people come off it here, because that subtraction is only knowable once
+    /// the guiding has happened.
+    ///
+    /// The floor of one stranger when there are leftover fingerprints is the
+    /// same judgement [`remote_target`] makes and for the same reason: leaving
+    /// real speech unattributed to make an arithmetic come out right is worse
+    /// than one voice too many.
+    pub fn cut_guided(&self, guided: &Guided, target: Option<usize>) -> ScanCut {
+        let known = guided.groups.len();
+        let leftovers: Vec<usize> = (0..self.items.len())
+            .filter(|i| guided.assignment.get(*i).copied().flatten().is_none())
+            .collect();
+        let items: Vec<ClusterItem> = leftovers.iter().map(|&i| self.items[i].clone()).collect();
+
+        let strangers = target.map(|t| {
+            let left = t.saturating_sub(known);
+            if left == 0 && !items.is_empty() {
+                1
+            } else {
+                left
+            }
+        });
+
+        let (clustering, choice) = match (items.is_empty(), strangers) {
+            (true, _) => (cluster::Clustering::default(), None),
+            (false, Some(0)) => (cluster::Clustering::default(), None),
+            (false, Some(k)) => (cluster::cluster_fixed(&items, k), None),
+            (false, None) => {
+                let (clustering, choice) = cluster::cluster_auto(&items);
+                (clustering, Some(choice))
+            }
+        };
+
+        // One label space over every fingerprint: the known people first, in the
+        // order they are first heard, then whatever the clustering made of the
+        // strangers.
+        let mut labels = vec![usize::MAX; self.items.len()];
+        for (i, slot) in guided.assignment.iter().enumerate() {
+            if let Some(who) = slot {
+                if let Some(group) = guided.groups.iter().position(|g| g == who) {
+                    labels[i] = group;
+                }
             }
         }
+        // A leftover cluster that is unmistakably more of a voice already
+        // recognised goes back to that voice instead of becoming a speaker of
+        // its own. Without this, enrolling somebody *adds* a person to the
+        // meeting they were enrolled from: their strong fingerprints are the
+        // guided group and their weaker ones cluster into a second, very
+        // convincing stranger. See `people::absorb_leftovers`.
+        let leftover_centroids: Vec<Vec<f32>> = (0..clustering.cluster_count)
+            .map(|label| {
+                people::centroid_of(
+                    clustering
+                        .labels
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| **l == label)
+                        .map(|(slot, _)| items[slot].embedding.as_slice()),
+                )
+            })
+            .collect();
+        let absorbed =
+            people::absorb_leftovers(&leftover_centroids, &guided.people, &guided.groups);
+        for (slot, &i) in leftovers.iter().enumerate() {
+            if let Some(label) = clustering.labels.get(slot) {
+                // The vacated label simply ends up with nothing in it, and
+                // `build_tracks` drops empty labels — so the count comes out
+                // right without any renumbering.
+                labels[i] = match absorbed.get(*label).copied().flatten() {
+                    Some(group) => group,
+                    None => known + label,
+                };
+            }
+        }
+        let combined = cluster::Clustering {
+            labels,
+            cluster_count: known + clustering.cluster_count,
+            threshold: clustering.threshold,
+        };
+        self.tracks_of(combined, choice, guided)
     }
 
     /// Turn one clustering of the fingerprints into per-person timelines.
@@ -331,10 +472,42 @@ impl Scan {
         &self,
         clustering: cluster::Clustering,
         choice: Option<cluster::CountChoice>,
+        guided: &Guided,
     ) -> ScanCut {
         let labelled = label_windows(&self.windows, &clustering.labels);
-        let (mut tracks, mut confidence) =
+        let (mut tracks, mut confidence, order) =
             build_tracks(&self.windows, &labelled, clustering.cluster_count);
+
+        // Per surviving person, the mean of the fingerprints the clustering put
+        // in their group. Computed here because this is the only place that holds
+        // both the fingerprints and the order the tracks came out in.
+        let mut centroids: Vec<Vec<f32>> = order
+            .iter()
+            .map(|&label| {
+                people::centroid_of(
+                    clustering
+                        .labels
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| **l == label)
+                        .map(|(i, _)| self.items[i].embedding.as_slice()),
+                )
+            })
+            .collect();
+        // Voices recognised before any of this happened keep their name.
+        let mut matches: Vec<Option<people::Match>> = order
+            .iter()
+            .enumerate()
+            .map(|(track, &label)| {
+                let who = *guided.groups.get(label)?;
+                let person = guided.people.get(who)?;
+                Some(people::Match::Linked {
+                    person_id: person.person_id.clone(),
+                    name: person.name.clone(),
+                    score: people::similarity(&centroids[track], &person.centroid),
+                })
+            })
+            .collect();
 
         // Nothing was fingerprintable — every voice talked over every other one,
         // or in snatches too short to identify. Falling through to zero speakers
@@ -346,6 +519,8 @@ impl Scan {
             if !fallback.is_empty() {
                 tracks = vec![fallback];
                 confidence = vec![0.0];
+                centroids = vec![Vec::new()];
+                matches = vec![None];
             }
         }
 
@@ -354,7 +529,37 @@ impl Scan {
             confidence,
             threshold: clustering.threshold,
             choice,
+            centroids,
+            matches,
         }
+    }
+}
+
+/// The voices Echo recognised before it started counting.
+///
+/// [`Scan::guide`] builds it; [`Scan::cut_guided`] turns it into ready-made
+/// groups. Empty — the [`Default`] — is a meeting with nobody enrolled in it,
+/// which is every meeting until somebody says "remember this voice", and it makes
+/// the guided path exactly the old path.
+#[derive(Debug, Clone, Default)]
+pub struct Guided {
+    /// Per fingerprint, which enrolled person it unmistakably is.
+    assignment: Vec<Option<usize>>,
+    /// Which enrolled people got a group, in the order they are first heard.
+    groups: Vec<usize>,
+    /// The enrolment this was decided against.
+    people: Vec<people::Enrolled>,
+}
+
+impl Guided {
+    /// How many voices this meeting no longer has to work out for itself.
+    pub fn recognised(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// How many fingerprints were handed to a known person.
+    pub fn fingerprints(&self) -> usize {
+        self.assignment.iter().flatten().count()
     }
 }
 
@@ -501,12 +706,42 @@ pub async fn refine(
         Source::MicOnly => mic_cluster_target(db, meeting_id).await?,
     };
 
+    // Who Echo has been told to remember, before anything is counted (DESIGN §1).
+    // A profile computed by an older network is re-embedded from its kept clips
+    // first, quietly, so a change of network costs nobody their people.
+    let embedder_tag = people::embedder_tag(db, embedder_path).await;
+    let mut enrolment = people::enrolled(db, &embedder_tag).await?;
+    if enrolment.stale > 0 {
+        control.checkpoint()?;
+        // Never fatal. A profile that cannot be brought up to date stays skipped
+        // and stays reported as needing a refresh; working out who said what does
+        // not depend on it.
+        match people::refresh_profiles(db, embedder_path).await {
+            Ok(0) => {}
+            Ok(_) => enrolment = people::enrolled(db, &embedder_tag).await?,
+            Err(error) => {
+                tracing::debug!(%error, "could not bring the remembered voices up to date")
+            }
+        }
+    }
+
     let Some(scanned) = scan(db, meeting_id, segmenter_path, embedder_path, control).await? else {
         return Err(DiarizeError::Failed(
             "the meeting's audio disappeared while the pass was starting".into(),
         ));
     };
-    let cut = scanned.cut_for(target);
+
+    let guided = scanned.guide(&enrolment.people);
+    if guided.recognised() > 0 {
+        tracing::debug!(
+            people = guided.recognised(),
+            fingerprints = guided.fingerprints(),
+            "recognised {} known voice(s) before counting the rest",
+            guided.recognised()
+        );
+    }
+    let mut cut = scanned.cut_guided(&guided, target);
+    people::match_remaining(&mut cut, &enrolment);
     if let Some(choice) = &cut.choice {
         tracing::debug!(
             count = choice.count,
@@ -748,11 +983,15 @@ fn label_windows(windows: &[WindowResult], labels: &[usize]) -> Vec<Vec<Option<u
 
 /// Collect every window's contribution into one timeline per person, then
 /// renumber so "Speaker 1" is the first voice heard.
+///
+/// The third return value is which cluster label each track came from, which is
+/// the only way back from a renumbered track to the fingerprints behind it — what
+/// [`Scan::tracks_of`] needs to attach a centroid and a known person to a row.
 fn build_tracks(
     windows: &[WindowResult],
     labelled: &[Vec<Option<usize>>],
     cluster_count: usize,
-) -> (Vec<Vec<Span>>, Vec<f32>) {
+) -> (Vec<Vec<Span>>, Vec<f32>, Vec<usize>) {
     let mut raw: Vec<Vec<Span>> = vec![Vec::new(); cluster_count];
     let mut weight: Vec<f64> = vec![0.0; cluster_count];
     let mut confidence: Vec<f64> = vec![0.0; cluster_count];
@@ -791,7 +1030,7 @@ fn build_tracks(
             }
         })
         .collect();
-    (tracks, confidences)
+    (tracks, confidences, order)
 }
 
 /// One track covering every stretch of remote speech we found, for the case
@@ -866,6 +1105,50 @@ async fn persist(
             repo::upsert_speaker(db, meeting_id, &cluster_key(i), &display_name(i), false)
                 .await
                 .map_err(db_failed)?;
+
+        // This meeting's voice print for this voice, whether or not anybody
+        // knows whose it is. Stored either way: it is what a person enrolled
+        // next month will be matched against (DESIGN §1).
+        let centroid = cut.centroids.get(i).filter(|c| !c.is_empty());
+        repo::set_speaker_centroid(db, &speaker.id, centroid.map(|c| c.as_slice()))
+            .await
+            .map_err(db_failed)?;
+
+        match cut.matches.get(i).and_then(|m| m.as_ref()) {
+            Some(people::Match::Linked {
+                person_id, name, ..
+            }) => {
+                repo::set_speaker_person(db, &speaker.id, Some(person_id))
+                    .await
+                    .map_err(db_failed)?;
+                // The name is *copied* onto the row, and only over a label Echo
+                // made up. From here it is meeting-local: renaming this speaker
+                // does not rename the person, and deleting the person does not
+                // rewrite this meeting.
+                if people::is_default_name(&speaker.display_name) {
+                    repo::rename_speaker(db, &speaker.id, name)
+                        .await
+                        .map_err(db_failed)?;
+                }
+            }
+            Some(people::Match::Suggested { person_id, score }) => {
+                // Only ever a question, and only on a row nobody has answered:
+                // a link or a name somebody typed outranks anything the pass
+                // suspects.
+                if speaker.person_id.is_none() {
+                    repo::set_speaker_suggestion(db, &speaker.id, Some(person_id), Some(*score))
+                        .await
+                        .map_err(db_failed)?;
+                }
+            }
+            None => {
+                if speaker.person_id.is_none() {
+                    repo::set_speaker_suggestion(db, &speaker.id, None, None)
+                        .await
+                        .map_err(db_failed)?;
+                }
+            }
+        }
         remote_ids.push(speaker.id);
     }
 
@@ -1138,7 +1421,7 @@ mod tests {
         let mut w = window(0, vec![vec![(6_000, 9_000)], vec![(0, 4_000)]]);
         w.fingerprint = vec![Some(0), Some(1)];
         let labelled = label_windows(std::slice::from_ref(&w), &[0, 1]);
-        let (tracks, conf) = build_tracks(&[w], &labelled, 2);
+        let (tracks, conf, _) = build_tracks(&[w], &labelled, 2);
         assert_eq!(tracks, vec![vec![(0, 4_000)], vec![(6_000, 9_000)]]);
         assert_eq!(conf.len(), 2);
         assert!(conf.iter().all(|c| (*c - 0.9).abs() < 1e-5));
@@ -1153,7 +1436,7 @@ mod tests {
         let windows = vec![a, b];
         // Both fingerprints landed in the same cluster.
         let labelled = label_windows(&windows, &[0, 0]);
-        let (tracks, _) = build_tracks(&windows, &labelled, 1);
+        let (tracks, _, _) = build_tracks(&windows, &labelled, 1);
         assert_eq!(tracks, vec![vec![(1_000, 14_000)]]);
     }
 
@@ -1163,7 +1446,7 @@ mod tests {
         w.fingerprint = vec![Some(0)];
         let labelled = label_windows(std::slice::from_ref(&w), &[1]);
         // Cluster 0 exists in the clustering but nothing carries its label.
-        let (tracks, _) = build_tracks(&[w], &labelled, 2);
+        let (tracks, _, _) = build_tracks(&[w], &labelled, 2);
         assert_eq!(tracks.len(), 1);
     }
 
@@ -1298,6 +1581,8 @@ mod tests {
     fn cut_of(tracks: &[Vec<Span>]) -> ScanCut {
         ScanCut {
             confidence: vec![0.9; tracks.len()],
+            centroids: vec![Vec::new(); tracks.len()],
+            matches: vec![None; tracks.len()],
             tracks: tracks.to_vec(),
             threshold: 0.5,
             choice: None,
@@ -1315,6 +1600,449 @@ mod tests {
             is_final: true,
             ..Default::default()
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Known people: recognised before anything is counted
+    // -----------------------------------------------------------------------
+
+    /// Room for several orthogonal "voices" plus somewhere to put the leftover
+    /// length, so a test can state exactly what every similarity is.
+    const DIM: usize = 32;
+
+    /// A fingerprint `similarity` alike to voice `v`, and near-nothing to every
+    /// other voice. `wobble` moves it a little without moving it towards anybody.
+    fn print_of(v: usize, similarity: f32, wobble: usize) -> Vec<f32> {
+        let mut e = vec![0.0f32; DIM];
+        e[v * 2] = similarity;
+        e[16 + wobble % 8] = (1.0 - similarity * similarity).max(0.0).sqrt();
+        cluster::l2_normalize(&mut e);
+        e
+    }
+
+    fn enrolled_as(v: usize, name: &str, person_id: &str) -> people::Enrolled {
+        let mut centroid = vec![0.0f32; DIM];
+        centroid[v * 2] = 1.0;
+        people::Enrolled {
+            person_id: person_id.to_string(),
+            name: name.to_string(),
+            centroid,
+        }
+    }
+
+    /// A scan of some fingerprints: one window each, one voice per window, each
+    /// talking its own stretch of the meeting clock. Everything the clustering and
+    /// the guiding need, and nothing that needs a model.
+    fn scan_of(prints: &[(Vec<f32>, i64)]) -> Scan {
+        let mut items: Vec<ClusterItem> = Vec::new();
+        let mut windows: Vec<WindowResult> = Vec::new();
+        for (i, (embedding, ms)) in prints.iter().enumerate() {
+            let start = i as i64 * 10_000;
+            let mut w = window(start, vec![vec![(start, start + ms)]]);
+            w.fingerprint = vec![Some(items.len())];
+            windows.push(w);
+            items.push(ClusterItem {
+                embedding: embedding.clone(),
+                weight_ms: *ms,
+            });
+        }
+        Scan {
+            items,
+            windows,
+            covered: vec![(0, prints.len() as i64 * 10_000)],
+        }
+    }
+
+    /// Three of a known voice and two strangers, which is the shape DESIGN §1 is
+    /// about: "enrolled voices are matched BEFORE the count question".
+    fn one_known_two_strangers() -> Scan {
+        scan_of(&[
+            (print_of(0, 0.95, 0), 4_000),
+            (print_of(0, 0.93, 1), 4_000),
+            (print_of(0, 0.96, 2), 4_000),
+            (print_of(1, 0.98, 3), 4_000),
+            (print_of(1, 0.97, 4), 4_000),
+            (print_of(2, 0.98, 5), 4_000),
+            (print_of(2, 0.96, 6), 4_000),
+        ])
+    }
+
+    /// The point of the whole feature: a voice Echo already knows is taken out
+    /// before the count is worked out, so the hard question — how many people
+    /// were here — is only ever asked about strangers.
+    #[test]
+    fn a_known_voice_is_taken_out_before_the_counting_starts() {
+        let scanned = one_known_two_strangers();
+        let known = vec![enrolled_as(0, "Marco", "person-marco")];
+
+        let guided = scanned.guide(&known);
+        assert_eq!(guided.recognised(), 1);
+        assert_eq!(guided.fingerprints(), 3, "all three of Marco's, and nobody else's");
+
+        let cut = scanned.cut_guided(&guided, None);
+        // The automatic count only ever saw the strangers. That is the claim, and
+        // this is the only place it can be observed.
+        let choice = cut.choice.as_ref().expect("the strangers were counted");
+        assert_eq!(choice.count, 2, "the count was asked about Marco as well");
+        assert_eq!(cut.tracks.len(), 3, "Marco plus the two strangers");
+
+        // Marco is the first voice heard, so he is the first row, and he arrives
+        // with a name rather than a number.
+        match cut.matches[0].as_ref().expect("Marco was recognised") {
+            people::Match::Linked { name, person_id, score } => {
+                assert_eq!(name, "Marco");
+                assert_eq!(person_id, "person-marco");
+                assert!(*score > people::TAU_LINK, "{score}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(cut.matches[1].is_none(), "a stranger must stay a stranger");
+        assert!(cut.matches[2].is_none());
+        // And every voice, known or not, leaves a print behind for next time.
+        assert!(cut.centroids.iter().all(|c| c.len() == DIM));
+    }
+
+    /// The same scan with nobody enrolled: three voices, all counted, no names.
+    /// The guided path has to be exactly the old path when there is nobody to
+    /// recognise, because that is every meeting until somebody says "remember
+    /// this voice".
+    #[test]
+    fn with_nobody_enrolled_the_pass_answers_exactly_as_it_used_to() {
+        let scanned = one_known_two_strangers();
+        let guided = scanned.guide(&[]);
+        assert_eq!(guided.recognised(), 0);
+
+        let cut = scanned.cut_guided(&guided, None);
+        assert_eq!(cut.choice.as_ref().unwrap().count, 3, "all three counted");
+        assert_eq!(cut.tracks.len(), 3);
+        assert!(cut.matches.iter().all(|m| m.is_none()));
+
+        // Byte for byte the same as the unguided entry point.
+        let plain = scanned.cut_for(None);
+        assert_eq!(plain.tracks, cut.tracks);
+        assert_eq!(plain.threshold, cut.threshold);
+    }
+
+    /// Enrolling somebody must not add a person to the meeting they were
+    /// enrolled from.
+    ///
+    /// The regression `examples/people_probe` caught on a real two-person
+    /// meeting: [`people::pre_assign`] takes the fingerprints that clear
+    /// `TAU_STRONG` and the rest of that same person's speech falls through to
+    /// the clustering, where it is a perfectly coherent unfamiliar voice. The
+    /// meeting went from two speakers to three, the enrolled person split across
+    /// two rows, both wearing their name. Here Marco has three fingerprints that
+    /// clear the strict bar and three that do not — the shape of any real voice,
+    /// where the clean stretches are recognisable and the short answers are not.
+    #[test]
+    fn enrolling_somebody_does_not_add_a_speaker_to_their_own_meeting() {
+        // The weak three share a wobble, so they are each other's nearest
+        // neighbour and the clustering does what it did in the field: makes them
+        // one convincing voice.
+        let scanned = scan_of(&[
+            (print_of(0, 0.95, 0), 6_000),
+            (print_of(0, 0.94, 1), 6_000),
+            (print_of(0, 0.96, 2), 6_000),
+            (print_of(0, 0.70, 7), 6_000),
+            (print_of(0, 0.70, 7), 6_000),
+            (print_of(0, 0.70, 7), 6_000),
+            (print_of(1, 0.98, 3), 8_000),
+            (print_of(1, 0.97, 4), 8_000),
+        ]);
+        let guided = scanned.guide(&[enrolled_as(0, "Marco", "person-marco")]);
+        assert_eq!(guided.recognised(), 1);
+        assert_eq!(
+            guided.fingerprints(),
+            3,
+            "only the three that clear the strict bar pre-assign — which is the \
+             whole reason the leftovers have to be dealt with"
+        );
+
+        let cut = scanned.cut_guided(&guided, None);
+        assert_eq!(
+            cut.tracks.len(),
+            2,
+            "Marco and one stranger — not Marco, Marco again, and one stranger"
+        );
+        assert_eq!(
+            cut.matches.iter().flatten().count(),
+            1,
+            "one person, one voice"
+        );
+        match cut.matches[0].as_ref().expect("Marco, heard first") {
+            people::Match::Linked { name, .. } => assert_eq!(name, "Marco"),
+            other => panic!("{other:?}"),
+        }
+        assert!(cut.matches[1].is_none(), "the stranger stays a stranger");
+
+        // And the speech went back to Marco rather than being dropped: his track
+        // holds the weak stretches too.
+        let marco = timeline::total_ms(&cut.tracks[0]);
+        let stranger = timeline::total_ms(&cut.tracks[1]);
+        assert!(
+            marco > stranger,
+            "Marco said 36 s and the stranger 16 s, got {marco} and {stranger}"
+        );
+    }
+
+    /// A single strong fingerprint is not somebody being in the meeting. Two
+    /// seconds of a voice that sounds like Marco is a cough, a hold tone, or a
+    /// word over the top of somebody else.
+    #[test]
+    fn a_moment_of_a_known_voice_is_not_enough_to_take_a_row() {
+        let scanned = scan_of(&[
+            (print_of(0, 0.95, 0), 1_200),
+            (print_of(1, 0.98, 1), 8_000),
+            (print_of(1, 0.97, 2), 8_000),
+        ]);
+        let guided = scanned.guide(&[enrolled_as(0, "Marco", "person-marco")]);
+        assert_eq!(guided.recognised(), 0, "under MIN_GUIDED_MS");
+        // And the fingerprint is back in the clustering rather than thrown away.
+        let cut = scanned.cut_guided(&guided, None);
+        assert!(cut.matches.iter().all(|m| m.is_none()));
+        assert!(!cut.tracks.is_empty());
+    }
+
+    /// "There were three of us" with one of the three already known: the count
+    /// the person gave still means the same thing, and the arithmetic happens
+    /// where the known people are known.
+    #[test]
+    fn a_count_the_person_gave_has_the_known_people_taken_off_it() {
+        let scanned = one_known_two_strangers();
+        let guided = scanned.guide(&[enrolled_as(0, "Marco", "person-marco")]);
+
+        let three = scanned.cut_guided(&guided, Some(3));
+        assert_eq!(three.tracks.len(), 3, "Marco plus two strangers");
+        assert!(three.choice.is_none(), "a count the person gave is not a guess");
+
+        // "There were two of us": Marco plus one stranger.
+        let two = scanned.cut_guided(&guided, Some(2));
+        assert_eq!(two.tracks.len(), 2);
+
+        // "Just me and Marco" on a recording that plainly has strangers in it.
+        // One voice too many beats leaving real speech unattributed, which is the
+        // same judgement `remote_target` makes.
+        let one = scanned.cut_guided(&guided, Some(1));
+        assert_eq!(one.tracks.len(), 2, "{:?}", one.tracks);
+    }
+
+    /// Everybody in the meeting is somebody Echo knows: nothing left to cluster
+    /// at all, and no count to work out.
+    #[test]
+    fn a_meeting_of_nothing_but_known_voices_needs_no_clustering() {
+        let scanned = scan_of(&[
+            (print_of(0, 0.95, 0), 6_000),
+            (print_of(0, 0.94, 1), 6_000),
+            (print_of(1, 0.96, 2), 6_000),
+            (print_of(1, 0.97, 3), 6_000),
+        ]);
+        let guided = scanned.guide(&[
+            enrolled_as(0, "Marco", "person-marco"),
+            enrolled_as(1, "Priya", "person-priya"),
+        ]);
+        assert_eq!(guided.recognised(), 2);
+
+        let cut = scanned.cut_guided(&guided, None);
+        assert!(cut.choice.is_none(), "there was nothing left to count");
+        assert_eq!(cut.tracks.len(), 2);
+        let names: Vec<&str> = cut
+            .matches
+            .iter()
+            .map(|m| match m.as_ref().expect("both recognised") {
+                people::Match::Linked { name, .. } => name.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["Marco", "Priya"]);
+    }
+
+    /// A voice that is only *probably* somebody is a question on the row, not a
+    /// name — and the same person cannot be two of this meeting's voices.
+    #[test]
+    fn the_second_stage_asks_rather_than_claims_and_never_names_one_person_twice() {
+        // Two voices, both somewhat like Marco, neither unmistakable. The better
+        // one gets the question; the other gets nothing, because two voices in one
+        // room cannot both be Marco.
+        let mut cut = ScanCut {
+            tracks: vec![vec![(0, 8_000)], vec![(9_000, 17_000)]],
+            confidence: vec![0.9, 0.9],
+            centroids: vec![print_of(0, 0.58, 0), print_of(0, 0.55, 1)],
+            matches: vec![None, None],
+            threshold: 0.5,
+            choice: None,
+        };
+        let enrolment = people::Enrolment {
+            people: vec![enrolled_as(0, "Marco", "person-marco")],
+            stale: 0,
+        };
+        people::match_remaining(&mut cut, &enrolment);
+
+        match cut.matches[0].as_ref().expect("the better one is asked about") {
+            people::Match::Suggested { person_id, .. } => assert_eq!(person_id, "person-marco"),
+            other => panic!("{other:?}"),
+        }
+        assert!(cut.matches[1].is_none(), "one person, one voice");
+    }
+
+    #[test]
+    fn a_voice_already_recognised_is_not_decided_twice() {
+        let mut cut = ScanCut {
+            tracks: vec![vec![(0, 8_000)]],
+            confidence: vec![0.9],
+            centroids: vec![print_of(0, 0.99, 0)],
+            matches: vec![Some(people::Match::Linked {
+                person_id: "person-marco".into(),
+                name: "Marco".into(),
+                score: 0.99,
+            })],
+            threshold: 0.5,
+            choice: None,
+        };
+        let enrolment = people::Enrolment {
+            people: vec![enrolled_as(0, "Renamed since", "person-marco")],
+            stale: 0,
+        };
+        people::match_remaining(&mut cut, &enrolment);
+        match cut.matches[0].as_ref().unwrap() {
+            people::Match::Linked { name, .. } => assert_eq!(name, "Marco"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // What the pass writes down about a known person
+    // -----------------------------------------------------------------------
+
+    /// A cut of one voice, with a known person attached and a voice print to
+    /// remember it by.
+    fn cut_with(matches: Vec<Option<people::Match>>) -> ScanCut {
+        let tracks = vec![vec![(0i64, 4_000i64)]; matches.len().max(1)];
+        ScanCut {
+            confidence: vec![0.9; tracks.len()],
+            centroids: (0..tracks.len()).map(|i| print_of(i, 0.99, i)).collect(),
+            matches,
+            tracks,
+            threshold: 0.5,
+            choice: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_linked_voice_gets_the_persons_name_and_keeps_a_typed_one() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Team sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(&db, &[remote_line(&meeting.id, 0, 4_000)])
+            .await
+            .unwrap();
+        let marco = repo::create_person(&db, "Marco").await.unwrap();
+
+        let linked = || {
+            vec![Some(people::Match::Linked {
+                person_id: marco.id.clone(),
+                name: "Marco".into(),
+                score: 0.9,
+            })]
+        };
+        let speakers = persist(&db, &meeting.id, &cut_with(linked()), Source::System)
+            .await
+            .unwrap();
+        let voice = speakers
+            .iter()
+            .find(|s| s.cluster_key == cluster_key(0))
+            .unwrap();
+        assert_eq!(voice.person_id.as_deref(), Some(marco.id.as_str()));
+        assert_eq!(voice.display_name, "Marco", "the label Echo made up is replaced");
+        assert!(voice.suggested_person_id.is_none());
+
+        // The person renames the chip in this meeting. That is meeting-local: the
+        // link stays, the person keeps their own name, and a re-run does not
+        // overwrite what was typed.
+        repo::rename_speaker(&db, &voice.id, "Marco B.").await.unwrap();
+        let again = persist(&db, &meeting.id, &cut_with(linked()), Source::System)
+            .await
+            .unwrap();
+        let voice = again
+            .iter()
+            .find(|s| s.cluster_key == cluster_key(0))
+            .unwrap();
+        assert_eq!(voice.display_name, "Marco B.");
+        assert_eq!(voice.person_id.as_deref(), Some(marco.id.as_str()));
+        assert_eq!(
+            repo::get_person(&db, &marco.id).await.unwrap().unwrap().name,
+            "Marco",
+            "renaming a speaker must never rename the person"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suggestion_is_stored_as_a_question_and_taken_back_when_it_stops_being_true() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Client call", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(&db, &[remote_line(&meeting.id, 0, 4_000)])
+            .await
+            .unwrap();
+        let marco = repo::create_person(&db, "Marco").await.unwrap();
+
+        let speakers = persist(
+            &db,
+            &meeting.id,
+            &cut_with(vec![Some(people::Match::Suggested {
+                person_id: marco.id.clone(),
+                score: 0.58,
+            })]),
+            Source::System,
+        )
+        .await
+        .unwrap();
+        let voice = speakers
+            .iter()
+            .find(|s| s.cluster_key == cluster_key(0))
+            .unwrap();
+        assert_eq!(voice.suggested_person_id.as_deref(), Some(marco.id.as_str()));
+        assert!((voice.suggestion_score.unwrap() - 0.58).abs() < 1e-6);
+        assert!(voice.person_id.is_none(), "a suggestion is never an assignment");
+        assert_eq!(voice.display_name, "Speaker 1", "and never a name");
+
+        // A later run that no longer believes it takes the question away rather
+        // than leaving it on the screen.
+        let speakers = persist(&db, &meeting.id, &cut_with(vec![None]), Source::System)
+            .await
+            .unwrap();
+        let voice = speakers
+            .iter()
+            .find(|s| s.cluster_key == cluster_key(0))
+            .unwrap();
+        assert!(voice.suggested_person_id.is_none());
+        assert!(voice.suggestion_score.is_none());
+    }
+
+    /// Every voice the pass separates leaves its print on the row — which is what
+    /// makes a recurring stranger findable later without re-reading any audio
+    /// (DESIGN §1).
+    #[tokio::test]
+    async fn the_pass_leaves_a_voice_print_on_every_row_it_makes() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Workshop", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(&db, &[remote_line(&meeting.id, 0, 4_000)])
+            .await
+            .unwrap();
+
+        persist(&db, &meeting.id, &cut_with(vec![None, None]), Source::System)
+            .await
+            .unwrap();
+
+        let prints = repo::list_unnamed_voice_prints(&db).await.unwrap();
+        assert_eq!(prints.len(), 2, "{prints:?}");
+        assert!(prints.iter().all(|p| p.centroid.len() == DIM));
+        assert!(prints.iter().all(|p| p.meeting_id == meeting.id));
+        // "You" is not one of them: the microphone was never clustered.
+        assert!(prints.iter().all(|p| p.display_name.starts_with("Speaker")));
     }
 
     /// The property the whole re-run rests on: a second pass lands on the rows

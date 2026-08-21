@@ -38,6 +38,9 @@ pub const DOWNLOAD_PROGRESS: &str = "echo://download-progress";
 pub const DETECTION: &str = "echo://detection";
 /// Speaker list changed (new speaker, rename, merge).
 pub const SPEAKERS_UPDATED: &str = "echo://speakers-updated";
+/// The people Echo remembers changed — one was added, renamed, deleted, or
+/// learned something new about a voice.
+pub const PEOPLE_UPDATED: &str = "echo://people-updated";
 /// A recap finished and is ready to render.
 pub const SUMMARY_READY: &str = "echo://summary-ready";
 /// Action items were (re)generated or edited.
@@ -71,6 +74,7 @@ pub const ALL: &[&str] = &[
     DOWNLOAD_PROGRESS,
     DETECTION,
     SPEAKERS_UPDATED,
+    PEOPLE_UPDATED,
     SUMMARY_READY,
     ACTION_ITEMS_UPDATED,
     MEETING_UPDATED,
@@ -221,6 +225,19 @@ pub struct SpeakersUpdatedPayload {
     pub people_count: u32,
     /// True when the count is the person's correction, not Echo's.
     pub people_count_is_override: bool,
+}
+
+/// `PEOPLE_UPDATED`
+///
+/// Carries the whole list rather than the one that changed. There are never many
+/// — a person has a handful of favourite people, not a directory — and one
+/// payload that replaces the list is what keeps Settings → People, the
+/// name-your-speakers rows and the suggestions list from disagreeing about who
+/// exists. Anything showing a person's name refetches nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeopleUpdatedPayload {
+    pub people: Vec<crate::types::PersonInfo>,
 }
 
 /// `SUMMARY_READY`

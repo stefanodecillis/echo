@@ -211,6 +211,61 @@ export interface Speaker {
   aliasOf?: Id;
   isSelf: boolean;
   speakingMs: number;
+  /**
+   * The known person this voice was matched to, when Echo is sure enough to say
+   * so. `displayName` was copied from that person when the link was made and is
+   * meeting-local from then on: renaming this speaker does **not** rename the
+   * person, and deleting the person leaves this meeting reading as it does now.
+   */
+  personId?: Id;
+  /**
+   * "Looks like Marco — confirm?". A match that cleared the asking bar but not
+   * the claiming one, so it is a question and never an assignment. Look the name
+   * up in the list from `listPeople`.
+   */
+  suggestedPersonId?: Id;
+  /** How alike the two voices were, 0..1. Internal; never shown (mantra 2). */
+  suggestionScore?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Known people (voice enrollment)
+// ---------------------------------------------------------------------------
+
+/** One remembered voice, as Settings > People shows it. */
+export interface PersonInfo {
+  id: Id;
+  name: string;
+  /** How many samples of this voice Echo is keeping. Capped. */
+  sampleCount: number;
+  /** When this voice was last heard in a meeting. Absent if never since. */
+  lastHeardAt?: Timestamp;
+  /**
+   * The stored voice data belongs to an older way of listening, so this person
+   * is not being matched at the moment. Echo redoes it from the clips it kept —
+   * nothing is lost and nobody has to be enrolled again. Say something calm, or
+   * nothing; never a technical reason (mantra 2).
+   */
+  needsRefresh: boolean;
+}
+
+/**
+ * A voice that keeps turning up without a name, offered as "shall I remember
+ * this one?".
+ *
+ * `meetingId` + `speakerId` are a representative appearance: use them for
+ * `speakerSample` (Listen) and for `acceptSuggestedPerson`.
+ */
+export interface SuggestedPerson {
+  id: string;
+  /** How many meetings this voice has been in. At least three. */
+  appearances: number;
+  lastHeardAt: Timestamp;
+  /** Total speech Echo has of this voice across those meetings. */
+  speakingMs: number;
+  meetingId: Id;
+  speakerId: Id;
+  meetingTitle: string;
 }
 
 export type MarkerKind = "actionItem" | "highlight" | "system";
@@ -692,6 +747,14 @@ export interface SpeakersUpdatedPayload {
   peopleCount: number;
   /** True when the count is the person's correction, not Echo's. */
   peopleCountIsOverride: boolean;
+}
+
+/**
+ * The people Echo remembers changed. Carries the whole list, so every view that
+ * shows a name lands on the same answer without refetching.
+ */
+export interface PeopleUpdatedPayload {
+  people: PersonInfo[];
 }
 
 export interface SummaryReadyPayload {

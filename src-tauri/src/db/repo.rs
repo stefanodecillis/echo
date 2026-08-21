@@ -980,7 +980,8 @@ pub async fn upsert_speaker(
     .await?;
 
     let row = sqlx::query(
-        "SELECT id, meeting_id, cluster_key, display_name, alias_of, is_self, speaking_ms
+        "SELECT id, meeting_id, cluster_key, display_name, alias_of, is_self, speaking_ms,
+                person_id, suggested_person_id, suggestion_score
          FROM speakers WHERE meeting_id = ?1 AND cluster_key = ?2",
     )
     .bind(meeting_id)
@@ -993,7 +994,8 @@ pub async fn upsert_speaker(
 
 pub async fn list_speakers(db: &Db, meeting_id: &str) -> Result<Vec<Speaker>, DbError> {
     let rows = sqlx::query(
-        "SELECT id, meeting_id, cluster_key, display_name, alias_of, is_self, speaking_ms
+        "SELECT id, meeting_id, cluster_key, display_name, alias_of, is_self, speaking_ms,
+                person_id, suggested_person_id, suggestion_score
          FROM speakers WHERE meeting_id = ?1
          ORDER BY is_self DESC, speaking_ms DESC, cluster_key",
     )
@@ -1005,7 +1007,8 @@ pub async fn list_speakers(db: &Db, meeting_id: &str) -> Result<Vec<Speaker>, Db
 
 pub async fn get_speaker(db: &Db, id: &str) -> Result<Option<Speaker>, DbError> {
     let row = sqlx::query(
-        "SELECT id, meeting_id, cluster_key, display_name, alias_of, is_self, speaking_ms
+        "SELECT id, meeting_id, cluster_key, display_name, alias_of, is_self, speaking_ms,
+                person_id, suggested_person_id, suggestion_score
          FROM speakers WHERE id = ?1",
     )
     .bind(id)
@@ -1184,6 +1187,451 @@ pub async fn recompute_speaking_time(db: &Db, meeting_id: &str) -> Result<(), Db
     .execute(db)
     .await?;
     Ok(())
+}
+
+/// Point this speaker at a known person, or release it.
+///
+/// Only the link. The display name is copied onto the row separately (through
+/// [`rename_speaker`]) and is meeting-local from then on, which is why deleting a
+/// person leaves the transcript reading the way the person last read it.
+pub async fn set_speaker_person(
+    db: &Db,
+    speaker_id: &str,
+    person_id: Option<&str>,
+) -> Result<(), DbError> {
+    // Linking settles the question, so any suggestion on the row goes with it:
+    // "looks like Marco" next to "Marco" is noise.
+    let r = sqlx::query(
+        "UPDATE speakers
+         SET person_id = ?2, suggested_person_id = NULL, suggestion_score = NULL
+         WHERE id = ?1",
+    )
+    .bind(speaker_id)
+    .bind(person_id)
+    .execute(db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(DbError::NotFound(format!("speaker {speaker_id}")));
+    }
+    Ok(())
+}
+
+/// "Looks like Marco — confirm?", with the score that produced it. `None`
+/// clears the suggestion.
+pub async fn set_speaker_suggestion(
+    db: &Db,
+    speaker_id: &str,
+    person_id: Option<&str>,
+    score: Option<f32>,
+) -> Result<(), DbError> {
+    sqlx::query("UPDATE speakers SET suggested_person_id = ?2, suggestion_score = ?3 WHERE id = ?1")
+        .bind(speaker_id)
+        .bind(person_id)
+        .bind(person_id.and(score))
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Store this speaker's voice print for this meeting, as computed by the
+/// offline pass. `None` forgets it.
+///
+/// This is what makes a recurring unnamed voice findable later without reading a
+/// second of audio back, and what lets a person enrolled today be matched
+/// against meetings that were separated before they existed.
+pub async fn set_speaker_centroid(
+    db: &Db,
+    speaker_id: &str,
+    centroid: Option<&[f32]>,
+) -> Result<(), DbError> {
+    sqlx::query("UPDATE speakers SET centroid = ?2 WHERE id = ?1")
+        .bind(speaker_id)
+        .bind(centroid.map(embedding_to_blob))
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+// ===========================================================================
+// known people (DESIGN §1 "Known people")
+// ===========================================================================
+
+/// A fingerprint as it is stored: f32 little-endian, no header.
+///
+/// Little-endian because every machine Echo ships on is, and a header would only
+/// be a second place for the length to be wrong. A blob whose length is not a
+/// multiple of four is a corrupt row, and [`blob_to_embedding`] returns what it
+/// can rather than failing the whole query — a profile with a truncated vector
+/// simply matches nothing.
+pub fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(embedding.len() * 4);
+    for x in embedding {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// The inverse of [`embedding_to_blob`].
+pub fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// Row of `people`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PersonRow {
+    pub id: Id,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Row of `person_samples`, without its audio.
+///
+/// The clip is the heavy half and almost nothing wants it, so it is fetched on
+/// its own ([`person_sample_clips`], [`freshest_person_clip`]). Curation and
+/// matching only ever look at the numbers.
+#[derive(Debug, Clone, Default)]
+pub struct PersonSampleRow {
+    pub id: Id,
+    pub person_id: Id,
+    pub embedding: Vec<f32>,
+    pub condition: Channel,
+    pub source_meeting_id: Option<Id>,
+    pub t_start_ms: i64,
+    pub t_end_ms: i64,
+    pub created_at: String,
+}
+
+/// A sample on its way in: both halves, because a sample without its audio
+/// cannot survive a change of network and a sample without its numbers cannot
+/// match anything today.
+#[derive(Debug, Clone)]
+pub struct NewPersonSample<'a> {
+    pub person_id: &'a str,
+    pub embedding: &'a [f32],
+    /// 16 kHz mono WAV.
+    pub clip: &'a [u8],
+    pub condition: Channel,
+    pub source_meeting_id: Option<&'a str>,
+    pub t_start_ms: i64,
+    pub t_end_ms: i64,
+}
+
+/// Row of `person_profiles`, with the person's name for free.
+#[derive(Debug, Clone, Default)]
+pub struct PersonProfileRow {
+    pub person_id: Id,
+    pub name: String,
+    pub centroid: Vec<f32>,
+    pub sample_count: u32,
+    /// The `models.id` of the network these numbers belong to.
+    pub embedder_asset_id: String,
+    pub updated_at: String,
+}
+
+/// One meeting's voice print for one speaker, for cross-meeting matching.
+#[derive(Debug, Clone, Default)]
+pub struct VoicePrint {
+    pub speaker_id: Id,
+    pub meeting_id: Id,
+    pub meeting_title: String,
+    pub started_at: String,
+    pub display_name: String,
+    pub speaking_ms: i64,
+    pub centroid: Vec<f32>,
+}
+
+pub async fn create_person(db: &Db, name: &str) -> Result<PersonRow, DbError> {
+    let row = PersonRow {
+        id: new_id(),
+        name: name.to_string(),
+        created_at: now(),
+        updated_at: now(),
+    };
+    sqlx::query("INSERT INTO people (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)")
+        .bind(&row.id)
+        .bind(&row.name)
+        .bind(&row.created_at)
+        .bind(&row.updated_at)
+        .execute(db)
+        .await?;
+    Ok(row)
+}
+
+pub async fn get_person(db: &Db, id: &str) -> Result<Option<PersonRow>, DbError> {
+    let row = sqlx::query("SELECT id, name, created_at, updated_at FROM people WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(db)
+        .await?;
+    row.map(row_to_person).transpose()
+}
+
+pub async fn list_people(db: &Db) -> Result<Vec<PersonRow>, DbError> {
+    let rows =
+        sqlx::query("SELECT id, name, created_at, updated_at FROM people ORDER BY name, created_at")
+            .fetch_all(db)
+            .await?;
+    rows.into_iter().map(row_to_person).collect()
+}
+
+pub async fn rename_person(db: &Db, id: &str, name: &str) -> Result<(), DbError> {
+    let r = sqlx::query("UPDATE people SET name = ?2, updated_at = ?3 WHERE id = ?1")
+        .bind(id)
+        .bind(name)
+        .bind(now())
+        .execute(db)
+        .await?;
+    if r.rows_affected() == 0 {
+        return Err(DbError::NotFound(format!("person {id}")));
+    }
+    Ok(())
+}
+
+/// Forget a person: the profile, the samples and the clips.
+///
+/// Speaker links go to NULL by foreign key, and the names already copied onto
+/// those speaker rows stay as plain text. That is the promise Settings makes —
+/// "delete destroys profile, samples and clips" — and nothing more: a meeting
+/// somebody has already read does not rewrite itself.
+pub async fn delete_person(db: &Db, id: &str) -> Result<(), DbError> {
+    let r = sqlx::query("DELETE FROM people WHERE id = ?1")
+        .bind(id)
+        .execute(db)
+        .await?;
+    if r.rows_affected() == 0 {
+        return Err(DbError::NotFound(format!("person {id}")));
+    }
+    Ok(())
+}
+
+/// Settings → Data → delete everything, the people half.
+///
+/// Deliberately separate from [`delete_all_meetings`]: the two answer different
+/// questions and `delete_all_data` asks both. Children first and by name, same
+/// reasoning as everywhere else in this file.
+pub async fn delete_all_people(db: &Db) -> Result<(), DbError> {
+    let mut tx = db.begin().await?;
+    for table in ["person_samples", "person_profiles", "people"] {
+        sqlx::query(&format!("DELETE FROM {table}"))
+            .execute(&mut *tx)
+            .await?;
+    }
+    // The links live on speaker rows that survive delete-all only if their
+    // meeting did; clearing them is belt and braces for a hand-edited database.
+    sqlx::query(
+        "UPDATE speakers SET person_id = NULL, suggested_person_id = NULL,
+                suggestion_score = NULL",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Everybody Echo remembers, as Settings → People shows them.
+///
+/// `current_embedder_asset_id` is the network in use right now; a profile tagged
+/// with anything else is reported as needing a refresh, which is the honest
+/// answer to "is this voice being matched at the moment" (DESIGN §1: "matching
+/// silently skips when the tags disagree until a refresh runs"). A person with no
+/// profile row at all — enrolled from a voice Echo could not fingerprint — needs
+/// one too.
+pub async fn list_person_infos(
+    db: &Db,
+    current_embedder_asset_id: &str,
+) -> Result<Vec<crate::types::PersonInfo>, DbError> {
+    let rows = sqlx::query(
+        "SELECT p.id            AS id,
+                p.name          AS name,
+                (SELECT COUNT(*) FROM person_samples s WHERE s.person_id = p.id) AS sample_count,
+                (SELECT MAX(m.started_at) FROM speakers k
+                   JOIN meetings m ON m.id = k.meeting_id
+                  WHERE k.person_id = p.id AND m.deleted_at IS NULL)             AS last_heard_at,
+                f.embedder_asset_id AS embedder_asset_id
+         FROM people p
+         LEFT JOIN person_profiles f ON f.person_id = p.id
+         ORDER BY p.name, p.created_at",
+    )
+    .fetch_all(db)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let tag: Option<String> = row.try_get("embedder_asset_id").map_err(decode)?;
+            let samples: i64 = row.try_get("sample_count").map_err(decode)?;
+            Ok(crate::types::PersonInfo {
+                id: row.try_get("id").map_err(decode)?,
+                name: row.try_get("name").map_err(decode)?,
+                sample_count: samples.max(0) as u32,
+                last_heard_at: row.try_get("last_heard_at").map_err(decode)?,
+                needs_refresh: tag.as_deref() != Some(current_embedder_asset_id),
+            })
+        })
+        .collect()
+}
+
+pub async fn insert_person_sample(db: &Db, sample: &NewPersonSample<'_>) -> Result<Id, DbError> {
+    let id = new_id();
+    sqlx::query(
+        "INSERT INTO person_samples
+             (id, person_id, embedding, clip, condition, source_meeting_id,
+              t_start_ms, t_end_ms, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )
+    .bind(&id)
+    .bind(sample.person_id)
+    .bind(embedding_to_blob(sample.embedding))
+    .bind(sample.clip)
+    .bind(sample.condition.as_str())
+    .bind(sample.source_meeting_id)
+    .bind(sample.t_start_ms)
+    .bind(sample.t_end_ms)
+    .bind(now())
+    .execute(db)
+    .await?;
+    Ok(id)
+}
+
+/// This person's samples, newest first, without their audio.
+pub async fn list_person_samples(
+    db: &Db,
+    person_id: &str,
+) -> Result<Vec<PersonSampleRow>, DbError> {
+    let rows = sqlx::query(
+        "SELECT id, person_id, embedding, condition, source_meeting_id,
+                t_start_ms, t_end_ms, created_at
+         FROM person_samples WHERE person_id = ?1
+         ORDER BY created_at DESC, id",
+    )
+    .bind(person_id)
+    .fetch_all(db)
+    .await?;
+    rows.into_iter().map(row_to_person_sample).collect()
+}
+
+/// Every sample's audio, for re-embedding when the network changes.
+pub async fn person_sample_clips(db: &Db, person_id: &str) -> Result<Vec<(Id, Vec<u8>)>, DbError> {
+    let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, clip FROM person_samples WHERE person_id = ?1 ORDER BY created_at, id",
+    )
+    .bind(person_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
+}
+
+/// The most recent clip of this voice, for the Listen button.
+pub async fn freshest_person_clip(db: &Db, person_id: &str) -> Result<Option<Vec<u8>>, DbError> {
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT clip FROM person_samples WHERE person_id = ?1
+         ORDER BY created_at DESC, id LIMIT 1",
+    )
+    .bind(person_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+pub async fn set_person_sample_embedding(
+    db: &Db,
+    sample_id: &str,
+    embedding: &[f32],
+) -> Result<(), DbError> {
+    sqlx::query("UPDATE person_samples SET embedding = ?2 WHERE id = ?1")
+        .bind(sample_id)
+        .bind(embedding_to_blob(embedding))
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_person_samples(db: &Db, ids: &[Id]) -> Result<u64, DbError> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("DELETE FROM person_samples WHERE id IN (");
+    let mut sep = qb.separated(", ");
+    for id in ids {
+        sep.push_bind(id);
+    }
+    qb.push(")");
+    Ok(qb.build().execute(db).await?.rows_affected())
+}
+
+/// Write the profile the samples add up to. One row per person; a second call
+/// replaces it.
+pub async fn upsert_person_profile(
+    db: &Db,
+    person_id: &str,
+    centroid: &[f32],
+    sample_count: u32,
+    embedder_asset_id: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO person_profiles
+             (person_id, centroid, sample_count, embedder_asset_id, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (person_id) DO UPDATE SET
+             centroid = excluded.centroid,
+             sample_count = excluded.sample_count,
+             embedder_asset_id = excluded.embedder_asset_id,
+             updated_at = excluded.updated_at",
+    )
+    .bind(person_id)
+    .bind(embedding_to_blob(centroid))
+    .bind(sample_count)
+    .bind(embedder_asset_id)
+    .bind(now())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_person_profile(db: &Db, person_id: &str) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM person_profiles WHERE person_id = ?1")
+        .bind(person_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Every profile there is, tags included. Callers decide which tags they can
+/// compare against — [`crate::diarize::people`] does, and refuses the rest.
+pub async fn list_person_profiles(db: &Db) -> Result<Vec<PersonProfileRow>, DbError> {
+    let rows = sqlx::query(
+        "SELECT f.person_id, p.name, f.centroid, f.sample_count, f.embedder_asset_id,
+                f.updated_at
+         FROM person_profiles f JOIN people p ON p.id = f.person_id
+         ORDER BY p.name, f.person_id",
+    )
+    .fetch_all(db)
+    .await?;
+    rows.into_iter().map(row_to_person_profile).collect()
+}
+
+/// Every stored voice print that still belongs to nobody.
+///
+/// The raw material for "this voice keeps turning up": one row per speaker the
+/// offline pass fingerprinted, from live meetings only, skipping the ones already
+/// linked to a person and the ones merged into another row (a merge means the
+/// surviving row already speaks for this voice).
+pub async fn list_unnamed_voice_prints(db: &Db) -> Result<Vec<VoicePrint>, DbError> {
+    let rows = sqlx::query(
+        "SELECT k.id AS speaker_id, k.meeting_id, k.display_name, k.speaking_ms, k.centroid,
+                m.title AS meeting_title, m.started_at
+         FROM speakers k JOIN meetings m ON m.id = k.meeting_id
+         WHERE k.centroid IS NOT NULL
+           AND k.person_id IS NULL
+           AND k.alias_of IS NULL
+           AND k.is_self = 0
+           AND m.deleted_at IS NULL
+         ORDER BY m.started_at, k.cluster_key",
+    )
+    .fetch_all(db)
+    .await?;
+    rows.into_iter().map(row_to_voice_print).collect()
 }
 
 // ===========================================================================
@@ -2112,6 +2560,59 @@ fn row_to_speaker(row: sqlx::sqlite::SqliteRow) -> Result<Speaker, DbError> {
         alias_of: row.try_get("alias_of").map_err(decode)?,
         is_self: row.try_get("is_self").map_err(decode)?,
         speaking_ms: row.try_get("speaking_ms").map_err(decode)?,
+        person_id: row.try_get("person_id").map_err(decode)?,
+        suggested_person_id: row.try_get("suggested_person_id").map_err(decode)?,
+        suggestion_score: row.try_get("suggestion_score").map_err(decode)?,
+    })
+}
+
+fn row_to_person(row: sqlx::sqlite::SqliteRow) -> Result<PersonRow, DbError> {
+    Ok(PersonRow {
+        id: row.try_get("id").map_err(decode)?,
+        name: row.try_get("name").map_err(decode)?,
+        created_at: row.try_get("created_at").map_err(decode)?,
+        updated_at: row.try_get("updated_at").map_err(decode)?,
+    })
+}
+
+fn row_to_person_sample(row: sqlx::sqlite::SqliteRow) -> Result<PersonSampleRow, DbError> {
+    let condition: String = row.try_get("condition").map_err(decode)?;
+    let embedding: Vec<u8> = row.try_get("embedding").map_err(decode)?;
+    Ok(PersonSampleRow {
+        id: row.try_get("id").map_err(decode)?,
+        person_id: row.try_get("person_id").map_err(decode)?,
+        embedding: blob_to_embedding(&embedding),
+        condition: Channel::parse(&condition).ok_or_else(|| bad_enum("condition", &condition))?,
+        source_meeting_id: row.try_get("source_meeting_id").map_err(decode)?,
+        t_start_ms: row.try_get("t_start_ms").map_err(decode)?,
+        t_end_ms: row.try_get("t_end_ms").map_err(decode)?,
+        created_at: row.try_get("created_at").map_err(decode)?,
+    })
+}
+
+fn row_to_person_profile(row: sqlx::sqlite::SqliteRow) -> Result<PersonProfileRow, DbError> {
+    let centroid: Vec<u8> = row.try_get("centroid").map_err(decode)?;
+    let count: i64 = row.try_get("sample_count").map_err(decode)?;
+    Ok(PersonProfileRow {
+        person_id: row.try_get("person_id").map_err(decode)?,
+        name: row.try_get("name").map_err(decode)?,
+        centroid: blob_to_embedding(&centroid),
+        sample_count: count.max(0) as u32,
+        embedder_asset_id: row.try_get("embedder_asset_id").map_err(decode)?,
+        updated_at: row.try_get("updated_at").map_err(decode)?,
+    })
+}
+
+fn row_to_voice_print(row: sqlx::sqlite::SqliteRow) -> Result<VoicePrint, DbError> {
+    let centroid: Vec<u8> = row.try_get("centroid").map_err(decode)?;
+    Ok(VoicePrint {
+        speaker_id: row.try_get("speaker_id").map_err(decode)?,
+        meeting_id: row.try_get("meeting_id").map_err(decode)?,
+        meeting_title: row.try_get("meeting_title").map_err(decode)?,
+        started_at: row.try_get("started_at").map_err(decode)?,
+        display_name: row.try_get("display_name").map_err(decode)?,
+        speaking_ms: row.try_get("speaking_ms").map_err(decode)?,
+        centroid: blob_to_embedding(&centroid),
     })
 }
 
@@ -3494,6 +3995,162 @@ mod tests {
 
         let (terms, _) = index_terms(&db, "segments_fts", "tangerine").await;
         assert_eq!(terms, 0, "delete-all left words in the search index");
+    }
+
+    /// "Delete everything" has to include the remembered voices, and they are the
+    /// one thing that would otherwise survive it: a person's samples hold their
+    /// own copy of the audio, so deleting every meeting leaves them untouched
+    /// (DESIGN §1: "`delete_all_data` includes people").
+    #[tokio::test]
+    async fn delete_all_takes_the_remembered_voices_and_their_audio_too() {
+        let (db, m) = seeded().await;
+        let speaker = upsert_speaker(&db, &m.id, "speaker-01", "Speaker 1", false)
+            .await
+            .unwrap();
+        let person = create_person(&db, "Marco").await.unwrap();
+        insert_person_sample(
+            &db,
+            &NewPersonSample {
+                person_id: &person.id,
+                embedding: &[0.5, 0.5, 0.5, 0.5],
+                clip: b"RIFF....WAVE",
+                condition: Channel::Mic,
+                source_meeting_id: Some(&m.id),
+                t_start_ms: 0,
+                t_end_ms: 6_000,
+            },
+        )
+        .await
+        .unwrap();
+        upsert_person_profile(&db, &person.id, &[0.5, 0.5, 0.5, 0.5], 1, "network").await.unwrap();
+        set_speaker_person(&db, &speaker.id, Some(&person.id))
+            .await
+            .unwrap();
+
+        // Meetings alone are not enough — the samples keep their own audio.
+        delete_all_meetings(&db).await.unwrap();
+        assert_eq!(list_person_samples(&db, &person.id).await.unwrap().len(), 1);
+
+        delete_all_people(&db).await.unwrap();
+        assert!(list_people(&db).await.unwrap().is_empty());
+        assert!(list_person_samples(&db, &person.id).await.unwrap().is_empty());
+        assert!(list_person_profiles(&db).await.unwrap().is_empty());
+        for table in ["people", "person_samples", "person_profiles"] {
+            let (rows,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_eq!(rows, 0, "{table} still holds something");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_voice_print_survives_the_trip_through_a_blob() {
+        let original: Vec<f32> = (0..256).map(|i| (i as f32) / 512.0 - 0.25).collect();
+        let blob = embedding_to_blob(&original);
+        assert_eq!(blob.len(), original.len() * 4);
+        assert_eq!(blob_to_embedding(&blob), original);
+        // A truncated row gives back what it can rather than failing a query: a
+        // profile with a short vector simply matches nothing.
+        assert_eq!(blob_to_embedding(&blob[..9]).len(), 2);
+        assert!(blob_to_embedding(&[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_person_reports_when_echo_last_heard_them_and_whether_it_can_match_them() {
+        let (db, m) = seeded().await;
+        let person = create_person(&db, "Marco").await.unwrap();
+        insert_person_sample(
+            &db,
+            &NewPersonSample {
+                person_id: &person.id,
+                embedding: &[1.0, 0.0],
+                clip: b"clip",
+                condition: Channel::System,
+                source_meeting_id: None,
+                t_start_ms: 0,
+                t_end_ms: 6_000,
+            },
+        )
+        .await
+        .unwrap();
+        upsert_person_profile(&db, &person.id, &[1.0, 0.0], 1, "network-a")
+            .await
+            .unwrap();
+
+        // Never heard in a meeting yet.
+        let info = &list_person_infos(&db, "network-a").await.unwrap()[0];
+        assert_eq!(info.sample_count, 1);
+        assert_eq!(info.last_heard_at, None);
+        assert!(!info.needs_refresh);
+
+        let speaker = upsert_speaker(&db, &m.id, "speaker-01", "Marco", false)
+            .await
+            .unwrap();
+        set_speaker_person(&db, &speaker.id, Some(&person.id))
+            .await
+            .unwrap();
+        let info = &list_person_infos(&db, "network-a").await.unwrap()[0];
+        assert_eq!(info.last_heard_at.as_deref(), Some(m.started_at.as_str()));
+
+        // A different network: still remembered, not currently matched.
+        let info = &list_person_infos(&db, "network-b").await.unwrap()[0];
+        assert!(info.needs_refresh);
+    }
+
+    #[tokio::test]
+    async fn linking_a_speaker_takes_any_suggestion_off_the_row() {
+        let (db, m) = seeded().await;
+        let speaker = upsert_speaker(&db, &m.id, "speaker-01", "Speaker 1", false)
+            .await
+            .unwrap();
+        let person = create_person(&db, "Marco").await.unwrap();
+        set_speaker_suggestion(&db, &speaker.id, Some(&person.id), Some(0.55))
+            .await
+            .unwrap();
+        assert!(get_speaker(&db, &speaker.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .suggested_person_id
+            .is_some());
+
+        set_speaker_person(&db, &speaker.id, Some(&person.id))
+            .await
+            .unwrap();
+        let row = get_speaker(&db, &speaker.id).await.unwrap().unwrap();
+        assert_eq!(row.person_id.as_deref(), Some(person.id.as_str()));
+        assert!(row.suggested_person_id.is_none(), "answered, so stop asking");
+        assert!(row.suggestion_score.is_none());
+
+        // A score without a person is not a suggestion, and must not be stored as
+        // one.
+        set_speaker_suggestion(&db, &speaker.id, None, Some(0.9))
+            .await
+            .unwrap();
+        assert!(get_speaker(&db, &speaker.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .suggestion_score
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn renaming_or_deleting_a_person_that_is_not_there_says_so() {
+        let db = connect_in_memory().await.unwrap();
+        assert!(matches!(
+            rename_person(&db, &new_id(), "Marco").await,
+            Err(DbError::NotFound(_))
+        ));
+        assert!(matches!(
+            delete_person(&db, &new_id()).await,
+            Err(DbError::NotFound(_))
+        ));
+        assert!(matches!(
+            set_speaker_person(&db, &new_id(), None).await,
+            Err(DbError::NotFound(_))
+        ));
     }
 
     /// How many terms one search index holds, and how many of them are `needle`.

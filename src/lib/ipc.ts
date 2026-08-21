@@ -43,6 +43,8 @@ import type {
   OnboardingState,
   PanelState,
   PanelStatePayload,
+  PeopleUpdatedPayload,
+  PersonInfo,
   PermissionState,
   PermissionStatus,
   PermissionTarget,
@@ -62,6 +64,7 @@ import type {
   SpeechReadiness,
   StartRecordingOptions,
   StorageReport,
+  SuggestedPerson,
   Summary,
   SummaryReadyPayload,
   SummaryReq,
@@ -263,6 +266,98 @@ export const refineSpeakers = (meetingId: Id) =>
  */
 export const setSpeakerCount = (meetingId: Id, count: number | null) =>
   call<void>("set_speaker_count", { meetingId, count });
+
+// ---------------------------------------------------------------------------
+// Known people (voice enrollment)
+//
+// Enrolment is opt-in, one person at a time. Every call here is something the
+// person clicked, and the ones that change anything emit `peopleUpdated`.
+// ---------------------------------------------------------------------------
+
+/** Everybody Echo remembers. Cheap: no audio, no models. */
+export const listPeople = () => call<PersonInfo[]>("list_people");
+
+/**
+ * Forget a voice — the profile, the samples and their clips, all of it.
+ *
+ * Speaker links go with it. Names already shown in past meetings stay as plain
+ * text, so a transcript somebody has read does not rewrite itself; say that
+ * plainly if the confirmation dialog needs a sentence.
+ */
+export const deletePerson = (personId: Id) =>
+  call<void>("delete_person", { personId });
+
+/**
+ * Rename a remembered person. Names already copied onto past meetings' speakers
+ * are left as they are; this is the name future matches will use.
+ */
+export const renamePerson = (personId: Id, name: string) =>
+  call<void>("rename_person", { personId, name });
+
+/**
+ * A few seconds of this remembered voice — **base64 WAV**, no prefix, same as
+ * `speakerSample`. Play it from a `blob:` URL (`base64ToBlobUrl`), not a `data:`
+ * one; the CSP allows only `blob:` under `media-src`.
+ *
+ * It comes from the clip kept with the profile, so it plays whether or not the
+ * meeting it came from still exists. Rejects with `notFound` when Echo has kept
+ * no audio for this person yet — an explanation, not a failure.
+ */
+export const personSampleAudio = (personId: Id) =>
+  call<string>("person_sample_audio", { personId });
+
+/**
+ * "This is Marco" — or, with `personId: null`, "actually, nobody I have named".
+ *
+ * Linking is a confirmation, and confirmations are the only thing that ever
+ * improves recognition: Echo keeps a few seconds of that voice from this meeting.
+ * The person's name is copied onto the speaker row when the row still carries a
+ * label Echo made up ("Speaker 2"); a name somebody typed is left alone.
+ *
+ * Renaming the speaker afterwards does **not** rename the person — the chip is
+ * this meeting's display, the person is the identity. Both `speakersUpdated` and
+ * `peopleUpdated` follow.
+ */
+export const linkSpeakerPerson = (
+  meetingId: Id,
+  speakerId: Id,
+  personId: Id | null,
+) => call<void>("link_speaker_person", { meetingId, speakerId, personId });
+
+/**
+ * "Remember this voice": make a new person out of one of this meeting's
+ * speakers, name them, and learn their voice from this recording.
+ *
+ * Resolves to the person as Settings > People will show them. Rejects, in words
+ * worth showing as an explanation, when this speaker never talks on their own
+ * for long enough to be recognisable and when the recording has been deleted —
+ * in both cases nothing is created.
+ */
+export const enrollSpeakerAsPerson = (
+  meetingId: Id,
+  speakerId: Id,
+  name: string,
+) => call<PersonInfo>("enroll_speaker_as_person", { meetingId, speakerId, name });
+
+/**
+ * Voices that have turned up unnamed in three or more meetings.
+ *
+ * Free to call: built from what the speaker pass already worked out, with no
+ * audio read and no model loaded. Use `speakerSample(meetingId, speakerId)` to
+ * let the person hear one before naming it.
+ */
+export const suggestedPeople = () => call<SuggestedPerson[]>("suggested_people");
+
+/**
+ * Name one of those recurring voices. Same effect as `enrollSpeakerAsPerson` on
+ * the appearance the suggestion carried, which is what accepting means: nothing
+ * about a suggestion is stored until somebody names it.
+ */
+export const acceptSuggestedPerson = (
+  meetingId: Id,
+  speakerId: Id,
+  name: string,
+) => call<PersonInfo>("accept_suggested_person", { meetingId, speakerId, name });
 
 // ---------------------------------------------------------------------------
 // Speech assets
@@ -471,6 +566,7 @@ export const EVENTS = {
   downloadProgress: "echo://download-progress",
   detection: "echo://detection",
   speakersUpdated: "echo://speakers-updated",
+  peopleUpdated: "echo://people-updated",
   summaryReady: "echo://summary-ready",
   actionItemsUpdated: "echo://action-items-updated",
   meetingUpdated: "echo://meeting-updated",
@@ -497,6 +593,7 @@ export interface EventPayloads {
   [EVENTS.downloadProgress]: DownloadProgressPayload;
   [EVENTS.detection]: DetectionPayload;
   [EVENTS.speakersUpdated]: SpeakersUpdatedPayload;
+  [EVENTS.peopleUpdated]: PeopleUpdatedPayload;
   [EVENTS.summaryReady]: SummaryReadyPayload;
   [EVENTS.actionItemsUpdated]: ActionItemsUpdatedPayload;
   [EVENTS.meetingUpdated]: MeetingUpdatedPayload;
