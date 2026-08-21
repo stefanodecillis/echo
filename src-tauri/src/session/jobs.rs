@@ -137,6 +137,19 @@ impl From<DbError> for JobFailure {
 // Copy
 // ---------------------------------------------------------------------------
 
+/// The sentence the UI shows for a stage inside a job. Zero jargon (mantra 2).
+///
+/// "Setting up" would be true here too, and it is what the whole job is called —
+/// which is exactly the problem: a person watching an unmoving bar under a
+/// sentence that has not changed in ten minutes has no way to tell working from
+/// stuck. This one says the download part is over and something else is
+/// finishing, without naming a single thing inside the machine.
+pub fn phase_label_for(phase: crate::events::JobPhase) -> &'static str {
+    match phase {
+        crate::events::JobPhase::PreparingEngine => "Finishing one-time setup…",
+    }
+}
+
 /// The sentence the UI shows while a job runs. Zero jargon (mantra 2).
 pub fn label_for(kind: JobKind) -> &'static str {
     match kind {
@@ -195,6 +208,24 @@ impl Progress {
         self.events.emit(UiEvent::JobProgress(JobProgressPayload {
             label: Some(label_for(job.kind).to_string()),
             job,
+            phase: None,
+        }));
+    }
+
+    /// This job has moved on to a stage of its own, with no fraction to report.
+    ///
+    /// Progress in the table is left exactly where it was — the stage is a fact
+    /// about now, not a rewind — but the event carries no number, because there
+    /// is no honest one to carry and a bar frozen at 100% for a quarter of an
+    /// hour reads as broken.
+    pub fn phase(&self, phase: crate::events::JobPhase) {
+        let mut job = self.job.clone();
+        job.status = JobStatus::Running;
+        job.progress = None;
+        self.events.emit(UiEvent::JobProgress(JobProgressPayload {
+            label: Some(phase_label_for(phase).to_string()),
+            job,
+            phase: Some(phase),
         }));
     }
 
@@ -313,6 +344,12 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
         return Ok(());
     }
 
+    // The engine may not be up yet, and on Apple silicon the first load after a
+    // model changes compiles the encoder for this machine — minutes, with no
+    // fraction to report. Named as its own stage, because "Catching up on the
+    // transcript" over a still bar is what a person read for eighteen minutes
+    // while this was what was happening (field report of 2026-08-21).
+    ctx.progress.phase(crate::events::JobPhase::PreparingEngine);
     if let Err(error) = ctx.asr.prewarm().await {
         return Err(asr_failure(&ctx.cancel, error));
     }
@@ -786,6 +823,11 @@ async fn download(ctx: &JobContext) -> Result<(), JobFailure> {
     //
     // Failing here is not a failed download: the bytes are installed and
     // verified, and the next load will try again.
+    //
+    // Announced as its own stage first. Everything above this line has a
+    // fraction; nothing below it does, and the eighteen minutes are all below
+    // it (field report of 2026-08-21).
+    ctx.progress.phase(crate::events::JobPhase::PreparingEngine);
     if let Err(error) = ctx.asr.prewarm().await {
         tracing::warn!(%error, "the new weights did not load on the first attempt");
     }
@@ -1099,6 +1141,7 @@ impl JobRuntime {
             .emit(UiEvent::JobProgress(JobProgressPayload {
                 job: job.clone(),
                 label: Some(label_for(job.kind).to_string()),
+                phase: None,
             }));
     }
 
@@ -1565,5 +1608,56 @@ mod tests {
             }
             assert!(label_for(kind).ends_with('…'));
         }
+        for phase in [crate::events::JobPhase::PreparingEngine] {
+            let label = phase_label_for(phase).to_lowercase();
+            for word in banned {
+                assert!(!label.contains(word), "{label:?} leaks {word:?}");
+            }
+            assert!(phase_label_for(phase).ends_with('…'));
+            assert_ne!(
+                phase_label_for(phase),
+                label_for(JobKind::Download),
+                "a stage worth naming has to read differently from the job"
+            );
+        }
+    }
+
+    /// A stage with no fraction says so, rather than leaving a bar parked at the
+    /// last number it had.
+    #[tokio::test]
+    async fn a_stage_of_a_job_reports_no_fraction_and_names_itself() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let job = Job {
+            id: "j1".into(),
+            meeting_id: None,
+            kind: JobKind::Download,
+            status: JobStatus::Running,
+            progress: Some(0.4),
+            error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let (ctx, seen) = context_for(&db, job).await;
+        ctx.progress.set(1.0).await;
+        ctx.progress
+            .phase(crate::events::JobPhase::PreparingEngine);
+
+        let announced = seen.job_progress();
+        assert_eq!(announced.len(), 2);
+        assert_eq!(announced[0].job.progress, Some(1.0));
+        assert!(announced[0].phase.is_none());
+        assert_eq!(
+            announced[1].phase,
+            Some(crate::events::JobPhase::PreparingEngine)
+        );
+        assert!(
+            announced[1].job.progress.is_none(),
+            "a bar at 100% for the next quarter of an hour reads as broken"
+        );
+        assert_eq!(
+            announced[1].label.as_deref(),
+            Some(phase_label_for(crate::events::JobPhase::PreparingEngine))
+        );
+        assert_eq!(announced[1].job.status, JobStatus::Running);
     }
 }

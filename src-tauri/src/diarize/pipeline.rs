@@ -6,11 +6,13 @@
 //!                            ├─ segmentation → powerset decode → local turns
 //!                            ├─ line up local labels with the previous window
 //!                            └─ single-voice audio → fingerprint
-//!   all fingerprints ─────────► agglomerative clustering — cut at the
-//!                               calibrated threshold, or at the count the
-//!                               person gave us if they gave us one
+//!   all fingerprints ─────────► agglomerative clustering — the count read out
+//!                               of the shape of the merge tree, or the count
+//!                               the person gave us if they gave us one
 //!   labels ───────────────────► per-person timeline → speakers rows
-//!   final segments ───────────► speaker_id by time overlap, new revision
+//!   final segments ───────────► lines holding two voices cut at the turn
+//!                               boundary, then speaker_id by time overlap,
+//!                               new revision
 //! ```
 //!
 //! Three properties this pass has to keep, in order of importance:
@@ -54,6 +56,16 @@
 //!
 //! Renaming works exactly the same in both shapes: rows are keyed by cluster key,
 //! so `speaker-01` keeps the name the person typed on it across a re-run.
+//!
+//! ## Lines that hold two voices
+//!
+//! This pass is also the only place that can fix a transcript line holding two
+//! people. The speech engine decides where a line ends from what the audio sounds
+//! like, so two people answering each other inside four hundred milliseconds come
+//! out as one row; attributing that row whole gives one of them the other's
+//! words. Because this pass holds both the turns and the transcript, it cuts the
+//! row at the turn boundary before attributing anything — [`split`] owns the rule
+//! for when that is honest and what it approximates when it is.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -65,6 +77,7 @@ use super::cluster::{self, ClusterItem};
 use super::embedding::{self, Embedder};
 use super::pcm::ChunkPcm;
 use super::segmentation::{self, Segmenter};
+use super::split;
 use super::timeline::{self, Span};
 use super::{DiarizationResult, DiarizeError, SpeakerTurn};
 
@@ -229,9 +242,14 @@ pub struct ScanCut {
     pub tracks: Vec<Vec<Span>>,
     /// Per person, mean activation while they were talking.
     pub confidence: Vec<f32>,
-    /// The threshold used, or — in fixed-count mode — the height the hierarchy
-    /// was cut at.
+    /// The height the hierarchy was cut at, or — for [`Scan::cut`], which is
+    /// swept by the calibration tools — the distance it was cut at, which is the
+    /// same number.
     pub threshold: f32,
+    /// How the automatic count was arrived at, when it was the automatic count
+    /// that arrived at it. `None` for a count the person gave us and for a cut
+    /// at a distance a sweep chose.
+    pub choice: Option<cluster::CountChoice>,
 }
 
 impl Scan {
@@ -280,14 +298,40 @@ impl Scan {
         out
     }
 
-    /// Cut at a distance: the automatic pass. `None` for `target` means exactly
-    /// that; `Some(k)` cuts at a count instead and ignores the threshold, which
-    /// is what an override does.
+    /// Cut at one distance, which is what the calibration tools sweep.
+    ///
+    /// The app does not take this path any more: the count it would produce is
+    /// the one that failed in the field, because a single distance always has
+    /// that failure available to it (see [`cluster::CountChoice`]). What the
+    /// sweep is still for is checking that the tree this criterion reads is the
+    /// same tree the old measurements were made against. `Some(k)` cuts at a
+    /// count and ignores the distance entirely.
     pub fn cut(&self, threshold: f32, target: Option<usize>) -> ScanCut {
-        let clustering = match target {
-            Some(k) => cluster::cluster_fixed(&self.items, k),
-            None => cluster::cluster(&self.items, threshold),
-        };
+        match target {
+            Some(k) => self.tracks_of(cluster::cluster_fixed(&self.items, k), None),
+            None => self.tracks_of(cluster::cluster(&self.items, threshold), None),
+        }
+    }
+
+    /// What the app runs. `Some(k)` is the count the person gave us and wins
+    /// outright; `None` is the automatic count, read out of the shape of the
+    /// merge tree ([`cluster::cluster_auto`]).
+    pub fn cut_for(&self, target: Option<usize>) -> ScanCut {
+        match target {
+            Some(k) => self.tracks_of(cluster::cluster_fixed(&self.items, k), None),
+            None => {
+                let (clustering, choice) = cluster::cluster_auto(&self.items);
+                self.tracks_of(clustering, Some(choice))
+            }
+        }
+    }
+
+    /// Turn one clustering of the fingerprints into per-person timelines.
+    fn tracks_of(
+        &self,
+        clustering: cluster::Clustering,
+        choice: Option<cluster::CountChoice>,
+    ) -> ScanCut {
         let labelled = label_windows(&self.windows, &clustering.labels);
         let (mut tracks, mut confidence) =
             build_tracks(&self.windows, &labelled, clustering.cluster_count);
@@ -309,6 +353,7 @@ impl Scan {
             tracks,
             confidence,
             threshold: clustering.threshold,
+            choice,
         }
     }
 }
@@ -439,7 +484,8 @@ pub async fn refine(
         return Ok(DiarizationResult {
             turns: Vec::new(),
             speaker_count: 0,
-            threshold: cluster::DISTANCE_THRESHOLD,
+            threshold: 0.0,
+            choice: None,
             speakers,
             people_count,
             people_count_is_override,
@@ -460,13 +506,23 @@ pub async fn refine(
             "the meeting's audio disappeared while the pass was starting".into(),
         ));
     };
-    let cut = scanned.cut(cluster::DISTANCE_THRESHOLD, target);
+    let cut = scanned.cut_for(target);
+    if let Some(choice) = &cut.choice {
+        tracing::debug!(
+            count = choice.count,
+            cut_at = choice.cut_at,
+            silhouette = choice.silhouette,
+            runner_up = ?choice.runner_up,
+            "the automatic count read {} people out of the merge tree",
+            choice.count
+        );
+    }
     let turns = turns_from_tracks(&cut.tracks, &cut.confidence);
 
     control.checkpoint()?;
     control.report(0.9);
 
-    let speakers = persist(db, meeting_id, &cut.tracks, source).await?;
+    let speakers = persist(db, meeting_id, &cut, source).await?;
     let (people_count, people_count_is_override) = people_count(db, meeting_id).await?;
     control.report(1.0);
 
@@ -474,6 +530,7 @@ pub async fn refine(
         speaker_count: cut.tracks.len() as u32,
         turns,
         threshold: cut.threshold,
+        choice: cut.choice,
         speakers,
         people_count,
         people_count_is_override,
@@ -785,9 +842,10 @@ fn turns_from_tracks(tracks: &[Vec<Span>], confidence: &[f32]) -> Vec<SpeakerTur
 async fn persist(
     db: &Db,
     meeting_id: &str,
-    tracks: &[Vec<Span>],
+    cut: &ScanCut,
     source: Source,
 ) -> Result<Vec<Speaker>, DiarizeError> {
+    let tracks = cut.tracks.as_slice();
     let revision = repo::transcript_revision(db, meeting_id)
         .await
         .map_err(db_failed)?
@@ -838,9 +896,54 @@ async fn persist(
     };
 
     let mut by_speaker: Vec<(Id, Vec<Id>)> = Vec::new();
+    let mut lines_split = 0usize;
     for segment in segments {
         let span: Span = (segment.t_start_ms, segment.t_end_ms);
         if segment.channel == separated {
+            // A line that holds two voices is cut in two before anything is
+            // attributed. Attributing it whole is what put a whole exchange of
+            // fast dialogue on one speaker and silently lost the other one's
+            // words; see [`split`].
+            if let Some(pieces) = split::split_line(
+                split::LineFacts {
+                    span,
+                    text_confidence: segment.avg_confidence,
+                },
+                &segment.text,
+                tracks,
+                &cut.confidence,
+            ) {
+                let drafts: Vec<crate::types::SegmentDraft> = pieces
+                    .iter()
+                    .map(|piece| crate::types::SegmentDraft {
+                        meeting_id: segment.meeting_id.clone(),
+                        t_start_ms: piece.span.0,
+                        t_end_ms: piece.span.1,
+                        channel: segment.channel,
+                        speaker_id: remote_ids.get(piece.speaker).cloned(),
+                        text: piece.text.clone(),
+                        // The words were not re-transcribed, so their language,
+                        // the engine's confidence in them and their provenance
+                        // are the line's. Only the cut is Echo's.
+                        language: segment.language.clone(),
+                        avg_confidence: segment.avg_confidence,
+                        revision,
+                        is_final: true,
+                        model_name: segment.model_name.clone(),
+                        model_revision: segment.model_revision.clone(),
+                    })
+                    .collect();
+                if drafts.iter().all(|d| d.speaker_id.is_some())
+                    && !repo::split_segment(db, &segment.id, &drafts, revision)
+                        .await
+                        .map_err(db_failed)?
+                        .is_empty()
+                {
+                    lines_split += 1;
+                    continue;
+                }
+            }
+
             let hit = timeline::assign_by_overlap(span, tracks)
                 .or_else(|| timeline::nearest_track(span, tracks, NEAREST_TOLERANCE_MS));
             if let Some(speaker_id) = hit.and_then(|i| remote_ids.get(i)).cloned() {
@@ -857,6 +960,12 @@ async fn persist(
         repo::assign_speaker(db, &segment_ids, &speaker_id, revision)
             .await
             .map_err(db_failed)?;
+    }
+    if lines_split > 0 {
+        tracing::debug!(
+            lines_split,
+            "cut {lines_split} line(s) that held more than one voice"
+        );
     }
 
     // Whoever this run did not produce is no longer one of the people in this
@@ -1183,6 +1292,18 @@ mod tests {
         db
     }
 
+    /// A clustering cut of some tracks, every voice heard clearly. What
+    /// [`persist`] takes, and the confidence is what decides whether a line
+    /// holding two voices may be cut in two.
+    fn cut_of(tracks: &[Vec<Span>]) -> ScanCut {
+        ScanCut {
+            confidence: vec![0.9; tracks.len()],
+            tracks: tracks.to_vec(),
+            threshold: 0.5,
+            choice: None,
+        }
+    }
+
     fn remote_line(meeting_id: &str, from: i64, to: i64) -> crate::types::SegmentDraft {
         crate::types::SegmentDraft {
             meeting_id: meeting_id.to_string(),
@@ -1223,7 +1344,7 @@ mod tests {
             vec![(5_000, 9_000)],
             vec![(10_000, 14_000)],
         ];
-        let after_first = persist(&db, &meeting.id, &three, Source::System)
+        let after_first = persist(&db, &meeting.id, &cut_of(&three), Source::System)
             .await
             .unwrap();
         assert_eq!(after_first.len(), 4, "You and three voices");
@@ -1239,7 +1360,7 @@ mod tests {
 
         // Second pass, cut to one voice covering the same speech.
         let one = vec![vec![(0i64, 14_000i64)]];
-        let after_second = persist(&db, &meeting.id, &one, Source::System)
+        let after_second = persist(&db, &meeting.id, &cut_of(&one), Source::System)
             .await
             .unwrap();
 
@@ -1287,7 +1408,7 @@ mod tests {
             .await
             .unwrap();
 
-        let first = persist(&db, &meeting.id, &[vec![(0i64, 4_000i64)]], Source::System)
+        let first = persist(&db, &meeting.id, &cut_of(&[vec![(0i64, 4_000i64)]]), Source::System)
             .await
             .unwrap();
         let voice = first
@@ -1299,7 +1420,7 @@ mod tests {
         let me = first.iter().find(|s| s.is_self).unwrap();
         repo::rename_speaker(&db, &me.id, "Stefano").await.unwrap();
 
-        let second = persist(&db, &meeting.id, &[vec![(0i64, 4_000i64)]], Source::System)
+        let second = persist(&db, &meeting.id, &cut_of(&[vec![(0i64, 4_000i64)]]), Source::System)
             .await
             .unwrap();
         assert_eq!(second.len(), 2);
@@ -1321,7 +1442,7 @@ mod tests {
             .await
             .unwrap();
 
-        let speakers = persist(&db, &meeting.id, &[], Source::System)
+        let speakers = persist(&db, &meeting.id, &cut_of(&[]), Source::System)
             .await
             .unwrap();
         assert_eq!(speakers.len(), 1);
@@ -1359,6 +1480,77 @@ mod tests {
         assert_eq!(mic_target(9_999), super::super::MAX_PEOPLE as usize);
     }
 
+    /// Fast dialogue the engine wrote as one row comes out as one row per voice,
+    /// and both halves keep the provenance of the words nobody re-transcribed.
+    ///
+    /// The other half of the field failure: before this, a line like the one
+    /// below went whole to whoever held more of it, and one of the two people in
+    /// the exchange silently lost their words.
+    #[tokio::test]
+    async fn a_line_of_fast_dialogue_is_cut_so_both_voices_keep_their_words() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Coffee", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[crate::types::SegmentDraft {
+                meeting_id: meeting.id.clone(),
+                t_start_ms: 0,
+                t_end_ms: 9_000,
+                channel: Channel::Mic,
+                text: "Domani sera prendo l'aereo e vengo in Italia. \
+                       Ah ok ho capito bene allora ci vediamo."
+                    .into(),
+                language: Some("it".into()),
+                avg_confidence: Some(0.8),
+                revision: 3,
+                is_final: true,
+                model_name: Some("whisper large-v3 (ggml)".into()),
+                model_revision: Some("abc123".into()),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+
+        let two = vec![vec![(0i64, 4_500i64)], vec![(4_500, 9_000)]];
+        let speakers = persist(&db, &meeting.id, &cut_of(&two), Source::MicOnly)
+            .await
+            .unwrap();
+        assert_eq!(speakers.len(), 2);
+
+        let segments = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(segments.len(), 2, "the line was not cut: {segments:?}");
+        assert_eq!(segments[0].speaker_id.as_deref(), Some(speakers[0].id.as_str()));
+        assert_eq!(segments[1].speaker_id.as_deref(), Some(speakers[1].id.as_str()));
+        assert!(segments[0].text.ends_with("Italia."), "{:?}", segments[0].text);
+        assert!(segments[1].text.starts_with("Ah ok"), "{:?}", segments[1].text);
+        // The pieces tile the line, carry the new revision, and keep the
+        // provenance of words that were never re-transcribed.
+        assert_eq!((segments[0].t_start_ms, segments[1].t_end_ms), (0, 9_000));
+        assert_eq!(segments[0].t_end_ms, segments[1].t_start_ms);
+        assert!(segments.iter().all(|s| s.revision == 4
+            && s.language.as_deref() == Some("it")
+            && s.model_revision.as_deref() == Some("abc123")));
+
+        // Running the pass again does not cut the halves in half: each of them
+        // now holds one voice.
+        let again = persist(&db, &meeting.id, &cut_of(&two), Source::MicOnly)
+            .await
+            .unwrap();
+        assert_eq!(again.len(), 2);
+        assert_eq!(repo::count_segments(&db, &meeting.id).await.unwrap(), 2);
+    }
+
     /// The whole point of the microphone path: two voices that both arrived
     /// through the one microphone come out as two people, and neither is claimed
     /// to be the person at the keyboard.
@@ -1383,7 +1575,7 @@ mod tests {
         assert_eq!(live[0].cluster_key, SELF_CLUSTER_KEY);
 
         let two = vec![vec![(0i64, 4_000i64)], vec![(5_000, 9_000)]];
-        let speakers = persist(&db, &meeting.id, &two, Source::MicOnly)
+        let speakers = persist(&db, &meeting.id, &cut_of(&two), Source::MicOnly)
             .await
             .unwrap();
 
@@ -1444,7 +1636,7 @@ mod tests {
         .unwrap();
         pin_channel_speakers(&db, &meeting.id).await.unwrap();
 
-        persist(&db, &meeting.id, &[vec![(0i64, 4_000i64)]], Source::MicOnly)
+        persist(&db, &meeting.id, &cut_of(&[vec![(0i64, 4_000i64)]]), Source::MicOnly)
             .await
             .unwrap();
 
@@ -1485,7 +1677,7 @@ mod tests {
         .unwrap();
 
         let two = vec![vec![(0i64, 4_000i64)], vec![(5_000, 9_000)]];
-        let first = persist(&db, &meeting.id, &two, Source::MicOnly)
+        let first = persist(&db, &meeting.id, &cut_of(&two), Source::MicOnly)
             .await
             .unwrap();
         repo::rename_speaker(&db, &first[0].id, "Stefano")
@@ -1495,7 +1687,7 @@ mod tests {
             .await
             .unwrap();
 
-        let second = persist(&db, &meeting.id, &two, Source::MicOnly)
+        let second = persist(&db, &meeting.id, &cut_of(&two), Source::MicOnly)
             .await
             .unwrap();
         assert_eq!(second.len(), 2);
@@ -1528,7 +1720,7 @@ mod tests {
         let speakers = persist(
             &db,
             &meeting.id,
-            &[vec![(5_000i64, 9_000i64)]],
+            &cut_of(&[vec![(5_000i64, 9_000i64)]]),
             Source::System,
         )
         .await

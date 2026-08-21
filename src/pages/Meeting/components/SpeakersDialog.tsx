@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 
 import { Button, Modal, ProgressBar } from "@/components";
 import { renameSpeaker, setSpeakerCount, speakerSample, toUiError } from "@/lib/ipc";
-import { common, labels, meeting as copy, peopleCount as peopleCountCopy } from "@/lib/copy";
+import { common, jobLine, meeting as copy, peopleCount as peopleCountCopy } from "@/lib/copy";
+import { presentJob } from "@/lib/jobs";
 import { useEchoStore } from "@/lib/store";
 import type { Id, Job, Speaker } from "@/lib/types";
 
@@ -65,6 +66,7 @@ export function SpeakersDialog({
 
   const rows = canonicalSpeakers(speakers);
   const canRerun = !disabled;
+  const shown = job ? presentJob(job) : undefined;
 
   // Only pick up a fresh automatic count while the dialog is open — a
   // background update shouldn't clobber a stepper value someone is mid-way
@@ -175,8 +177,10 @@ export function SpeakersDialog({
       <div className="mb-4 rounded-xl border border-hairline bg-surface-sunken p-3">
         {job ? (
           <div className="flex flex-col gap-1.5">
-            <ProgressBar value={job.progress} label={labels.jobKind[job.kind]} />
-            <span className="text-xs text-ink-faint">{labels.jobKind[job.kind]}…</span>
+            <ProgressBar value={shown?.fraction} label={shown?.label ?? ""} />
+            <span className="text-xs text-ink-faint">
+              {shown && (shown.running ? jobLine.running(shown.label) : jobLine.waiting(shown.label))}
+            </span>
           </div>
         ) : pending ? (
           <div className="flex flex-col gap-2">

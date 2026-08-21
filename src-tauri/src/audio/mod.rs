@@ -1362,6 +1362,21 @@ pub async fn build_mixdown(chunks: &[ChunkRef], destination: &Path) -> Result<Pa
     .map_err(|e| AudioError::Backend(e.to_string()))?
 }
 
+/// The chunks a window could possibly draw a sample from.
+///
+/// Everything overlapping `[from_ms, to_ms)`, plus one chunk of slack behind it:
+/// a chunk's file may hold a little more audio than the journal claimed (see
+/// [`decode_channel`], which resizes rather than truncate), and the tail of the
+/// chunk before the window is the only place that overrun could reach into it.
+fn chunks_touching(chunks: &[ChunkRef], from_ms: i64, to_ms: i64) -> Vec<ChunkRef> {
+    let reach_back = from_ms - i64::from(CHUNK_SECONDS) * 1_000;
+    chunks
+        .iter()
+        .filter(|c| c.t_end_ms > reach_back && c.t_start_ms < to_ms)
+        .cloned()
+        .collect()
+}
+
 /// Read a window of a meeting's audio back as 16 kHz mono, how the ASR
 /// catch-up pass reads from disk instead of from the live queue.
 ///
@@ -1369,12 +1384,19 @@ pub async fn build_mixdown(chunks: &[ChunkRef], destination: &Path) -> Result<Pa
 /// their own offsets, so the window that comes back is the audio that really
 /// happened then — a gap or an unreadable chunk reads as silence in its own
 /// place rather than pulling later audio earlier.
+///
+/// Only the chunks the window actually touches are opened. That sounds obvious
+/// and was not true: this used to decode every chunk of the channel on every
+/// call, so a pass over a two-hour meeting decoded the whole recording once per
+/// window — hundreds of times over — for the thirty seconds it needed. Chunks
+/// outside the window contribute nothing to the answer, so skipping them changes
+/// no sample of it.
 pub async fn read_window(
     chunks: &[ChunkRef],
     from_ms: i64,
     to_ms: i64,
 ) -> Result<Vec<f32>, AudioError> {
-    let chunks = chunks.to_vec();
+    let chunks = chunks_touching(chunks, from_ms, to_ms);
     tokio::task::spawn_blocking(move || {
         if to_ms <= from_ms {
             return Ok(Vec::new());
@@ -1695,6 +1717,73 @@ mod tests {
         // And the hole reads as silence where it happened.
         let hole = rt.block_on(read_window(&chunks, 1_000, 2_000)).unwrap();
         assert!(hole.iter().all(|s| *s == 0.0));
+    }
+
+    /// A window opens the files it needs and no others.
+    ///
+    /// Not a micro-optimisation: this used to decode every chunk of the channel
+    /// on every call, so the catch-up pass over a long meeting read the whole
+    /// recording once per window — a whole recording's worth of decoding for
+    /// thirty seconds of audio, hundreds of times over.
+    #[test]
+    fn a_window_only_opens_the_chunks_it_covers() {
+        let hour: Vec<ChunkRef> = (0..120)
+            .map(|seq| {
+                let from = seq * i64::from(CHUNK_SECONDS) * 1_000;
+                ChunkRef::new(
+                    format!("/a/mic-{seq:06}.wav"),
+                    Channel::Mic,
+                    from,
+                    from + i64::from(CHUNK_SECONDS) * 1_000,
+                )
+            })
+            .collect();
+
+        // A window in the middle of the meeting: the chunk it lands in, and one
+        // behind it in case that file overran its journal entry.
+        let touched = chunks_touching(&hour, 1_800_000, 1_824_000);
+        assert_eq!(touched.len(), 2, "{touched:?}");
+        assert_eq!(touched[0].t_start_ms, 1_770_000);
+        assert_eq!(touched[1].t_start_ms, 1_800_000);
+
+        // A window straddling a boundary takes both, and still not the rest.
+        let straddling = chunks_touching(&hour, 1_790_000, 1_814_000);
+        assert_eq!(straddling.len(), 3);
+
+        // A chunk that ends exactly where the window starts is not in the
+        // window — but it is inside the slack, so it is still read.
+        assert!(chunks_touching(&hour, 30_000, 60_000)
+            .iter()
+            .any(|c| c.t_start_ms == 0));
+        // And a window before all of the audio takes nothing at all.
+        assert!(chunks_touching(&hour, 0, 1).len() <= 1);
+    }
+
+    /// The window that comes back is the same audio it always was: the chunks
+    /// left out cannot contribute a sample to it.
+    #[test]
+    fn leaving_chunks_out_changes_no_sample_of_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut chunks = Vec::new();
+        // Three one-second chunks, a minute apart, so each window is well clear
+        // of the others (`chunks_touching` allows a chunk of slack).
+        for (seq, value) in [(0u64, 0.2f32), (1, 0.4), (2, 0.6)] {
+            let mut w = ChunkWriter::create(dir.path(), Channel::Mic, TARGET_SAMPLE_RATE).unwrap();
+            w.resume_at(seq, seq as i64 * 60_000);
+            w.write_samples(&vec![value; TARGET_SAMPLE_RATE as usize])
+                .unwrap();
+            chunks.push(ChunkRef::from_committed(&w.finish().unwrap().unwrap()));
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (i, expected) in [0.2f32, 0.4, 0.6].iter().enumerate() {
+            let at = i as i64 * 60_000;
+            let out = rt.block_on(read_window(&chunks, at, at + 1_000)).unwrap();
+            assert_eq!(out.len(), TARGET_SAMPLE_RATE as usize);
+            assert!((out[100] - expected).abs() < 1e-2, "{} at {at}", out[100]);
+        }
     }
 
     #[test]

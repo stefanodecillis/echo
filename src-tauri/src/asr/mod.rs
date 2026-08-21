@@ -83,6 +83,23 @@ impl AsrError {
     }
 }
 
+/// One line the engine wrote inside a decode, with where it falls on the
+/// meeting clock.
+///
+/// This is whisper's own segmentation, mapped through the window's origin by
+/// [`crate::asr::engine::Engine::transcribe`] — so a packed catch-up window
+/// comes back as the sentences it contained rather than as one wall of text
+/// stamped with the window's start (see [`crate::asr::catchup`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TranscribedLine {
+    /// On the meeting clock, never relative to the window.
+    pub t_start_ms: i64,
+    pub t_end_ms: i64,
+    pub text: String,
+    /// Mean token probability for this line alone.
+    pub avg_confidence: Option<f32>,
+}
+
 /// One transcribed stretch of audio, before it becomes a database row.
 #[derive(Debug, Clone, Default)]
 pub struct Transcription {
@@ -98,9 +115,43 @@ pub struct Transcription {
     /// Name and revision of what produced this, stored on the segment.
     pub model_name: Option<String>,
     pub model_revision: Option<String>,
+    /// The lines this decode produced, in order, when timestamps were asked
+    /// for. Empty for a caption (no timestamps) and for a decode that said
+    /// nothing; [`Transcription::per_line`] is how to read it either way.
+    pub lines: Vec<TranscribedLine>,
 }
 
 impl Transcription {
+    /// This decode as one transcription per line, each one ready to become a
+    /// row of its own.
+    ///
+    /// A window that came back as a single line — or as no lines at all,
+    /// because the caller asked for no timestamps — is one transcription: the
+    /// whole thing, exactly as it was before there were lines. Everything that
+    /// is a property of the *decode* rather than of the words (the language it
+    /// settled on, the weights that read it) is copied onto every line, because
+    /// that is what it is true of.
+    pub fn per_line(&self) -> Vec<Transcription> {
+        if self.lines.len() < 2 {
+            return vec![self.clone()];
+        }
+        self.lines
+            .iter()
+            .map(|line| Transcription {
+                channel: self.channel,
+                t_start_ms: line.t_start_ms,
+                t_end_ms: line.t_end_ms,
+                text: line.text.clone(),
+                language: self.language.clone(),
+                language_confidence: self.language_confidence,
+                avg_confidence: line.avg_confidence.or(self.avg_confidence),
+                model_name: self.model_name.clone(),
+                model_revision: self.model_revision.clone(),
+                lines: Vec::new(),
+            })
+            .collect()
+    }
+
     /// Nothing worth storing: whisper.cpp emits empty strings and lone
     /// punctuation for silence.
     pub fn is_empty(&self) -> bool {
@@ -187,6 +238,63 @@ mod tests {
     }
 
     #[test]
+    fn a_packed_window_comes_apart_into_the_lines_the_engine_wrote() {
+        let window = Transcription {
+            channel: Channel::Mic,
+            t_start_ms: 60_000,
+            t_end_ms: 88_000,
+            text: "allora sì, d'accordo".into(),
+            language: Some("it".into()),
+            avg_confidence: Some(0.7),
+            model_name: Some("weights".into()),
+            model_revision: Some("rev1".into()),
+            lines: vec![
+                TranscribedLine {
+                    t_start_ms: 60_000,
+                    t_end_ms: 64_000,
+                    text: "allora".into(),
+                    avg_confidence: Some(0.9),
+                },
+                TranscribedLine {
+                    t_start_ms: 70_000,
+                    t_end_ms: 73_500,
+                    text: "sì, d'accordo".into(),
+                    avg_confidence: Some(0.5),
+                },
+            ],
+            ..Default::default()
+        };
+        let lines = window.per_line();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].t_start_ms, 60_000);
+        assert_eq!(lines[1].t_end_ms, 73_500);
+        assert_eq!(lines[1].text, "sì, d'accordo");
+        // Each line keeps its own confidence and the window's language and
+        // provenance: those are true of the decode, not of the sentence.
+        assert_eq!(lines[1].avg_confidence, Some(0.5));
+        assert!(lines.iter().all(|l| l.language.as_deref() == Some("it")));
+        assert!(lines
+            .iter()
+            .all(|l| l.model_revision.as_deref() == Some("rev1")));
+        assert!(lines.iter().all(|l| l.channel == Channel::Mic));
+        assert!(
+            lines.iter().all(|l| l.lines.is_empty()),
+            "a line does not contain lines"
+        );
+
+        // One line, or none at all — a caption asks for no timestamps — is the
+        // whole thing, exactly as it was before there were lines.
+        let single = Transcription {
+            text: "ok".into(),
+            t_start_ms: 10,
+            t_end_ms: 20,
+            ..Default::default()
+        };
+        assert_eq!(single.per_line().len(), 1);
+        assert_eq!(single.per_line()[0].t_end_ms, 20);
+    }
+
+    #[test]
     fn a_job_knows_how_long_it_is() {
         let job = TranscribeJob {
             t_start_ms: 5_000,
@@ -212,6 +320,7 @@ mod tests {
             // (see `crate::asr::reconcile`), so this is the case worth pinning.
             model_name: Some("whisper large-v3-turbo (ggml)".into()),
             model_revision: Some("abc123".into()),
+            lines: Vec::new(),
         };
         let d = t.to_draft("m1");
         assert_eq!(d.meeting_id, "m1");

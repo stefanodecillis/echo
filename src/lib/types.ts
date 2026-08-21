@@ -364,6 +364,15 @@ export interface Job {
   error?: string;
   createdAt: Timestamp;
   updatedAt: Timestamp;
+  /**
+   * The stage this job last reported, when it has stages worth naming.
+   *
+   * Not part of the row: the core carries it beside the job on
+   * `jobProgress`, and the screens that keep a list of jobs fold it in as it
+   * arrives (see `useMeetingDetail`) so that what is drawn is the job as it is
+   * now, not as it was when the list was fetched.
+   */
+  phase?: JobPhase;
 }
 
 export interface JobQuery {
@@ -642,10 +651,20 @@ export interface AudioLevelsPayload {
   tMs: number;
 }
 
+/**
+ * A stage inside one job that a person reads as a different activity.
+ *
+ * Only the download has one: its second half is not a download, and it is the
+ * long half. `job.progress` is absent for a stage with no honest fraction.
+ */
+export type JobPhase = "preparingEngine";
+
 export interface JobProgressPayload {
   job: Job;
   /** Ready-to-show sentence, e.g. "Writing your recap...". */
   label?: string;
+  /** Which stage of the job this is, when it has stages worth naming. */
+  phase?: JobPhase;
 }
 
 export interface DownloadProgressPayload {

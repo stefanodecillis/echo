@@ -77,6 +77,16 @@ export const labels = {
     download: "Downloading",
     mixdown: "Preparing playback",
   },
+  /**
+   * A stage inside a job, named because a person would read it as a different
+   * activity. Only the one-time download has one: once the bytes are here,
+   * Echo has to get this particular computer ready to use them, which can take
+   * a while and has no percentage to report. Saying "Downloading" through that
+   * would be a lie, and saying nothing leaves somebody watching a still bar.
+   */
+  jobPhase: {
+    preparingEngine: "Finishing one-time setup",
+  },
   jobStatus: {
     queued: "Waiting",
     running: "In progress",
@@ -93,6 +103,19 @@ export const labels = {
     restartRequired: "Restart Echo to finish",
     notApplicable: "Nothing to set up",
   },
+} as const;
+
+/**
+ * The line above a progress bar, for work that is happening and work that is
+ * not.
+ *
+ * The distinction is the whole point (see `lib/jobs.ts`): a job that has not
+ * started says so, in words, instead of borrowing the sentence — and the bar —
+ * of the one that is running.
+ */
+export const jobLine = {
+  running: (label: string) => `${label}…`,
+  waiting: (label: string) => `${label} — waiting its turn`,
 } as const;
 
 /** Words used across more than one screen: dialogs, toasts, generic buttons. */

@@ -4,7 +4,8 @@ import { save } from "@tauri-apps/plugin-dialog";
 
 import { Button, Chip, Modal, ProgressBar } from "@/components";
 import { formatBytes } from "@/components/lib/format";
-import { channels, common, labels, meeting as copy, notices } from "@/lib/copy";
+import { channels, common, jobLine, meeting as copy, notices } from "@/lib/copy";
+import { isActive, presentJob, runningFirst } from "@/lib/jobs";
 import { deleteMeeting, downloadRecording, toUiError } from "@/lib/ipc";
 import { useEchoStore } from "@/lib/store";
 import type { Channel, Id, MeetingDetail } from "@/lib/types";
@@ -31,7 +32,10 @@ export function InfoTab({ meetingId, detail }: InfoTabProps) {
 
   const language = languageName(detail.meeting.language);
   const hasAudio = detail.audioBytes > 0 && !detail.meeting.deletedAt;
-  const activeJobs = detail.jobs.filter((j) => j.status === "running" || j.status === "queued");
+  // What is happening first, then what is waiting — and the two look
+  // different, because they are (see `lib/jobs.ts`). A queued job with a
+  // progress bar over it reads as work in flight that has stalled.
+  const activeJobs = runningFirst(detail.jobs.filter(isActive));
 
   /** Builds the playback mix on demand if it isn't ready yet (an older
    * meeting, or one where that pass hasn't finished) — `downloadRecording`
@@ -120,12 +124,17 @@ export function InfoTab({ meetingId, detail }: InfoTabProps) {
       {activeJobs.length > 0 && (
         <section className="echo-card flex flex-col gap-3 p-6">
           <h2 className="text-sm font-semibold text-ink">{copy.infoWorkingTitle}</h2>
-          {activeJobs.map((job) => (
-            <div key={job.id} className="flex flex-col gap-1.5">
-              <ProgressBar value={job.progress} label={labels.jobKind[job.kind]} />
-              <span className="text-xs text-ink-faint">{labels.jobKind[job.kind]}…</span>
-            </div>
-          ))}
+          {activeJobs.map((job) => {
+            const shown = presentJob(job);
+            return (
+              <div key={job.id} className="flex flex-col gap-1.5">
+                {shown.running && <ProgressBar value={shown.fraction} label={shown.label} />}
+                <span className="text-xs text-ink-faint">
+                  {shown.running ? jobLine.running(shown.label) : jobLine.waiting(shown.label)}
+                </span>
+              </div>
+            );
+          })}
         </section>
       )}
 

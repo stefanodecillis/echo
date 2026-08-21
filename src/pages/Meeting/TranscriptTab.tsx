@@ -18,7 +18,14 @@ import {
   retranscribeMeeting,
   toUiError,
 } from "@/lib/ipc";
-import { common, labels, meeting as copy, notices, peopleCount as peopleCountCopy } from "@/lib/copy";
+import {
+  common,
+  jobLine,
+  meeting as copy,
+  notices,
+  peopleCount as peopleCountCopy,
+} from "@/lib/copy";
+import { inProgressJob, isActive, presentJob } from "@/lib/jobs";
 import { useEvent } from "@/hooks/useEvent";
 import { useEchoStore } from "@/lib/store";
 import type { Id, MeetingDetail, Segment } from "@/lib/types";
@@ -126,12 +133,14 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
       });
   });
 
-  const transcribeJob = detail.jobs.find(
-    (j) =>
-      j.meetingId === meetingId &&
-      TRANSCRIBE_JOB_KINDS.has(j.kind) &&
-      (j.status === "running" || j.status === "queued"),
+  // The one that is *running*, and only failing that the one that is waiting.
+  // Picking whichever came first in the list named the job at the back of the
+  // queue while another one worked (see `lib/jobs.ts`).
+  const transcribeJob = inProgressJob(
+    detail.jobs.filter((j) => j.meetingId === meetingId && isActive(j)),
+    TRANSCRIBE_JOB_KINDS,
   );
+  const transcribeProgress = transcribeJob ? presentJob(transcribeJob) : undefined;
 
   const filtered = useMemo(() => {
     const list = segments ?? [];
@@ -244,10 +253,19 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
         </div>
       </div>
 
-      {transcribeJob && (
+      {transcribeProgress && (
         <div className="flex flex-col gap-1.5 rounded-xl border border-hairline bg-surface-sunken p-4">
-          <ProgressBar value={transcribeJob.progress} label={labels.jobKind[transcribeJob.kind]} />
-          <span className="text-xs text-ink-faint">{labels.jobKind[transcribeJob.kind]}…</span>
+          {transcribeProgress.running && (
+            <ProgressBar
+              value={transcribeProgress.fraction}
+              label={transcribeProgress.label}
+            />
+          )}
+          <span className="text-xs text-ink-faint">
+            {transcribeProgress.running
+              ? jobLine.running(transcribeProgress.label)
+              : jobLine.waiting(transcribeProgress.label)}
+          </span>
         </div>
       )}
 

@@ -38,6 +38,7 @@
 //! | log-mel features for the fingerprint network | [`features`] |
 //! | fingerprint the audio where one person talks alone | [`embedding`] |
 //! | group fingerprints into people; line up window-local labels | [`cluster`] |
+//! | cut a transcript line that holds two voices in two | [`split`] |
 //! | span arithmetic and the segment-to-speaker mapping | [`timeline`] |
 //! | run all of it, write the result | [`pipeline`] |
 //! | the same thing as a cancellable row in `jobs` | [`job`] |
@@ -52,6 +53,16 @@
 //! the person at the keyboard — and the answer is shown as "detected". The
 //! person can correct it, and a correction is better evidence than any threshold
 //! (DESIGN §1), so it re-runs the pass cut to exactly that many voices.
+//!
+//! **How the pass decides, and why it changed.** It used to merge fingerprints
+//! until the closest pair was further apart than one calibrated distance. That
+//! distance was measured twice and still got a two-person conversation wrong in
+//! the field on 2026-08-21, because the band of distances that gets a given
+//! meeting right is only a few hundredths wide and a retranscription can slide
+//! it. The count is now read out of the *shape* of the merge tree — the cut that
+//! best explains the fingerprints — with the calibrated distance kept only as a
+//! floor, a ceiling and a tie-break. [`cluster::CountChoice`] carries the
+//! criterion, the evidence for it, and what it does not fix.
 //!
 //! **The number is the total, including whoever was at this computer.** That is
 //! what "people in this meeting" means to a human, and the UI asks the question
@@ -96,6 +107,7 @@ pub mod pcm;
 pub mod pipeline;
 pub mod sample;
 pub mod segmentation;
+pub mod split;
 pub mod timeline;
 
 use std::path::Path;
@@ -199,9 +211,20 @@ pub struct DiarizationResult {
     /// no system channel the pass read the microphone instead and this *is*
     /// everybody. Either way [`Self::people_count`] is the number to show.
     pub speaker_count: u32,
-    /// Clustering threshold used, for diagnostics. In fixed-count mode there is
-    /// no threshold, so this is the distance the hierarchy was cut at instead.
+    /// The distance the hierarchy was cut at, for diagnostics. Not a threshold
+    /// any more in either mode: the automatic pass reads its count out of the
+    /// shape of the tree ([`cluster::CountChoice`]) and a count the person gave
+    /// us was never a distance at all.
     pub threshold: f32,
+    /// How the automatic count was arrived at — the merge ladder, every count
+    /// the tree could have been cut at, and what decided between them. `None`
+    /// when the count was the person's own, or when there was no audio to
+    /// cluster.
+    ///
+    /// Carried out of the pass so `examples/speakers_probe.rs` can print the
+    /// decision and Settings → Advanced could show it. A count nobody can
+    /// inspect is a count nobody can argue with.
+    pub choice: Option<cluster::CountChoice>,
     /// The speaker rows as they now stand, ready for
     /// [`crate::events::SPEAKERS_UPDATED`].
     pub speakers: Vec<Speaker>,
@@ -660,7 +683,11 @@ mod tests {
             .expect("the pass runs");
         assert!(result.speaker_count >= 2, "{result:?}");
         assert!(!result.turns.is_empty());
-        assert_eq!(result.threshold, DISTANCE_THRESHOLD);
+        // The count came out of the tree, so the recorded number is the height
+        // the tree was cut at — inside the bounds, not equal to either.
+        let choice = result.choice.as_ref().expect("the automatic count decided");
+        assert_eq!(choice.count as u32, result.speaker_count);
+        assert!(result.threshold > 0.0 && result.threshold < cluster::FUSE_CEILING);
         // Turns never run backwards and never overlap within one person.
         for pair in result.turns.windows(2) {
             assert!(pair[0].t_start_ms <= pair[1].t_start_ms);

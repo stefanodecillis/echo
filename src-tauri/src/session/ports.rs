@@ -398,6 +398,11 @@ impl AsrPort for EngineAsr {
                 // Everything captured so far, and nothing the live pass is
                 // decoding right now.
                 to_ms: Some(to_ms.max(0)),
+                // Narrower windows than the post-meeting pass uses: a live
+                // final waits behind whatever decode is in flight, and this
+                // one is in flight during the meeting (see
+                // [`crate::asr::catchup::LIVE_PACK_MS`]).
+                pack_ms: crate::asr::catchup::LIVE_PACK_MS,
                 // `pause_while` stays unset on purpose. The post-meeting pass
                 // yields to a live recording; this one *is* the live recording,
                 // and yielding to itself would mean never running. It stays out

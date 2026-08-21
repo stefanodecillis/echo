@@ -729,6 +729,89 @@ pub async fn assign_speaker(
     Ok(affected)
 }
 
+/// Replace one transcript line with the pieces a speaker turn cut it into.
+///
+/// What the separation pass does to a line of fast dialogue that the speech
+/// engine wrote as one row (see [`crate::diarize::split`]): the row goes and one
+/// row per voice takes its place. Everything else about the line is carried over
+/// unchanged — channel, language, the engine's own confidence, and the
+/// provenance of the words — because the words were not re-transcribed. Only
+/// where they were cut is Echo's own doing, and only the caller knows that.
+///
+/// Two details this depends on, the same two [`clear_transcript`] depends on:
+///
+/// * The old row is deleted **by name**, so the `segments_fts_ad` trigger fires
+///   and both search indexes lose its words; the inserts then fire
+///   `segments_fts_ai` and the indexes gain the pieces. A search for a sentence
+///   that got cut in two still finds the half it is in.
+/// * It is one transaction, so a crash can leave the line whole or leave it
+///   split, and never leave the meeting with a hole where it was.
+///
+/// Refuses a "split" into fewer than two pieces — that is a rewrite, and
+/// [`revise_segment`] is the function for those — and refuses one whose pieces
+/// do not carry the revision forward, because a later pass must never be
+/// overwritable by an earlier one.
+pub async fn split_segment(
+    db: &Db,
+    id: &str,
+    pieces: &[SegmentDraft],
+    revision: i64,
+) -> Result<Vec<Id>, DbError> {
+    if pieces.len() < 2 {
+        return Err(DbError::Invalid(
+            "a split needs at least two pieces to put back".into(),
+        ));
+    }
+    if pieces.iter().any(|p| p.revision < revision) {
+        return Err(DbError::Invalid(
+            "every piece of a split line has to carry the new revision".into(),
+        ));
+    }
+
+    let mut tx = db.begin().await?;
+    let gone = sqlx::query("DELETE FROM segments WHERE id = ?1 AND revision <= ?2")
+        .bind(id)
+        .bind(revision)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if gone == 0 {
+        // Either it is already gone, or a later pass has moved past this one.
+        // Both mean this split is not the current answer any more.
+        tx.rollback().await?;
+        return Ok(Vec::new());
+    }
+
+    let mut ids = Vec::with_capacity(pieces.len());
+    for p in pieces {
+        let piece_id = new_id();
+        sqlx::query(
+            "INSERT INTO segments (id, meeting_id, t_start_ms, t_end_ms, channel, speaker_id, text,
+                                   language, avg_confidence, revision, is_final, model_name,
+                                   model_revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        )
+        .bind(&piece_id)
+        .bind(&p.meeting_id)
+        .bind(p.t_start_ms)
+        .bind(p.t_end_ms)
+        .bind(p.channel.as_str())
+        .bind(p.speaker_id.as_deref())
+        .bind(&p.text)
+        .bind(p.language.as_deref())
+        .bind(p.avg_confidence)
+        .bind(p.revision.max(1))
+        .bind(p.is_final)
+        .bind(p.model_name.as_deref())
+        .bind(p.model_revision.as_deref())
+        .execute(&mut *tx)
+        .await?;
+        ids.push(piece_id);
+    }
+    tx.commit().await?;
+    Ok(ids)
+}
+
 /// Drop live partials once the final pass replaced them.
 pub async fn delete_partial_segments(db: &Db, meeting_id: &str) -> Result<u64, DbError> {
     let r = sqlx::query("DELETE FROM segments WHERE meeting_id = ?1 AND is_final = 0")
@@ -3241,6 +3324,163 @@ mod tests {
             .unwrap()
             .len(),
             1
+        );
+    }
+
+    /// Cutting a line in two has to leave search knowing about both halves and
+    /// nothing about the line they came from. The index is external content, so a
+    /// stale entry is invisible as a row — it has to be read out of the index.
+    #[tokio::test]
+    async fn splitting_a_line_moves_its_words_into_the_search_index_in_halves() {
+        let (db, m) = seeded().await;
+        let whole = insert_segment(
+            &db,
+            &SegmentDraft {
+                meeting_id: m.id.clone(),
+                t_start_ms: 0,
+                t_end_ms: 8_000,
+                channel: Channel::Mic,
+                speaker_id: None,
+                text: "pomegranate then quince".into(),
+                language: Some("it".into()),
+                avg_confidence: Some(0.8),
+                revision: 3,
+                is_final: true,
+                model_name: Some("whisper large-v3 (ggml)".into()),
+                model_revision: Some("abc123".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let piece = |from: i64, to: i64, text: &str| SegmentDraft {
+            meeting_id: m.id.clone(),
+            t_start_ms: from,
+            t_end_ms: to,
+            channel: Channel::Mic,
+            speaker_id: None,
+            text: text.into(),
+            language: Some("it".into()),
+            avg_confidence: Some(0.8),
+            revision: 4,
+            is_final: true,
+            model_name: Some("whisper large-v3 (ggml)".into()),
+            model_revision: Some("abc123".into()),
+        };
+        let ids = split_segment(
+            &db,
+            &whole.id,
+            &[
+                piece(0, 4_000, "pomegranate then"),
+                piece(4_000, 8_000, "quince"),
+            ],
+            4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(get_segment(&db, &whole.id).await.unwrap().is_none());
+
+        // Both halves are findable, and the words are each in exactly one of
+        // them.
+        for word in ["pomegranate", "quince"] {
+            let hits = search_segments(
+                &db,
+                &SearchQuery {
+                    text: word.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(hits.len(), 1, "search lost {word}");
+        }
+        // The word index knows whole words; the trigram index knows threes.
+        for (index, term) in [
+            ("segments_fts", "pomegranate"),
+            ("segments_fts_trigram", "pom"),
+        ] {
+            let (_, hits) = index_terms(&db, index, term).await;
+            assert_eq!(hits, 1, "{index} has the wrong idea about the split");
+        }
+
+        // Provenance and the revision came across; the pieces tile the line.
+        let after = get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: m.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].t_start_ms, 0);
+        assert_eq!(after[1].t_end_ms, 8_000);
+        assert!(after
+            .iter()
+            .all(|s| s.revision == 4 && s.model_revision.as_deref() == Some("abc123")));
+    }
+
+    #[tokio::test]
+    async fn a_split_is_refused_rather_than_half_done() {
+        let (db, m) = seeded().await;
+        let whole = insert_segment(&db, &draft(&m.id, 0, "kumquat")).await.unwrap();
+        let piece = |text: &str, revision: i64| SegmentDraft {
+            meeting_id: m.id.clone(),
+            t_start_ms: 0,
+            t_end_ms: 500,
+            channel: Channel::Mic,
+            text: text.into(),
+            revision,
+            is_final: true,
+            ..Default::default()
+        };
+
+        // One piece is not a split.
+        assert!(split_segment(&db, &whole.id, &[piece("kumquat", 2)], 2)
+            .await
+            .is_err());
+        // Nor is a piece that would let an older pass overwrite a newer one.
+        assert!(
+            split_segment(&db, &whole.id, &[piece("kum", 1), piece("quat", 2)], 2)
+                .await
+                .is_err()
+        );
+        // Both refusals left the line exactly where it was.
+        assert_eq!(
+            get_segment(&db, &whole.id).await.unwrap().unwrap().text,
+            "kumquat"
+        );
+
+        // A line a later pass has already moved past is not split at all, and
+        // that is not an error — it is no longer the current answer.
+        let newer = insert_segment(
+            &db,
+            &SegmentDraft {
+                revision: 5,
+                ..draft(&m.id, 1_000, "loquat")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            split_segment(&db, &newer.id, &[piece("lo", 4), piece("quat", 4)], 4)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            get_segment(&db, &newer.id).await.unwrap().unwrap().text,
+            "loquat"
+        );
+
+        // And a line that is not there any more is a no-op, not a panic.
+        assert!(
+            split_segment(&db, "no-such-line", &[piece("a", 9), piece("b", 9)], 9)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -5,9 +5,13 @@
 //! ```text
 //! cargo run --release --example catchup_probe -- <meeting-id> [minutes|all] [flags]
 //!
-//!   minutes    how much of the meeting to decode; `all` for the whole thing
-//!   --table    one line per decode attempt (private audio: 8 words each)
-//!   --dump P   write the segments this pass wrote to P, as JSON
+//!   minutes      how much of the meeting to decode; `all` for the whole thing
+//!   --table      one line per decode attempt (private audio: 8 words each)
+//!   --dump P     write the segments this pass wrote to P, as JSON
+//!   --no-packing every speech stretch its own decode: the pass as it worked
+//!                before window packing, for a before-and-after over the same
+//!                audio, the same weights and the same machine
+//!   --pack-ms N  a packed window of exactly N ms, for finding the knee
 //! ```
 //!
 //! Nothing in the app's own storage is written: the chunks are copied to a
@@ -142,11 +146,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut positional: Vec<String> = Vec::new();
     let mut want_table = false;
     let mut dump: Option<PathBuf> = None;
+    let mut pack_ms: i64 = 0;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--table" => want_table = true,
             "--dump" => dump = args.next().map(PathBuf::from),
+            // One millisecond of budget is one stretch per window: the pass as
+            // it was before packing.
+            "--no-packing" => pack_ms = 1,
+            "--pack-ms" => {
+                pack_ms = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+            }
             other => positional.push(other.to_string()),
         }
     }
@@ -212,9 +226,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or_else(|| format!("{speech_id} is not in the catalog"))?;
     let mut wanted: Vec<(&str, PathBuf)> =
         vec![(speech_entry.id, speech.join(speech_entry.installed_name()))];
-    if let Some(accel) = echo_lib::asr::catalog::accelerator_for(speech_entry.id) {
-        wanted.push((accel.id, speech.join(accel.installed_name())));
-    }
     let detector = echo_lib::asr::catalog::entry(echo_lib::asr::catalog::ids::DETECTOR).unwrap();
     wanted.push((detector.id, speech.join(detector.installed_name())));
 
@@ -223,6 +234,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("{} is not installed at {}", id, path.display()).into());
         }
         repo::set_model_installed(&db, id, true, Some(&path.to_string_lossy())).await?;
+    }
+    // The Apple encoder companion only affects speed (review finding 1), so a
+    // probe runs without it rather than refusing to run — and says which it
+    // was, because a timing without that sentence next to it is misleading.
+    if let Some(accel) = echo_lib::asr::catalog::accelerator_for(speech_entry.id) {
+        let path = speech.join(accel.installed_name());
+        if path.exists() {
+            repo::set_model_installed(&db, accel.id, true, Some(&path.to_string_lossy())).await?;
+        } else {
+            println!("note: no Apple encoder companion in {} — the encoder runs on the graphics backend alone", speech.display());
+        }
     }
     println!(
         "weights: {}",
@@ -285,7 +307,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &probe,
         &db,
         &created.id,
-        CatchUpOptions::default(),
+        CatchUpOptions {
+            pack_ms,
+            ..Default::default()
+        },
         &DiskAudio,
     )
     .await?;
@@ -372,7 +397,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.segments_written,
         report.windows_read
     );
+    println!();
+    println!("=== what the engine was asked to do ===");
+    println!(
+        "packing                   {:>8}",
+        if pack_ms == 1 {
+            "off (one decode per stretch)".to_string()
+        } else if pack_ms > 0 {
+            format!("{pack_ms} ms windows")
+        } else {
+            format!("{} ms windows", catchup::MAX_PACK_MS)
+        }
+    );
+    println!("speech stretches packed   {:>8}", report.stretches_packed);
+    println!(
+        "windows decoded (encodes) {:>8}   ({:.1} stretches a window, {:.1} s of audio a window)",
+        report.windows_decoded,
+        if report.windows_decoded > 0 {
+            f64::from(report.stretches_packed) / f64::from(report.windows_decoded)
+        } else {
+            0.0
+        },
+        if report.windows_decoded > 0 {
+            stretch_ms as f64 / 1_000.0 / f64::from(report.windows_decoded)
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "second readings (retries)  {:>7}   (ladder capped at {} decodes a window)",
+        report.fallback_attempts,
+        echo_lib::asr::catalog::CATCHUP_MAX_FALLBACKS + 1
+    );
     println!("wall clock                {:>8.1} s", elapsed.as_secs_f32());
+    println!(
+        "real time                 {:>8.2}x   (wall clock over meeting length)",
+        elapsed.as_secs_f64() / (meeting_ms as f64 / 1_000.0).max(0.001)
+    );
 
     // Five lines spread across the whole meeting, so the evidence is that the
     // end was transcribed as well as the beginning.

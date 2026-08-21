@@ -317,6 +317,7 @@ impl AsrPort for MockAsr {
                 avg_confidence: Some(0.9),
                 model_name: Some("test".into()),
                 model_revision: Some("1".into()),
+                lines: Vec::new(),
             })
         })
     }
@@ -523,6 +524,19 @@ impl CollectingEvents {
             UiEvent::Notice(payload) => payload.tag.as_deref() == Some(tag),
             _ => false,
         })
+    }
+
+    /// Every job announcement, in order.
+    pub(crate) fn job_progress(&self) -> Vec<crate::events::JobProgressPayload> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::JobProgress(payload) => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[allow(dead_code)]

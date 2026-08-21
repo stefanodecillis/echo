@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 
 import { Button, ProgressBar } from "@/components";
 import { cx } from "@/components/lib/cx";
-import { labels, meeting as copy } from "@/lib/copy";
+import { jobLine, labels, meeting as copy } from "@/lib/copy";
+import { isActive } from "@/lib/jobs";
 import { generateSummary, listTemplates } from "@/lib/ipc";
 import type { Id, Job, Template } from "@/lib/types";
 
@@ -94,10 +95,16 @@ export function RecapControls({ meetingId, hasSummary, activeJob, onQueued, subt
           tab below this fills its whole panel with "Writing your recap…" and a
           bar of its own, and saying the same thing twice, two lines apart, reads
           like two things are happening. */}
-      {hasSummary && activeJob && (activeJob.status === "running" || activeJob.status === "queued") && (
+      {hasSummary && activeJob && isActive(activeJob) && (
         <div className="flex flex-col gap-1.5">
-          <ProgressBar value={activeJob.progress} label={labels.jobKind.summarize} />
-          <span className="text-xs text-ink-faint">{labels.jobKind.summarize}…</span>
+          {activeJob.status === "running" && (
+            <ProgressBar value={activeJob.progress} label={labels.jobKind.summarize} />
+          )}
+          <span className="text-xs text-ink-faint">
+            {activeJob.status === "running"
+              ? jobLine.running(labels.jobKind.summarize)
+              : jobLine.waiting(labels.jobKind.summarize)}
+          </span>
         </div>
       )}
     </div>

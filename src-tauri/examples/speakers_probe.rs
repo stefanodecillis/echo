@@ -15,13 +15,29 @@
 //!   --embedder P    use this ONNX fingerprint network instead of the installed
 //!                   one. How a candidate asset is tried on real audio before it
 //!                   goes in the catalog.
-//!   --sweep         also print how many people every clustering threshold would
-//!                   find on this meeting. The check against having tuned the
-//!                   threshold to synthetic voices: the plateau here and the
-//!                   plateau in `examples/voices_fixture.rs` have to overlap.
+//!   --sweep         also print how many people every clustering *distance*
+//!                   would find on this meeting. Kept because it is the picture
+//!                   of the failure this probe exists to document: the band of
+//!                   distances that gets this meeting right is 0.04 wide, and a
+//!                   retranscription moved it under the number that shipped.
+//!                   The automatic count no longer reads a distance at all.
 //!   --from --to --step
 //!                   narrow the sweep, to find an edge precisely.
 //! ```
+//!
+//! ## What it prints, and why that is the point
+//!
+//! The automatic count comes out of the shape of the merge tree
+//! (`diarize::cluster::CountChoice`), so this probe prints the tree: every merge
+//! distance near the top, and one row per count the tree could have been cut at
+//! with the relative gap, the silhouette and the cluster masses that decided
+//! between them. A count nobody can inspect is a count nobody can argue with,
+//! and the number this replaces was wrong in the field for exactly that reason.
+//!
+//! It also prints the lines that used to hold two voices and now hold one each
+//! — the second half of the same failure, where fast dialogue came out as one
+//! transcript row and attribution had to give the whole exchange to whoever held
+//! more of it.
 //!
 //! This is the microphone-only half of the speaker pass, on the audio it was
 //! written for: a meeting where the person was on speakers, so the other voice
@@ -36,7 +52,7 @@ use std::path::{Path, PathBuf};
 
 use echo_lib::asr::{catalog, models};
 use echo_lib::db::{self, repo};
-use echo_lib::diarize::{self, pipeline::DiarizeControl};
+use echo_lib::diarize::{self, cluster, pipeline::DiarizeControl};
 use echo_lib::types::{AssetKind, Channel, Segment, SegmentDraft, TranscriptQuery};
 
 const CHUNK_MS: i64 = 30_000;
@@ -60,6 +76,124 @@ fn app_support() -> PathBuf {
 
 fn clock(ms: i64) -> String {
     format!("{:>3}:{:02}", ms / 60_000, (ms % 60_000) / 1_000)
+}
+
+/// How many rungs of the merge ladder are worth reading. The decision is always
+/// near the top; the hundreds of merges below it are one voice agreeing with
+/// itself.
+const LADDER_ROWS: usize = 14;
+/// Mixed-voice lines to show cut in two.
+const SPLIT_EXAMPLES: usize = 3;
+
+fn verdict(refusal: Option<cluster::Refusal>) -> &'static str {
+    match refusal {
+        None => "allowed",
+        Some(cluster::Refusal::OneVoice) => "one voice",
+        Some(cluster::Refusal::Fused) => "two fused",
+        Some(cluster::Refusal::TooMany) => "too many",
+    }
+}
+
+fn masses(mass_ms: &[i64]) -> String {
+    mass_ms
+        .iter()
+        .map(|ms| format!("{:.0}s", *ms as f64 / 1_000.0))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The whole automatic decision, printed so somebody can disagree with it.
+fn print_choice(choice: &cluster::CountChoice) {
+    println!();
+    println!("=== the merge tree the count was read out of ===");
+    println!(
+        "{} merges, of which the top {} — a cluster under {:.1} s of speech is a \
+         fragment in this meeting, not a person",
+        choice.ladder.len(),
+        LADDER_ROWS.min(choice.ladder.len()),
+        choice.fragment_bar_ms as f64 / 1_000.0,
+    );
+    println!("{:>9}{:>10}{:>8}", "clusters", "distance", "gap");
+    // The ladder is recorded in merge order, so the top of the tree is the tail.
+    // `gap` is the merge this cut refuses over the last one it accepted — the
+    // column a gap criterion would read the answer off.
+    let from = choice.ladder.len().saturating_sub(LADDER_ROWS);
+    for (i, rung) in choice.ladder.iter().enumerate().skip(from) {
+        let accepted = rung.distance;
+        let refused = choice.ladder.get(i + 1).map(|r| r.distance);
+        println!(
+            "{:>9}{:>10.4}{:>8}",
+            rung.clusters,
+            rung.distance,
+            match refused {
+                Some(r) if accepted > 1e-6 => format!("{:.3}", r / accepted),
+                _ => "-".to_string(),
+            }
+        );
+    }
+
+    println!();
+    println!("=== every count the tree could have been cut into ===");
+    println!(
+        "{:>7}{:>7}{:>7}{:>10}{:>10}{:>8}{:>12}   {:<10} speech per voice",
+        "people", "cut", "folded", "accepted", "refused", "gap", "silhouette", "verdict",
+    );
+    for c in &choice.candidates {
+        println!(
+            "{:>7}{:>7}{:>7}{:>10.4}{:>10.4}{:>8}{:>12.3}   {:<10} {}{}",
+            c.count,
+            c.cut_clusters,
+            c.folded,
+            c.accepted,
+            c.refused,
+            if c.gap > 0.0 {
+                format!("{:.3}", c.gap)
+            } else {
+                "-".to_string()
+            },
+            c.silhouette,
+            verdict(c.refusal),
+            masses(&c.mass_ms),
+            if c.count == choice.count {
+                "   <- chosen"
+            } else {
+                ""
+            }
+        );
+    }
+
+    println!();
+    match choice.runner_up {
+        Some((count, score)) => println!(
+            "chose {} people at silhouette {:.3}; next best was {count} at {score:.3} \
+             (margin {:.3})",
+            choice.count,
+            choice.silhouette,
+            choice.silhouette - score
+        ),
+        None => println!(
+            "chose {} people at silhouette {:.3}; there was nothing to compare it to",
+            choice.count, choice.silhouette
+        ),
+    }
+    if let Some(widest) = &choice.gap_answer {
+        println!(
+            "the largest relative gap over every cut height is {:.3}, at a cut into {} \
+             clusters, which folds to {} — {}",
+            widest.gap,
+            widest.cut_clusters,
+            if widest.count == 1 {
+                "one voice".to_string()
+            } else {
+                format!("{} people", widest.count)
+            },
+            if widest.count == choice.count {
+                "which agrees here, but see cluster::CountChoice for a tree where it does not"
+            } else {
+                "which is the wrong answer, and is why the criterion is not the gap"
+            }
+        );
+    }
 }
 
 #[tokio::main]
@@ -164,11 +298,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("segmenter: {}", segmenter.display());
     println!("embedder:  {}", embedder.display());
     println!(
-        "threshold: {:.4}  ({})",
-        diarize::DISTANCE_THRESHOLD,
+        "network:   {}",
         catalog::entry(catalog::ids::EMBEDDER)
             .map(|e| e.name)
             .unwrap_or("?")
+    );
+    println!(
+        "count:     silhouette of the merge tree, floor {:.2} ceiling {:.2} \
+         (old shipped cut {:.4}, not used)",
+        cluster::SPLIT_FLOOR,
+        cluster::FUSE_CEILING,
+        diarize::DISTANCE_THRESHOLD,
     );
     // The rows must name the assets that are actually loaded, or the pass would
     // silently fall back to something else.
@@ -204,6 +344,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // speakers, so both voices are in the microphone recording.
 
     // --- the transcript the catch-up probe produced ------------------------
+    //
+    // Kept as it went in, so the lines the pass cut in two can be found
+    // afterwards by looking for the ones that are no longer one row.
+    let mut seeded: Vec<(i64, i64, String)> = Vec::new();
     if let Some(path) = &segments_file {
         let raw = std::fs::read(path)?;
         let loaded: Vec<Segment> = serde_json::from_slice(&raw)?;
@@ -226,6 +370,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect();
         repo::insert_segments(&db, &drafts).await?;
+        seeded = drafts
+            .iter()
+            .map(|d| (d.t_start_ms, d.t_end_ms, d.text.clone()))
+            .collect();
         println!(
             "seeded {} transcript line(s) from {}",
             drafts.len(),
@@ -301,7 +449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cut.tracks.len(),
                 per.join(" "),
                 if (t - diarize::DISTANCE_THRESHOLD).abs() < 1e-4 {
-                    "   <- shipped"
+                    "   <- what used to ship"
                 } else {
                     ""
                 }
@@ -327,12 +475,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("voices separated          {:>8}", result.speaker_count);
     println!("turns                     {:>8}", result.turns.len());
-    println!("clustering cut at         {:>8.4}", result.threshold);
+    println!("tree cut at               {:>8.4}", result.threshold);
     println!(
         "pass took                 {:>8.1} s   ({:.2}x real time)",
         elapsed.as_secs_f32(),
         elapsed.as_secs_f64() / (meeting_ms as f64 / 1_000.0)
     );
+
+    if let Some(choice) = &result.choice {
+        print_choice(choice);
+    }
 
     let all = repo::get_segments(
         &db,
@@ -377,6 +529,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 clock(s.t_start_ms),
                 first_words(&s.text, SAMPLE_WORDS)
             );
+        }
+    }
+
+    // --- the lines that used to hold two voices ---------------------------
+    //
+    // A seeded line that is no longer one row was cut by the pass. Showing the
+    // halves side by side with the speaker each landed on is the whole claim:
+    // before this, one of the two people in every one of these exchanges lost
+    // their words to the other.
+    let name_of = |id: Option<&str>| -> String {
+        id.and_then(|id| result.speakers.iter().find(|s| s.id == id))
+            .map(|s| s.display_name.clone())
+            .unwrap_or_else(|| "unattributed".to_string())
+    };
+    let mut shown = 0usize;
+    let mut split_total = 0usize;
+    let mut report: Vec<String> = Vec::new();
+    for (from, to, text) in &seeded {
+        let pieces: Vec<&Segment> = all
+            .iter()
+            .filter(|s| s.t_start_ms >= *from && s.t_end_ms <= *to)
+            .collect();
+        let voices: std::collections::BTreeSet<&str> = pieces
+            .iter()
+            .filter_map(|p| p.speaker_id.as_deref())
+            .collect();
+        if pieces.len() < 2 || voices.len() < 2 {
+            continue;
+        }
+        split_total += 1;
+        if shown >= SPLIT_EXAMPLES {
+            continue;
+        }
+        shown += 1;
+        report.push(format!(
+            "[{}] was one line: {}",
+            clock(*from),
+            first_words(text, SAMPLE_WORDS)
+        ));
+        for p in &pieces {
+            report.push(format!(
+                "    [{}] {:<12} {}",
+                clock(p.t_start_ms),
+                name_of(p.speaker_id.as_deref()),
+                first_words(&p.text, SAMPLE_WORDS)
+            ));
+        }
+    }
+    if split_total > 0 {
+        println!();
+        println!(
+            "=== {split_total} line(s) held more than one voice and were cut; {shown} of them ==="
+        );
+        for line in report {
+            println!("{line}");
         }
     }
 

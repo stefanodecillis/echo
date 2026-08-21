@@ -531,6 +531,28 @@ pub const LIVE_DEGRADED_BEAM: u32 = 2;
 /// audio, which is fine on disk and unpredictable on a caption.
 pub const LIVE_TEMPERATURE_INC: f32 = 0.6;
 
+/// How many fallbacks one catch-up window is allowed: two retries, three
+/// decodes of the same audio at most.
+///
+/// The disk pass used to run the preset's whole `0.0, 0.2, … 1.0` ladder, six
+/// decodes of the same window. On clean audio nothing past the first rung ever
+/// runs, so it looked free; on the degraded stretches a real meeting is full of
+/// — a phone speaker, someone typing, two people at once — it is the difference
+/// between one decode and six, on every one of them. Past the third rung the
+/// answer is a hotter guess at audio that is not going to resolve, and the words
+/// are the same words. Two retries keep the recovery that matters and drop the
+/// tail that only costs time.
+pub const CATCHUP_MAX_FALLBACKS: u32 = 2;
+
+/// Temperature step for a catch-up window.
+///
+/// The number of rungs is the *only* thing whisper.cpp's ladder can be capped
+/// by: it is built as `for (t = temperature; t < 1.0 + 1e-6; t += inc)` with no
+/// count to limit (`whisper.cpp:6851`), so "three attempts from 0.0" and "steps
+/// of 0.4" are the same statement. Hence `1.0 / 3` rounded down to something
+/// legible: 0.0, 0.4, 0.8.
+pub const CATCHUP_TEMPERATURE_INC: f32 = 0.4;
+
 impl DecodeParams {
     pub fn uses_beam_search(&self) -> bool {
         self.beam_size >= 2
@@ -588,6 +610,21 @@ impl DecodeParams {
             params.best_of = LIVE_DEGRADED_BEAM;
         }
         params
+    }
+
+    /// The same preset, decoding a **window read back from disk**: the preset's
+    /// full beam, and at most [`CATCHUP_MAX_FALLBACKS`] retries.
+    ///
+    /// Nothing is waiting for this, which is why it keeps the wide beam — but
+    /// "nothing is waiting" is not "it may cost anything". A pass that takes
+    /// longer than the meeting did is a pass that is still running when the
+    /// person opens the transcript, so the ladder is capped here for the same
+    /// reason the beam is not: the beam buys words, the sixth temperature does
+    /// not.
+    pub const fn catch_up(mut self) -> Self {
+        self.temperature = 0.0;
+        self.temperature_inc = CATCHUP_TEMPERATURE_INC;
+        self
     }
 
     /// The same preset, decoding a **speculative caption**: greedy, one attempt,
@@ -1134,7 +1171,7 @@ mod tests {
     #[test]
     fn a_live_final_keeps_the_presets_beam_and_gives_up_only_the_ladder() {
         for p in PRESETS {
-            let catchup = p.decode;
+            let catchup = p.decode.catch_up();
             let live = catchup.live_final();
             let degraded = catchup.live_final_degraded();
             let speculative = catchup.speculative();
@@ -1175,11 +1212,19 @@ mod tests {
             // silence and gibberish, not about how hard to try.
             assert_eq!(speculative.no_speech_thold, catchup.no_speech_thold);
             assert_eq!(live.no_speech_thold, catchup.no_speech_thold);
-            // And the preset itself still has its full ladder for the disk pass.
+            // The disk pass still tries harder than a live final — it just no
+            // longer tries six times.
             assert!(
-                catchup.max_attempts() >= live.max_attempts(),
+                catchup.max_attempts() > live.max_attempts(),
                 "{} would decode less thoroughly from disk than live",
                 p.id
+            );
+            assert_eq!(
+                catchup.max_attempts(),
+                CATCHUP_MAX_FALLBACKS + 1,
+                "{} spends {} decodes on one window of disk audio",
+                p.id,
+                catchup.max_attempts()
             );
         }
         let everyday = default_preset().decode;
@@ -1190,7 +1235,15 @@ mod tests {
             "a live final is decoded at catch-up quality"
         );
         assert_eq!(everyday.live_final_degraded().beam_size, 2);
-        assert_eq!(everyday.max_attempts(), 6, "0.0, 0.2, … 1.0 on disk");
+        assert_eq!(
+            everyday.catch_up().beam_size,
+            5,
+            "the cap is on the ladder, never on the beam"
+        );
+        assert_eq!(everyday.catch_up().max_attempts(), 3, "0.0, 0.4, 0.8 on disk");
+        // The uncapped preset is what the cap is measured against: six decodes
+        // of the same window is what the disk pass used to allow itself.
+        assert_eq!(everyday.max_attempts(), 6, "0.0, 0.2, … 1.0 uncapped");
     }
 
     // -----------------------------------------------------------------

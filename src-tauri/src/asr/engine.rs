@@ -381,7 +381,7 @@ impl Decoding {
                 timestamps: true,
             },
             JobKind::CatchUp => Self {
-                params: *preset,
+                params: preset.catch_up(),
                 single_segment: false,
                 timestamps: true,
             },
@@ -735,6 +735,8 @@ impl Engine {
                 }
                 text.push_str(&piece);
             }
+            let mut line_sum = 0.0f64;
+            let mut line_count = 0usize;
             for t in 0..segment.n_tokens() {
                 let Some(token) = segment.get_token(t) else {
                     continue;
@@ -744,10 +746,26 @@ impl Engine {
                 if token.token_id() >= self.first_special_token {
                     continue;
                 }
-                prob_sum += f64::from(token.token_probability());
-                prob_count += 1;
+                line_sum += f64::from(token.token_probability());
+                line_count += 1;
             }
+            prob_sum += line_sum;
+            prob_count += line_count;
             last_end_ms = Some(segment.end_timestamp() * CS_TO_MS);
+            // Where this line falls on the meeting clock. Only meaningful when
+            // timestamps were asked for; a caption asks for none, and whisper
+            // then reports every segment as starting at zero.
+            if decoding.timestamps && !piece.is_empty() {
+                let from = (segment.start_timestamp() * CS_TO_MS).clamp(0, duration_ms);
+                let to = (segment.end_timestamp() * CS_TO_MS).clamp(from, duration_ms);
+                result.lines.push(crate::asr::TranscribedLine {
+                    t_start_ms: job.t_start_ms + from,
+                    t_end_ms: job.t_start_ms + to,
+                    text: piece,
+                    avg_confidence: (line_count > 0)
+                        .then(|| (line_sum / line_count as f64) as f32),
+                });
+            }
         }
 
         result.text = text;
@@ -2752,7 +2770,20 @@ mod tests {
         assert!(live.timestamps, "coverage needs them");
 
         let disk = Decoding::for_job(JobKind::CatchUp, &preset, false);
-        assert_eq!(disk.params, preset, "the disk pass keeps the whole preset");
+        assert_eq!(
+            disk.params,
+            preset.catch_up(),
+            "the disk pass keeps the preset's beam, with its ladder capped"
+        );
+        assert_eq!(disk.params.beam_size, preset.beam_size);
+        assert!(
+            disk.params.max_attempts() > live.params.max_attempts(),
+            "the disk pass should still try harder than a caption a person is waiting for"
+        );
+        assert!(
+            disk.params.max_attempts() < preset.max_attempts(),
+            "the whole ladder is six decodes of the same window"
+        );
         assert!(disk.timestamps);
     }
 
@@ -2790,7 +2821,11 @@ mod tests {
             "captions are untouched"
         );
         let disk = Decoding::for_job(JobKind::CatchUp, &preset, true);
-        assert_eq!(disk.params, preset, "the disk pass is untouched");
+        assert_eq!(
+            disk.params,
+            preset.catch_up(),
+            "the disk pass is untouched by the valve"
+        );
     }
 
     /// The queue counts what "behind" means: finished utterances waiting.

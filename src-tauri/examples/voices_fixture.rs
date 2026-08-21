@@ -630,6 +630,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let thresholds = sweep();
     // fixture size -> threshold -> score
     let mut table: Vec<(usize, Vec<(f32, Score)>)> = Vec::new();
+    // fixture size -> what the automatic count made of it
+    let mut automatic: Vec<(usize, Score, Option<echo_lib::diarize::cluster::CountChoice>)> =
+        Vec::new();
 
     for &n in &sizes {
         if pool.len() < n {
@@ -716,6 +719,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // What the app actually does now: the count read out of the shape of the
+        // merge tree, no threshold consulted. The sweep below is kept because it
+        // is what placed the bounds the criterion still uses, but *this* is the
+        // line that has to say `n`.
+        let auto = scanned.cut_for(None);
+        let auto_score = score(&auto.tracks, &turns, n);
+        automatic.push((n, auto_score, auto.choice.clone()));
+        println!(
+            "    automatic: {} people (of {n}), purity {:.3}, coverage {:.3}{}",
+            auto_score.found,
+            auto_score.purity,
+            auto_score.coverage,
+            match &auto.choice {
+                Some(c) => format!(
+                    ", silhouette {:.3}{}",
+                    c.silhouette,
+                    c.runner_up
+                        .map(|(k, s)| format!(" against {k} at {s:.3}"))
+                        .unwrap_or_default()
+                ),
+                None => String::new(),
+            }
+        );
+
         let mut row: Vec<(f32, Score)> = Vec::new();
         for &t in &thresholds {
             let cut = scanned.cut(t, None);
@@ -732,6 +759,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!();
     }
+
+    // --- what the app actually does ---------------------------------------
+    //
+    // The count comes out of the shape of the merge tree
+    // (`diarize::cluster::CountChoice`). It has to get every fixture right
+    // without being told anything, and it has to have room to spare while doing
+    // it — a criterion that only just wins is the failure this replaced.
+    println!("=== the automatic count, on fixtures whose answer is known ===");
+    println!(
+        "{:>7}{:>8}{:>9}{:>10}{:>12}{:>12}{:>8}{:>7}{:>8}   how the cut was reached",
+        "true", "found", "purity", "coverage", "silhouette", "runner-up", "margin", "cut", "folded"
+    );
+    let mut all_right = true;
+    for (n, s, choice) in &automatic {
+        let runner = choice.as_ref().and_then(|c| c.runner_up);
+        let silhouette = choice.as_ref().map_or(0.0, |c| c.silhouette);
+        let chosen = choice.as_ref().and_then(|c| c.chosen());
+        println!(
+            "{n:>7}{:>8}{:>9.3}{:>10.3}{:>12.3}{:>12}{:>8}{:>7}{:>8}   {}",
+            s.found,
+            s.purity,
+            s.coverage,
+            silhouette,
+            runner.map_or_else(|| "-".to_string(), |(k, v)| format!("{k} at {v:.3}")),
+            runner.map_or_else(|| "-".to_string(), |(_, v)| format!("{:.3}", silhouette - v)),
+            chosen.map_or_else(|| "-".to_string(), |c| c.cut_clusters.to_string()),
+            chosen.map_or_else(|| "-".to_string(), |c| c.folded.to_string()),
+            match chosen.map(|c| c.refusal) {
+                Some(None) => "the prior allowed it".to_string(),
+                Some(Some(why)) => format!("only the fallback left it: {why:?}"),
+                None => "no decision recorded".to_string(),
+            }
+        );
+        all_right &= s.found == *n && s.purity > 0.95;
+    }
+    if let Some((_, _, Some(c))) = automatic.first() {
+        println!();
+        println!(
+            "the largest relative gap on the {}-voice fixture: {}",
+            automatic[0].0,
+            c.gap_answer.as_ref().map_or_else(
+                || "-".to_string(),
+                |g| format!(
+                    "{:.3} at a cut into {} clusters, which folds to {} people",
+                    g.gap, g.cut_clusters, g.count
+                )
+            )
+        );
+    }
+    println!();
+    println!(
+        "{}",
+        if all_right {
+            "every fixture right, with no threshold consulted"
+        } else {
+            "the automatic count got a fixture wrong — that is a release blocker"
+        }
+    );
+    println!();
 
     // --- the sweep, as one table ------------------------------------------
     println!("=== how many people each threshold finds ===");
