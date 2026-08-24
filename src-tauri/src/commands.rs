@@ -124,6 +124,11 @@ impl From<diarize::DiarizeError> for UiError {
             D::NoVoiceSample => UiError::not_found(
                 "Echo hasn't got a clear moment of this person speaking on their own.",
             ),
+            // Not the same thing, and worth its own sentence: there is nothing
+            // to look through, rather than nothing clear enough in it. The
+            // first sends somebody hunting for a recording fault; this one
+            // says what is actually true of the row they clicked.
+            D::NoLines => UiError::not_found("None of this meeting's words are on this voice."),
             D::AudioForgotten => {
                 UiError::not_found("This meeting's recording is gone, so there's nothing to play.")
             }
@@ -921,10 +926,7 @@ pub async fn rename_person(
 /// still exists: that is what keeping the clips buys. Play it from a `blob:` URL,
 /// exactly like [`speaker_sample`].
 #[tauri::command]
-pub async fn person_sample_audio(
-    state: State<'_, AppState>,
-    person_id: Id,
-) -> CmdResult<String> {
+pub async fn person_sample_audio(state: State<'_, AppState>, person_id: Id) -> CmdResult<String> {
     check_id(&person_id)?;
     Ok(diarize::people::person_sample_audio(&state.db, &person_id).await?)
 }
@@ -951,13 +953,7 @@ pub async fn link_speaker_person(
     if let Some(person_id) = &person_id {
         check_id(person_id)?;
     }
-    diarize::people::link(
-        &state.db,
-        &meeting_id,
-        &speaker_id,
-        person_id.as_deref(),
-    )
-    .await?;
+    diarize::people::link(&state.db, &meeting_id, &speaker_id, person_id.as_deref()).await?;
     announce_people(&app, &state).await;
     announce_speakers(&state, &meeting_id).await;
     Ok(())
@@ -981,8 +977,7 @@ pub async fn enroll_speaker_as_person(
     check_id(&meeting_id)?;
     check_id(&speaker_id)?;
     let name = trim_limited(&name, 80, "A name")?;
-    let person =
-        diarize::people::enroll(&state.db, &meeting_id, &speaker_id, &name).await?;
+    let person = diarize::people::enroll(&state.db, &meeting_id, &speaker_id, &name).await?;
     announce_people(&app, &state).await;
     announce_speakers(&state, &meeting_id).await;
     Ok(person)
@@ -1050,6 +1045,10 @@ async fn announce_speakers(state: &AppState, meeting_id: &str) {
                 speakers,
                 people_count,
                 people_count_is_override: is_override,
+                // Announcing rows somebody just renamed or linked, not a fresh
+                // separation. Only the pass knows how many voices it heard.
+                voices_found: None,
+                alternative_count: None,
             },
         ));
 }

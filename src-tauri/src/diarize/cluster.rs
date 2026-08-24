@@ -13,7 +13,10 @@
 //!   calibration tools sweep. The app does not call it any more.
 //! * [`cluster_fixed`] is the same hierarchy cut at a count the person gave us
 //!   instead of at a distance. A number a human states is better evidence than
-//!   any threshold, so this path ignores the threshold entirely.
+//!   any threshold, so this path ignores the threshold entirely — but it reads
+//!   the tree the same way the automatic count does, because handing back the
+//!   `k` clusters that are furthest apart hands back noise (see
+//!   [`ForcedOutcome`]).
 //! * [`align_permutation`] lines up one window's local speaker labels with the
 //!   previous window's, using the audio the two windows share. Clustering owns
 //!   the final identity; alignment is what keeps a speaker who talks too little
@@ -28,7 +31,7 @@ use std::collections::HashMap;
 /// automatic count is now read out of the shape of the merge tree
 /// ([`CountChoice`]) and this number survives as three smaller things:
 ///
-/// * the pooling radius for a long meeting (half of it — see [`leaves`]),
+/// * the pooling radius for a long meeting (a third of it — see [`leaves`]),
 /// * the tie-break when two counts explain the fingerprints equally well,
 /// * and the number [`SPLIT_FLOOR`] and [`FUSE_CEILING`] are placed around.
 ///
@@ -178,8 +181,10 @@ pub const FUSE_CEILING: f32 = 0.75;
 /// speech before it will call somebody a person.
 ///
 /// A count the person states is not filtered by this at all: [`cluster_fixed`]
-/// folds nothing away, because somebody who says "morning" is still one of the
-/// four people in the room when a human has said there were four.
+/// folds at [`FORCED_FLOOR_MS`] instead, which is the flat absolute rule and
+/// far lower on any meeting past five minutes, because somebody who says
+/// "morning, sorry I'm late" is still one of the four people in the room when a
+/// human has said there were four.
 pub const MIN_CLUSTER_SHARE: f32 = 0.01;
 
 /// However long the meeting, a cluster holding this much speech is somebody.
@@ -206,9 +211,34 @@ pub fn fragment_bar(speech_ms: i64) -> i64 {
 pub const MAX_SPEAKERS: usize = 12;
 
 /// Above this many fingerprints, an exact all-pairs pass gets expensive, so
-/// near-identical fingerprints are pooled first at half the threshold. A
+/// near-identical fingerprints are pooled first at a third of the threshold. A
 /// two-hour meeting produces roughly 1,500.
 const MAX_EXACT_ITEMS: usize = 600;
+
+/// The pre-pass pools fingerprints within this fraction of
+/// [`DISTANCE_THRESHOLD`] ([`MAX_EXACT_ITEMS`] explains why it exists at all).
+///
+/// Half was the first value; it is now a third. The radius only bounds cost —
+/// it groups fingerprints the exact pass would certainly have merged anyway —
+/// but every fingerprint two distinct quiet voices share inside one pool is a
+/// separation the tree can never make later, and the pool phase is exactly
+/// where similar voices get flattened together. A third costs more leaves on
+/// long meetings and pre-merges less.
+const POOL_RADIUS_DIVISOR: f32 = 3.0;
+
+/// How tightly a small cluster's own fingerprints have to sit around its centre
+/// before it is spared fragment absorption.
+///
+/// One coherent voice's fingerprints agree with each other even when there are
+/// only a few seconds of it: a mean member-to-centroid cosine distance at or
+/// under this is one person talking, not door noise, however little of the
+/// meeting they had. Scattered noise — a cough, half a word over somebody,
+/// a chair — does not cohere, which is the difference this draws. The value
+/// sits under the within-voice spreads the calibration meetings showed and is
+/// deliberately generous: sparing a fragment costs one extra "Speaker N" chip a
+/// person can merge away; absorbing the quiet fourth person loses them from the
+/// meeting entirely, and nothing in the UI can bring a voice back.
+pub const COHERENT_SPREAD: f32 = 0.35;
 
 /// One fingerprint with the amount of speech behind it.
 #[derive(Debug, Clone, Default)]
@@ -307,15 +337,21 @@ pub fn cluster(items: &[ClusterItem], threshold: f32) -> Clustering {
     };
 
     // Above MAX_EXACT_ITEMS the leaves are pools rather than single
-    // fingerprints; the pre-pass groups at half the threshold, so it only ever
-    // groups fingerprints the exact pass would certainly have grouped anyway.
-    let mut nodes = leaves(items, &embeddings, threshold / 2.0);
+    // fingerprints; the pre-pass groups at a third of the threshold, so it only
+    // ever groups fingerprints the exact pass would certainly have grouped
+    // anyway.
+    let mut nodes = leaves(items, &embeddings, threshold / POOL_RADIUS_DIVISOR);
     merge_loop(&mut nodes, threshold, MAX_SPEAKERS);
     // The absolute fragment rule, which is the one this path has always had. The
     // automatic count uses the proportional one instead ([`fragment_bar`]); this
     // path keeps the old bar so the sweeps that measured
     // [`DISTANCE_THRESHOLD`] stay comparable with what they measured.
-    absorb_fragments(&mut nodes, MIN_CLUSTER_MS);
+    absorb_fragments(
+        &mut nodes,
+        MIN_CLUSTER_MS,
+        &embeddings,
+        items.len() > MAX_EXACT_ITEMS,
+    );
     finish(nodes, items.len(), threshold)
 }
 
@@ -378,63 +414,218 @@ fn pool(items: &[ClusterItem], embeddings: &[Vec<f32>], radius: f32) -> Vec<Node
     pools
 }
 
-/// The same hierarchy, cut at exactly `k` clusters instead of at a distance.
+/// Speech a cluster has to hold before a count the person gave us will call it
+/// a person.
+///
+/// [`MIN_CLUSTER_MS`], the absolute fragment rule this module has always had —
+/// deliberately *not* [`fragment_bar`], which asks a long meeting for up to
+/// thirty seconds and would throw away the quiet fourth person a human has just
+/// told Echo was there. Three seconds is roughly "morning, sorry I'm late,
+/// carry on": somebody who says that much is one of the four people in the room
+/// when a human has said there were four.
+///
+/// **It has to be above [`MIN_EMBED_MS`](super::embedding::MIN_EMBED_MS), and
+/// that is the whole reason this is not 700 ms.** The first version of this bar
+/// was [`sample::MIN_CLIP_MS`](super::sample::MIN_CLIP_MS) — the length below
+/// which there is no clip to play back — which reads well and does nothing: a
+/// fingerprint is only ever computed from a second or more of one voice alone
+/// ([`worth_embedding`](super::embedding::worth_embedding)), so no cluster this
+/// path can ever see holds less than a second, and a 700 ms bar folds nothing.
+/// The assertion below is what keeps that from happening again silently.
+///
+/// So this asks for three of the shortest fingerprints Echo will take, or one
+/// good stretch of somebody talking. What it stops is the shape that produced
+/// the empty rows on the meeting of 2026-08-24: a single stray window — a door,
+/// a cough, half a word over the top of somebody — handed back as one of the
+/// people in the room. What it does **not** promise is a clip: this counts a
+/// cluster's speech across the whole meeting, and three seconds spread over
+/// three windows still need not contain one contiguous
+/// [`MIN_CLIP_MS`](super::sample::MIN_CLIP_MS) stretch for enrolment to cut.
+/// The row a voice like that would get is stopped downstream instead, by
+/// [`persist`](super::pipeline)'s rule that a voice winning no line of
+/// transcript gets no row at all.
+pub const FORCED_FLOOR_MS: i64 = MIN_CLUSTER_MS;
+
+const _: () = assert!(
+    FORCED_FLOOR_MS > super::embedding::MIN_EMBED_MS,
+    "a floor at or below the shortest fingerprint folds nothing at all"
+);
+const _: () = assert!(
+    FORCED_FLOOR_MS <= super::embedding::MAX_EMBED_MS,
+    "a floor above one window's worth of speech folds away quiet people"
+);
+
+/// What a count the person gave us actually came back with.
+///
+/// `asked` and `got` differ exactly when the meeting does not hold that many
+/// separable voices, and that difference is the thing the rest of Echo has to
+/// say out loud rather than paper over with empty speaker rows.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ForcedOutcome {
+    /// Voices the caller asked this cut for, after clamping.
+    pub asked: usize,
+    /// Voices it could actually hand back, every one of them holding real
+    /// speech.
+    pub got: usize,
+    /// Height the hierarchy was cut at to get there.
+    pub cut_at: f32,
+    /// Speech behind each surviving voice, largest first.
+    pub mass_ms: Vec<i64>,
+    /// Weighted mean silhouette of the cut that won — the same score the
+    /// automatic path ranks candidates by ([`CountChoice`]).
+    pub silhouette: f32,
+}
+
+impl ForcedOutcome {
+    /// True when the meeting did not hold as many voices as it was asked for.
+    pub fn short(&self) -> bool {
+        self.got < self.asked
+    }
+}
+
+/// The same hierarchy, cut at the count the person gave us instead of at a
+/// distance.
 ///
 /// This is what an override runs: the person has told Echo how many people were
 /// in the meeting, and a number a human states about a conversation they were in
 /// beats any threshold measured on somebody else's corpus. So the calibrated
-/// distance is not consulted at all — the closest pair keeps merging until `k`
-/// are left, however near or far the last merge was.
+/// distance is not consulted at all.
 ///
-/// Two things this deliberately does *not* do, both because they would quietly
-/// overrule the person:
+/// # Why this is not just "merge until `k` are left"
 ///
-/// * **No fragment absorption.** [`absorb_fragments`] exists to stop a sliver of
-///   speech becoming a "Speaker 5" nobody asked for. Here somebody *did* ask:
-///   a person who only says "morning" is still one of the four people in the
-///   room, and folding them away would hand back three.
-/// * **No ceiling below `k`.** `k` is clamped into `1..=`[`MAX_SPEAKERS`] by the
-///   caller and again here, and nothing else shrinks it.
+/// It was, until the meeting of 2026-08-24. Cutting the ladder at exactly `k`
+/// takes the `k` clusters that are furthest apart, and on real audio those are
+/// not the `k` people: a 35-minute recording asked for four voices came back as
+/// [voice A][voice B][one stray window][one stray window], because those
+/// windows — a door, a cough, half a word over the top of somebody — sit
+/// further from everything than the two people sit from each other. Two rows
+/// then won every line between them and two rows got nothing at all, and the
+/// person met those two ghosts in the enrolment dialog, which could only tell
+/// them there was no clear moment of a voice that had never spoken.
 ///
-/// Honest about not being able to deliver: with fewer fingerprints than `k`
-/// there is no way to show `k` distinct voices, so it returns as many as it
-/// actually has rather than inventing the rest.
-pub fn cluster_fixed(items: &[ClusterItem], k: usize) -> Clustering {
-    let k = k.clamp(1, MAX_SPEAKERS);
+/// So this reads the tree the way [`cluster_auto`] does. The hierarchy is
+/// recorded once; every cut height is replayed, fragments under
+/// [`FORCED_FLOOR_MS`] are handed to whoever they resemble, and the count is
+/// read *after* that folding. Among the cuts that fold to exactly `k` people the
+/// best-explained one wins (weighted mean silhouette, the criterion
+/// [`CountChoice`] documents). The difference from the automatic path is the
+/// bar and the ranking, not the machinery: a flat three seconds rather than up
+/// to thirty, and "does this cut give the person the number they stated" ahead
+/// of "how many people does the tree suggest".
+///
+/// # When it cannot deliver
+///
+/// It says so, in [`ForcedOutcome::got`], and hands back the largest number of
+/// real voices it could reach instead. Inventing the rest is what produced the
+/// empty rows; refusing to answer at all would throw away the two voices it did
+/// separate. `k` is clamped into `1..=`[`MAX_SPEAKERS`] by the caller and again
+/// here.
+pub fn cluster_fixed(items: &[ClusterItem], k: usize) -> (Clustering, ForcedOutcome) {
+    let asked = k.clamp(1, MAX_SPEAKERS);
     if items.is_empty() {
-        return Clustering {
-            labels: Vec::new(),
-            cluster_count: 0,
-            threshold: 0.0,
-        };
+        return (
+            Clustering {
+                labels: Vec::new(),
+                cluster_count: 0,
+                threshold: 0.0,
+            },
+            ForcedOutcome {
+                asked,
+                ..Default::default()
+            },
+        );
     }
 
     let Some(embeddings) = normalised(items) else {
         // Nothing usable to measure with: one speaker rather than a crash, the
-        // same answer `cluster` gives.
-        return Clustering {
-            labels: vec![0; items.len()],
-            cluster_count: 1,
-            threshold: 0.0,
-        };
+        // same answer every other path here gives.
+        return (
+            Clustering {
+                labels: vec![0; items.len()],
+                cluster_count: 1,
+                threshold: 0.0,
+            },
+            ForcedOutcome {
+                asked,
+                got: 1,
+                mass_ms: vec![items.iter().map(|i| i.weight_ms.max(0)).sum()],
+                ..Default::default()
+            },
+        );
     };
 
-    // Fewer voices to hand out than the person asked for: give back what exists.
-    if items.len() <= k {
-        return Clustering {
-            labels: (0..items.len()).collect(),
-            cluster_count: items.len(),
-            threshold: 0.0,
+    // Same pre-pass as the automatic path, and for the same reason: an exact
+    // all-pairs loop over a two-hour meeting is expensive. Pooling at a third
+    // of the calibrated distance only ever groups fingerprints the exact pass
+    // would certainly have grouped, so it cannot change where the cut lands.
+    let leaf_nodes = leaves(items, &embeddings, DISTANCE_THRESHOLD / POOL_RADIUS_DIVISOR);
+    let mut working = leaf_nodes.clone();
+    let merges = record_merges(&mut working);
+    drop(working);
+
+    let weights: Vec<i64> = items.iter().map(|i| i.weight_ms.max(0)).collect();
+
+    // Best is "as close to `asked` as this meeting can get, and among the cuts
+    // that get there, the one that explains the fingerprints best". A cut
+    // folding to more people than were asked for is not a candidate at all —
+    // the person said how many there were.
+    let pooled = items.len() > MAX_EXACT_ITEMS;
+    let mut best: Option<(Vec<Node>, f32, usize, f32)> = None;
+    for cut_clusters in 1..=CUT_HEIGHTS.min(leaf_nodes.len()) {
+        let mut nodes = leaf_nodes.clone();
+        let cut_at = replay(&mut nodes, &merges, cut_clusters);
+        absorb_fragments(&mut nodes, FORCED_FLOOR_MS, &embeddings, pooled);
+        let (labels, count) = labels_of(&nodes, items.len());
+        if count > asked {
+            continue;
+        }
+        let score = silhouette(&embeddings, &weights, &labels, count);
+        let better = match &best {
+            None => true,
+            Some((_, _, best_count, best_score)) => {
+                count > *best_count || (count == *best_count && score > *best_score)
+            }
         };
+        if better {
+            best = Some((nodes, cut_at, count, score));
+        }
     }
 
-    // Same pre-pass as the automatic path, and for the same reason: an exact
-    // all-pairs loop over a two-hour meeting is expensive. Pooling at half the
-    // calibrated distance only ever groups fingerprints the exact pass would
-    // certainly have grouped, so it cannot change where the cut lands.
-    let mut nodes = leaves(items, &embeddings, DISTANCE_THRESHOLD / 2.0);
-    let cut = merge_to_k(&mut nodes, k);
-    finish(nodes, items.len(), cut)
+    // The loop always has the whole-tree cut to fall back on (one cluster,
+    // which is never more than `asked`), so `None` here is unreachable; answer
+    // it the way every other unusable input is answered rather than panicking.
+    let Some((nodes, cut_at, got, silhouette)) = best else {
+        return (
+            Clustering {
+                labels: vec![0; items.len()],
+                cluster_count: 1,
+                threshold: 0.0,
+            },
+            ForcedOutcome {
+                asked,
+                got: 1,
+                ..Default::default()
+            },
+        );
+    };
+
+    let mut mass_ms: Vec<i64> = nodes
+        .iter()
+        .filter(|node| node.alive)
+        .map(|node| node.weight_ms)
+        .collect();
+    mass_ms.sort_unstable_by(|a, b| b.cmp(a));
+
+    (
+        finish(nodes, items.len(), cut_at),
+        ForcedOutcome {
+            asked,
+            got,
+            cut_at,
+            mass_ms,
+            silhouette,
+        },
+    )
 }
 
 // ===========================================================================
@@ -494,6 +685,14 @@ pub struct Candidate {
     /// Height of the merge the cut refuses — how far apart the two nearest
     /// clusters still are. `0.0` for the whole tree merged into one.
     pub refused: f32,
+    /// How far apart the two nearest **surviving** clusters are once fragments
+    /// have been handed away — the question [`SPLIT_FLOOR`] is really about.
+    ///
+    /// `refused` above is measured on the raw ladder, where the next merge can
+    /// be two fragments that folding removes anyway; a sliver pair sitting close
+    /// together used to veto a cut whose actual people were far apart. `0.0`
+    /// when fewer than two clusters survive.
+    pub split_gap: f32,
     /// `refused / accepted`, the relative gap in the ladder at this rung. Kept
     /// because it is the first thing anybody looks for, and because on the real
     /// meeting it is the column that gets the answer *wrong* — see
@@ -675,6 +874,31 @@ impl CountChoice {
 /// distance is a better tie-break than noise is.
 pub const SILHOUETTE_TIE: f32 = 0.01;
 
+/// The one way a count refused as [`Refusal::OneVoice`] can still win: it has to
+/// beat every allowed count by at least this much silhouette.
+///
+/// The floor exists because a silhouette will happily score a split of one blob;
+/// but when every allowed answer scores *negatively* — every fingerprint is on
+/// average nearer some other voice than its own — the allowed set has nothing
+/// worth protecting and the evidence for the refused count is decisive rather
+/// than lucky. A margin this wide does not happen on a split blob.
+pub const DECISIVE_MARGIN: f32 = 0.05;
+
+/// ...and the pair that count insists on separating still has to sit at least
+/// this far apart.
+///
+/// Below [`SPLIT_FLOOR`], but above the worst within-voice spread the fixtures
+/// and the real meeting showed inside a single synthetic voice's own merges.
+/// A pair between the two numbers is where "one voice" and "two similar voices"
+/// genuinely blur, and that is exactly the case the decisive-margin test above
+/// exists to arbitrate.
+pub const SOFT_SPLIT_FLOOR: f32 = 0.42;
+
+const _: () = assert!(
+    SOFT_SPLIT_FLOOR < SPLIT_FLOOR,
+    "the soft floor must sit under the hard one or it refuses nothing"
+);
+
 /// How many cut heights to weigh, as a multiple of [`MAX_SPEAKERS`].
 ///
 /// Not one per person: fragments take cluster slots, and on the real meeting the
@@ -724,7 +948,7 @@ pub fn cluster_auto(items: &[ClusterItem]) -> (Clustering, CountChoice) {
     // the way down to one cluster costs no more than the old loop did: it stopped
     // a handful of merges short of this, and those last merges are the cheap ones
     // — a pair search over a handful of clusters.
-    let leaf_nodes = leaves(items, &embeddings, DISTANCE_THRESHOLD / 2.0);
+    let leaf_nodes = leaves(items, &embeddings, DISTANCE_THRESHOLD / POOL_RADIUS_DIVISOR);
     let mut working = leaf_nodes.clone();
     let merges = record_merges(&mut working);
     drop(working);
@@ -740,7 +964,7 @@ pub fn cluster_auto(items: &[ClusterItem]) -> (Clustering, CountChoice) {
     // hand the fragments away exactly as the candidate that won was scored with.
     let mut nodes = leaf_nodes;
     let cut_at = replay(&mut nodes, &merges, cut_clusters);
-    absorb_fragments(&mut nodes, bar);
+    absorb_fragments(&mut nodes, bar, &embeddings, items.len() > MAX_EXACT_ITEMS);
 
     (
         finish(nodes, items.len(), cut_at),
@@ -831,6 +1055,10 @@ fn weigh_counts(
     // How many clusters the ceiling insists on: enough that the merge which
     // would fuse two people is not one of the merges accepted.
     let forced = ceiling_breach(merges, leaves, bar).map_or(0, |at| n - at);
+    // Coherence sparing is an exact-pass luxury: pooled leaves are cost
+    // artefacts spanning many windows, not anyone's voice, and sparing them
+    // would turn pooling artefacts into people.
+    let pooled = items.len() > MAX_EXACT_ITEMS;
 
     let mut out: Vec<Candidate> = Vec::new();
     let mut widest: Option<Candidate> = None;
@@ -841,7 +1069,7 @@ fn weigh_counts(
 
         let mut nodes = leaves.to_vec();
         replay(&mut nodes, merges, cut_clusters);
-        absorb_fragments(&mut nodes, bar);
+        absorb_fragments(&mut nodes, bar, embeddings, pooled);
         let (labels, count) = labels_of(&nodes, items.len());
         let mut mass_ms: Vec<i64> = nodes
             .iter()
@@ -850,9 +1078,20 @@ fn weigh_counts(
             .collect();
         mass_ms.sort_unstable_by(|a, b| b.cmp(a));
 
+        // The floor question, asked about what the cut actually claims: the
+        // closest pair among the clusters that survive folding. Measured on the
+        // raw ladder (`refused` above) the answer can be a fragment pair that
+        // this very cut's own folding removes, which is how a cut whose people
+        // sit far apart got refused for the closeness of two bits of noise.
+        let split_gap = if count > 1 {
+            closest_pair(&nodes).map_or(0.0, |(_, _, d)| d)
+        } else {
+            0.0
+        };
+
         let refusal = if count > MAX_SPEAKERS {
             Some(Refusal::TooMany)
-        } else if cut_clusters > 1 && refused < SPLIT_FLOOR {
+        } else if count > 1 && split_gap < SPLIT_FLOOR {
             Some(Refusal::OneVoice)
         } else if cut_clusters < forced && count < MAX_SPEAKERS {
             // The `count < MAX_SPEAKERS` half is what stops the ceiling refusing
@@ -872,6 +1111,7 @@ fn weigh_counts(
             folded: cut_clusters.saturating_sub(count),
             accepted,
             refused,
+            split_gap,
             gap: if accepted > 1e-6 {
                 refused / accepted
             } else {
@@ -980,14 +1220,30 @@ fn silhouette(embeddings: &[Vec<f32>], weights: &[i64], labels: &[usize], count:
 /// Ties inside [`SILHOUETTE_TIE`] go to the cut nearest the old shipped distance,
 /// then to the larger count. See [`CountChoice`].
 ///
-/// When the prior refuses every cut — which takes a tree where every cut either
-/// needs more people than Echo shows or splits a pair too close to be two — the
-/// best-explained cut wins anyway. A bound is there to keep a criterion honest,
-/// not to leave it with nothing to say.
+/// A [`Refusal::OneVoice`] count wins anyway when it satisfies
+/// [`decisive_refusal`] — the one crack in the floor, and a narrow one. When the
+/// prior refuses *every* cut, the best-explained cut wins as it always did. A
+/// bound is there to keep a criterion honest, not to leave it with nothing to
+/// say.
 fn pick(candidates: &[Candidate]) -> (Option<&Candidate>, Option<(usize, f32)>) {
     let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.allowed()).collect();
+    let rescued = decisive_refusal(
+        candidates,
+        ranked
+            .iter()
+            .copied()
+            .max_by(|x, y| x.silhouette.total_cmp(&y.silhouette)),
+    );
     if ranked.is_empty() {
         ranked = candidates.iter().collect();
+    }
+    if let Some(winner) = rescued {
+        let runner_up = candidates
+            .iter()
+            .filter(|c| Some(c.count) != Some(winner.count))
+            .max_by(|x, y| x.silhouette.total_cmp(&y.silhouette))
+            .map(|c| (c.count, c.silhouette));
+        return (Some(winner), runner_up);
     }
     ranked.sort_by(|x, y| {
         if (x.silhouette - y.silhouette).abs() < SILHOUETTE_TIE {
@@ -1005,6 +1261,33 @@ fn pick(candidates: &[Candidate]) -> (Option<&Candidate>, Option<(usize, f32)>) 
         .max_by(|x, y| x.silhouette.total_cmp(&y.silhouette))
         .map(|c| (c.count, c.silhouette));
     (winner, runner_up)
+}
+
+/// The one way a [`Refusal::OneVoice`] count may still win: every allowed count
+/// explains the fingerprints negatively, and this one beats them all by at least
+/// [`DECISIVE_MARGIN`] while the pair it insists on separating sits above
+/// [`SOFT_SPLIT_FLOOR`].
+///
+/// A negative silhouette means every fingerprint is on average nearer some other
+/// voice than the voice it was given — the allowed set is arguing for cuts that
+/// fit nobody. That is evidence, not noise, and it is the situation the hard
+/// floor was never measured against: the floor guards against a silhouette that
+/// scores a lucky split of one blob, not against an allowed set that fits
+/// nothing at all.
+fn decisive_refusal<'a>(
+    candidates: &'a [Candidate],
+    best_allowed: Option<&'a Candidate>,
+) -> Option<&'a Candidate> {
+    let best_allowed = best_allowed?;
+    if best_allowed.silhouette >= 0.0 {
+        return None;
+    }
+    candidates
+        .iter()
+        .filter(|c| c.refusal == Some(Refusal::OneVoice))
+        .filter(|c| c.split_gap >= SOFT_SPLIT_FLOOR)
+        .filter(|c| c.silhouette >= best_allowed.silhouette + DECISIVE_MARGIN)
+        .max_by(|x, y| x.silhouette.total_cmp(&y.silhouette))
 }
 
 fn alive_count(nodes: &[Node]) -> usize {
@@ -1063,31 +1346,43 @@ fn merge_loop(nodes: &mut [Node], threshold: f32, max_clusters: usize) {
     }
 }
 
-/// Merge the closest pair over and over until exactly `k` clusters are left,
-/// however far apart they end up being.
-///
-/// Returns the distance of the last merge — the height the dendrogram was cut
-/// at, which is the useful diagnostic here in place of a threshold. `0.0` when
-/// nothing had to be merged at all.
-fn merge_to_k(nodes: &mut [Node], k: usize) -> f32 {
-    let mut cut = 0.0f32;
-    while alive_count(nodes) > k {
-        let Some((a, b, d)) = closest_pair(nodes) else {
-            break;
-        };
-        cut = d;
-        fold(nodes, a, b);
-    }
-    cut
-}
-
 /// Hand every cluster holding less than `min_ms` of speech to the cluster it
-/// most resembles.
+/// most resembles — unless it is a coherent small voice, which stays.
 ///
-/// `min_ms` is [`MIN_CLUSTER_MS`] for a cut at a distance, and [`fragment_bar`]
-/// for the automatic count — a fragment is a fragment in proportion to the
-/// meeting it is in, and the real failure had ten of them.
-fn absorb_fragments(nodes: &mut [Node], min_ms: i64) {
+/// `min_ms` is [`MIN_CLUSTER_MS`] for a cut at a distance, [`fragment_bar`] for
+/// the automatic count — a fragment is a fragment in proportion to the meeting
+/// it is in, and the real failure had ten of them — and [`FORCED_FLOOR_MS`] for
+/// a count the person gave us, which folds away only a stray window or two.
+///
+/// # The quiet fourth person
+///
+/// A proportional bar asks a half-hour meeting for nineteen seconds of speech
+/// before it calls somebody a person, and plenty of real people in real
+/// meetings say less than that. So when `min_ms` is above [`MIN_CLUSTER_MS`]
+/// (the proportional paths) a cluster holding at least [`MIN_CLUSTER_MS`] of
+/// speech whose own fingerprints cohere around their centre within
+/// [`COHERENT_SPREAD`] is spared: it is somebody talking, not noise. Scattered
+/// noise does not cohere, which is the whole distinction. The absolute-bar and
+/// forced-count paths fold exactly as they always did — their bars are already
+/// at or below what sparing would protect — and the pooled paths skip sparing
+/// entirely, because a pool is a cost artefact spanning many windows rather
+/// than anybody's voice.
+///
+/// # Which cluster a fragment goes to
+///
+/// The nearest one, whether or not that cluster is a person yet: fragments
+/// resolve outward, smallest first, so two halves of one quiet voice a fine cut
+/// split apart find each other and come back as the person they are instead of
+/// being parcelled out to whoever was talking either side of them. A heap of
+/// unrelated strays can pile up the same way and clear the bar together — but
+/// only the same way the merge ladder itself would have grouped them one rung
+/// lower, and the rung is what the caller is choosing between. What stops a
+/// heap like that from reaching anybody is the rule at the end of the pass:
+/// a voice that wins no line of transcript gets no row.
+fn absorb_fragments(nodes: &mut [Node], min_ms: i64, embeddings: &[Vec<f32>], pooled: bool) {
+    // Sparing applies only where the bar can exceed what sparing protects; see
+    // the module comment above.
+    let sparing = min_ms > MIN_CLUSTER_MS && !pooled;
     loop {
         let alive: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].alive).collect();
         if alive.len() < 2 {
@@ -1097,6 +1392,7 @@ fn absorb_fragments(nodes: &mut [Node], min_ms: i64) {
         let Some(&small) = alive
             .iter()
             .filter(|&&i| nodes[i].weight_ms < min_ms)
+            .filter(|&&i| !(sparing && is_coherent_voice(&nodes[i], embeddings)))
             .min_by_key(|&&i| nodes[i].weight_ms)
         else {
             return;
@@ -1127,6 +1423,26 @@ fn absorb_fragments(nodes: &mut [Node], min_ms: i64) {
         h.members.extend(members);
         h.recentre();
     }
+}
+
+/// Is this small cluster a quiet person rather than a bit of noise?
+///
+/// It is, when it holds at least [`MIN_CLUSTER_MS`] of speech (a bar below that
+/// protects nothing — everything under it is already foldable) and its own
+/// fingerprints cohere around their centre within [`COHERENT_SPREAD`]. One
+/// voice agreeing with itself is the signature of somebody talking; noise does
+/// not agree with anything.
+fn is_coherent_voice(node: &Node, embeddings: &[Vec<f32>]) -> bool {
+    if node.weight_ms < MIN_CLUSTER_MS || node.members.is_empty() {
+        return false;
+    }
+    let total: f64 = node
+        .members
+        .iter()
+        .map(|&m| cosine_distance(&embeddings[m], &node.centroid) as f64)
+        .sum();
+    let mean = (total / node.members.len() as f64) as f32;
+    mean <= COHERENT_SPREAD
 }
 
 /// One label per item, numbered in the order the surviving clusters come, and
@@ -1423,11 +1739,22 @@ mod tests {
         assert_eq!(cluster(&four_voices(), DISTANCE_THRESHOLD).cluster_count, 4);
     }
 
+    /// Speech behind each cluster of a forced cut, so a test can say "every
+    /// voice this handed back is somebody" without reaching into the nodes.
+    fn cluster_mass(items: &[ClusterItem], c: &Clustering) -> Vec<i64> {
+        let mut mass = vec![0i64; c.cluster_count];
+        for (i, label) in c.labels.iter().enumerate() {
+            mass[*label] += items[i].weight_ms.max(0);
+        }
+        mass
+    }
+
     #[test]
     fn asked_for_two_it_gives_exactly_two() {
         let items = four_voices();
-        let c = cluster_fixed(&items, 2);
+        let (c, outcome) = cluster_fixed(&items, 2);
         assert_eq!(c.cluster_count, 2, "labels {:?}", c.labels);
+        assert_eq!((outcome.asked, outcome.got), (2, 2));
         assert_eq!(c.labels.len(), items.len());
         assert!(c.labels.iter().all(|l| *l < 2));
         // Fusing happens between whole voices, never inside one: each group of
@@ -1441,13 +1768,30 @@ mod tests {
         }
     }
 
+    /// **Contract changed on 2026-08-24, deliberately.** This used to assert
+    /// nothing but the number six, and that assertion is the bug: cutting the
+    /// ladder at exactly six hands back the six clusters that are furthest
+    /// apart, which on a real recording means two people and four slivers of
+    /// door noise. Six is still the right answer *here* — every one of these
+    /// fingerprints is four seconds of real speech, so splitting a voice in two
+    /// leaves two halves anybody could listen to — and that is now what the test
+    /// says. The meeting where six is not available is
+    /// `a_count_no_meeting_can_deliver_comes_back_short` below.
     #[test]
-    fn asked_for_six_it_gives_exactly_six() {
+    fn asked_for_six_it_gives_six_because_every_one_of_them_is_somebody() {
         let items = four_voices();
-        let c = cluster_fixed(&items, 6);
+        let (c, outcome) = cluster_fixed(&items, 6);
         assert_eq!(c.cluster_count, 6, "labels {:?}", c.labels);
+        assert_eq!((outcome.asked, outcome.got), (6, 6));
         assert_eq!(c.labels.len(), items.len());
         assert!(c.labels.iter().all(|l| *l < 6));
+        assert!(
+            cluster_mass(&items, &c)
+                .iter()
+                .all(|m| *m >= FORCED_FLOOR_MS),
+            "a voice nobody could listen to was handed back: {:?}",
+            cluster_mass(&items, &c)
+        );
     }
 
     /// The whole point of this path: the calibrated distance does not get a vote.
@@ -1455,70 +1799,256 @@ mod tests {
     fn the_calibrated_threshold_does_not_override_the_count() {
         let items = four_voices();
         for k in 1..=8 {
-            let c = cluster_fixed(&items, k);
+            let (c, outcome) = cluster_fixed(&items, k);
             assert_eq!(c.cluster_count, k, "asked for {k}, got {}", c.cluster_count);
+            assert_eq!(outcome.got, k);
         }
     }
 
-    /// A sliver of speech is a person too, when somebody has said so. The
-    /// automatic path folds it away; this one must not.
+    /// **Contract changed on 2026-08-24, deliberately.** The old version of this
+    /// test asserted that a single stray window becomes a person when the count
+    /// asks for one, and that promise is exactly what produced the empty rows:
+    /// the stray takes a cluster slot, wins no transcript line, and the person
+    /// meets it in the enrolment dialog as a voice with no clear moment.
+    ///
+    /// The promise it replaces keeps the half that was true — somebody who says
+    /// "morning, sorry I'm late" is still one of the people in the room — at
+    /// [`FORCED_FLOOR_MS`]: five seconds of a third voice is a person, and one
+    /// stray second of anything is not. When the stray is all there is, the
+    /// count comes back short rather than made up.
+    ///
+    /// Both weights here are ones the pass can really produce: a fingerprint is
+    /// computed from between [`MIN_EMBED_MS`](super::super::embedding::MIN_EMBED_MS)
+    /// and [`MAX_EMBED_MS`](super::super::embedding::MAX_EMBED_MS) of one voice
+    /// alone, so a cluster of one window holds at least a second, and the bar
+    /// has to sit above that to fold anything at all.
     #[test]
-    fn a_short_speaker_is_kept_when_the_count_asks_for_them() {
+    fn five_seconds_of_a_voice_is_a_person_but_one_stray_second_is_not() {
         let dim = 32;
-        let mut items = vec![
-            item(voice(dim, 2, 0), 20_000),
-            item(voice(dim, 2, 1), 20_000),
-            item(voice(dim, 25, 0), 20_000),
-        ];
-        let mut sliver = vec![0.0f32; dim];
-        sliver[2] = 0.2;
-        sliver[15] = 0.7;
-        sliver[16] = 0.7;
-        l2_normalize(&mut sliver);
-        items.push(item(sliver, 300));
+        // One fingerprint per voice on purpose. A voice fingerprinted twice can
+        // be cut in half to make a count up — this path is allowed to do that,
+        // and `the_calibrated_threshold_does_not_override_the_count` above
+        // requires it — which would hide what this test is about.
+        let two_voices = || {
+            vec![
+                item(voice(dim, 2, 0), 20_000),
+                item(voice(dim, 25, 0), 20_000),
+            ]
+        };
+        // Far from both voices, leaning towards the first — a cough, a door, or
+        // somebody saying one word over the top of the meeting.
+        let stranger = || {
+            let mut v = vec![0.0f32; dim];
+            v[2] = 0.2;
+            v[15] = 0.7;
+            v[16] = 0.7;
+            l2_normalize(&mut v);
+            v
+        };
 
-        // Left to itself the sliver is absorbed and two people come out.
-        assert_eq!(cluster(&items, DISTANCE_THRESHOLD).cluster_count, 2);
-        // Asked for three, the sliver stays a person of its own.
-        let c = cluster_fixed(&items, 3);
+        // Five seconds of them: a person, and asked-for-three delivers three.
+        let mut spoke = two_voices();
+        spoke.push(item(stranger(), 5_000));
+        let (c, outcome) = cluster_fixed(&spoke, 3);
         assert_eq!(c.cluster_count, 3, "labels {:?}", c.labels);
+        assert_eq!(outcome.got, 3);
         assert_ne!(
-            c.labels[3], c.labels[0],
+            c.labels[2], c.labels[0],
             "the short speaker was folded away anyway"
         );
+
+        // One window of them, the shortest a fingerprint is ever made from: not
+        // a person. Two real voices come back, and the shortfall is reported
+        // rather than filled with a row nobody can hear.
+        let mut sliver = two_voices();
+        sliver.push(item(stranger(), super::super::embedding::MIN_EMBED_MS));
+        assert_eq!(cluster(&sliver, DISTANCE_THRESHOLD).cluster_count, 2);
+        let (c, outcome) = cluster_fixed(&sliver, 3);
+        assert_eq!(c.cluster_count, 2, "labels {:?}", c.labels);
+        assert_eq!((outcome.asked, outcome.got), (3, 2));
+        assert!(outcome.short());
+        assert!(
+            cluster_mass(&sliver, &c)
+                .iter()
+                .all(|m| *m >= FORCED_FLOOR_MS),
+            "a voice nobody could listen to was handed back"
+        );
+    }
+
+    /// The shape of the meeting of 2026-08-24, in miniature: two voices holding
+    /// the whole conversation between them, and a tail of strays that sit
+    /// further from everything than the two people sit from each other. Asked
+    /// for four, the old cut answered [voice][voice][stray][stray] and two of
+    /// those four rows never got a single line of transcript.
+    ///
+    /// One fingerprint per voice, for the reason given in the test above: the
+    /// point here is a meeting with no third and fourth voice in it at all.
+    ///
+    /// Every weight is one the pass can really produce — one window each, at
+    /// [`MIN_EMBED_MS`](super::super::embedding::MIN_EMBED_MS) — which is the
+    /// point: a bar that only folds things shorter than a fingerprint folds
+    /// nothing on a real meeting.
+    #[test]
+    fn a_count_no_meeting_can_deliver_comes_back_short() {
+        let dim = 64;
+        let mut items = vec![
+            item(voice(dim, 1, 0), 60_000),
+            item(voice(dim, 9, 0), 45_000),
+        ];
+        // The tail: five outliers, one window of speech each, none of them
+        // anybody. Each leans slightly towards one of the two voices — a cough
+        // is a cough in somebody's room — which is what the real tail did.
+        for (n, id) in [20usize, 26, 32, 38, 44].into_iter().enumerate() {
+            let towards = if n % 2 == 0 { 1 } else { 9 };
+            let mut v = vec![0.0f32; dim];
+            v[id] = 1.0;
+            v[towards] = 0.4;
+            l2_normalize(&mut v);
+            items.push(item(v, super::super::embedding::MIN_EMBED_MS));
+        }
+
+        let (c, outcome) = cluster_fixed(&items, 4);
+        assert_eq!(outcome.asked, 4);
+        assert_eq!(
+            outcome.got, 2,
+            "the strays were handed back as people again: masses {:?}",
+            outcome.mass_ms
+        );
+        assert_eq!(c.cluster_count, 2);
+        assert!(outcome.short());
+        assert!(
+            outcome.mass_ms.iter().all(|m| *m >= FORCED_FLOOR_MS),
+            "masses {:?}",
+            outcome.mass_ms
+        );
+        // Every fingerprint still belongs somewhere: the strays were handed to
+        // whoever they resemble, not dropped on the floor.
+        assert_eq!(c.labels.len(), items.len());
+        assert!(c.labels.iter().all(|l| *l < c.cluster_count));
+    }
+
+    /// The limit of what the bar can do, written down so nobody reads more into
+    /// it than it says.
+    ///
+    /// Strays that resemble each other more than they resemble either person
+    /// come back as a third voice: the merge ladder groups them one rung below
+    /// the cut, so they arrive at the fold already over the bar and there is
+    /// nothing left to fold. That is the forced path doing what it is for — the
+    /// person said there were four, and this is the closest the recording gets —
+    /// and it is only safe because the cluster still has to win a line of
+    /// transcript before anybody meets it as a speaker row
+    /// ([`persist`](super::super::pipeline)). The bar's job is the other shape:
+    /// a stray that resembles *nobody*, including the other strays.
+    #[test]
+    fn strays_that_resemble_each_other_come_back_as_one_more_voice() {
+        let dim = 64;
+        let mut items = vec![
+            item(voice(dim, 1, 0), 60_000),
+            item(voice(dim, 9, 0), 45_000),
+        ];
+        // Each stray has a direction of its own plus a shared component, which
+        // puts them nearer each other than either voice — near enough that the
+        // nearest-cluster rule alone pours them together, far enough apart
+        // (0.77) that no two of them are the same voice.
+        for id in [20usize, 26, 32, 38, 44] {
+            let mut v = vec![0.0f32; dim];
+            v[id] = 1.0;
+            v[50] = 0.55;
+            l2_normalize(&mut v);
+            items.push(item(v, super::super::embedding::MIN_EMBED_MS));
+        }
+        let strays = &items[2..];
+        for (i, a) in strays.iter().enumerate() {
+            for b in strays.iter().skip(i + 1) {
+                assert!(
+                    cosine_distance(&a.embedding, &b.embedding) > SPLIT_FLOOR,
+                    "the fixture made two strays into one voice"
+                );
+            }
+        }
+
+        let (c, outcome) = cluster_fixed(&items, 4);
+        assert_eq!((outcome.asked, outcome.got), (4, 3));
+        assert_eq!(c.cluster_count, 3);
+        assert_eq!(
+            outcome.mass_ms,
+            vec![60_000, 45_000, 5_000],
+            "the third voice is the strays together, and it holds real speech"
+        );
+        // Not one of them would have come back on its own: the bar is what
+        // stops a single stray window becoming somebody.
+        const { assert!(super::super::embedding::MIN_EMBED_MS < FORCED_FLOOR_MS) };
+    }
+
+    /// Two pieces of one quiet voice, each under the bar, are handed to each
+    /// other rather than parcelled out to the two people talking either side of
+    /// them — which is what "fold a fragment into the cluster it most resembles"
+    /// buys, and the reason the fold does not insist on a host that is already a
+    /// person.
+    #[test]
+    fn two_pieces_of_one_quiet_voice_find_each_other() {
+        let dim = 64;
+        let mut items = vec![
+            item(voice(dim, 1, 0), 60_000),
+            item(voice(dim, 9, 0), 45_000),
+        ];
+        for jitter in [21usize, 22] {
+            let mut v = vec![0.0f32; dim];
+            v[20] = 1.0;
+            v[jitter] = 0.15;
+            l2_normalize(&mut v);
+            items.push(item(v, 2_000));
+        }
+        assert!(
+            cosine_distance(&items[2].embedding, &items[3].embedding) < SPLIT_FLOOR,
+            "the fixture has to hold one voice, not two"
+        );
+
+        let (c, outcome) = cluster_fixed(&items, 3);
+        assert_eq!(
+            (outcome.asked, outcome.got),
+            (3, 3),
+            "the quiet person was handed to the loud ones: masses {:?}",
+            outcome.mass_ms
+        );
+        assert_eq!(c.labels[2], c.labels[3], "one voice came back as two");
+        assert!(outcome.mass_ms.contains(&4_000));
     }
 
     #[test]
     fn fewer_fingerprints_than_asked_for_gives_back_what_exists() {
         let dim = 16;
         let items: Vec<_> = (0..3).map(|i| item(voice(dim, i * 5, 0), 5_000)).collect();
-        let c = cluster_fixed(&items, 6);
+        let (c, outcome) = cluster_fixed(&items, 6);
         assert_eq!(c.cluster_count, 3, "there were only three to hand out");
         assert_eq!(c.labels, vec![0, 1, 2]);
+        assert_eq!((outcome.asked, outcome.got), (6, 3));
     }
 
     #[test]
     fn a_count_outside_what_echo_can_do_is_pulled_into_range() {
         let items = four_voices();
-        assert_eq!(cluster_fixed(&items, 0).cluster_count, 1);
+        assert_eq!(cluster_fixed(&items, 0).0.cluster_count, 1);
         assert_eq!(
-            cluster_fixed(&items, 999).cluster_count,
+            cluster_fixed(&items, 999).0.cluster_count,
             items.len().min(MAX_SPEAKERS)
         );
+        assert_eq!(cluster_fixed(&items, 999).1.asked, MAX_SPEAKERS);
     }
 
     #[test]
     fn no_fingerprints_stays_no_speakers_whatever_the_count_says() {
-        let c = cluster_fixed(&[], 4);
+        let (c, outcome) = cluster_fixed(&[], 4);
         assert_eq!(c.cluster_count, 0);
         assert!(c.labels.is_empty());
+        assert_eq!((outcome.asked, outcome.got), (4, 0));
     }
 
     #[test]
     fn the_recorded_number_is_the_height_the_hierarchy_was_cut_at() {
         let items = four_voices();
-        let tight = cluster_fixed(&items, 4);
-        let loose = cluster_fixed(&items, 2);
+        let (tight, tight_outcome) = cluster_fixed(&items, 4);
+        let (loose, _) = cluster_fixed(&items, 2);
         // Cutting lower down the tree means the last merge was a closer pair.
         assert!(
             loose.threshold > tight.threshold,
@@ -1526,8 +2056,9 @@ mod tests {
             tight.threshold,
             loose.threshold
         );
+        assert_eq!(tight_outcome.cut_at, tight.threshold);
         // Nothing had to be merged, so there is no cut to report.
-        assert_eq!(cluster_fixed(&items[..2], 4).threshold, 0.0);
+        assert_eq!(cluster_fixed(&items[..2], 4).0.threshold, 0.0);
     }
 
     #[test]
@@ -1537,8 +2068,9 @@ mod tests {
         let items: Vec<_> = (0..(MAX_EXACT_ITEMS + 60))
             .map(|i| item(voice(dim, [4usize, 17, 33][i % 3], i % 3), 4_000))
             .collect();
-        let c = cluster_fixed(&items, 2);
+        let (c, outcome) = cluster_fixed(&items, 2);
         assert_eq!(c.cluster_count, 2);
+        assert_eq!(outcome.got, 2);
         assert_eq!(c.labels.len(), items.len());
     }
 
@@ -1639,7 +2171,10 @@ mod tests {
         );
         // Neither sliver survives as somebody, and both people do.
         assert_eq!(chosen.mass_ms.len(), 2);
-        assert!(chosen.mass_ms.iter().all(|ms| *ms >= choice.fragment_bar_ms));
+        assert!(chosen
+            .mass_ms
+            .iter()
+            .all(|ms| *ms >= choice.fragment_bar_ms));
     }
 
     /// Two voices nothing could confuse. The ceiling refuses to make them one
@@ -1688,7 +2223,10 @@ mod tests {
 
     #[test]
     fn fingerprints_that_cannot_be_compared_are_one_person_rather_than_a_crash() {
-        let items = vec![item(vec![1.0, 0.0], 5_000), item(vec![1.0, 0.0, 0.0], 5_000)];
+        let items = vec![
+            item(vec![1.0, 0.0], 5_000),
+            item(vec![1.0, 0.0, 0.0], 5_000),
+        ];
         let (clustering, choice) = cluster_auto(&items);
         assert_eq!(clustering.cluster_count, 1);
         assert_eq!(choice.count, 1);
@@ -1719,7 +2257,10 @@ mod tests {
         // Distances are what the merges happened at, so the ladder climbs.
         assert!(choice.ladder.first().unwrap().distance <= choice.ladder.last().unwrap().distance);
         // One row per count, ascending, and the chosen one is in it.
-        assert!(choice.candidates.windows(2).all(|w| w[0].count < w[1].count));
+        assert!(choice
+            .candidates
+            .windows(2)
+            .all(|w| w[0].count < w[1].count));
         assert!(choice.chosen().is_some());
         assert!(choice.gap_answer.is_some());
         assert!(choice.fragment_bar_ms >= MIN_CLUSTER_MS);
@@ -1734,6 +2275,7 @@ mod tests {
             folded: 0,
             accepted,
             refused,
+            split_gap: 0.0,
             gap,
             silhouette,
             mass_ms: vec![10_000; count],
@@ -1767,7 +2309,10 @@ mod tests {
     fn a_tie_goes_to_the_cut_nearest_the_distance_that_used_to_ship() {
         // Both score the same. The first is the answer for distances around
         // 0.30, the second for distances around 0.58.
-        let rows = vec![row(3, 0.50, 1.1, 0.20, 0.30), row(2, 0.505, 1.1, 0.56, 0.60)];
+        let rows = vec![
+            row(3, 0.50, 1.1, 0.20, 0.30),
+            row(2, 0.505, 1.1, 0.56, 0.60),
+        ];
         assert_eq!(pick(&rows).0.map(|c| c.count), Some(2));
     }
 
@@ -1785,6 +2330,165 @@ mod tests {
         rows[0].refusal = Some(Refusal::Fused);
         rows[1].refusal = Some(Refusal::TooMany);
         assert_eq!(pick(&rows).0.map(|c| c.count), Some(2));
+    }
+
+    /// The floor question is asked about the survivors, not about the raw
+    /// ladder: whatever the next merge on the way up was, an allowed answer's
+    /// people sit at least [`SPLIT_FLOOR`] apart after folding, and a refused
+    /// one's do not.
+    #[test]
+    fn the_split_gap_describes_the_survivors_not_the_ladder() {
+        let mut items = pair_apart(0.60, 0.4, 8, 20_000);
+        for k in 0..4 {
+            items.push(item(voice(64, 10 + k * 7, 0), 500));
+        }
+
+        let (_, choice) = cluster_auto(&items);
+        for c in &choice.candidates {
+            match c.refusal {
+                Some(Refusal::OneVoice) => assert!(
+                    c.split_gap < SPLIT_FLOOR,
+                    "count {} refused as one voice but its survivors are {} apart",
+                    c.count,
+                    c.split_gap
+                ),
+                None => assert!(
+                    c.count == 1 || c.split_gap >= SPLIT_FLOOR,
+                    "count {} allowed but its survivors are only {} apart",
+                    c.count,
+                    c.split_gap
+                ),
+                _ => {}
+            }
+        }
+        let chosen = choice.chosen().expect("a chosen row");
+        assert!(chosen.allowed() && chosen.split_gap >= SPLIT_FLOOR);
+    }
+
+    /// The one crack in the floor: when every allowed count fits nobody — every
+    /// silhouette negative — and a refused count beats them all decisively while
+    /// keeping its people a honest distance apart, the refused count wins.
+    #[test]
+    fn a_refused_count_is_rescued_when_everything_allowed_fits_nobody() {
+        let mut good = row(3, 0.30, 0.0, 0.40, 0.46);
+        good.refusal = Some(Refusal::OneVoice);
+        good.split_gap = 0.46;
+        let allowed_blob = row(1, -0.20, 0.0, 0.81, 0.0);
+        let rows = [good.clone(), allowed_blob];
+        let (winner, runner_up) = pick(&rows);
+        assert_eq!(winner.map(|c| c.count), Some(3));
+        assert_eq!(runner_up, Some((1, -0.20)));
+    }
+
+    /// The rescue is not a second threshold in disguise: a pair inside the soft
+    /// floor stays refused however well it scores.
+    #[test]
+    fn a_rescue_needs_a_pair_above_the_soft_floor() {
+        let mut close_pair = row(3, 0.30, 0.0, 0.40, 0.30);
+        close_pair.refusal = Some(Refusal::OneVoice);
+        close_pair.split_gap = 0.20;
+        let allowed_blob = row(1, -0.20, 0.0, 0.81, 0.0);
+        assert_eq!(
+            pick(&[close_pair, allowed_blob]).0.map(|c| c.count),
+            Some(1)
+        );
+    }
+
+    /// ...and without a decisive margin over the best allowed count, the floor
+    /// stands.
+    #[test]
+    fn a_rescue_needs_a_real_margin() {
+        let mut marginal = row(3, -0.06, 0.0, 0.40, 0.46);
+        marginal.refusal = Some(Refusal::OneVoice);
+        marginal.split_gap = 0.46;
+        let allowed_blob = row(1, -0.10, 0.0, 0.81, 0.0);
+        assert_eq!(pick(&[marginal, allowed_blob]).0.map(|c| c.count), Some(1));
+    }
+
+    /// The quiet fourth person: under the proportional bar there is a voice with
+    /// too little speech to count as a person, whose fingerprints nonetheless
+    /// cohere — one person talking briefly. Folding would hand them to whoever
+    /// they vaguely resemble; sparing keeps them in the meeting.
+    #[test]
+    fn a_small_but_coherent_voice_survives_a_proportional_bar() {
+        // Enough loud speech that the proportional bar clears MIN_CLUSTER_MS,
+        // which is what turns sparing on. Well clear of the two voices'
+        // dimensions, so it cannot be mistaken for either of them.
+        let mut items = pair_apart(0.65, 0.4, 7, 25_000);
+
+        // Two fingerprints of one other voice, 1.6 s each: together over the
+        // absolute floor, apart under the proportional one, and internally a
+        // single point of view.
+        let mut quiet = vec![0.0f32; 64];
+        quiet[40] = 1.0;
+        items.push(item(quiet.clone(), 1_600));
+        items.push(item(quiet, 1_600));
+
+        let (clustering, choice) = cluster_auto(&items);
+        assert_eq!(clustering.cluster_count, 3, "{:?}", choice.candidates);
+    }
+
+    /// Noise does not get the same protection: fingerprints that share nothing
+    /// with anything, and too little speech to cohere on their own, fold away
+    /// exactly as before.
+    #[test]
+    fn scattered_noise_still_folds_under_a_proportional_bar() {
+        let mut items = pair_apart(0.65, 0.4, 7, 25_000);
+
+        // Two unrelated noises, nowhere near either voice and nothing like
+        // each other.
+        let mut first = vec![0.0f32; 64];
+        first[40] = 1.0;
+        let mut second = vec![0.0f32; 64];
+        second[50] = 1.0;
+        items.push(item(first, 1_600));
+        items.push(item(second, 1_600));
+
+        let (clustering, choice) = cluster_auto(&items);
+        assert_eq!(clustering.cluster_count, 2, "{:?}", choice.candidates);
+    }
+
+    /// What coherence means, on its own: two fingerprints of one voice agree;
+    /// two that disagree with each other do not, however little speech they
+    /// hold together.
+    #[test]
+    fn coherence_is_about_the_fingerprints_agreeing_not_their_count() {
+        let mut tight_a = vec![1.0f32, 0.05, 0.0];
+        l2_normalize(&mut tight_a);
+        let mut tight_b = vec![1.0f32, 0.07, 0.0];
+        l2_normalize(&mut tight_b);
+        let opposed = vec![-1.0f32, 0.0, 0.0];
+
+        let embeddings = vec![tight_a.clone(), tight_b, opposed.clone()];
+        let mut nodes = vec![
+            Node::leaf(0, &embeddings[0], 1_600),
+            Node::leaf(1, &embeddings[1], 1_600),
+            Node::leaf(2, &embeddings[2], 1_600),
+        ];
+        fold(&mut nodes, 0, 1);
+        assert!(
+            is_coherent_voice(&nodes[0], &embeddings),
+            "two near-identical fingerprints are one voice"
+        );
+        assert!(
+            !is_coherent_voice(&nodes[2], &embeddings),
+            "a single fingerprint under the absolute floor is never spared"
+        );
+
+        let mut loose_a = vec![1.0f32, 0.0];
+        l2_normalize(&mut loose_a);
+        let mut loose_b = vec![-1.0f32, 0.0];
+        l2_normalize(&mut loose_b);
+        let loose_embeddings = vec![loose_a, loose_b];
+        let mut loose = vec![
+            Node::leaf(0, &loose_embeddings[0], 1_600),
+            Node::leaf(1, &loose_embeddings[1], 1_600),
+        ];
+        fold(&mut loose, 0, 1);
+        assert!(
+            !is_coherent_voice(&loose[0], &loose_embeddings),
+            "fingerprints pointing opposite ways are not one voice"
+        );
     }
 
     /// A cluster is a fragment in proportion to the meeting it is in, and never

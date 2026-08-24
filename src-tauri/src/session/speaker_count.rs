@@ -5,7 +5,10 @@
 //! — nobody outside a lab could reason about one (mantra 2) — it is a number, and
 //! a number a human states about a conversation they were in is better evidence
 //! than any distance measured on somebody else's corpus. So this stores the
-//! number and queues the pass again, cut to exactly that many voices.
+//! number and queues the pass again, cut to that many voices — and, when the
+//! recording holds fewer voices than that which can be told apart, says so
+//! plainly instead of handing back speaker rows with no words on them
+//! ([`crate::diarize::cluster::ForcedOutcome`]).
 //!
 //! What it deliberately does *not* touch:
 //!
@@ -138,6 +141,11 @@ pub(crate) async fn run(
             speakers: repo::list_speakers(&inner.db, meeting_id).await?,
             people_count,
             people_count_is_override,
+            // The person has just said how many people were here and the pass
+            // has not run yet. Anything Echo could say about how many voices it
+            // can hear belongs to the previous cut, so it says nothing.
+            voices_found: None,
+            alternative_count: None,
         }));
 
     // Only the speaker pass. The words are untouched, so nothing needs

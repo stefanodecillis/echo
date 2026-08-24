@@ -32,6 +32,15 @@ export interface SpeakersDialogProps {
   peopleCount: number;
   /** True once someone has corrected the count by hand. */
   peopleCountIsOverride: boolean;
+  /** How many voices the last pass could actually tell apart, when one has run
+   * since this page opened. Below `peopleCount` means the recording doesn't
+   * hold as many separable voices as someone asked for, and the stepper says
+   * so rather than leaving them looking for the missing chips. */
+  voicesFound?: number;
+  /** The best count the last automatic pass decided against. Shown beside the
+   * number as an invitation to correct it: a wrong count is the one speaker
+   * mistake nothing here can fix later (merges exist; splits do not). */
+  alternativeCount?: number;
   /** The job re-working out who said what, if one is running right now —
    * shown here as the in-progress state, alongside whatever else already
    * shows it (a fresh recording gets the same treatment). */
@@ -61,6 +70,8 @@ export function SpeakersDialog({
   speakers,
   peopleCount,
   peopleCountIsOverride,
+  voicesFound,
+  alternativeCount,
   job,
   disabled,
 }: SpeakersDialogProps) {
@@ -85,6 +96,10 @@ export function SpeakersDialog({
   const peopleById = new Map(people.map((p) => [p.id, p]));
   const canRerun = !disabled;
   const shown = job ? presentJob(job) : undefined;
+  // The last pass found fewer voices than someone asked for. Their number is
+  // theirs and stays on the stepper; this says what Echo can hear, so the
+  // missing chips are explained instead of just absent.
+  const voicesShort = typeof voicesFound === "number" && voicesFound < peopleCount;
 
   // Only pick up a fresh automatic count while the dialog is open — a
   // background update shouldn't clobber a stepper value someone is mid-way
@@ -281,8 +296,20 @@ export function SpeakersDialog({
           </div>
         ) : (
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <span className="text-xs font-medium uppercase tracking-wide text-ink-faint">
-              {copy.speakersDialogParticipantsLabel}
+            <span className="flex flex-col gap-0.5">
+              <span className="text-xs font-medium uppercase tracking-wide text-ink-faint">
+                {copy.speakersDialogParticipantsLabel}
+              </span>
+              {voicesShort && (
+                <span className="text-xs text-ink-faint">
+                  {peopleCountCopy.voicesFound(voicesFound as number)}
+                </span>
+              )}
+              {!peopleCountIsOverride && typeof alternativeCount === "number" && (
+                <span className="text-xs text-ink-faint">
+                  {peopleCountCopy.alternativeCount(alternativeCount)}
+                </span>
+              )}
             </span>
             <div className="flex items-center gap-2">
               <IconButton

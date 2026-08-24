@@ -57,6 +57,11 @@ export interface TranscriptTabProps {
    * arriving from a search hit. Consumed once. */
   jumpToMs?: number;
   onJumpConsumed: () => void;
+  /** How many voices the last speaker pass could tell apart, if one has
+   * finished since this page opened. Only "Name your speakers" uses it. */
+  voicesFound?: number;
+  /** The best count that pass decided against, when the count is Echo's own. */
+  alternativeCount?: number;
 }
 
 function highlightMatches(text: string, query: string): ReactNode {
@@ -84,7 +89,15 @@ function highlightMatches(text: string, query: string): ReactNode {
 /** The Transcript tab: a virtualized, filterable list of segments with
  * clickable speaker chips for renaming, and a "combine two speakers" flow
  * for the provisional labels an offline pass hasn't stabilized yet. */
-export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpConsumed }: TranscriptTabProps) {
+export function TranscriptTab({
+  meetingId,
+  detail,
+  setDetail,
+  jumpToMs,
+  onJumpConsumed,
+  voicesFound,
+  alternativeCount,
+}: TranscriptTabProps) {
   const [segments, setSegments] = useState<Segment[]>();
   const [filter, setFilter] = useState("");
   const [mergeOpen, setMergeOpen] = useState(false);
@@ -342,6 +355,8 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
             : canonicalSpeakers(detail.speakers).length
         }
         peopleCountIsOverride={!!detailWithPeopleCount.peopleCountIsOverride}
+        voicesFound={voicesFound}
+        alternativeCount={alternativeCount}
         job={transcribeJob}
         disabled={peopleCountDisabled}
       />

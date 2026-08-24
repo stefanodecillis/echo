@@ -28,7 +28,8 @@ function parseTab(value: string | null): TabId {
 export default function MeetingPage() {
   const { id: meetingId } = useParams<{ id: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
-  const { detail, loading, error, setDetail } = useMeetingDetail(meetingId);
+  const { detail, loading, error, setDetail, voicesFound, alternativeCount } =
+    useMeetingDetail(meetingId);
 
   const [activeTab, setActiveTab] = useState<TabId>(() => parseTab(searchParams.get("tab")));
   const [jumpToMs, setJumpToMs] = useState<number | undefined>(() => {
@@ -107,6 +108,8 @@ export default function MeetingPage() {
             setDetail={setDetail}
             jumpToMs={jumpToMs}
             onJumpConsumed={() => setJumpToMs(undefined)}
+            voicesFound={voicesFound}
+            alternativeCount={alternativeCount}
           />
         )}
         {activeTab === "info" && <InfoTab meetingId={detail.meeting.id} detail={detail} />}

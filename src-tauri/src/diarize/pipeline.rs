@@ -205,6 +205,16 @@ enum Source {
     MicOnly,
 }
 
+impl Source {
+    /// For the log only. Never shown to anybody (mantra 2).
+    fn as_str(self) -> &'static str {
+        match self {
+            Source::System => "system",
+            Source::MicOnly => "microphone-only",
+        }
+    }
+}
+
 /// What one sliding window produced. Local speaker indices are meaningless
 /// outside the window they came from.
 #[derive(Debug, Clone, Default)]
@@ -252,6 +262,13 @@ pub struct ScanCut {
     /// that arrived at it. `None` for a count the person gave us and for a cut
     /// at a distance a sweep chose.
     pub choice: Option<cluster::CountChoice>,
+    /// What a count the person gave us actually came back with — and whether it
+    /// came back short. `None` for the automatic count and for a cut at a
+    /// distance a sweep chose.
+    ///
+    /// The counterpart of [`Self::choice`]: one of the two is always `None`,
+    /// because a cut is either Echo's decision or the person's.
+    pub forced: Option<cluster::ForcedOutcome>,
     /// Per person, the voice print of everything they said in this meeting.
     ///
     /// Stored on the speaker row by [`persist`], which is what makes "this
@@ -270,6 +287,13 @@ impl Scan {
     /// no threshold can possibly find them all.
     pub fn fingerprints(&self) -> usize {
         self.items.len()
+    }
+
+    /// Speech behind all the fingerprints together. The mass the clustering has
+    /// to divide up, which is what makes a per-cluster figure in the log mean
+    /// something.
+    pub fn fingerprinted_ms(&self) -> i64 {
+        self.items.iter().map(|i| i.weight_ms.max(0)).sum()
     }
 
     /// Length of the fingerprints, or `None` when nothing was fingerprintable.
@@ -366,8 +390,16 @@ impl Scan {
     pub fn cut(&self, threshold: f32, target: Option<usize>) -> ScanCut {
         let nobody = Guided::default();
         match target {
-            Some(k) => self.tracks_of(cluster::cluster_fixed(&self.items, k), None, &nobody),
-            None => self.tracks_of(cluster::cluster(&self.items, threshold), None, &nobody),
+            Some(k) => {
+                let (clustering, forced) = cluster::cluster_fixed(&self.items, k);
+                self.tracks_of(clustering, None, Some(forced), &nobody)
+            }
+            None => self.tracks_of(
+                cluster::cluster(&self.items, threshold),
+                None,
+                None,
+                &nobody,
+            ),
         }
     }
 
@@ -407,13 +439,16 @@ impl Scan {
             }
         });
 
-        let (clustering, choice) = match (items.is_empty(), strangers) {
-            (true, _) => (cluster::Clustering::default(), None),
-            (false, Some(0)) => (cluster::Clustering::default(), None),
-            (false, Some(k)) => (cluster::cluster_fixed(&items, k), None),
+        let (clustering, choice, forced) = match (items.is_empty(), strangers) {
+            (true, _) => (cluster::Clustering::default(), None, None),
+            (false, Some(0)) => (cluster::Clustering::default(), None, None),
+            (false, Some(k)) => {
+                let (clustering, forced) = cluster::cluster_fixed(&items, k);
+                (clustering, None, Some(forced))
+            }
             (false, None) => {
                 let (clustering, choice) = cluster::cluster_auto(&items);
-                (clustering, Some(choice))
+                (clustering, Some(choice), None)
             }
         };
 
@@ -464,7 +499,7 @@ impl Scan {
             cluster_count: known + clustering.cluster_count,
             threshold: clustering.threshold,
         };
-        self.tracks_of(combined, choice, guided)
+        self.tracks_of(combined, choice, forced, guided)
     }
 
     /// Turn one clustering of the fingerprints into per-person timelines.
@@ -472,6 +507,7 @@ impl Scan {
         &self,
         clustering: cluster::Clustering,
         choice: Option<cluster::CountChoice>,
+        forced: Option<cluster::ForcedOutcome>,
         guided: &Guided,
     ) -> ScanCut {
         let labelled = label_windows(&self.windows, &clustering.labels);
@@ -529,6 +565,7 @@ impl Scan {
             confidence,
             threshold: clustering.threshold,
             choice,
+            forced,
             centroids,
             matches,
         }
@@ -694,6 +731,14 @@ pub async fn refine(
             speakers,
             people_count,
             people_count_is_override,
+            voices_asked: None,
+            // The same question as below, asked of the rows channel attribution
+            // just pinned: how many voices are audible in what was recorded. A
+            // row with nothing on it — "You" on a meeting the person only
+            // listened to — is not one of them.
+            voices_found: repo::count_audible_people(db, meeting_id)
+                .await
+                .map_err(db_failed)?,
         });
     };
 
@@ -740,16 +785,55 @@ pub async fn refine(
             guided.recognised()
         );
     }
+    // What the clustering is about to be asked, and what it has to work with.
+    // At info, because the forced path used to log nothing at all and a run that
+    // under-delivers is exactly the run somebody reads the log for.
+    tracing::info!(
+        source = source.as_str(),
+        target = ?target,
+        recognised = guided.recognised(),
+        fingerprints = scanned.fingerprints(),
+        dim = ?scanned.fingerprint_dim(),
+        speech_ms = scanned.fingerprinted_ms(),
+        "separating this meeting's voices"
+    );
     let mut cut = scanned.cut_guided(&guided, target);
     people::match_remaining(&mut cut, &enrolment);
     if let Some(choice) = &cut.choice {
-        tracing::debug!(
+        for candidate in &choice.candidates {
+            tracing::info!(
+                count = candidate.count,
+                silhouette = candidate.silhouette,
+                verdict = ?candidate.refusal,
+                split_gap = candidate.split_gap,
+                cut_clusters = candidate.cut_clusters,
+                folded = candidate.folded,
+                mass_ms = ?candidate.mass_ms,
+                "a possible answer: {} people",
+                candidate.count
+            );
+        }
+        tracing::info!(
             count = choice.count,
             cut_at = choice.cut_at,
             silhouette = choice.silhouette,
             runner_up = ?choice.runner_up,
+            fragment_bar_ms = choice.fragment_bar_ms,
             "the automatic count read {} people out of the merge tree",
             choice.count
+        );
+    }
+    if let Some(forced) = &cut.forced {
+        tracing::info!(
+            asked = forced.asked,
+            got = forced.got,
+            cut_at = forced.cut_at,
+            silhouette = forced.silhouette,
+            mass_ms = ?forced.mass_ms,
+            floor_ms = cluster::FORCED_FLOOR_MS,
+            "the count this meeting was given came back with {} of {} voice(s)",
+            forced.got,
+            forced.asked
         );
     }
     let turns = turns_from_tracks(&cut.tracks, &cut.confidence);
@@ -759,6 +843,16 @@ pub async fn refine(
 
     let speakers = persist(db, meeting_id, &cut, source).await?;
     let (people_count, people_count_is_override) = people_count(db, meeting_id).await?;
+    // Counted from the rows the pass just wrote, and only the ones a line of
+    // transcript landed on. `people_count` cannot answer this: with an override
+    // it reads back the person's own number, which is the question, not the
+    // answer. Nor can a plain row count — "You" exists on a two-channel meeting
+    // whether or not the microphone caught a word, and on a meeting somebody
+    // only listened to, counting it would claim one more audible voice than the
+    // recording holds.
+    let voices_found = repo::count_audible_people(db, meeting_id)
+        .await
+        .map_err(db_failed)?;
     control.report(1.0);
 
     Ok(DiarizationResult {
@@ -769,6 +863,11 @@ pub async fn refine(
         speakers,
         people_count,
         people_count_is_override,
+        // In people, counting whoever was at this computer — the same units the
+        // person typed their correction in, so the two are comparable without
+        // anybody redoing [`remote_target`]'s arithmetic backwards.
+        voices_asked: people_count_is_override.then_some(people_count),
+        voices_found,
     })
 }
 
@@ -1078,6 +1177,26 @@ fn turns_from_tracks(tracks: &[Vec<Span>], confidence: &[f32]) -> Vec<SpeakerTur
 /// run no longer produced. Without that a meeting re-cut from four voices to two
 /// would keep two ghost chips with nothing behind them, and Echo's own count of
 /// how many people were in the meeting would still say four.
+///
+/// **The invariant: no voice row without a line of transcript on it.** Who said
+/// what is worked out *first*, in track numbers, and only the tracks that ended
+/// up owning at least one final segment get a row. This is a safety net and it
+/// is deliberately independent of the clustering: whatever a cut hands over —
+/// a count the person gave us, the automatic count, a sweep — a voice that wins
+/// no line is not a person anybody can do anything with. On 2026-08-24 a forced
+/// count of four produced two rows with 630 and 313 lines and two rows with
+/// none, and the person met those two in the enrolment dialog, which could only
+/// tell them there was no clear moment of a voice that had never spoken.
+///
+/// The one row this does not apply to is "You", which is not a cluster: it is
+/// the microphone channel itself, and it exists on a two-channel meeting
+/// whether or not the person happened to say anything.
+///
+/// Surviving voices are *labelled* from one in the order they first speak, so a
+/// meeting whose first cluster won no line still shows a "Speaker 1" — but they
+/// are *keyed* by the voice, not by that position, so a re-run in which one
+/// voice falls silent cannot slide the row underneath somebody's rename. See
+/// [`cluster_key`].
 async fn persist(
     db: &Db,
     meeting_id: &str,
@@ -1090,6 +1209,75 @@ async fn persist(
         .map_err(db_failed)?
         + 1;
 
+    let segments = repo::get_segments(
+        db,
+        &TranscriptQuery {
+            meeting_id: meeting_id.to_string(),
+            limit: Some(50_000),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(db_failed)?;
+
+    // Which channel's lines the clustering is entitled to speak for. The other
+    // one is either "You" (a microphone line, when the far end had its own
+    // channel) or nothing at all.
+    let separated = match source {
+        Source::System => Channel::System,
+        Source::MicOnly => Channel::Mic,
+    };
+
+    // ---- Who said what, in track numbers. Nothing is written yet. ----------
+    let mut plan: Vec<(crate::types::Segment, Attribution)> = Vec::new();
+    let mut mine: Vec<Id> = Vec::new();
+    let mut owned_ms: Vec<i64> = vec![0; tracks.len()];
+    let mut owned_lines: Vec<usize> = vec![0; tracks.len()];
+    let mut unattributed = 0usize;
+    for segment in segments {
+        let span: Span = (segment.t_start_ms, segment.t_end_ms);
+        if segment.channel == separated {
+            // A line that holds two voices is cut in two before anything is
+            // attributed. Attributing it whole is what put a whole exchange of
+            // fast dialogue on one speaker and silently lost the other one's
+            // words; see [`split`].
+            let pieces = split::split_line(
+                split::LineFacts {
+                    span,
+                    text_confidence: segment.avg_confidence,
+                },
+                &segment.text,
+                tracks,
+                &cut.confidence,
+            );
+            let attribution = match pieces {
+                Some(pieces) => Some(Attribution::Split(pieces)),
+                None => timeline::assign_by_overlap(span, tracks)
+                    .or_else(|| timeline::nearest_track(span, tracks, NEAREST_TOLERANCE_MS))
+                    .map(Attribution::Whole),
+            };
+            match attribution {
+                Some(a) => {
+                    for (track, ms) in a.claims(span) {
+                        if let (Some(slot), Some(lines)) =
+                            (owned_ms.get_mut(track), owned_lines.get_mut(track))
+                        {
+                            *slot += ms;
+                            *lines += 1;
+                        }
+                    }
+                    plan.push((segment, a));
+                }
+                // Nothing covers it, and guessing is worse than saying nothing:
+                // an unattributed line stays honestly unattributed.
+                None => unattributed += 1,
+            }
+        } else if segment.channel == Channel::Mic && source == Source::System {
+            mine.push(segment.id);
+        }
+    }
+
+    // ---- The rows, for the tracks that own speech and no others. -----------
     let me = match source {
         Source::System => Some(
             repo::upsert_speaker(db, meeting_id, SELF_CLUSTER_KEY, SELF_DISPLAY_NAME, true)
@@ -1099,22 +1287,42 @@ async fn persist(
         Source::MicOnly => None,
     };
 
-    let mut remote_ids: Vec<Id> = Vec::with_capacity(tracks.len());
-    for i in 0..tracks.len() {
-        let speaker =
-            repo::upsert_speaker(db, meeting_id, &cluster_key(i), &display_name(i), false)
+    let surviving: Vec<usize> = (0..tracks.len()).filter(|i| owned_lines[*i] > 0).collect();
+
+    let mut remote_ids: Vec<Option<Id>> = vec![None; tracks.len()];
+    for (slot, &track) in surviving.iter().enumerate() {
+        // Keyed by the voice, named by where it comes in the list. The key is
+        // the row's identity across runs and is never renumbered (see below);
+        // the label is what the person reads, and reads best counting from one.
+        let speaker = repo::upsert_speaker(
+            db,
+            meeting_id,
+            &cluster_key(track),
+            &display_name(slot),
+            false,
+        )
+        .await
+        .map_err(db_failed)?;
+
+        // A row that was already here keeps whatever it is called, unless what
+        // it is called is a label Echo made up — those are renumbered so the
+        // list still reads 1, 2, 3 after a voice drops out of it. A name
+        // somebody typed is never touched.
+        if speaker.display_name != display_name(slot) && is_numbered_name(&speaker.display_name) {
+            repo::rename_speaker(db, &speaker.id, &display_name(slot))
                 .await
                 .map_err(db_failed)?;
+        }
 
         // This meeting's voice print for this voice, whether or not anybody
         // knows whose it is. Stored either way: it is what a person enrolled
         // next month will be matched against (DESIGN §1).
-        let centroid = cut.centroids.get(i).filter(|c| !c.is_empty());
+        let centroid = cut.centroids.get(track).filter(|c| !c.is_empty());
         repo::set_speaker_centroid(db, &speaker.id, centroid.map(|c| c.as_slice()))
             .await
             .map_err(db_failed)?;
 
-        match cut.matches.get(i).and_then(|m| m.as_ref()) {
+        match cut.matches.get(track).and_then(|m| m.as_ref()) {
             Some(people::Match::Linked {
                 person_id, name, ..
             }) => {
@@ -1149,20 +1357,17 @@ async fn persist(
                 }
             }
         }
-        remote_ids.push(speaker.id);
+        tracing::info!(
+            speaker = %cluster_key(slot),
+            lines = owned_lines[track],
+            speaking_ms = owned_ms[track],
+            "this voice ended up with {} line(s) of the transcript",
+            owned_lines[track]
+        );
+        remote_ids[track] = Some(speaker.id);
     }
 
-    let segments = repo::get_segments(
-        db,
-        &TranscriptQuery {
-            meeting_id: meeting_id.to_string(),
-            limit: Some(50_000),
-            ..Default::default()
-        },
-    )
-    .await
-    .map_err(db_failed)?;
-
+    // ---- The writes, now that every piece has a row to point at. -----------
     fn push(into: &mut Vec<(Id, Vec<Id>)>, speaker_id: &Id, segment_id: Id) {
         match into.iter_mut().find(|(s, _)| s == speaker_id) {
             Some((_, ids)) => ids.push(segment_id),
@@ -1170,32 +1375,17 @@ async fn persist(
         }
     }
 
-    // Which channel's lines the clustering is entitled to speak for. The other
-    // one is either "You" (a microphone line, when the far end had its own
-    // channel) or nothing at all.
-    let separated = match source {
-        Source::System => Channel::System,
-        Source::MicOnly => Channel::Mic,
-    };
-
     let mut by_speaker: Vec<(Id, Vec<Id>)> = Vec::new();
+    if let Some(me) = &me {
+        for id in mine {
+            push(&mut by_speaker, &me.id, id);
+        }
+    }
     let mut lines_split = 0usize;
-    for segment in segments {
+    for (segment, attribution) in plan {
         let span: Span = (segment.t_start_ms, segment.t_end_ms);
-        if segment.channel == separated {
-            // A line that holds two voices is cut in two before anything is
-            // attributed. Attributing it whole is what put a whole exchange of
-            // fast dialogue on one speaker and silently lost the other one's
-            // words; see [`split`].
-            if let Some(pieces) = split::split_line(
-                split::LineFacts {
-                    span,
-                    text_confidence: segment.avg_confidence,
-                },
-                &segment.text,
-                tracks,
-                &cut.confidence,
-            ) {
+        match attribution {
+            Attribution::Split(pieces) => {
                 let drafts: Vec<crate::types::SegmentDraft> = pieces
                     .iter()
                     .map(|piece| crate::types::SegmentDraft {
@@ -1203,7 +1393,7 @@ async fn persist(
                         t_start_ms: piece.span.0,
                         t_end_ms: piece.span.1,
                         channel: segment.channel,
-                        speaker_id: remote_ids.get(piece.speaker).cloned(),
+                        speaker_id: remote_ids.get(piece.speaker).and_then(|id| id.clone()),
                         text: piece.text.clone(),
                         // The words were not re-transcribed, so their language,
                         // the engine's confidence in them and their provenance
@@ -1225,16 +1415,22 @@ async fn persist(
                     lines_split += 1;
                     continue;
                 }
+                // The cut did not happen after all. The line is still one of
+                // these voices' — whoever holds most of it — rather than
+                // nobody's.
+                let hit = timeline::assign_by_overlap(span, tracks)
+                    .or_else(|| timeline::nearest_track(span, tracks, NEAREST_TOLERANCE_MS));
+                if let Some(speaker_id) = hit
+                    .and_then(|i| remote_ids.get(i))
+                    .and_then(|id| id.clone())
+                {
+                    push(&mut by_speaker, &speaker_id, segment.id);
+                }
             }
-
-            let hit = timeline::assign_by_overlap(span, tracks)
-                .or_else(|| timeline::nearest_track(span, tracks, NEAREST_TOLERANCE_MS));
-            if let Some(speaker_id) = hit.and_then(|i| remote_ids.get(i)).cloned() {
-                push(&mut by_speaker, &speaker_id, segment.id);
-            }
-        } else if segment.channel == Channel::Mic {
-            if let Some(me) = &me {
-                push(&mut by_speaker, &me.id, segment.id);
+            Attribution::Whole(track) => {
+                if let Some(speaker_id) = remote_ids.get(track).and_then(|id| id.clone()) {
+                    push(&mut by_speaker, &speaker_id, segment.id);
+                }
             }
         }
     }
@@ -1244,31 +1440,74 @@ async fn persist(
             .await
             .map_err(db_failed)?;
     }
-    if lines_split > 0 {
-        tracing::debug!(
-            lines_split,
-            "cut {lines_split} line(s) that held more than one voice"
-        );
-    }
 
     // Whoever this run did not produce is no longer one of the people in this
     // meeting. Their rows go, which releases any line still pointing at them
     // back to unattributed rather than leaving it labelled with a voice the pass
     // no longer believes in.
-    let mut keep: Vec<String> = Vec::with_capacity(tracks.len() + 1);
+    let mut keep: Vec<String> = Vec::with_capacity(surviving.len() + 1);
     if let Some(me) = &me {
         keep.push(me.cluster_key.clone());
     }
-    keep.extend((0..tracks.len()).map(cluster_key));
-    repo::prune_speakers_except(db, meeting_id, &keep)
-        .await
-        .map_err(db_failed)?;
+    keep.extend(surviving.iter().map(|&track| cluster_key(track)));
+    let pruned = if keep.is_empty() {
+        // Nothing on the microphone belongs to any voice this pass found — a
+        // meeting with no transcript yet, or one whose lines all sit outside
+        // the speech it detected. There is nobody to keep, and saying so is
+        // `prune_speakers_except`'s one refusal, so it is said here instead.
+        repo::forget_speakers(db, meeting_id)
+            .await
+            .map_err(db_failed)?
+    } else {
+        repo::prune_speakers_except(db, meeting_id, &keep)
+            .await
+            .map_err(db_failed)?
+    };
+
+    tracing::info!(
+        voices = tracks.len(),
+        rows = surviving.len(),
+        silent_voices = tracks.len() - surviving.len(),
+        rows_pruned = pruned,
+        lines_split,
+        unattributed,
+        "wrote {} voice row(s); {} voice(s) won no line and got none",
+        surviving.len(),
+        tracks.len() - surviving.len()
+    );
 
     repo::recompute_speaking_time(db, meeting_id)
         .await
         .map_err(db_failed)?;
 
     repo::list_speakers(db, meeting_id).await.map_err(db_failed)
+}
+
+/// Which voice one final segment turned out to belong to, before any row
+/// exists to point it at.
+///
+/// [`persist`] works this out for every line first and creates rows afterwards,
+/// so that a voice nobody's words landed on never becomes a speaker row.
+enum Attribution {
+    /// The whole line is one voice's.
+    Whole(usize),
+    /// The line holds more than one voice and is cut at the turn boundary
+    /// first; each piece names the track it belongs to.
+    Split(Vec<split::Piece>),
+}
+
+impl Attribution {
+    /// Per track, how much of the line it claims. One entry for a whole line,
+    /// one per piece for a split one.
+    fn claims(&self, line: Span) -> Vec<(usize, i64)> {
+        match self {
+            Attribution::Whole(track) => vec![(*track, timeline::span_ms(line))],
+            Attribution::Split(pieces) => pieces
+                .iter()
+                .map(|p| (p.speaker, timeline::span_ms(p.span)))
+                .collect(),
+        }
+    }
 }
 
 /// Channel attribution on its own: "You" for the microphone, and one provisional
@@ -1341,6 +1580,15 @@ pub async fn pin_channel_speakers(db: &Db, meeting_id: &str) -> Result<Vec<Speak
 
 /// Stable per-meeting cluster key. Stable matters: re-running the pass must
 /// reuse the same rows so a rename survives it.
+///
+/// **Keyed by the voice the cut produced, never by where that voice comes in the
+/// list.** [`persist`] shows only the voices that won a line of transcript, so
+/// the list has gaps in it — voice 3 of 4 can be the second row on the screen.
+/// Numbering the *rows* instead would mean a re-run in which one voice fell
+/// silent handed voice 3's fingerprints, and its lines, to the row voice 2 is
+/// on: the person's rename, and the person they linked it to, would end up on
+/// somebody else's speech, and the last row would be pruned away with a name on
+/// it. So the key follows the voice and [`display_name`] does the counting.
 pub fn cluster_key(index: usize) -> String {
     format!("speaker-{:02}", index + 1)
 }
@@ -1348,6 +1596,16 @@ pub fn cluster_key(index: usize) -> String {
 /// Zero jargon: the person sees "Speaker 1", never a cluster id (mantra 2).
 pub fn display_name(index: usize) -> String {
     format!("Speaker {}", index + 1)
+}
+
+/// Is this still one of the labels Echo made up, rather than a name somebody
+/// typed? Only those are renumbered when the list of voices changes.
+///
+/// Narrower than [`people::is_default_name`], which also counts "You": a remote
+/// row somebody has named "You" is a name they chose, and this must not take it
+/// off them.
+fn is_numbered_name(display_name: &str) -> bool {
+    (0..cluster::MAX_SPEAKERS).any(|i| display_name == self::display_name(i))
 }
 
 fn db_failed(err: crate::db::DbError) -> DiarizeError {
@@ -1586,6 +1844,7 @@ mod tests {
             tracks: tracks.to_vec(),
             threshold: 0.5,
             choice: None,
+            forced: None,
         }
     }
 
@@ -1677,7 +1936,11 @@ mod tests {
 
         let guided = scanned.guide(&known);
         assert_eq!(guided.recognised(), 1);
-        assert_eq!(guided.fingerprints(), 3, "all three of Marco's, and nobody else's");
+        assert_eq!(
+            guided.fingerprints(),
+            3,
+            "all three of Marco's, and nobody else's"
+        );
 
         let cut = scanned.cut_guided(&guided, None);
         // The automatic count only ever saw the strangers. That is the claim, and
@@ -1689,7 +1952,11 @@ mod tests {
         // Marco is the first voice heard, so he is the first row, and he arrives
         // with a name rather than a number.
         match cut.matches[0].as_ref().expect("Marco was recognised") {
-            people::Match::Linked { name, person_id, score } => {
+            people::Match::Linked {
+                name,
+                person_id,
+                score,
+            } => {
                 assert_eq!(name, "Marco");
                 assert_eq!(person_id, "person-marco");
                 assert!(*score > people::TAU_LINK, "{score}");
@@ -1813,7 +2080,10 @@ mod tests {
 
         let three = scanned.cut_guided(&guided, Some(3));
         assert_eq!(three.tracks.len(), 3, "Marco plus two strangers");
-        assert!(three.choice.is_none(), "a count the person gave is not a guess");
+        assert!(
+            three.choice.is_none(),
+            "a count the person gave is not a guess"
+        );
 
         // "There were two of us": Marco plus one stranger.
         let two = scanned.cut_guided(&guided, Some(2));
@@ -1870,6 +2140,7 @@ mod tests {
             matches: vec![None, None],
             threshold: 0.5,
             choice: None,
+            forced: None,
         };
         let enrolment = people::Enrolment {
             people: vec![enrolled_as(0, "Marco", "person-marco")],
@@ -1877,7 +2148,10 @@ mod tests {
         };
         people::match_remaining(&mut cut, &enrolment);
 
-        match cut.matches[0].as_ref().expect("the better one is asked about") {
+        match cut.matches[0]
+            .as_ref()
+            .expect("the better one is asked about")
+        {
             people::Match::Suggested { person_id, .. } => assert_eq!(person_id, "person-marco"),
             other => panic!("{other:?}"),
         }
@@ -1897,6 +2171,7 @@ mod tests {
             })],
             threshold: 0.5,
             choice: None,
+            forced: None,
         };
         let enrolment = people::Enrolment {
             people: vec![enrolled_as(0, "Renamed since", "person-marco")],
@@ -1915,8 +2190,14 @@ mod tests {
 
     /// A cut of one voice, with a known person attached and a voice print to
     /// remember it by.
+    ///
+    /// Each voice gets four seconds of its own, five seconds apart, so a caller
+    /// can give every one of them a line — a voice with no line of transcript on
+    /// it no longer gets a row at all ([`persist`]).
     fn cut_with(matches: Vec<Option<people::Match>>) -> ScanCut {
-        let tracks = vec![vec![(0i64, 4_000i64)]; matches.len().max(1)];
+        let tracks: Vec<Vec<Span>> = (0..matches.len().max(1))
+            .map(|i| vec![(i as i64 * 5_000, i as i64 * 5_000 + 4_000)])
+            .collect();
         ScanCut {
             confidence: vec![0.9; tracks.len()],
             centroids: (0..tracks.len()).map(|i| print_of(i, 0.99, i)).collect(),
@@ -1924,6 +2205,7 @@ mod tests {
             tracks,
             threshold: 0.5,
             choice: None,
+            forced: None,
         }
     }
 
@@ -1953,13 +2235,18 @@ mod tests {
             .find(|s| s.cluster_key == cluster_key(0))
             .unwrap();
         assert_eq!(voice.person_id.as_deref(), Some(marco.id.as_str()));
-        assert_eq!(voice.display_name, "Marco", "the label Echo made up is replaced");
+        assert_eq!(
+            voice.display_name, "Marco",
+            "the label Echo made up is replaced"
+        );
         assert!(voice.suggested_person_id.is_none());
 
         // The person renames the chip in this meeting. That is meeting-local: the
         // link stays, the person keeps their own name, and a re-run does not
         // overwrite what was typed.
-        repo::rename_speaker(&db, &voice.id, "Marco B.").await.unwrap();
+        repo::rename_speaker(&db, &voice.id, "Marco B.")
+            .await
+            .unwrap();
         let again = persist(&db, &meeting.id, &cut_with(linked()), Source::System)
             .await
             .unwrap();
@@ -1970,7 +2257,11 @@ mod tests {
         assert_eq!(voice.display_name, "Marco B.");
         assert_eq!(voice.person_id.as_deref(), Some(marco.id.as_str()));
         assert_eq!(
-            repo::get_person(&db, &marco.id).await.unwrap().unwrap().name,
+            repo::get_person(&db, &marco.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
             "Marco",
             "renaming a speaker must never rename the person"
         );
@@ -2002,9 +2293,15 @@ mod tests {
             .iter()
             .find(|s| s.cluster_key == cluster_key(0))
             .unwrap();
-        assert_eq!(voice.suggested_person_id.as_deref(), Some(marco.id.as_str()));
+        assert_eq!(
+            voice.suggested_person_id.as_deref(),
+            Some(marco.id.as_str())
+        );
         assert!((voice.suggestion_score.unwrap() - 0.58).abs() < 1e-6);
-        assert!(voice.person_id.is_none(), "a suggestion is never an assignment");
+        assert!(
+            voice.person_id.is_none(),
+            "a suggestion is never an assignment"
+        );
         assert_eq!(voice.display_name, "Speaker 1", "and never a name");
 
         // A later run that no longer believes it takes the question away rather
@@ -2029,13 +2326,24 @@ mod tests {
         let meeting = repo::create_meeting(&db, "Workshop", "/tmp/echo-test", None)
             .await
             .unwrap();
-        repo::insert_segments(&db, &[remote_line(&meeting.id, 0, 4_000)])
-            .await
-            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                remote_line(&meeting.id, 0, 4_000),
+                remote_line(&meeting.id, 5_000, 9_000),
+            ],
+        )
+        .await
+        .unwrap();
 
-        persist(&db, &meeting.id, &cut_with(vec![None, None]), Source::System)
-            .await
-            .unwrap();
+        persist(
+            &db,
+            &meeting.id,
+            &cut_with(vec![None, None]),
+            Source::System,
+        )
+        .await
+        .unwrap();
 
         let prints = repo::list_unnamed_voice_prints(&db).await.unwrap();
         assert_eq!(prints.len(), 2, "{prints:?}");
@@ -2136,9 +2444,14 @@ mod tests {
             .await
             .unwrap();
 
-        let first = persist(&db, &meeting.id, &cut_of(&[vec![(0i64, 4_000i64)]]), Source::System)
-            .await
-            .unwrap();
+        let first = persist(
+            &db,
+            &meeting.id,
+            &cut_of(&[vec![(0i64, 4_000i64)]]),
+            Source::System,
+        )
+        .await
+        .unwrap();
         let voice = first
             .iter()
             .find(|s| s.cluster_key == cluster_key(0))
@@ -2148,9 +2461,14 @@ mod tests {
         let me = first.iter().find(|s| s.is_self).unwrap();
         repo::rename_speaker(&db, &me.id, "Stefano").await.unwrap();
 
-        let second = persist(&db, &meeting.id, &cut_of(&[vec![(0i64, 4_000i64)]]), Source::System)
-            .await
-            .unwrap();
+        let second = persist(
+            &db,
+            &meeting.id,
+            &cut_of(&[vec![(0i64, 4_000i64)]]),
+            Source::System,
+        )
+        .await
+        .unwrap();
         assert_eq!(second.len(), 2);
         let names: Vec<&str> = second.iter().map(|s| s.display_name.as_str()).collect();
         assert!(names.contains(&"Ada"), "{names:?}");
@@ -2176,6 +2494,194 @@ mod tests {
         assert_eq!(speakers.len(), 1);
         assert_eq!(speakers[0].cluster_key, SELF_CLUSTER_KEY);
         assert!(speakers[0].is_self);
+    }
+
+    /// The safety net, and the shape of the meeting of 2026-08-24: a cut that
+    /// hands over a voice which then wins no line of the transcript. Whatever
+    /// decided that cut — a count the person gave us, the automatic count — a
+    /// voice with nothing behind it must not become a row. Two of them did on
+    /// that meeting, and the person met them in the naming dialog.
+    #[tokio::test]
+    async fn a_voice_that_wins_no_line_gets_no_row() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Standup", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                remote_line(&meeting.id, 0, 4_000),
+                remote_line(&meeting.id, 5_000, 9_000),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Two voices with the conversation between them, and two slivers off in
+        // the silence where nobody said anything.
+        let cut = cut_of(&[
+            vec![(0i64, 4_000i64)],
+            vec![(5_000, 9_000)],
+            vec![(30_000, 30_300)],
+            vec![(31_000, 31_300)],
+        ]);
+        let speakers = persist(&db, &meeting.id, &cut, Source::System)
+            .await
+            .unwrap();
+
+        assert_eq!(speakers.len(), 3, "You and the two voices that spoke");
+        let keys: Vec<&str> = speakers.iter().map(|s| s.cluster_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                SELF_CLUSTER_KEY,
+                cluster_key(0).as_str(),
+                cluster_key(1).as_str()
+            ],
+            "the two silent voices left rows behind"
+        );
+        // The invariant, stated as the person would meet it: every row has at
+        // least one line of the transcript on it.
+        let segments = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for speaker in speakers.iter().filter(|s| !s.is_self) {
+            assert!(
+                segments
+                    .iter()
+                    .any(|s| s.speaker_id.as_deref() == Some(speaker.id.as_str())),
+                "{} has no lines and should not exist",
+                speaker.display_name
+            );
+        }
+        assert_eq!(repo::count_people(&db, &meeting.id).await.unwrap(), 3);
+    }
+
+    /// The rows are *labelled* by the voices that survive, so a meeting whose
+    /// first cluster is a stray still has a "Speaker 1". Without this the person
+    /// is shown "Speaker 2" and "Speaker 3" and left wondering where the first
+    /// one went. The key underneath still names the voice, not the position —
+    /// [`a_rename_stays_on_the_voice_it_was_given_to`] is what that is for.
+    #[tokio::test]
+    async fn the_voices_that_survive_are_numbered_from_one() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Retro", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(&db, &[remote_line(&meeting.id, 10_000, 14_000)])
+            .await
+            .unwrap();
+
+        // The sliver speaks first on the clock, so it is track 0.
+        let cut = cut_of(&[vec![(0i64, 300i64)], vec![(10_000, 14_000)]]);
+        let speakers = persist(&db, &meeting.id, &cut, Source::System)
+            .await
+            .unwrap();
+
+        let voices: Vec<&Speaker> = speakers.iter().filter(|s| !s.is_self).collect();
+        assert_eq!(voices.len(), 1);
+        assert_eq!(voices[0].display_name, display_name(0), "counted from one");
+        assert_eq!(
+            voices[0].cluster_key,
+            cluster_key(1),
+            "the key names the voice it came from, not where it sits in the list"
+        );
+    }
+
+    /// **The thing the key exists for.** A person renames a voice and links it
+    /// to somebody they know; a re-run then finds one of the *earlier* voices
+    /// silent. The row must still be the row for that voice — same name, same
+    /// person, same lines — however the list around it shifts. Numbering the
+    /// rows instead of the voices slides the name onto somebody else's speech
+    /// and deletes the last row with a name still on it.
+    #[tokio::test]
+    async fn a_rename_stays_on_the_voice_it_was_given_to() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Weekly", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                remote_line(&meeting.id, 0, 4_000),
+                remote_line(&meeting.id, 5_000, 9_000),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Two voices, both talking: two rows.
+        let both = cut_of(&[vec![(0i64, 4_000i64)], vec![(5_000, 9_000)]]);
+        persist(&db, &meeting.id, &both, Source::System)
+            .await
+            .unwrap();
+        let second = repo::list_speakers(&db, &meeting.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.cluster_key == cluster_key(1))
+            .expect("the second voice has a row");
+        let person = repo::create_person(&db, "Ada").await.unwrap();
+        repo::rename_speaker(&db, &second.id, "Ada").await.unwrap();
+        repo::set_speaker_person(&db, &second.id, Some(&person.id))
+            .await
+            .unwrap();
+
+        // A re-run in which the first voice wins nothing at all.
+        let only_second = cut_of(&[vec![(30_000i64, 30_300i64)], vec![(5_000, 9_000)]]);
+        let speakers = persist(&db, &meeting.id, &only_second, Source::System)
+            .await
+            .unwrap();
+
+        let voices: Vec<&Speaker> = speakers.iter().filter(|s| !s.is_self).collect();
+        assert_eq!(voices.len(), 1, "one voice spoke, so one row");
+        assert_eq!(voices[0].cluster_key, cluster_key(1));
+        assert_eq!(voices[0].display_name, "Ada", "the name moved or was lost");
+        assert_eq!(voices[0].person_id.as_deref(), Some(person.id.as_str()));
+        // And Ada still has the lines she said, not the silent voice's.
+        let segments = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let hers: Vec<i64> = segments
+            .iter()
+            .filter(|s| s.speaker_id.as_deref() == Some(voices[0].id.as_str()))
+            .map(|s| s.t_start_ms)
+            .collect();
+        assert_eq!(hers, vec![5_000]);
+    }
+
+    /// With nothing on disk to separate there is no pass to report on: the
+    /// result carries the rows that exist and no claim about how many voices
+    /// were heard.
+    #[tokio::test]
+    async fn a_meeting_with_no_audio_reports_the_rows_it_has() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Notes only", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(&db, &[mic_line(&meeting.id, 0, 4_000)])
+            .await
+            .unwrap();
+
+        let missing = std::path::Path::new("/nowhere/at/all");
+        let result = refine(&db, &meeting.id, missing, missing, &DiarizeControl::new())
+            .await
+            .expect("no audio is an answer, not a failure");
+        assert_eq!(result.voices_asked, None);
+        assert_eq!(result.voices_found, 1, "the microphone row");
+        assert_eq!(result.speaker_count, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -2258,10 +2764,24 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(segments.len(), 2, "the line was not cut: {segments:?}");
-        assert_eq!(segments[0].speaker_id.as_deref(), Some(speakers[0].id.as_str()));
-        assert_eq!(segments[1].speaker_id.as_deref(), Some(speakers[1].id.as_str()));
-        assert!(segments[0].text.ends_with("Italia."), "{:?}", segments[0].text);
-        assert!(segments[1].text.starts_with("Ah ok"), "{:?}", segments[1].text);
+        assert_eq!(
+            segments[0].speaker_id.as_deref(),
+            Some(speakers[0].id.as_str())
+        );
+        assert_eq!(
+            segments[1].speaker_id.as_deref(),
+            Some(speakers[1].id.as_str())
+        );
+        assert!(
+            segments[0].text.ends_with("Italia."),
+            "{:?}",
+            segments[0].text
+        );
+        assert!(
+            segments[1].text.starts_with("Ah ok"),
+            "{:?}",
+            segments[1].text
+        );
         // The pieces tile the line, carry the new revision, and keep the
         // provenance of words that were never re-transcribed.
         assert_eq!((segments[0].t_start_ms, segments[1].t_end_ms), (0, 9_000));
@@ -2364,9 +2884,14 @@ mod tests {
         .unwrap();
         pin_channel_speakers(&db, &meeting.id).await.unwrap();
 
-        persist(&db, &meeting.id, &cut_of(&[vec![(0i64, 4_000i64)]]), Source::MicOnly)
-            .await
-            .unwrap();
+        persist(
+            &db,
+            &meeting.id,
+            &cut_of(&[vec![(0i64, 4_000i64)]]),
+            Source::MicOnly,
+        )
+        .await
+        .unwrap();
 
         let segments = repo::get_segments(
             &db,
@@ -2469,5 +2994,106 @@ mod tests {
         assert_eq!(segments[0].speaker_id.as_deref(), Some(me.id.as_str()));
         assert_ne!(segments[1].speaker_id.as_deref(), Some(me.id.as_str()));
         assert!(segments[1].speaker_id.is_some());
+    }
+
+    /// A meeting the person only listened to: "You" gets a row because they were
+    /// there, and it has nothing on it because they said nothing. The count Echo
+    /// reports back — the one behind "Echo can only hear N distinct voices" —
+    /// must not include it, or a two-voice recording claims three.
+    #[tokio::test]
+    async fn the_silent_you_row_is_not_one_of_the_voices_echo_can_hear() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Webinar", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                remote_line(&meeting.id, 0, 4_000),
+                remote_line(&meeting.id, 5_000, 9_000),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let cut = cut_of(&[vec![(0i64, 4_000i64)], vec![(5_000, 9_000)]]);
+        let speakers = persist(&db, &meeting.id, &cut, Source::System)
+            .await
+            .unwrap();
+        assert_eq!(speakers.len(), 3, "You, silent, plus the two who spoke");
+        assert_eq!(
+            repo::count_people(&db, &meeting.id).await.unwrap(),
+            3,
+            "there were three people in the meeting"
+        );
+        assert_eq!(
+            repo::count_audible_people(&db, &meeting.id).await.unwrap(),
+            2,
+            "and two of them can be heard"
+        );
+    }
+
+    /// The other end of the same rule: nothing on the microphone belongs to any
+    /// voice the pass found, so there is nobody to keep and every row goes.
+    /// Microphone-only, so there is no "You" row holding the list open — the
+    /// branch that deletes them all outright.
+    #[tokio::test]
+    async fn a_pass_that_finds_nobody_leaves_nobody_behind() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Voice memo", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(&db, &[mic_line(&meeting.id, 0, 4_000)])
+            .await
+            .unwrap();
+        // The rows a previous run left behind, one of them with a name on it.
+        let stale = repo::upsert_speaker(&db, &meeting.id, &cluster_key(0), "Speaker 1", false)
+            .await
+            .unwrap();
+        repo::rename_speaker(&db, &stale.id, "Giulia")
+            .await
+            .unwrap();
+        let existing = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ids: Vec<Id> = existing.iter().map(|s| s.id.clone()).collect();
+        repo::assign_speaker(&db, &ids, &stale.id, 1).await.unwrap();
+
+        // Another meeting's rows, which this must not touch.
+        let other = repo::create_meeting(&db, "Standup", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::upsert_speaker(&db, &other.id, &cluster_key(0), "Speaker 1", false)
+            .await
+            .unwrap();
+
+        let speakers = persist(&db, &meeting.id, &cut_of(&[]), Source::MicOnly)
+            .await
+            .unwrap();
+        assert!(speakers.is_empty(), "{speakers:?}");
+        assert_eq!(repo::count_people(&db, &meeting.id).await.unwrap(), 0);
+        assert_eq!(
+            repo::count_people(&db, &other.id).await.unwrap(),
+            1,
+            "the other meeting's speakers were deleted too"
+        );
+        // The line that pointed at a deleted row reads as unattributed rather
+        // than as a voice nobody can look up.
+        let segments = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(segments.iter().all(|s| s.speaker_id.is_none()));
     }
 }

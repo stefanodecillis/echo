@@ -148,6 +148,10 @@ pub(crate) async fn run(
             speakers: Vec::new(),
             people_count,
             people_count_is_override,
+            // The rows are gone and the pass has not run yet, so there is
+            // nothing true to say about how many voices are in there.
+            voices_found: None,
+            alternative_count: None,
         }));
 
     // Back to Processing while the work runs. This is also what lets the meeting

@@ -710,6 +710,30 @@ export const peopleCount = {
     n === null
       ? "Redo who said what automatically?"
       : `Redo who said what for ${n} ${n === 1 ? meeting.peopleCountSingular : meeting.peopleCountPlural}?`,
+  /**
+   * Beside the participants stepper when someone asked for more people than
+   * the recording holds separable voices. Says what Echo can hear and asks for
+   * nothing: the number they typed is about the room they were in, and it
+   * stays. Same sentence the backend puts in the message when the pass
+   * finishes, so the two never disagree.
+   */
+  voicesFound: (n: number) =>
+    n === 0
+      ? "Echo can't tell any voices apart in this recording."
+      : n === 1
+        ? "Echo can only hear one voice clearly in this recording."
+        : `Echo can only hear ${n} distinct voices in this recording.`,
+  /**
+   * Beside the participants stepper when the count is Echo's own automatic
+   * reading. Shows the best count it decided against, because a wrong count is
+   * the one speaker mistake nothing here can fix later — merges exist, splits
+   * don't — and a decision nobody can see is a decision nobody can argue with.
+   * An invitation to correct the number, not a confession of error.
+   */
+  alternativeCount: (n: number) =>
+    n === 1
+      ? "One voice was Echo's next best reading. If that's right, lower the number."
+      : `${n} was Echo's next best reading. If that's right, set the number to ${n}.`,
 } as const;
 
 /**

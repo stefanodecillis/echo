@@ -520,7 +520,10 @@ pub fn match_remaining(cut: &mut super::pipeline::ScanCut, enrolment: &Enrolment
         }
     }
     for (track, found) in decided {
-        if best_for.get(found.person_id()).is_some_and(|(t, _)| *t == track) {
+        if best_for
+            .get(found.person_id())
+            .is_some_and(|(t, _)| *t == track)
+        {
             if let Some(slot) = cut.matches.get_mut(track) {
                 *slot = Some(found);
             }
@@ -757,7 +760,10 @@ pub async fn learn_from_confirmation(
 
     let picks = sample::pick_windows(&segments, &theirs, SAMPLES_PER_CONFIRMATION);
     if picks.is_empty() {
-        return Err(DiarizeError::NoVoiceSample);
+        // A voice with no lines at all and a voice with no clear moment in its
+        // lines are different answers to the person; `why_no_moment` owns the
+        // distinction.
+        return Err(sample::why_no_moment(&segments, &theirs));
     }
     let clips = sample::clips_for(db, meeting_id, &picks).await?;
     if clips.is_empty() {
@@ -978,7 +984,11 @@ pub fn choose_evictions(samples: &[SampleFacts], keep: usize) -> Vec<Id> {
 /// Order matters: outliers go first, because a mislabelled sample is *also* an
 /// unusually well-spread one and would survive the cap on exactly the grounds
 /// that make it wrong.
-pub async fn curate(db: &Db, person_id: &str, embedder_tag: &str) -> Result<Curation, DiarizeError> {
+pub async fn curate(
+    db: &Db,
+    person_id: &str,
+    embedder_tag: &str,
+) -> Result<Curation, DiarizeError> {
     let rows = repo::list_person_samples(db, person_id)
         .await
         .map_err(failed)?;
@@ -1015,7 +1025,9 @@ pub async fn curate(db: &Db, person_id: &str, embedder_tag: &str) -> Result<Cura
 
     doomed.extend(outliers.iter().cloned());
     doomed.extend(evicted.iter().cloned());
-    repo::delete_person_samples(db, &doomed).await.map_err(failed)?;
+    repo::delete_person_samples(db, &doomed)
+        .await
+        .map_err(failed)?;
 
     let kept: Vec<&SampleFacts> = surviving
         .iter()
@@ -1030,15 +1042,9 @@ pub async fn curate(db: &Db, person_id: &str, embedder_tag: &str) -> Result<Cura
             .map_err(failed)?;
     } else {
         let centroid = centroid_of(kept.iter().map(|f| f.embedding.as_slice()));
-        repo::upsert_person_profile(
-            db,
-            person_id,
-            &centroid,
-            kept.len() as u32,
-            embedder_tag,
-        )
-        .await
-        .map_err(failed)?;
+        repo::upsert_person_profile(db, person_id, &centroid, kept.len() as u32, embedder_tag)
+            .await
+            .map_err(failed)?;
     }
 
     Ok(Curation {
@@ -1695,7 +1701,10 @@ mod tests {
         // The ordering the whole module's reasoning depends on, and the
         // clearance over the closest stranger ever measured, at both levels.
         const {
-            assert!(TAU_SUGGEST < TAU_LINK, "asking must be easier than claiming");
+            assert!(
+                TAU_SUGGEST < TAU_LINK,
+                "asking must be easier than claiming"
+            );
             assert!(
                 TAU_LINK < TAU_STRONG,
                 "one fingerprint must be held to a higher bar than a cluster"
@@ -1777,7 +1786,10 @@ mod tests {
         }
         let dropped = find_outliers(&samples);
         assert_eq!(dropped.len(), 4, "{dropped:?}");
-        assert!(dropped.iter().all(|id| id.starts_with("wrong")), "{dropped:?}");
+        assert!(
+            dropped.iter().all(|id| id.starts_with("wrong")),
+            "{dropped:?}"
+        );
     }
 
     #[test]
@@ -1886,11 +1898,7 @@ mod tests {
     #[test]
     fn a_leftover_that_looks_like_two_people_goes_back_to_neither() {
         let people = vec![person(0, "Marco"), person(1, "Ada")];
-        let absorbed = absorb_leftovers(
-            &[print_scoring(&[0.70, 0.65])],
-            &people,
-            &[0, 1],
-        );
+        let absorbed = absorb_leftovers(&[print_scoring(&[0.70, 0.65])], &people, &[0, 1]);
         assert_eq!(absorbed, vec![None], "{MARGIN} of daylight or nothing");
     }
 
@@ -1912,9 +1920,8 @@ mod tests {
     #[tokio::test]
     async fn curating_comes_down_to_the_cap_and_rewrites_the_centroid() {
         let db = db().await;
-        let mut samples: Vec<(Vec<f32>, Channel)> = (0..28)
-            .map(|_| (sample_near(0, 0), Channel::Mic))
-            .collect();
+        let mut samples: Vec<(Vec<f32>, Channel)> =
+            (0..28).map(|_| (sample_near(0, 0), Channel::Mic)).collect();
         samples[0] = (sample_near(0, 3), Channel::System);
         let person_id = person_with_samples(&db, "Marco", &samples, "old-network").await;
 
@@ -1923,7 +1930,10 @@ mod tests {
         assert_eq!(curated.evicted, 28 - MAX_SAMPLES);
         assert_eq!(curated.outliers, 0);
         assert_eq!(
-            repo::list_person_samples(&db, &person_id).await.unwrap().len(),
+            repo::list_person_samples(&db, &person_id)
+                .await
+                .unwrap()
+                .len(),
             MAX_SAMPLES
         );
 
@@ -1951,9 +1961,8 @@ mod tests {
     #[tokio::test]
     async fn curating_a_profile_with_a_mislabel_in_it_drops_the_mislabel() {
         let db = db().await;
-        let mut samples: Vec<(Vec<f32>, Channel)> = (0..10)
-            .map(|i| (sample_near(0, i), Channel::Mic))
-            .collect();
+        let mut samples: Vec<(Vec<f32>, Channel)> =
+            (0..10).map(|i| (sample_near(0, i), Channel::Mic)).collect();
         samples.push((sample_near(3, 1), Channel::Mic));
         let person_id = person_with_samples(&db, "Marco", &samples, "n").await;
 
@@ -2008,7 +2017,13 @@ mod tests {
         let people = repo::list_person_infos(&db, "new").await.unwrap();
         let marco = people.iter().find(|p| p.name == "Marco").unwrap();
         assert!(marco.needs_refresh);
-        assert!(!people.iter().find(|p| p.name == "Luca").unwrap().needs_refresh);
+        assert!(
+            !people
+                .iter()
+                .find(|p| p.name == "Luca")
+                .unwrap()
+                .needs_refresh
+        );
     }
 
     #[tokio::test]
@@ -2019,13 +2034,19 @@ mod tests {
         let before = repo::list_person_profiles(&db).await.unwrap();
 
         let outcome = refresh_profiles(&db, Path::new("/nonexistent/fingerprints.onnx")).await;
-        assert!(matches!(outcome, Err(DiarizeError::NotInstalled)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Err(DiarizeError::NotInstalled)),
+            "{outcome:?}"
+        );
 
         let after = repo::list_person_profiles(&db).await.unwrap();
         assert_eq!(after.len(), before.len());
         assert_eq!(after[0].embedder_asset_id, "old");
         assert_eq!(
-            repo::list_person_samples(&db, &person_id).await.unwrap().len(),
+            repo::list_person_samples(&db, &person_id)
+                .await
+                .unwrap()
+                .len(),
             1,
             "a failed refresh must not cost anybody their samples"
         );
@@ -2159,7 +2180,9 @@ mod tests {
         repo::set_speaker_person(&db, &speaker_id, Some(&person_id))
             .await
             .unwrap();
-        repo::rename_speaker(&db, &speaker_id, "Marco").await.unwrap();
+        repo::rename_speaker(&db, &speaker_id, "Marco")
+            .await
+            .unwrap();
 
         repo::delete_person(&db, &person_id).await.unwrap();
 
@@ -2169,7 +2192,10 @@ mod tests {
             speaker.display_name, "Marco",
             "the name already read in this meeting stays as plain text"
         );
-        assert!(repo::list_person_samples(&db, &person_id).await.unwrap().is_empty());
+        assert!(repo::list_person_samples(&db, &person_id)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(repo::list_person_profiles(&db).await.unwrap().is_empty());
         assert!(repo::get_person(&db, &person_id).await.unwrap().is_none());
         // And the meeting itself is untouched.
@@ -2216,7 +2242,9 @@ mod tests {
         repo::set_speaker_person(&db, &speaker_id, Some(&person_id))
             .await
             .unwrap();
-        repo::rename_speaker(&db, &speaker_id, "Marco").await.unwrap();
+        repo::rename_speaker(&db, &speaker_id, "Marco")
+            .await
+            .unwrap();
 
         link(&db, &meeting_id, &speaker_id, None).await.unwrap();
 
@@ -2269,7 +2297,10 @@ mod tests {
         let person_id =
             person_with_samples(&db, "Marco", &[(sample_near(0, 1), Channel::Mic)], "n").await;
         let encoded = person_sample_audio(&db, &person_id).await.unwrap();
-        assert!(encoded.starts_with("UklGR"), "has to be a WAV: {encoded:.8}");
+        assert!(
+            encoded.starts_with("UklGR"),
+            "has to be a WAV: {encoded:.8}"
+        );
 
         let empty = repo::create_person(&db, "Never heard").await.unwrap();
         assert!(matches!(
@@ -2357,7 +2388,12 @@ mod tests {
         let speaker = repo::upsert_speaker(&db, &meeting.id, "speaker-01", "Speaker 1", false)
             .await
             .unwrap();
-        let turns = [(10_000, 20_000), (30_000, 40_000), (50_000, 60_000), (70_000, 80_000)];
+        let turns = [
+            (10_000, 20_000),
+            (30_000, 40_000),
+            (50_000, 60_000),
+            (70_000, 80_000),
+        ];
         for (from, to) in turns {
             repo::insert_segments(
                 &db,
@@ -2380,7 +2416,9 @@ mod tests {
             .await
             .unwrap();
 
-        let info = enroll(&db, &meeting.id, &speaker.id, "Marco").await.unwrap();
+        let info = enroll(&db, &meeting.id, &speaker.id, "Marco")
+            .await
+            .unwrap();
         assert_eq!(info.name, "Marco");
         assert_eq!(
             info.sample_count as usize, SAMPLES_PER_CONFIRMATION,
@@ -2412,7 +2450,9 @@ mod tests {
 
         // Confirming again adds more of the same voice without doubling anything
         // it already knows.
-        link(&db, &meeting.id, &speaker.id, Some(&info.id)).await.unwrap();
+        link(&db, &meeting.id, &speaker.id, Some(&info.id))
+            .await
+            .unwrap();
         let after = list_people(&db).await.unwrap();
         assert!(
             after[0].sample_count as usize <= MAX_SAMPLES,
@@ -2455,7 +2495,9 @@ mod tests {
         )
         .await
         .unwrap();
-        repo::recompute_speaking_time(db, &meeting.id).await.unwrap();
+        repo::recompute_speaking_time(db, &meeting.id)
+            .await
+            .unwrap();
         repo::set_speaker_centroid(db, &speaker.id, Some(centroid))
             .await
             .unwrap();
@@ -2466,8 +2508,13 @@ mod tests {
     async fn a_voice_in_three_meetings_is_offered_and_one_in_two_is_not() {
         let db = db().await;
         for i in 0..3 {
-            meeting_with_a_voice(&db, &format!("Sync {i}"), &sample_near(0, i), 60_000 + i as i64)
-                .await;
+            meeting_with_a_voice(
+                &db,
+                &format!("Sync {i}"),
+                &sample_near(0, i),
+                60_000 + i as i64,
+            )
+            .await;
         }
         for i in 0..2 {
             meeting_with_a_voice(&db, &format!("Other {i}"), &sample_near(3, i), 10_000).await;

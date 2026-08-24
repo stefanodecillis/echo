@@ -771,6 +771,25 @@ export interface SpeakersUpdatedPayload {
   peopleCount: number;
   /** True when the count is the person's correction, not Echo's. */
   peopleCountIsOverride: boolean;
+  /**
+   * How many people the pass could actually tell apart, when this payload comes
+   * from a pass that has just run. Absent from every other emitter, which are
+   * announcing rows rather than a fresh separation.
+   *
+   * Below `peopleCount` when someone asked for more people than the recording
+   * holds. "Name your speakers" says so beside the number.
+   */
+  voicesFound?: number;
+  /**
+   * The best count Echo decided against, when the count is Echo's own automatic
+   * reading. Absent when the person set the count, and from every other
+   * emitter.
+   *
+   * A wrong count is the one speaker mistake nothing in the UI can fix after
+   * the fact (merges exist; splits do not), so the dialog shows what the
+   * runner-up said rather than leaving the decision unarguable.
+   */
+  alternativeCount?: number;
 }
 
 /**

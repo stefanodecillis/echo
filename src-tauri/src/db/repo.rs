@@ -258,6 +258,35 @@ pub async fn people_count(db: &Db, meeting_id: &str) -> Result<(u32, bool), DbEr
     Ok((count_people(db, meeting_id).await?, false))
 }
 
+/// Speaker rows for this meeting that are not merged into another one **and
+/// have a line of the transcript on them**.
+///
+/// [`count_people`] is Echo's count of the people in the meeting, and "You" is
+/// one of them whether or not the microphone caught a word — the person was
+/// there. This answers the other question, the one the speaker pass reports and
+/// the one "Echo can only hear N distinct voices" is about: how many voices are
+/// audible in the recording. On a meeting somebody only listened to, those two
+/// differ by exactly the silent "You" row, and counting it there would claim one
+/// more voice than the recording holds.
+///
+/// A row somebody merged into another counts towards the row it was merged
+/// into, so a person whose every line sits on the merged-away half is still one
+/// voice. One hop, the same depth [`count_people`] reasons at.
+pub async fn count_audible_people(db: &Db, meeting_id: &str) -> Result<u32, DbError> {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM speakers s
+         WHERE s.meeting_id = ?1 AND s.alias_of IS NULL AND EXISTS (
+             SELECT 1 FROM segments g
+             JOIN speakers t ON t.id = g.speaker_id
+             WHERE g.is_final = 1 AND (t.id = s.id OR t.alias_of = s.id)
+         )",
+    )
+    .bind(meeting_id)
+    .fetch_one(db)
+    .await?;
+    Ok(n as u32)
+}
+
 /// Speaker rows for this meeting that are not merged into another one.
 pub async fn count_people(db: &Db, meeting_id: &str) -> Result<u32, DbError> {
     let (n,): (i64,) =
@@ -1114,6 +1143,22 @@ pub async fn unmerge_speaker(db: &Db, id: &str) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Forget every speaker of this meeting.
+///
+/// The honest end of [`prune_speakers_except`], which refuses an empty `keep`
+/// on purpose (see its docs) because that shape usually means a caller lost its
+/// list. A caller that means it — the speaker pass on a meeting where no line of
+/// transcript belongs to any voice it found — says so here instead, and the
+/// lines those rows held go back to unattributed exactly as a partial prune
+/// would leave them.
+pub async fn forget_speakers(db: &Db, meeting_id: &str) -> Result<u64, DbError> {
+    Ok(sqlx::query("DELETE FROM speakers WHERE meeting_id = ?1")
+        .bind(meeting_id)
+        .execute(db)
+        .await?
+        .rows_affected())
+}
+
 /// Forget the speakers of this meeting whose cluster keys are not in `keep`.
 ///
 /// What the speaker pass calls after it has re-pointed the transcript: the keys
@@ -1224,12 +1269,14 @@ pub async fn set_speaker_suggestion(
     person_id: Option<&str>,
     score: Option<f32>,
 ) -> Result<(), DbError> {
-    sqlx::query("UPDATE speakers SET suggested_person_id = ?2, suggestion_score = ?3 WHERE id = ?1")
-        .bind(speaker_id)
-        .bind(person_id)
-        .bind(person_id.and(score))
-        .execute(db)
-        .await?;
+    sqlx::query(
+        "UPDATE speakers SET suggested_person_id = ?2, suggestion_score = ?3 WHERE id = ?1",
+    )
+    .bind(speaker_id)
+    .bind(person_id)
+    .bind(person_id.and(score))
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -1369,10 +1416,11 @@ pub async fn get_person(db: &Db, id: &str) -> Result<Option<PersonRow>, DbError>
 }
 
 pub async fn list_people(db: &Db) -> Result<Vec<PersonRow>, DbError> {
-    let rows =
-        sqlx::query("SELECT id, name, created_at, updated_at FROM people ORDER BY name, created_at")
-            .fetch_all(db)
-            .await?;
+    let rows = sqlx::query(
+        "SELECT id, name, created_at, updated_at FROM people ORDER BY name, created_at",
+    )
+    .fetch_all(db)
+    .await?;
     rows.into_iter().map(row_to_person).collect()
 }
 
@@ -1551,7 +1599,8 @@ pub async fn delete_person_samples(db: &Db, ids: &[Id]) -> Result<u64, DbError> 
     if ids.is_empty() {
         return Ok(0);
     }
-    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("DELETE FROM person_samples WHERE id IN (");
+    let mut qb: QueryBuilder<Sqlite> =
+        QueryBuilder::new("DELETE FROM person_samples WHERE id IN (");
     let mut sep = qb.separated(", ");
     for id in ids {
         sep.push_bind(id);
@@ -3250,6 +3299,74 @@ mod tests {
         assert_eq!(count_people(&db, &m.id).await.unwrap(), 1);
     }
 
+    /// The deliberate end of the same road, and the one destructive query with
+    /// no `keep` list to hold it back: a pass that found nobody at all says so
+    /// here. Every row of *this* meeting goes, the lines they held read as
+    /// unattributed, and no other meeting is touched.
+    #[tokio::test]
+    async fn forgetting_takes_this_meeting_s_voices_and_only_this_meeting_s() {
+        let (db, m) = seeded().await;
+        let other = create_meeting(&db, "Retro", "/tmp/audio/m2", None)
+            .await
+            .unwrap();
+        upsert_speaker(&db, &m.id, "you", "You", true)
+            .await
+            .unwrap();
+        let voice = upsert_speaker(&db, &m.id, "speaker-01", "Dana", false)
+            .await
+            .unwrap();
+        upsert_speaker(&db, &other.id, "speaker-01", "Speaker 1", false)
+            .await
+            .unwrap();
+        let ids = insert_segments(&db, &[draft(&m.id, 0, "we ship on Friday")])
+            .await
+            .unwrap();
+        assign_speaker(&db, &ids, &voice.id, 2).await.unwrap();
+
+        assert_eq!(forget_speakers(&db, &m.id).await.unwrap(), 2);
+        assert_eq!(count_people(&db, &m.id).await.unwrap(), 0);
+        assert_eq!(count_people(&db, &other.id).await.unwrap(), 1);
+        let segment = get_segment(&db, &ids[0]).await.unwrap().unwrap();
+        assert_eq!(segment.speaker_id, None);
+        assert_eq!(segment.text, "we ship on Friday", "the words are untouched");
+        // Saying it twice is not an error, it is just nothing left to forget.
+        assert_eq!(forget_speakers(&db, &m.id).await.unwrap(), 0);
+    }
+
+    /// Who Echo can actually hear, which is not the same question as who was in
+    /// the meeting: a row nobody's words landed on — "You" on a meeting the
+    /// person only listened to — is not a voice in the recording.
+    #[tokio::test]
+    async fn the_audible_count_leaves_out_rows_with_no_lines_on_them() {
+        let (db, m) = seeded().await;
+        upsert_speaker(&db, &m.id, "you", "You", true)
+            .await
+            .unwrap();
+        let voice = upsert_speaker(&db, &m.id, "speaker-01", "Speaker 1", false)
+            .await
+            .unwrap();
+        let merged = upsert_speaker(&db, &m.id, "speaker-02", "Speaker 2", false)
+            .await
+            .unwrap();
+        let ids = insert_segments(&db, &[draft(&m.id, 0, "morning")])
+            .await
+            .unwrap();
+        assign_speaker(&db, &ids, &voice.id, 2).await.unwrap();
+
+        assert_eq!(count_people(&db, &m.id).await.unwrap(), 3);
+        assert_eq!(count_audible_people(&db, &m.id).await.unwrap(), 1);
+
+        // A merged row's lines count towards the row it was merged into, so a
+        // person is not made inaudible by somebody tidying the list.
+        let more = insert_segments(&db, &[draft(&m.id, 5_000, "and then we shipped")])
+            .await
+            .unwrap();
+        assign_speaker(&db, &more, &merged.id, 3).await.unwrap();
+        merge_speakers(&db, &merged.id, &voice.id).await.unwrap();
+        assert_eq!(count_people(&db, &m.id).await.unwrap(), 2);
+        assert_eq!(count_audible_people(&db, &m.id).await.unwrap(), 1);
+    }
+
     #[tokio::test]
     async fn pruning_never_reaches_into_another_meeting() {
         let (db, m) = seeded().await;
@@ -4097,7 +4214,9 @@ mod tests {
     #[tokio::test]
     async fn a_split_is_refused_rather_than_half_done() {
         let (db, m) = seeded().await;
-        let whole = insert_segment(&db, &draft(&m.id, 0, "kumquat")).await.unwrap();
+        let whole = insert_segment(&db, &draft(&m.id, 0, "kumquat"))
+            .await
+            .unwrap();
         let piece = |text: &str, revision: i64| SegmentDraft {
             meeting_id: m.id.clone(),
             t_start_ms: 0,
@@ -4193,7 +4312,9 @@ mod tests {
         )
         .await
         .unwrap();
-        upsert_person_profile(&db, &person.id, &[0.5, 0.5, 0.5, 0.5], 1, "network").await.unwrap();
+        upsert_person_profile(&db, &person.id, &[0.5, 0.5, 0.5, 0.5], 1, "network")
+            .await
+            .unwrap();
         set_speaker_person(&db, &speaker.id, Some(&person.id))
             .await
             .unwrap();
@@ -4204,7 +4325,10 @@ mod tests {
 
         delete_all_people(&db).await.unwrap();
         assert!(list_people(&db).await.unwrap().is_empty());
-        assert!(list_person_samples(&db, &person.id).await.unwrap().is_empty());
+        assert!(list_person_samples(&db, &person.id)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(list_person_profiles(&db).await.unwrap().is_empty());
         for table in ["people", "person_samples", "person_profiles"] {
             let (rows,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
@@ -4291,7 +4415,10 @@ mod tests {
             .unwrap();
         let row = get_speaker(&db, &speaker.id).await.unwrap().unwrap();
         assert_eq!(row.person_id.as_deref(), Some(person.id.as_str()));
-        assert!(row.suggested_person_id.is_none(), "answered, so stop asking");
+        assert!(
+            row.suggested_person_id.is_none(),
+            "answered, so stop asking"
+        );
         assert!(row.suggestion_score.is_none());
 
         // A score without a person is not a suggestion, and must not be stored as

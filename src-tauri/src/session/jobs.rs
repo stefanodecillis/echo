@@ -22,7 +22,7 @@ use futures::future::BoxFuture;
 use tokio::sync::Notify;
 
 use crate::db::{repo, Db, DbError};
-use crate::events::{JobProgressPayload, NoticeLevel};
+use crate::events::{JobProgressPayload, NoticeLevel, NoticePayload};
 use crate::paths::AppPaths;
 use crate::session::ports::{AsrPort, EventBus, EventSink, Ports, UiEvent};
 use crate::types::{Channel, Id, Job, JobKind, JobQuery, JobStatus, MeetingStatus, SummaryReq};
@@ -470,16 +470,19 @@ async fn diarize(ctx: &JobContext) -> Result<(), JobFailure> {
     let result = outcome.map_err(|error| diarize_failure(&ctx.cancel, error))?;
 
     let _ = repo::recompute_speaking_time(&ctx.db, &meeting_id).await;
-    ctx.events.emit(UiEvent::SpeakersUpdated(
-        crate::events::SpeakersUpdatedPayload {
-            meeting_id: meeting_id.clone(),
-            speakers: result.speakers.clone(),
-            // The pass has just decided this, so it comes from the pass rather
-            // than from a second query that could disagree with it.
-            people_count: result.people_count,
-            people_count_is_override: result.people_count_is_override,
-        },
-    ));
+    ctx.events.emit(UiEvent::SpeakersUpdated(speakers_event(
+        &meeting_id,
+        &result,
+    )));
+    if let Some(notice) = voices_short_notice(&meeting_id, &result) {
+        tracing::info!(
+            meeting = %meeting_id,
+            asked = ?result.voices_asked,
+            found = result.voices_found,
+            "the meeting holds fewer separable voices than the count asks for"
+        );
+        ctx.events.emit(UiEvent::Notice(notice));
+    }
     // The pass is the one thing that changes the remembered voices without
     // anybody clicking: it links a voice (so somebody was "last heard" just
     // now), and it re-embeds a profile the network moved on from (so the quiet
@@ -512,6 +515,67 @@ async fn diarize(ctx: &JobContext) -> Result<(), JobFailure> {
     }
     ctx.progress.set(1.0).await;
     Ok(())
+}
+
+/// The speaker rows the pass just wrote, as the event every open view reads.
+///
+/// Straight off the pass rather than out of a second query, so the chips and
+/// the number beside them cannot disagree.
+fn speakers_event(
+    meeting_id: &str,
+    result: &crate::diarize::DiarizationResult,
+) -> crate::events::SpeakersUpdatedPayload {
+    crate::events::SpeakersUpdatedPayload {
+        meeting_id: meeting_id.to_string(),
+        speakers: result.speakers.clone(),
+        people_count: result.people_count,
+        people_count_is_override: result.people_count_is_override,
+        voices_found: Some(result.voices_found),
+        alternative_count: result
+            .choice
+            .as_ref()
+            .and_then(|choice| choice.runner_up.map(|(count, _)| count as u32)),
+    }
+}
+
+/// Say it out loud when the recording does not hold as many separable voices as
+/// the person asked for — and say nothing at all otherwise.
+///
+/// Echo used to answer a shortfall by making the difference up in empty speaker
+/// rows, which the person then met in the naming dialog as voices with nothing
+/// behind them (2026-08-24). The number they typed is left exactly as it is:
+/// they were in the meeting and Echo was not, so this states what Echo can hear
+/// and asks for nothing.
+fn voices_short_notice(
+    meeting_id: &str,
+    result: &crate::diarize::DiarizationResult,
+) -> Option<NoticePayload> {
+    let asked = result.voices_asked?;
+    if result.voices_found >= asked {
+        return None;
+    }
+    Some(NoticePayload {
+        level: NoticeLevel::Info,
+        message: voices_short_message(result.voices_found),
+        persistent: false,
+        meeting_id: Some(meeting_id.to_string()),
+        // One meeting, one such message: a re-run replaces it rather than
+        // stacking a second copy of the same sentence.
+        tag: Some("voicesShort".into()),
+    })
+}
+
+/// What Echo says when it could not find as many voices as it was asked for.
+///
+/// "Distinct" is doing the work — it says the voices are in there and Echo
+/// cannot tell them apart, which is the true shape of the problem on a
+/// recording of a room. No jargon, no exclamation mark, nothing to press.
+fn voices_short_message(found: u32) -> String {
+    match found {
+        0 => "Echo can't tell any voices apart in this recording.".into(),
+        1 => "Echo can only hear one voice clearly in this recording.".into(),
+        n => format!("Echo can only hear {n} distinct voices in this recording."),
+    }
 }
 
 fn diarize_failure(cancel: &Cancel, error: crate::diarize::DiarizeError) -> JobFailure {
@@ -1738,6 +1802,86 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert!(!blocked.contains("RECITATION"), "{blocked}");
+    }
+
+    /// A result shaped like the end of a speaker pass, so the two pure
+    /// functions above can be driven without models or audio.
+    fn pass_result(asked: Option<u32>, found: u32) -> crate::diarize::DiarizationResult {
+        crate::diarize::DiarizationResult {
+            people_count: asked.unwrap_or(found),
+            people_count_is_override: asked.is_some(),
+            voices_asked: asked,
+            voices_found: found,
+            ..Default::default()
+        }
+    }
+
+    /// The 2026-08-24 shape: four people asked for, two voices in the
+    /// recording. Echo says so instead of inventing the other two, and the
+    /// number the person typed is left exactly as they typed it.
+    #[test]
+    fn a_count_the_recording_cannot_deliver_is_said_out_loud() {
+        let notice = voices_short_notice("meeting-1", &pass_result(Some(4), 2))
+            .expect("a shortfall the person can see in the chips has to be said");
+        assert_eq!(
+            notice.message,
+            "Echo can only hear 2 distinct voices in this recording."
+        );
+        assert_eq!(notice.meeting_id.as_deref(), Some("meeting-1"));
+        assert!(!notice.persistent, "one sentence, not a banner to dismiss");
+
+        let payload = speakers_event("meeting-1", &pass_result(Some(4), 2));
+        assert_eq!(payload.people_count, 4, "the person's number is theirs");
+        assert!(payload.people_count_is_override);
+        assert_eq!(
+            payload.voices_found,
+            Some(2),
+            "the dialog needs the true number to annotate the count with"
+        );
+    }
+
+    #[test]
+    fn a_count_that_was_delivered_says_nothing() {
+        assert!(voices_short_notice("m", &pass_result(Some(3), 3)).is_none());
+        assert!(
+            voices_short_notice("m", &pass_result(Some(2), 3)).is_none(),
+            "more voices than asked for is not a shortfall"
+        );
+        assert!(
+            voices_short_notice("m", &pass_result(None, 1)).is_none(),
+            "nobody asked for a number, so there is nothing to fall short of"
+        );
+    }
+
+    #[test]
+    fn the_shortfall_sentence_reads_as_one_and_carries_no_jargon() {
+        let banned = [
+            "cluster",
+            "diariz",
+            "silhouette",
+            "threshold",
+            "override",
+            "embed",
+            "voiceprint",
+        ];
+        for found in [0u32, 1, 2, 7] {
+            let message = voices_short_message(found);
+            assert!(
+                message.ends_with('.'),
+                "{message:?} should read as a sentence"
+            );
+            assert!(
+                !message.contains('!'),
+                "{message:?} is shouting at somebody"
+            );
+            let lower = message.to_lowercase();
+            for word in banned {
+                assert!(!lower.contains(word), "{message:?} leaks {word:?}");
+            }
+        }
+        // A number a person reads has to agree with itself.
+        assert!(voices_short_message(1).contains("one voice"));
+        assert!(voices_short_message(2).contains("2 distinct voices"));
     }
 
     #[test]

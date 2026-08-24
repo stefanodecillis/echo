@@ -225,6 +225,27 @@ pub struct SpeakersUpdatedPayload {
     pub people_count: u32,
     /// True when the count is the person's correction, not Echo's.
     pub people_count_is_override: bool,
+    /// How many people the pass could actually tell apart, when this payload
+    /// comes from a pass that has just run. `None` from every other emitter —
+    /// they are announcing rows, not a fresh separation, and a stale number
+    /// here would annotate the count with an answer from a previous run.
+    ///
+    /// Below [`Self::people_count`] when a count the person gave us was more
+    /// than the recording holds. The dialog says so beside the number rather
+    /// than showing rows nobody can hear (2026-08-24).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voices_found: Option<u32>,
+    /// The best count Echo decided against, when the count is Echo's own
+    /// automatic reading. `None` when the person set the count, and from every
+    /// other emitter.
+    ///
+    /// A wrong count is the one speaker mistake nothing in the UI can fix after
+    /// the fact (merges exist; splits do not), so the dialog shows what the
+    /// runner-up said rather than leaving the decision unarguable. It is an
+    /// invitation to correct the number, not a confession of error: plenty of
+    /// meetings have a plausible second reading.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternative_count: Option<u32>,
 }
 
 /// `PEOPLE_UPDATED`
