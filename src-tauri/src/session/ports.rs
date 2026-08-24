@@ -689,9 +689,15 @@ impl EventSink for TauriEvents {
             UiEvent::SettingsChanged(p) => self.app.emit(name, p),
             UiEvent::RecoveryAvailable(p) => self.app.emit(name, p),
             UiEvent::TrayState(state) => {
-                // `set_tray_state` emits the event itself.
-                crate::set_tray_state(&self.app, state);
-                Ok(())
+                // Nothing special about this arm any more. It used to call
+                // `set_tray_state`, which emitted its own event and swallowed
+                // the result — so a dead window went unnoticed here while the
+                // other fifteen arms reported it, and, worse, the icon was
+                // painted synchronously from whichever thread was emitting.
+                // Now the icon is queued for the main thread and the event goes
+                // out through the same path as everything else.
+                crate::schedule_tray_state(&self.app, state);
+                self.app.emit(name, events::TrayStatePayload { state })
             }
         };
         if let Err(error) = sent {

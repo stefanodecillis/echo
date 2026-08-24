@@ -29,10 +29,20 @@ export function useEvent<K extends EventName>(
     let stop: (() => void) | undefined;
     let cancelled = false;
 
-    on(event, (payload) => handlerRef.current(payload)).then((fn) => {
-      if (cancelled) fn();
-      else stop = fn;
-    });
+    on(event, (payload) => handlerRef.current(payload))
+      .then((fn) => {
+        if (cancelled) fn();
+        else stop = fn;
+      })
+      .catch((err) => {
+        // Subscribing itself failed, so this component will never hear about
+        // `event` again — silently, which is how a whole meeting's worth of
+        // updates went missing on 2026-08-24. There is nothing the person
+        // using Echo can do about it and nothing worth interrupting them with
+        // (the screens that matter re-read the core on a timer anyway), but
+        // whoever is looking at the console should see which event died.
+        console.warn(`Echo: could not subscribe to the "${event}" event`, err);
+      });
 
     return () => {
       cancelled = true;

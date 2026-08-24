@@ -82,29 +82,64 @@ impl Default for UiFlags {
     }
 }
 
-/// Swap the tray icon. Called by the session and detection layers.
+/// Swap the tray icon and tell the UI what it now says. Called by the session
+/// and detection layers.
 pub fn set_tray_state(app: &AppHandle, state: TrayState) {
+    schedule_tray_state(app, state);
+    let _ = app.emit(events::TRAY_STATE, events::TrayStatePayload { state });
+}
+
+/// Swap the tray icon and say nothing. The half of [`set_tray_state`] the event
+/// sink wants: it is already holding a `TrayState` event of its own to send, and
+/// sending it twice would be two of everything on the bus.
+///
+/// Never blocks and never panics — it sits on the path every event takes, and on
+/// 2026-08-24 one panic on that path stopped every event for the rest of a
+/// 35-minute meeting.
+pub fn schedule_tray_state(app: &AppHandle, state: TrayState) {
     // The pulse only exists while the tray says "recording". Standing it down
     // here as well as from the capture-state listener closes the one race worth
     // caring about: a frame landing after the icon went back to idle would
-    // leave the menu bar claiming a recording that had finished.
+    // leave the menu bar claiming a recording that had finished, and nothing
+    // repaints until the tray state next changes.
+    //
+    // Stopping synchronously is necessary but not sufficient — aborting a timer
+    // does not reach into a tick that is already running, and that tick's frame
+    // can still be queued behind the paint below. So `stop` also retires the
+    // frames the old pulse has in flight (see [`panel::FrameToken`]), and the
+    // main thread drops them when it gets to them.
     if state != TrayState::Recording {
         if let Some(animation) = app.try_state::<panel::TrayAnimation>() {
             animation.stop();
         }
     }
+    // The paint itself is an AppKit call, so it belongs on the main thread, and
+    // it is queued rather than waited on: whoever asked for this icon has a
+    // meeting to record and should not be parked behind a menu bar.
+    let handle = app.clone();
+    if app
+        .run_on_main_thread(move || paint_tray_state(&handle, state))
+        .is_err()
+    {
+        tracing::warn!(?state, "the menu bar icon could not be changed");
+    }
+}
+
+/// Put `state`'s icon on the tray. Main thread only.
+fn paint_tray_state(app: &AppHandle, state: TrayState) {
     let bytes = match state {
         TrayState::Idle => TRAY_ICON_IDLE,
         TrayState::Detected => TRAY_ICON_DETECTED,
         TrayState::Recording => TRAY_ICON_RECORDING,
     };
     paint_tray(app, bytes);
-    let _ = app.emit(events::TRAY_STATE, events::TrayStatePayload { state });
 }
 
 /// Paint one frame of the recording pulse. Deliberately quiet: the tray *state*
 /// has not changed, so no `TRAY_STATE` event goes out — twice a second of "still
 /// recording" would be noise on the bus.
+///
+/// Main thread only; [`panel::TrayPainter`] is what gets it there.
 pub fn set_tray_frame(app: &AppHandle, frame: usize) {
     paint_tray(app, TRAY_ICON_RECORDING_FRAMES[frame % panel::FRAME_COUNT]);
 }

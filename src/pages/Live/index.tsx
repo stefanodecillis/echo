@@ -54,8 +54,12 @@ const LISTENING_ROW_STATES = new Set(["recording", "degraded"]);
 export default function Live() {
   const navigate = useNavigate();
   const capture = useCaptureState();
-  const speakerLabelFor = useSpeakerNames(capture.meetingId);
-  const lines = useTranscriptStream(capture.meetingId);
+  // Worked out before the hooks below because they take it: a meeting that is
+  // still running is one they keep re-reading from the core, a finished one is
+  // not (see `useTranscriptStream`).
+  const active = capture.meetingId != null && ACTIVE_STATES.has(capture.state);
+  const speakerLabelFor = useSpeakerNames(capture.meetingId, active);
+  const lines = useTranscriptStream(capture.meetingId, active);
   const addToast = useEchoStore((s) => s.addToast);
 
   const pauseCmd = useCommand(pauseRecording);
@@ -85,7 +89,6 @@ export default function Live() {
   const [preparingIsNews, setPreparingIsNews] = useState(false);
 
   const paused = capture.state === "paused";
-  const active = capture.meetingId != null && ACTIVE_STATES.has(capture.state);
   const showListeningRow = LISTENING_ROW_STATES.has(capture.state);
   const hasLines = lines.length > 0;
 
