@@ -515,22 +515,31 @@ pub(crate) struct CollectingEvents {
 
 impl CollectingEvents {
     pub(crate) fn names(&self) -> Vec<&'static str> {
-        self.seen.lock().unwrap().iter().map(|e| e.name()).collect()
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|e| e.name())
+            .collect()
     }
 
     /// Did a banner with this machine tag go out?
     pub(crate) fn notice_tagged(&self, tag: &str) -> bool {
-        self.seen.lock().unwrap().iter().any(|event| match event {
-            UiEvent::Notice(payload) => payload.tag.as_deref() == Some(tag),
-            _ => false,
-        })
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|event| match event {
+                UiEvent::Notice(payload) => payload.tag.as_deref() == Some(tag),
+                _ => false,
+            })
     }
 
     /// Every job announcement, in order.
     pub(crate) fn job_progress(&self) -> Vec<crate::events::JobProgressPayload> {
         self.seen
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter_map(|event| match event {
                 UiEvent::JobProgress(payload) => Some(payload.clone()),
@@ -549,7 +558,7 @@ impl CollectingEvents {
     pub(crate) fn transcript_revisions(&self) -> Vec<crate::events::TranscriptRevisedPayload> {
         self.seen
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter_map(|event| match event {
                 UiEvent::TranscriptRevised(payload) => Some(payload.clone()),
@@ -564,7 +573,7 @@ impl CollectingEvents {
     pub(crate) fn speaker_updates(&self) -> Vec<crate::events::SpeakersUpdatedPayload> {
         self.seen
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter_map(|event| match event {
                 UiEvent::SpeakersUpdated(payload) => Some(payload.clone()),
@@ -577,7 +586,7 @@ impl CollectingEvents {
     pub(crate) fn finals(&self) -> Vec<crate::events::TranscriptFinalPayload> {
         self.seen
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter_map(|event| match event {
                 UiEvent::TranscriptFinal(payload) => Some(payload.clone()),
@@ -589,7 +598,10 @@ impl CollectingEvents {
 
 impl EventSink for CollectingEvents {
     fn emit(&self, event: UiEvent) {
-        self.seen.lock().unwrap().push(event);
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(event);
     }
 }
 

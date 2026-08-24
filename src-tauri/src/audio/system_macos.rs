@@ -46,7 +46,7 @@
 #![allow(non_snake_case)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,7 +55,17 @@ use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
-use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags};
+use objc2_core_media::{
+    kCMSampleBufferError_AllocationFailed, kCMSampleBufferError_AlreadyHasDataBuffer,
+    kCMSampleBufferError_ArrayTooSmall, kCMSampleBufferError_BufferHasNoSampleSizes,
+    kCMSampleBufferError_BufferHasNoSampleTimingInfo, kCMSampleBufferError_BufferNotReady,
+    kCMSampleBufferError_CannotSubdivide, kCMSampleBufferError_DataCanceled,
+    kCMSampleBufferError_DataFailed, kCMSampleBufferError_InvalidEntryCount,
+    kCMSampleBufferError_InvalidMediaFormat, kCMSampleBufferError_InvalidMediaTypeForOperation,
+    kCMSampleBufferError_InvalidSampleData, kCMSampleBufferError_Invalidated,
+    kCMSampleBufferError_RequiredParameterMissing, kCMSampleBufferError_SampleIndexOutOfRange,
+    kCMSampleBufferError_SampleTimingInfoInvalid, CMSampleBuffer, CMTime, CMTimeFlags,
+};
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSProcessInfo, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCRunningApplication, SCShareableContent, SCStream, SCStreamConfiguration,
@@ -175,6 +185,37 @@ unsafe extern "C" {
     fn CGRequestScreenCaptureAccess() -> bool;
 }
 
+/// Names an `OSStatus` CoreMedia handed back from a failed buffer-list call.
+/// The number alone means nothing to whoever reads the log next; the constant
+/// name is the thing a search engine (or a memory of this file) can work with.
+/// Zero-jargon doesn't apply here — this is a tracing line, not something a
+/// person in a meeting ever sees.
+// The kCMSampleBufferError_* constants keep Apple's own spelling so a search
+// for the name in Apple's headers or docs finds it here too.
+#[allow(non_upper_case_globals)]
+fn sample_buffer_status_name(status: i32) -> &'static str {
+    match status {
+        kCMSampleBufferError_AllocationFailed => "AllocationFailed",
+        kCMSampleBufferError_RequiredParameterMissing => "RequiredParameterMissing",
+        kCMSampleBufferError_AlreadyHasDataBuffer => "AlreadyHasDataBuffer",
+        kCMSampleBufferError_BufferNotReady => "BufferNotReady",
+        kCMSampleBufferError_SampleIndexOutOfRange => "SampleIndexOutOfRange",
+        kCMSampleBufferError_BufferHasNoSampleSizes => "BufferHasNoSampleSizes",
+        kCMSampleBufferError_BufferHasNoSampleTimingInfo => "BufferHasNoSampleTimingInfo",
+        kCMSampleBufferError_ArrayTooSmall => "ArrayTooSmall",
+        kCMSampleBufferError_InvalidEntryCount => "InvalidEntryCount",
+        kCMSampleBufferError_CannotSubdivide => "CannotSubdivide",
+        kCMSampleBufferError_SampleTimingInfoInvalid => "SampleTimingInfoInvalid",
+        kCMSampleBufferError_InvalidMediaTypeForOperation => "InvalidMediaTypeForOperation",
+        kCMSampleBufferError_InvalidSampleData => "InvalidSampleData",
+        kCMSampleBufferError_InvalidMediaFormat => "InvalidMediaFormat",
+        kCMSampleBufferError_Invalidated => "Invalidated",
+        kCMSampleBufferError_DataFailed => "DataFailed",
+        kCMSampleBufferError_DataCanceled => "DataCanceled",
+        _ => "unknown",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // State shared between the sample handler and Echo's threads
 // ---------------------------------------------------------------------------
@@ -204,6 +245,15 @@ struct SystemShared {
     counts: BufferCounts,
     /// Set once the first audio buffer's format has been written to the log.
     format_logged: AtomicBool,
+    /// Set once the first buffer-list refusal for this stream has been
+    /// written to the log. Every subsequent refusal still counts toward
+    /// `unreadable`; it just doesn't get its own log line, or a failing
+    /// stream would drown the log in a repeat of the same OSStatus.
+    read_failure_logged: AtomicBool,
+    /// The OSStatus CoreMedia gave back for the most recent buffer-list
+    /// refusal. Zero means never failed. This is deliberately not reset by
+    /// `reopen()` — see the comment there.
+    last_read_status: AtomicI32,
 }
 
 /// How many sample buffers arrived and what became of them.
@@ -228,6 +278,23 @@ impl SystemShared {
             .unwrap_or_else(|e| e.into_inner()) = Some(reason);
         self.stopped.store(true, Ordering::Relaxed);
         self.counters.mark_stopped();
+    }
+
+    /// One line of counters for the diagnostics log. Lives here, not on
+    /// [`SystemCapture`], so a test can build a `SystemShared` directly and
+    /// check the line without opening a stream.
+    fn diagnostics_summary(&self) -> String {
+        diagnostics_line(
+            self.counts.audio.load(Ordering::Relaxed),
+            self.counts.other.load(Ordering::Relaxed),
+            self.counts.not_float.load(Ordering::Relaxed),
+            self.counts.unreadable.load(Ordering::Relaxed),
+            self.counts.empty.load(Ordering::Relaxed),
+            self.counters.pushed_samples(),
+            self.counters.dropped_samples(),
+            self.rate.load(Ordering::Relaxed),
+            self.last_read_status.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -346,12 +413,14 @@ fn handle_audio(shared: &Arc<SystemShared>, sbuf: &CMSampleBuffer) {
 
     let mut list = AudioBufferListRaw::zeroed();
     let mut block_buffer: *mut c_void = std::ptr::null_mut();
+    let provided_size = std::mem::size_of::<AudioBufferListRaw>();
+    let mut needed: usize = 0;
     let status = unsafe {
         CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
             raw,
-            std::ptr::null_mut(),
+            &mut needed,
             (&mut list as *mut AudioBufferListRaw).cast(),
-            std::mem::size_of::<AudioBufferListRaw>(),
+            provided_size,
             std::ptr::null(),
             std::ptr::null(),
             0,
@@ -360,6 +429,23 @@ fn handle_audio(shared: &Arc<SystemShared>, sbuf: &CMSampleBuffer) {
     };
     if status != 0 {
         shared.counts.unreadable.fetch_add(1, Ordering::Relaxed);
+        shared.last_read_status.store(status, Ordering::Relaxed);
+        // Once per stream, and named rather than numbered: this is the exact
+        // failure that made a real meeting's system channel unreadable
+        // (2026-08-24) while the OSStatus itself was thrown away. Every later
+        // refusal still counts toward `unreadable` above; it just doesn't get
+        // its own line, or a stream that fails on every buffer would drown
+        // the log in the same status a thousand times over.
+        if !shared.read_failure_logged.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "echo::audio",
+                status,
+                status_name = sample_buffer_status_name(status),
+                needed_size = needed,
+                provided_size,
+                "macOS refused to hand over an audio buffer list"
+            );
+        }
         if !block_buffer.is_null() {
             unsafe { CFRelease(block_buffer) };
         }
@@ -421,6 +507,36 @@ fn presentation_us(sbuf: &CMSampleBuffer) -> i64 {
         return 0;
     }
     time.value.saturating_mul(1_000_000) / i64::from(time.timescale)
+}
+
+/// Builds the one-line diagnostics summary, pulled out of [`SystemCapture::diagnostics`]
+/// so the format can be tested without a stream, a display, or anyone's
+/// permission. `read_status` is 0 when the buffer-list call has never failed
+/// on this stream.
+#[allow(clippy::too_many_arguments)]
+fn diagnostics_line(
+    audio_buffers: u64,
+    video_buffers: u64,
+    not_float: u64,
+    unreadable: u64,
+    empty: u64,
+    pushed_samples: u64,
+    dropped_samples: u64,
+    rate: u32,
+    read_status: i32,
+) -> String {
+    let mut line = format!(
+        "audio_buffers={audio_buffers} video_buffers={video_buffers} not_float={not_float} unreadable={unreadable} empty={empty} pushed_samples={pushed_samples} dropped_samples={dropped_samples} rate={rate}"
+    );
+    if read_status != 0 {
+        use std::fmt::Write as _;
+        let _ = write!(
+            line,
+            " read_status={read_status}({})",
+            sample_buffer_status_name(read_status)
+        );
+    }
+    line
 }
 
 // ---------------------------------------------------------------------------
@@ -495,6 +611,8 @@ impl SystemCapture {
             stopped: AtomicBool::new(false),
             counts: BufferCounts::default(),
             format_logged: AtomicBool::new(false),
+            read_failure_logged: AtomicBool::new(false),
+            last_read_status: AtomicI32::new(0),
         });
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -653,18 +771,7 @@ impl SystemCapture {
     /// running but carries no audio; a non-zero `not_float`/`unreadable`/`empty`
     /// means the buffers arrived and this file threw them away.
     pub fn diagnostics(&self) -> String {
-        let counts = &self.shared.counts;
-        format!(
-            "audio_buffers={} video_buffers={} not_float={} unreadable={} empty={} pushed_samples={} dropped_samples={} rate={}",
-            counts.audio.load(Ordering::Relaxed),
-            counts.other.load(Ordering::Relaxed),
-            counts.not_float.load(Ordering::Relaxed),
-            counts.unreadable.load(Ordering::Relaxed),
-            counts.empty.load(Ordering::Relaxed),
-            self.counters.pushed_samples(),
-            self.counters.dropped_samples(),
-            self.shared.rate.load(Ordering::Relaxed),
-        )
+        self.shared.diagnostics_summary()
     }
 
     /// Where on the meeting clock this channel started. -1 until the first
@@ -698,6 +805,15 @@ impl SystemCapture {
         // change under us when the output device does. The buffer counts stay
         // cumulative, because they are the record of the whole meeting.
         self.shared.format_logged.store(false, Ordering::Relaxed);
+        // A new stream also gets to earn its own once-per-stream read-failure
+        // warning rather than staying silent because the last stream already
+        // used its one line. `last_read_status` is deliberately left alone:
+        // it is the record of the meeting, not of this particular stream, and
+        // the diagnostics line at the end should still be able to say what
+        // went wrong even if the last reopen happened to succeed.
+        self.shared
+            .read_failure_logged
+            .store(false, Ordering::Relaxed);
         self.shutdown = Arc::new(AtomicBool::new(false));
 
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), AudioError>>();
@@ -1277,6 +1393,64 @@ mod tests {
         let flag = Arc::clone(&ran);
         queue.exec_sync(move || flag.store(true, Ordering::SeqCst));
         assert!(ran.load(Ordering::SeqCst), "the queue never ran anything");
+    }
+
+    #[test]
+    fn read_failures_are_named_not_numbered() {
+        // The bug this instrumentation exists to fix: a real meeting's log
+        // could only say "unreadable=500", never which OSStatus macOS
+        // actually returned. Every status the failing branch can plausibly
+        // see must come back as a name, and an OSStatus nobody has catalogued
+        // yet must say "unknown" rather than panic or lie.
+        assert_eq!(
+            sample_buffer_status_name(kCMSampleBufferError_ArrayTooSmall),
+            "ArrayTooSmall"
+        );
+        assert_eq!(
+            sample_buffer_status_name(kCMSampleBufferError_InvalidMediaTypeForOperation),
+            "InvalidMediaTypeForOperation"
+        );
+        assert_eq!(
+            sample_buffer_status_name(kCMSampleBufferError_InvalidMediaFormat),
+            "InvalidMediaFormat"
+        );
+        assert_eq!(sample_buffer_status_name(-1), "unknown");
+    }
+
+    #[test]
+    fn the_diagnostics_line_carries_the_last_refusal() {
+        // Constructed the same way `open_blocking` builds one, so this test
+        // breaks the moment a field is added there and forgotten here.
+        let (producer, _consumer, counters) =
+            hand_over(REQUESTED_RATE, REQUESTED_CHANNELS, Instant::now());
+        let shared = SystemShared {
+            producer: Mutex::new(producer),
+            counters: Arc::clone(&counters),
+            scratch: Mutex::new(Vec::new()),
+            first_pts_us: AtomicI64::new(i64::MIN),
+            first_clock_ms: AtomicI64::new(0),
+            rate: AtomicU32::new(REQUESTED_RATE),
+            stopped_reason: Mutex::new(None),
+            stopped: AtomicBool::new(false),
+            counts: BufferCounts::default(),
+            format_logged: AtomicBool::new(false),
+            read_failure_logged: AtomicBool::new(false),
+            last_read_status: AtomicI32::new(0),
+        };
+
+        // Never failed: no read_status clause at all, so a healthy meeting's
+        // diagnostics line doesn't grow a misleading "read_status=0(unknown)".
+        assert!(!shared.diagnostics_summary().contains("read_status"));
+
+        shared.counts.unreadable.fetch_add(1, Ordering::Relaxed);
+        shared
+            .last_read_status
+            .store(kCMSampleBufferError_ArrayTooSmall, Ordering::Relaxed);
+        let line = shared.diagnostics_summary();
+        assert!(
+            line.contains("read_status=-12737(ArrayTooSmall)"),
+            "diagnostics line did not name the last refusal: {line}"
+        );
     }
 
     #[test]

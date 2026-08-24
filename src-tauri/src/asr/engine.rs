@@ -192,6 +192,11 @@ pub struct BackendReport {
     /// Whether the Apple encoder companion was found next to the weights. It
     /// only affects speed (review finding 1).
     pub accelerator_present: bool,
+    /// How long `WhisperContext::new_with_params` took to return.
+    pub load_ms: u64,
+    /// Heuristic, named as one: see [`compiled_for_this_machine`]. True means
+    /// this load probably paid the one-time Apple-encoder compile.
+    pub compiled_for_this_machine: bool,
     /// Verbatim whisper.cpp build banner. Technical, diagnostics only.
     pub details: String,
 }
@@ -216,6 +221,30 @@ fn gpu_backend_name() -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// How long a load has to take before it looks like the one-time Apple-encoder
+/// compile rather than a slow disk.
+///
+/// `WhisperContext::new_with_params` is where whisper.cpp hands the model to
+/// Core ML, and the first time a set of weights meets a machine, Core ML
+/// compiles the encoder for it — measured at 16-18 minutes on the incident of
+/// 2026-08-24, where that compile was paid inside a live meeting because
+/// nothing said it was happening. An ordinary load, even off a cold disk, is
+/// seconds; half a minute is already an order of magnitude past that.
+const LIKELY_COMPILED_AT: Duration = Duration::from_secs(30);
+
+/// Best guess that a load just paid the one-time Apple-encoder compile,
+/// rather than just being slow.
+///
+/// A heuristic, not a fact: whisper.cpp does not report "I compiled today", so
+/// this infers it from the two things that go together when it happens. A
+/// load can be slow without the accelerator (a thrashing disk) and the
+/// accelerator can be present without a slow load (compiled on a previous
+/// run) — without the encoder companion, a slow load is just a slow disk, not
+/// a compile.
+fn compiled_for_this_machine(accelerator_present: bool, load: Duration) -> bool {
+    accelerator_present && load >= LIKELY_COMPILED_AT
 }
 
 /// Decoding threads: leave [`CORES_RESERVED_FOR_CAPTURE`] cores for capture and
@@ -548,6 +577,20 @@ impl Engine {
             tracing::warn!("the encoder companion is not usable; continuing without it");
         }
 
+        // Logged before the call, not after: the 16 minutes of 2026-08-24 happened
+        // between two lines that only ever spoke once the compile was over, so the
+        // meeting looked frozen rather than busy. If this is the last line the log
+        // has for a while, that is the compile, not a hang.
+        tracing::info!(
+            model = %config.model_path.display(),
+            model_name = %config.model_name,
+            model_revision = %config.model_revision,
+            accelerator = accelerator_present,
+            threads,
+            "reading the speech weights"
+        );
+        let load_started = Instant::now();
+
         let mut fallback_reason = None;
         let mut active = "cpu".to_string();
         let mut ctx = None;
@@ -586,18 +629,37 @@ impl Engine {
             .map_err(|e| AsrError::Load(e.to_string()))?;
         let first_special_token = ctx.token_eot();
 
+        let load_duration = load_started.elapsed();
+        let load_ms = load_duration.as_millis() as u64;
+        let compiled_for_this_machine =
+            compiled_for_this_machine(accelerator_present, load_duration);
+        if compiled_for_this_machine {
+            // Not a warning about anything being wrong: it is the loud version of
+            // "that took a while, and here is why". It happens once per set of
+            // weights per machine, never again for the same pair.
+            tracing::warn!(
+                load_ms,
+                model = %config.model_path.display(),
+                "the encoder was compiled for this machine; this happens once per set of weights"
+            );
+        }
+
         let backend = BackendReport {
             compiled: compiled_backends().to_string(),
             active,
             fallback_reason,
             threads,
             accelerator_present,
+            load_ms,
+            compiled_for_this_machine,
             details: whisper_rs::print_system_info().to_string(),
         };
         tracing::info!(
             backend = %backend.active,
             threads = backend.threads,
             accelerator = backend.accelerator_present,
+            load_ms = backend.load_ms,
+            compiled = backend.compiled_for_this_machine,
             "speech engine loaded"
         );
 
@@ -762,8 +824,7 @@ impl Engine {
                     t_start_ms: job.t_start_ms + from,
                     t_end_ms: job.t_start_ms + to,
                     text: piece,
-                    avg_confidence: (line_count > 0)
-                        .then(|| (line_sum / line_count as f64) as f32),
+                    avg_confidence: (line_count > 0).then(|| (line_sum / line_count as f64) as f32),
                 });
             }
         }
@@ -2095,6 +2156,19 @@ mod tests {
         // And the real reading obeys the same bounds.
         let real = recommended_threads() as usize;
         assert!((MIN_DECODE_THREADS..=MAX_DECODE_THREADS).contains(&real));
+    }
+
+    /// The heuristic behind the 2026-08-24 incident's missing warning: a load
+    /// only reads as "probably compiled" when it was both slow AND had the
+    /// encoder companion to compile in the first place.
+    #[test]
+    fn a_load_that_took_minutes_is_recorded_as_a_compile() {
+        // A few seconds is an ordinary load, accelerator or not.
+        assert!(!compiled_for_this_machine(true, Duration::from_secs(3)));
+        // Slow and the companion is there: this is the compile.
+        assert!(compiled_for_this_machine(true, Duration::from_secs(90)));
+        // Slow but no companion to compile: just a slow disk.
+        assert!(!compiled_for_this_machine(false, Duration::from_secs(90)));
     }
 
     /// One model, three lanes. The lane decides beam-versus-greedy; the model
