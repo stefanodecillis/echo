@@ -39,8 +39,8 @@ use docx_rs::{Docx, Paragraph, Run, Table, TableAlignmentType, TableCell, TableR
 use crate::db::repo;
 use crate::db::Db;
 use crate::types::{
-    Channel, ExportFormat, ExportRequest, ExportResult, JobKind, JobStatus, Meeting, Speaker,
-    TranscriptQuery,
+    Channel, ExportFormat, ExportRequest, ExportResult, JobKind, JobStatus, Meeting, Segment,
+    Speaker, TranscriptQuery,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -189,11 +189,11 @@ fn format_timestamp(t_ms: i64) -> String {
 }
 
 /// Follow a speaker's `alias_of` chain within an already-fetched map, so a
-/// renamed-then-merged speaker still shows its survivor's name.
-fn resolve_speaker_name<'a>(
+/// renamed-then-merged speaker still resolves to its survivor.
+fn resolve_speaker<'a>(
     speakers: &'a HashMap<String, Speaker>,
     mut id: &'a str,
-) -> Option<String> {
+) -> Option<&'a Speaker> {
     let mut hops = 0;
     loop {
         let speaker = speakers.get(id)?;
@@ -202,15 +202,53 @@ fn resolve_speaker_name<'a>(
                 id = next;
                 hops += 1;
             }
-            _ => return Some(speaker.display_name.clone()),
+            _ => return Some(speaker),
         }
     }
 }
 
-fn default_speaker_label(channel: Channel) -> &'static str {
+/// What an unattributed microphone line is called in this meeting.
+///
+/// With a system channel the microphone carried one known person, and "You" is
+/// safe. Without one it carried the whole room — the far end leaks in through
+/// the speakers — so an unattributed microphone line is not safely anybody, and
+/// calling it "You" is the mislabel of 2026-08-24 baked into a file somebody is
+/// about to paste into Slack.
+///
+/// The catch, and the reason this is not simply `if mic_only { "Speaker" }`:
+/// only *unattributed* lines reach a fallback, and on a mic-only meeting the
+/// live pass has already pointed every line it wrote at a "You" row picked from
+/// the channel alone, while the catch-up pass leaves its lines unattributed
+/// (`asr::mod::Line::to_draft`). A file that says "You" on the live lines and
+/// "Speaker" on the catch-up lines — one voice, one meeting, two names — is
+/// worse than an honest over-claim, so while that row is still carrying lines
+/// this matches whatever it is called. The offline pass drops that row entirely
+/// on a mic-only meeting (`diarize::pipeline::persist`, `Source::MicOnly`), and
+/// from the moment it has spoken nothing in the file claims "You" — including
+/// the lines it declined to attribute, which is exactly where the honest
+/// "Speaker" belongs.
+fn mic_fallback_label(segments: &[Segment], speakers: &HashMap<String, Speaker>) -> String {
+    if segments.iter().any(|s| s.channel == Channel::System) {
+        return "You".to_string();
+    }
+    segments
+        .iter()
+        .filter(|s| s.channel == Channel::Mic)
+        .filter_map(|s| s.speaker_id.as_deref())
+        .filter_map(|id| resolve_speaker(speakers, id))
+        .find(|speaker| speaker.is_self)
+        .map(|speaker| speaker.display_name.clone())
+        .unwrap_or_else(|| "Speaker".to_string())
+}
+
+/// The name a line with no speaker of its own carries. Anything that is not the
+/// microphone has never been claimed to be a particular person; the microphone
+/// is the interesting one and `mic_fallback` is what this meeting worked out for
+/// it (see [`mic_fallback_label`]).
+fn default_speaker_label(channel: Channel, mic_fallback: &str) -> String {
     match channel {
-        Channel::Mic => "You",
-        Channel::System | Channel::Mixed => "Speaker",
+        Channel::Mic => mic_fallback.to_string(),
+        Channel::System | Channel::Mixed => "Speaker".to_string(),
     }
 }
 
@@ -236,6 +274,8 @@ async fn build_transcript_lines(
     )
     .await?;
 
+    let mic_fallback = mic_fallback_label(&segments, &speakers);
+
     Ok(segments
         .into_iter()
         .filter(|s| !s.text.trim().is_empty())
@@ -243,8 +283,9 @@ async fn build_transcript_lines(
             let label = s
                 .speaker_id
                 .as_deref()
-                .and_then(|id| resolve_speaker_name(&speakers, id))
-                .unwrap_or_else(|| default_speaker_label(s.channel).to_string());
+                .and_then(|id| resolve_speaker(&speakers, id))
+                .map(|speaker| speaker.display_name.clone())
+                .unwrap_or_else(|| default_speaker_label(s.channel, &mic_fallback));
             (
                 format_timestamp(s.t_start_ms),
                 label,
@@ -717,6 +758,93 @@ mod tests {
                 ),
             ],
         }
+    }
+
+    // -- mic_fallback_label / default_speaker_label ------------------------
+
+    fn line(channel: Channel, speaker_id: Option<&str>) -> Segment {
+        Segment {
+            channel,
+            speaker_id: speaker_id.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn speaker_rows(rows: &[(&str, &str, bool)]) -> HashMap<String, Speaker> {
+        rows.iter()
+            .map(|(id, display_name, is_self)| {
+                (
+                    (*id).to_string(),
+                    Speaker {
+                        id: (*id).to_string(),
+                        display_name: (*display_name).to_string(),
+                        is_self: *is_self,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_meeting_with_a_system_channel_still_calls_the_microphone_you() {
+        // The microphone carried one known person, so the live pass's label is
+        // the right one for a line nothing else claimed.
+        let segments = [
+            line(Channel::Mic, Some("me")),
+            line(Channel::System, Some("s1")),
+            line(Channel::Mic, None),
+        ];
+        let speakers = speaker_rows(&[("me", "You", true), ("s1", "Speaker 1", false)]);
+        assert_eq!(mic_fallback_label(&segments, &speakers), "You");
+        assert_eq!(default_speaker_label(Channel::Mic, "You"), "You");
+        assert_eq!(default_speaker_label(Channel::System, "You"), "Speaker");
+        assert_eq!(default_speaker_label(Channel::Mixed, "You"), "Speaker");
+    }
+
+    #[test]
+    fn a_mic_only_meeting_calls_every_unclaimed_line_what_it_calls_the_rest() {
+        // Live lines point at the "You" row the live pass made from the channel
+        // alone; catch-up lines are unattributed. One voice, one meeting: the
+        // file must not call it two things. Over-claiming is bad, contradicting
+        // itself is worse.
+        let segments = [
+            line(Channel::Mic, Some("me")),
+            line(Channel::Mic, None),
+            line(Channel::Mic, Some("me")),
+        ];
+        let speakers = speaker_rows(&[("me", "You", true)]);
+        assert_eq!(mic_fallback_label(&segments, &speakers), "You");
+    }
+
+    #[test]
+    fn a_mic_only_meeting_stops_saying_you_once_the_offline_pass_has_spoken() {
+        // `Source::MicOnly` drops the "You" row and hands the microphone to the
+        // voices it separated; a line it declined to attribute is then honestly
+        // nobody in particular, and nothing else in the file says "You" either.
+        let segments = [
+            line(Channel::Mic, Some("v1")),
+            line(Channel::Mic, None),
+            line(Channel::Mic, Some("v2")),
+        ];
+        let speakers = speaker_rows(&[("v1", "Speaker 1", false), ("v2", "Speaker 2", false)]);
+        assert_eq!(mic_fallback_label(&segments, &speakers), "Speaker");
+        assert_eq!(default_speaker_label(Channel::Mic, "Speaker"), "Speaker");
+    }
+
+    #[test]
+    fn a_mic_only_meeting_with_no_lines_at_all_claims_nobody() {
+        assert_eq!(mic_fallback_label(&[], &HashMap::new()), "Speaker");
+    }
+
+    #[test]
+    fn a_renamed_microphone_row_is_what_its_unclaimed_lines_are_called() {
+        // Somebody typed a name over "You". That is their claim, and the lines
+        // the same row would have carried belong under it, not under a second
+        // name invented here.
+        let segments = [line(Channel::Mic, Some("me")), line(Channel::Mic, None)];
+        let speakers = speaker_rows(&[("me", "Stefano", true)]);
+        assert_eq!(mic_fallback_label(&segments, &speakers), "Stefano");
     }
 
     // -- safe_file_stem / export_file_name --------------------------------

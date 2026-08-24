@@ -21,11 +21,12 @@ import {
 import {
   common,
   jobLine,
+  labels,
   meeting as copy,
   notices,
   peopleCount as peopleCountCopy,
 } from "@/lib/copy";
-import { inProgressJob, isActive, presentJob } from "@/lib/jobs";
+import { inProgressJob, isActive, lastFailure, presentJob } from "@/lib/jobs";
 import { useEvent } from "@/hooks/useEvent";
 import { useEchoStore } from "@/lib/store";
 import type { Id, MeetingDetail, Segment } from "@/lib/types";
@@ -141,6 +142,17 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
     TRANSCRIBE_JOB_KINDS,
   );
   const transcribeProgress = transcribeJob ? presentJob(transcribeJob) : undefined;
+
+  // A pass that stopped without finishing. Nothing used to show this, so the
+  // most common way for Echo to fail to tell voices apart — the speaker files
+  // are allowed to land after the first recording — arrived as a transcript
+  // where every line said "You" and no explanation anywhere, after a banner
+  // that had promised the opposite. Only while nothing is running: work in
+  // progress is the more useful thing to say about the same passes.
+  const transcribeFailure = lastFailure(
+    detail.jobs.filter((j) => j.meetingId === meetingId),
+    TRANSCRIBE_JOB_KINDS,
+  );
 
   const filtered = useMemo(() => {
     const list = segments ?? [];
@@ -265,6 +277,17 @@ export function TranscriptTab({ meetingId, detail, setDetail, jumpToMs, onJumpCo
             {transcribeProgress.running
               ? jobLine.running(transcribeProgress.label)
               : jobLine.waiting(transcribeProgress.label)}
+          </span>
+        </div>
+      )}
+
+      {!transcribeProgress && transcribeFailure && (
+        <div className="flex flex-col gap-1 rounded-xl border border-hairline bg-surface-sunken p-4">
+          <span className="text-xs font-medium text-ink-soft">
+            {jobLine.stopped(labels.jobKind[transcribeFailure.kind])}
+          </span>
+          <span className="text-xs text-ink-faint">
+            {transcribeFailure.error ?? notices.somethingWentWrong}
           </span>
         </div>
       )}

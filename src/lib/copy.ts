@@ -58,8 +58,31 @@ export const labels = {
     recovering: "Picking up where it left off",
   },
   degradedReason: {
+    /** The one true copy for "nothing this computer plays ever reached Echo, so
+     * the whole meeting is in the microphone recording". It used to be
+     * hand-copied into four places (`live.micOnlyBanner`,
+     * `notices.systemAudioLost`, `anchors.micOnlyBanner`, and this one) and
+     * drifted — the incident of 2026-08-24 shipped a banner that claimed Echo
+     * couldn't hear the other people at all, while it was transcribing them
+     * anyway, mislabelled "You". The others now reference these two instead of
+     * repeating them. A Rust test (`SYSTEM_AUDIO_SILENT_MESSAGE` in
+     * `src-tauri/src/audio/mod.rs`) pins the backend's copy of the same
+     * sentence to this exact string.
+     *
+     * The last sentence is a promise, and this is the only state that can keep
+     * it: the offline pass re-cuts the microphone recording into separate
+     * voices for a meeting that has no system audio at all, and pins every
+     * microphone line to "You" for one that has any. Hence the separate
+     * `systemAudioLost` below rather than one sentence for both. */
     systemAudioUnavailable:
-      "Echo can hear you, but not the other people. It will keep recording.",
+      "Echo is recording through the microphone only, so it can't tell who is speaking — every line says You for now. It will work out who said what once the meeting ends.",
+    /** The computer's audio was arriving and stopped. Says what changed and
+     * claims nothing else: the lines written while it was working carry real
+     * names and stay that way, and the microphone tail is not separated by
+     * anything, so neither half of the sentence above would be true here.
+     * Pinned to `SYSTEM_AUDIO_LOST_MESSAGE` in `src-tauri/src/audio/mod.rs`. */
+    systemAudioLost:
+      "Echo stopped hearing what this computer plays. It's still recording through the microphone.",
     microphoneUnavailable:
       "Echo can hear the meeting, but not your own microphone.",
     transcriptBehind: "Catching up on the last few minutes.",
@@ -134,6 +157,16 @@ export const labels = {
 export const jobLine = {
   running: (label: string) => `${label}…`,
   waiting: (label: string) => `${label} — waiting its turn`,
+  /**
+   * A pass that stopped without finishing, said on the screen that was waiting
+   * for it. The banner during a mic-only recording promises that Echo will work
+   * out who said what once the meeting ends; when the pass can't — the speaker
+   * files are allowed to arrive after the first recording, so a meeting can
+   * happen before they land — this is what keeps that from being a promise
+   * quietly broken behind a transcript where every line still says You. The
+   * reason underneath it comes from the core, already in plain words.
+   */
+  stopped: (label: string) => `${label} — didn't finish`,
 } as const;
 
 /** Words used across more than one screen: dialogs, toasts, generic buttons. */
@@ -223,8 +256,7 @@ export const live = {
   stopConfirmTitle: "Stop recording?",
   stopConfirmDescription:
     "Echo will finish listening and start writing the recap.",
-  micOnlyBanner:
-    "Echo can hear you, but not the other people. It will keep recording.",
+  micOnlyBanner: labels.degradedReason.systemAudioUnavailable,
   systemOnlyBanner: "Echo can hear the meeting, but not your own microphone.",
   unknownSpeaker: "Speaker",
   nothingRecordingTitle: "Nothing is being recorded",
@@ -607,8 +639,7 @@ export const onboarding = {
 export const notices = {
   somethingWentWrong: "Something went wrong. Nothing was lost.",
   setupDone: "Echo is ready — recording and meeting alerts are on.",
-  systemAudioLost:
-    "Echo can hear you, but not the other people. It will keep recording.",
+  systemAudioLost: labels.degradedReason.systemAudioLost,
   storageLow:
     "Running low on space. Recording keeps going — free up room when you can.",
   storageFull:
@@ -645,8 +676,7 @@ export const anchors = {
   systemAudioMeaning: "everything your computer plays",
   catchingUp: "Catching up on the last few minutes",
   workingOutSpeakers: "Working out who said what",
-  micOnlyBanner:
-    "Echo can still hear you, but not the other people. It will keep recording.",
+  micOnlyBanner: labels.degradedReason.systemAudioUnavailable,
 } as const;
 
 /**

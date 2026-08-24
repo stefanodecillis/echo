@@ -69,8 +69,17 @@ export type CaptureState =
 
 export type Channel = "mic" | "system" | "mixed";
 
+/**
+ * The two system-audio reasons are not one reason twice.
+ * `systemAudioUnavailable` means nothing this computer plays ever reached Echo,
+ * so the whole meeting is in the microphone recording and the offline pass will
+ * separate the voices in it. `systemAudioLost` means it was arriving and
+ * stopped — the lines already written carry real names, and the microphone tail
+ * is not separated by anything. They get different banners for that reason.
+ */
 export type DegradedReason =
   | "systemAudioUnavailable"
+  | "systemAudioLost"
   | "microphoneUnavailable"
   | "transcriptBehind"
   | "storageLow";

@@ -100,10 +100,44 @@ const SNAPSHOT_OFFER_MS: i64 = 1_000;
 /// the first minute rather than at the end of the meeting.
 const SILENT_CHANNEL_GRACE: Duration = Duration::from_secs(10);
 
+/// Three sibling messages for the three ways the system channel can be
+/// missing: never opened, opened but silent, and opened then lost mid-meeting.
+/// They must never contradict each other or the banner on screen, so they are
+/// named consts in one place rather than three hand-typed string literals —
+/// that is exactly how the copy drifted before (four hand-maintained copies of
+/// one sentence, one of them wrong, incident of 2026-08-24). A test below
+/// sweeps all three together.
+///
 /// What the person is told when the computer's audio started but carries
-/// nothing. The same sentence the UI already uses for this reason.
-const SYSTEM_AUDIO_SILENT_MESSAGE: &str =
-    "Echo can hear you, but not the other people. It will keep recording.";
+/// nothing. Word for word `labels.degradedReason.systemAudioUnavailable` in
+/// `src/lib/copy.ts` — a test pins the two together.
+///
+/// The second sentence is a promise, and it is only keepable in this state.
+/// [`SilenceWatchdog`] counts frames for the whole recording and never resets
+/// them, so `WentSilent` can only fire when *no* system audio has ever arrived —
+/// which is the one case where `diarize::pipeline::voice_channel` picks
+/// `Source::MicOnly` and the offline pass really does re-cut the microphone
+/// recording into separate voices. A meeting that had system audio for even a
+/// minute takes the other branch and pins every microphone line to "You"
+/// forever, which is why the stream-died-mid-meeting case below promises
+/// nothing.
+pub const SYSTEM_AUDIO_SILENT_MESSAGE: &str = "Echo is recording through the microphone only, so it can't tell who is speaking — every line says You for now. It will work out who said what once the meeting ends.";
+
+/// What the person is told when the system channel never opened at all, so
+/// the recording started mic-only from t=0 (`session::mod::start`). Same state
+/// as [`SYSTEM_AUDIO_SILENT_MESSAGE`] — nothing from this computer will ever be
+/// in this recording — said as the thing that just happened rather than as the
+/// standing description the banner carries.
+pub const SYSTEM_AUDIO_UNAVAILABLE_AT_START: &str =
+    "Echo can't hear what this computer plays. It's recording through the microphone only.";
+
+/// What the person is told when a system-audio stream that was working dies
+/// mid-meeting. It says what changed and stops there: the labels on the lines
+/// already written are real, the ones from here on are not separated by the
+/// offline pass, and there is nothing useful to promise about either
+/// ([`crate::types::DegradedReason::SystemAudioLost`]).
+pub const SYSTEM_AUDIO_LOST_MESSAGE: &str =
+    "Echo stopped hearing what this computer plays. It's still recording through the microphone.";
 
 /// Loudness is reported ten times a second, capped here rather than in the UI.
 const LEVELS_INTERVAL: Duration = Duration::from_millis(100);
@@ -912,9 +946,13 @@ fn spawn_pump(
                             );
                             let _ = signals.send(CaptureSignal::Degraded {
                                 channel: Some(Channel::System),
-                                reason: DegradedReason::SystemAudioUnavailable,
-                                message: "Echo stopped hearing what your computer plays, and is still recording your microphone."
-                                    .to_string(),
+                                // Not `SystemAudioUnavailable`: the banner that
+                                // reason draws promises a separation of the
+                                // microphone recording that a meeting with any
+                                // system audio in it never gets, and calls lines
+                                // "You" that already carry a real name.
+                                reason: DegradedReason::SystemAudioLost,
+                                message: SYSTEM_AUDIO_LOST_MESSAGE.to_string(),
                             });
                             next_reopen = Some(Instant::now() + REOPEN_BACKOFF);
                         }
@@ -1583,11 +1621,28 @@ mod tests {
 
     #[test]
     fn the_silent_channel_notice_is_the_sentence_the_ui_already_uses() {
-        // Copy lives in src/lib/copy.ts as notices.systemAudioLost and
-        // recording.micOnlyBanner. If it changes there it changes here.
+        // Copy lives in src/lib/copy.ts as labels.degradedReason.systemAudioUnavailable
+        // (and, by reference from there, live.micOnlyBanner and
+        // anchors.micOnlyBanner). If it changes there it changes here.
         assert_eq!(
             SYSTEM_AUDIO_SILENT_MESSAGE,
-            "Echo can hear you, but not the other people. It will keep recording."
+            "Echo is recording through the microphone only, so it can't tell who is speaking — every line says You for now. It will work out who said what once the meeting ends."
+        );
+        // ...and this one is labels.degradedReason.systemAudioLost (and, by
+        // reference, notices.systemAudioLost). The banner the person reads when
+        // a working stream dies mid-meeting is drawn from that key, not from the
+        // one above, because the sentence above would be false in that state:
+        // the lines already written carry real names, and the microphone tail is
+        // never re-cut into separate voices (`diarize::pipeline::voice_channel`
+        // takes the system branch for any meeting with system audio in it).
+        assert_eq!(
+            SYSTEM_AUDIO_LOST_MESSAGE,
+            "Echo stopped hearing what this computer plays. It's still recording through the microphone."
+        );
+        assert!(
+            !SYSTEM_AUDIO_LOST_MESSAGE.contains("You")
+                && !SYSTEM_AUDIO_LOST_MESSAGE.contains("who said what"),
+            "{SYSTEM_AUDIO_LOST_MESSAGE} makes a claim about labels it can't keep"
         );
         for jargon in [
             "ScreenCaptureKit",
@@ -1601,6 +1656,38 @@ mod tests {
                 !SYSTEM_AUDIO_SILENT_MESSAGE.contains(jargon),
                 "{SYSTEM_AUDIO_SILENT_MESSAGE} leaks {jargon} to the person"
             );
+        }
+    }
+
+    #[test]
+    fn every_system_audio_message_says_what_changed_and_claims_nothing_more() {
+        // The three sibling messages for "the system channel is missing" must
+        // never contradict each other or read like a panic — this sweeps all
+        // three in one place so a future edit to any of them stays honest.
+        for message in [
+            SYSTEM_AUDIO_SILENT_MESSAGE,
+            SYSTEM_AUDIO_UNAVAILABLE_AT_START,
+            SYSTEM_AUDIO_LOST_MESSAGE,
+        ] {
+            assert!(message.ends_with('.'), "{message}");
+            assert!(!message.contains('!'), "{message}");
+            assert!(
+                !message.to_lowercase().contains("recording you"),
+                "{message} claims Echo is recording the person specifically, which it can't tell"
+            );
+            for jargon in [
+                "ScreenCaptureKit",
+                "SCStream",
+                "OSStatus",
+                "queue",
+                "buffer",
+                "stream",
+            ] {
+                assert!(
+                    !message.contains(jargon),
+                    "{message} leaks {jargon} to the person"
+                );
+            }
         }
     }
 

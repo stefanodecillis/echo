@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
-use crate::audio::{AudioError, CaptureConfig};
+use crate::audio::{AudioError, CaptureConfig, SYSTEM_AUDIO_UNAVAILABLE_AT_START};
 use crate::db::{repo, Db};
 use crate::events::{MeetingUpdatedPayload, NoticeLevel, NoticePayload};
 use crate::paths::AppPaths;
@@ -305,7 +305,9 @@ impl Inner {
         tracing::warn!(?channel, ?reason, "capture degraded");
         let source_lost = matches!(
             reason,
-            DegradedReason::SystemAudioUnavailable | DegradedReason::MicrophoneUnavailable
+            DegradedReason::SystemAudioUnavailable
+                | DegradedReason::SystemAudioLost
+                | DegradedReason::MicrophoneUnavailable
         );
 
         let elapsed = {
@@ -827,7 +829,7 @@ impl SessionManager {
                 .note_degraded(
                     Some(Channel::System),
                     DegradedReason::SystemAudioUnavailable,
-                    "Echo is recording you, but it can't hear what this computer plays.",
+                    SYSTEM_AUDIO_UNAVAILABLE_AT_START,
                     &meeting.id,
                 )
                 .await;
@@ -1111,6 +1113,7 @@ impl SessionManager {
             .degraded_reason;
         if let Some(
             reason @ (DegradedReason::SystemAudioUnavailable
+            | DegradedReason::SystemAudioLost
             | DegradedReason::MicrophoneUnavailable),
         ) = reason
         {
@@ -1562,7 +1565,12 @@ fn session_error_for(error: AudioError) -> SessionError {
 /// stack them.
 fn degraded_tag(reason: DegradedReason) -> &'static str {
     match reason {
-        DegradedReason::SystemAudioUnavailable => "systemAudioLost",
+        // The two system-audio reasons share a tag on purpose: they are the same
+        // banner slot, so the second one replaces the first rather than stacking
+        // a second sentence about the same channel.
+        DegradedReason::SystemAudioUnavailable | DegradedReason::SystemAudioLost => {
+            "systemAudioLost"
+        }
         DegradedReason::MicrophoneUnavailable => "microphoneLost",
         DegradedReason::TranscriptBehind => "transcriptBehind",
         DegradedReason::StorageLow => "storageLow",
@@ -1851,11 +1859,21 @@ mod tests {
 
         h.capture.send(ports::CaptureSignal::Degraded {
             channel: Some(Channel::System),
-            reason: DegradedReason::SystemAudioUnavailable,
-            message: "Echo stopped hearing what this computer plays.".into(),
+            reason: DegradedReason::SystemAudioLost,
+            message: crate::audio::SYSTEM_AUDIO_LOST_MESSAGE.into(),
         });
         h.settle().await;
-        assert_eq!(h.session.status().await.state, CaptureState::Degraded);
+        let status = h.session.status().await;
+        assert_eq!(status.state, CaptureState::Degraded);
+        // The reason a stream that died mid-meeting reports is its own, and the
+        // screen draws its banner from it: the mic-only banner would promise a
+        // separation of the microphone tail that this meeting never gets.
+        assert_eq!(
+            status.degraded_reason,
+            Some(DegradedReason::SystemAudioLost)
+        );
+        // Same banner slot as a system channel that never opened, so the second
+        // sentence replaces the first instead of stacking beside it.
         assert!(h.events.notice_tagged("systemAudioLost"));
 
         h.capture.send(ports::CaptureSignal::Recovered {

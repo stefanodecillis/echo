@@ -186,8 +186,20 @@ impl Channel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DegradedReason {
-    /// No permission / device gone: we keep the microphone only.
+    /// What this computer plays never reached Echo at all — no permission, no
+    /// device, or a stream that opened and delivered nothing. The whole meeting
+    /// is in the microphone recording, so the offline pass will separate the
+    /// voices in it and the banner is allowed to say so.
     SystemAudioUnavailable,
+    /// What this computer plays *was* reaching Echo and stopped. The two halves
+    /// of the meeting are not alike: the first has its own channel and the
+    /// second does not, which is why this is a reason of its own rather than a
+    /// second use of [`Self::SystemAudioUnavailable`]. A banner drawn from that
+    /// one would promise a separation of the microphone tail that the offline
+    /// pass does not do for a meeting that has any system audio at all
+    /// (`diarize::pipeline::voice_channel`), and would claim every line so far
+    /// says "You" when the ones from this computer say a real name.
+    SystemAudioLost,
     /// Microphone gone, we keep what the computer plays.
     MicrophoneUnavailable,
     /// Live text is behind; audio on disk is complete and will catch up.

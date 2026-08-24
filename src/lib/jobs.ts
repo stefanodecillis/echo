@@ -49,6 +49,37 @@ export function inProgressJob(jobs: Job[], kinds?: ReadonlySet<string>): Job | u
   );
 }
 
+/**
+ * The failure a screen still has to own up to, or `undefined` when there isn't
+ * one.
+ *
+ * A job row survives its own failure, and "Listen again" queues a fresh job
+ * beside the old one rather than replacing it — so "any job that failed" would
+ * pin a months-old failure to a transcript that has been rewritten twice since.
+ * Only the newest job of each kind speaks for that kind: if *that* one failed,
+ * nothing since has done the work, and the person is looking at a transcript
+ * missing whatever it was going to add.
+ *
+ * This exists because the failure that matters most here is the quietest one.
+ * The speaker files are allowed to arrive after the first recording, so a
+ * meeting can be recorded before Echo can tell voices apart; the pass then fails
+ * with a perfectly clear sentence that, until now, nothing on any screen showed
+ * — while the mic-only banner had already promised the person that Echo would
+ * work out who said what once the meeting ended.
+ */
+export function lastFailure(jobs: Job[], kinds?: ReadonlySet<string>): Job | undefined {
+  const mine = kinds ? jobs.filter((job) => kinds.has(job.kind)) : jobs;
+  const at = (stamp: string) => Date.parse(stamp) || 0;
+  const newestOfEachKind = new Map<string, Job>();
+  for (const job of mine) {
+    const seen = newestOfEachKind.get(job.kind);
+    if (!seen || at(job.createdAt) >= at(seen.createdAt)) newestOfEachKind.set(job.kind, job);
+  }
+  return [...newestOfEachKind.values()]
+    .filter((job) => job.status === "failed")
+    .sort((a, b) => at(b.updatedAt) - at(a.updatedAt))[0];
+}
+
 /** Running jobs first, then the ones waiting — for a screen that lists them. */
 export function runningFirst(jobs: Job[]): Job[] {
   return [
