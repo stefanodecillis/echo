@@ -11,6 +11,8 @@
 //! * [`engine`] runs it: one loaded engine, one job at a time.
 //! * [`language`] decides when the meeting's language is settled.
 //! * [`catchup`] transcribes from disk whatever the live pass missed.
+//! * [`phantom`] recognises the lines silence talked the decoder into, after
+//!   the fact, and drops them.
 //!
 //! Lifecycle (mantra 1, as amended 2026-08-20): the engine loads the moment a
 //! meeting is detected or started and stays resident for the whole conversation
@@ -25,6 +27,7 @@ pub mod catchup;
 pub mod engine;
 pub mod language;
 pub mod models;
+pub mod phantom;
 pub mod reconcile;
 
 use crate::types::{Channel, Id};

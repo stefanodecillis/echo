@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::asr::engine::EngineWorker;
+use crate::asr::phantom::VoicedSpans;
 use crate::asr::{models, AsrError, TranscribeJob, Transcription};
 use crate::audio::vad::Utterance;
 use crate::audio::ChunkRef;
@@ -230,6 +231,11 @@ pub struct CatchUpReport {
     /// ladder is capped at [`crate::asr::catalog::CATCHUP_MAX_FALLBACKS`], and
     /// this is the half of the retry story Echo controls.
     pub fallback_attempts: u32,
+    /// Lines the engine wrote that the recording has no voice under: a stock
+    /// courtesy phrase over near-silence, dropped rather than written down (see
+    /// [`crate::asr::phantom`]). Counted so a pass that starts throwing away
+    /// real speech is visible in the log rather than only in the transcript.
+    pub phantoms_dropped: u32,
     /// Where the pass began and ended on the meeting clock, per channel summed
     /// into one span for the log.
     pub from_ms: i64,
@@ -394,6 +400,11 @@ fn whole_window(samples: &[f32], t_offset_ms: i64, channel: Channel) -> Vec<Utte
         t_end_ms: t_offset_ms + duration,
         samples: samples.to_vec(),
         truncated: false,
+        // Nothing measured this: there is no detector, which is why the window
+        // is being handed over whole. Claiming it was all speech is the answer
+        // that can never cost words — the courtesy filter downstream deletes on
+        // evidence of silence, and there is none here.
+        voiced_ms: duration,
     }]
 }
 
@@ -575,6 +586,7 @@ where
             // Nothing before the open window — or before the oldest utterance
             // the detector could still be sitting on — is ever wanted again.
             let keep_from = pack
+                .as_ref()
                 .map(|open| open.from_ms)
                 .unwrap_or(cursor)
                 .min(cursor - crate::audio::vad::MAX_UTTERANCE_MS);
@@ -599,6 +611,7 @@ where
         fallbacks = report.fallback_attempts,
         ladder_cap = crate::asr::catalog::CATCHUP_MAX_FALLBACKS + 1,
         written = report.segments_written,
+        phantoms_dropped = report.phantoms_dropped,
         audio_ms = total_ms,
         "catch-up pass finished"
     );
@@ -639,12 +652,19 @@ enum Outcome {
 /// was trained, and its timestamps only mean anything if the window is a
 /// continuous stretch of the meeting. Splicing would also break the mapping
 /// back, because there would be no single origin to map through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Pack {
     from_ms: i64,
     to_ms: i64,
     /// How many stretches went in, for the report.
     stretches: u32,
+    /// Where inside the window the detector actually heard voice.
+    ///
+    /// Carried because the window is mostly silence by construction, so "how
+    /// voiced was this window" is the wrong question — each line the window
+    /// comes back as has to be asked about its own place on the clock. See
+    /// [`crate::asr::phantom::VoicedSpans`].
+    voiced: VoicedSpans,
 }
 
 impl Pack {
@@ -656,16 +676,24 @@ impl Pack {
     /// already has text would say the same words twice.
     fn of(utterance: &Utterance, hole: (i64, i64)) -> Option<Self> {
         let (start, end) = hole;
-        if utterance.samples.is_empty() || utterance.t_end_ms <= start || utterance.t_start_ms >= end
+        if utterance.samples.is_empty()
+            || utterance.t_end_ms <= start
+            || utterance.t_start_ms >= end
         {
             return None;
         }
         let from_ms = utterance.t_start_ms.max(start);
         let to_ms = utterance.t_end_ms.min(end);
-        (to_ms > from_ms).then_some(Self {
+        if to_ms <= from_ms {
+            return None;
+        }
+        let mut voiced = VoicedSpans::default();
+        voiced.add(from_ms, to_ms, utterance.voiced_ratio());
+        Some(Self {
             from_ms,
             to_ms,
             stretches: 1,
+            voiced,
         })
     }
 
@@ -683,6 +711,7 @@ impl Pack {
     fn extend(&mut self, next: &Pack) {
         self.to_ms = self.to_ms.max(next.to_ms);
         self.stretches += next.stretches;
+        self.voiced.absorb(&next.voiced);
     }
 
     fn len_ms(&self) -> i64 {
@@ -810,7 +839,38 @@ async fn decode_pack<T: Transcriber>(
             // One row per line the engine wrote, each at its own place on the
             // meeting clock. A window that came back as one line is one row,
             // exactly as a single stretch always was.
-            for line in split_onto_the_transcript(&text, pack) {
+            for line in split_onto_the_transcript(&text, &pack) {
+                // A stock courtesy phrase sitting where the detector heard no
+                // voice at all — see the 2026-08-24 phantoms in
+                // [`crate::asr::phantom`].
+                //
+                // The question is asked about this line's own seconds. When
+                // whisper gave the window one line and no timestamps, those
+                // seconds *are* the whole packed window, and the answer is then
+                // all the voice the window holds across every stretch packed
+                // into it — which is why this counts milliseconds rather than a
+                // share. A packed window is mostly pause by construction, and a
+                // share of one would call every multi-stretch window silence and
+                // delete the real answer at the end of it.
+                //
+                // Dropping leaves those seconds with no text against them, so a
+                // later pass over the same meeting reads them again and drops
+                // the same line again. That is the same thing that already
+                // happens to a window that decodes to nothing, and it is the
+                // right way round: the alternative would be writing a line
+                // nobody said to keep a coverage sum tidy.
+                let voiced_ms = pack.voiced.voiced_ms(line.t_start_ms, line.t_end_ms);
+                if crate::asr::phantom::is_phantom(&line.text, voiced_ms) {
+                    report.phantoms_dropped += 1;
+                    tracing::debug!(
+                        target: "echo::asr",
+                        t_start_ms = line.t_start_ms,
+                        voiced_ms,
+                        text = %line.text,
+                        "dropped a courtesy line the recording has no voice under"
+                    );
+                    continue;
+                }
                 repo::insert_segment(work.db, &line.to_draft(work.meeting_id)).await?;
                 report.segments_written += 1;
             }
@@ -842,7 +902,7 @@ async fn decode_pack<T: Transcriber>(
 /// arithmetic: a line has to sit inside the window and it has to have width, or
 /// the coverage machinery would either claim text over audio nobody read or
 /// leave a zero-width row that never counts as covered and gets re-read for ever.
-fn split_onto_the_transcript(text: &Transcription, pack: Pack) -> Vec<Transcription> {
+fn split_onto_the_transcript(text: &Transcription, pack: &Pack) -> Vec<Transcription> {
     let mut rows = Vec::new();
     for mut line in text.per_line() {
         if line.is_empty() {
@@ -1070,6 +1130,10 @@ mod tests {
         /// detector makes of a real meeting, and the shape the field regression
         /// of 2026-08-20 came in (281 stretches over 21 minutes).
         ManyShort,
+        /// A few short utterances a long way apart, each holding this much
+        /// voice: the end of a call, where three exchanges are separated by the
+        /// pauses that pack them into one window (2026-08-24).
+        FarApart { voiced_ms: i64 },
     }
 
     /// How long each utterance is when the detector hears [`Speech::ManyShort`],
@@ -1077,6 +1141,11 @@ mod tests {
     /// meeting, where the median stretch was a little over a second.
     const SHORT_UTTERANCE_MS: i64 = 1_200;
     const SHORT_GAP_MS: i64 = 300;
+
+    /// Clock between the starts of two [`Speech::FarApart`] stretches: long
+    /// enough that three of them still pack into one window, and that a share of
+    /// that window would read as silence.
+    const FAR_APART_STEP_MS: i64 = 12_000;
 
     /// Reads back audio of exactly the length asked for, and reports every
     /// window it was asked to read.
@@ -1142,6 +1211,24 @@ mod tests {
                     self.held.extend_from_slice(&samples);
                     Ok(Vec::new())
                 }
+                Speech::FarApart { voiced_ms } => {
+                    let per = (SHORT_UTTERANCE_MS as usize * SR) / 1_000;
+                    let step = (FAR_APART_STEP_MS as usize * SR) / 1_000;
+                    let mut found = Vec::new();
+                    let mut at = 0usize;
+                    while at + per <= samples.len() {
+                        found.extend(whole_window(
+                            &samples[at..at + per],
+                            t_start_ms + ms_of(at),
+                            self.channel,
+                        ));
+                        at += step;
+                    }
+                    for utterance in &mut found {
+                        utterance.voiced_ms = voiced_ms;
+                    }
+                    Ok(found)
+                }
                 Speech::ManyShort => {
                     let per = (SHORT_UTTERANCE_MS as usize * SR) / 1_000;
                     let step = ((SHORT_UTTERANCE_MS + SHORT_GAP_MS) as usize * SR) / 1_000;
@@ -1203,6 +1290,15 @@ mod tests {
         fn with_a_meeting_full_of_speech() -> Self {
             Self {
                 speech: Speech::ManyShort,
+                ..Default::default()
+            }
+        }
+
+        /// Three short exchanges twelve seconds apart, each holding `voiced_ms`
+        /// of real voice: the end of a call, packed into one window.
+        fn with_a_few_exchanges_far_apart(voiced_ms: i64) -> Self {
+            Self {
+                speech: Speech::FarApart { voiced_ms },
                 ..Default::default()
             }
         }
@@ -1528,7 +1624,11 @@ mod tests {
             report.windows_decoded,
             report.stretches_packed
         );
-        assert_eq!(engine.asked(), report.windows_decoded, "one decode a window");
+        assert_eq!(
+            engine.asked(),
+            report.windows_decoded,
+            "one decode a window"
+        );
     }
 
     /// Total length of a set of spans, overlaps counted once.
@@ -1589,6 +1689,167 @@ mod tests {
         // of `MAX_PACK_MS` for no reason is encoder time spent on zeros.
         let widest = jobs.iter().map(|(_, d)| *d).max().unwrap_or(0);
         assert!(widest > MAX_PACK_MS / 2, "widest window was {widest} ms");
+    }
+
+    /// The 2026-08-24 failure, on the disk lane: the same courtesy phrase, once
+    /// where somebody was speaking and once in the pause between two stretches.
+    ///
+    /// A packed window is mostly silence by construction, so this is the test
+    /// that the question is asked about each *line's* own seconds rather than
+    /// about the window it arrived in — the difference between a filter that
+    /// works and one that would empty a transcript.
+    #[tokio::test]
+    async fn a_courtesy_line_over_a_pause_goes_and_the_same_line_over_speech_stays() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 1).await;
+        // `with_a_meeting_full_of_speech` finds a 1200 ms stretch every 1500 ms,
+        // so offsets 0..1200 of any packed window are speech and 1200..1500 is
+        // the pause after it.
+        let engine = FakeEngine::in_lines(&[
+            (0, SHORT_UTTERANCE_MS, "Grazie."),
+            (
+                SHORT_UTTERANCE_MS,
+                SHORT_UTTERANCE_MS + SHORT_GAP_MS,
+                "Grazie.",
+            ),
+        ]);
+        let report = run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &FakeAudio::with_a_meeting_full_of_speech(),
+        )
+        .await
+        .unwrap();
+
+        assert!(report.windows_decoded > 0);
+        assert_eq!(
+            report.phantoms_dropped, report.windows_decoded,
+            "the line over the pause should have been dropped once per window"
+        );
+        assert_eq!(
+            report.segments_written, report.windows_decoded,
+            "the line over the speech should have been kept once per window"
+        );
+
+        let rows = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: id.clone(),
+                include_partial: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len() as u32, report.segments_written);
+        for row in &rows {
+            assert_eq!(row.text, "Grazie.");
+            assert_eq!(
+                row.t_end_ms - row.t_start_ms,
+                SHORT_UTTERANCE_MS,
+                "the surviving row is the one over the speech"
+            );
+        }
+    }
+
+    /// The dangerous half of the same filter, and the reason it counts
+    /// milliseconds of voice instead of a share of the window.
+    ///
+    /// Three short exchanges twelve seconds apart pack into one window, and
+    /// whisper answers it with a single line and no timestamps of its own — the
+    /// ordinary shape of a short window, and the one neither test above covers.
+    /// That line is left spanning the whole packed window, which is mostly pause
+    /// **by construction**: a share of it reads as 0.14, under any bar that
+    /// catches a cough. Judged that way, a real "Grazie a tutti." at the end of
+    /// a call is deleted, and the catch-up pass is the last read of that audio.
+    #[tokio::test]
+    async fn a_courtesy_line_the_engine_gave_no_timestamps_is_judged_on_the_voice_the_window_holds()
+    {
+        // Each exchange really was speech: 600 ms of voice in 1200 ms.
+        let real = run_one_line_over_far_apart_speech("Grazie a tutti.", 600, None).await;
+        assert_eq!(
+            real.phantoms_dropped, 0,
+            "the recording holds seconds of voice under that line"
+        );
+        assert!(real.segments_written > 0, "and the words were written down");
+
+        // And the filter still bites on a window it can see the whole of: one
+        // stretch, opened by the three windows of a cough and nothing more.
+        let blip = run_one_line_over_far_apart_speech("Grazie a tutti.", 96, Some(2_000)).await;
+        assert_eq!(blip.segments_written, 0);
+        assert_eq!(blip.phantoms_dropped, 1);
+
+        // Ordinary words are never this filter's business, however quiet.
+        let words =
+            run_one_line_over_far_apart_speech("allora vediamo domani", 96, Some(2_000)).await;
+        assert_eq!(words.phantoms_dropped, 0);
+        assert_eq!(words.segments_written, 1);
+    }
+
+    /// One meeting of far-apart exchanges, decoded as one line per window with
+    /// no per-line timestamps — what a real engine hands back for a window it
+    /// heard one sentence in. `to_ms` cuts the pass short, so a test can have
+    /// one stretch in the window instead of three.
+    async fn run_one_line_over_far_apart_speech(
+        said: &str,
+        voiced_ms: i64,
+        to_ms: Option<i64>,
+    ) -> CatchUpReport {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 1).await;
+        run(
+            &FakeEngine::saying(said),
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                to_ms,
+                ..Default::default()
+            },
+            &FakeAudio::with_a_few_exchanges_far_apart(voiced_ms),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A real sentence in the same pause is not this filter's business, and a
+    /// window with no phantom in it is not touched at all.
+    #[tokio::test]
+    async fn ordinary_words_in_a_pause_are_left_exactly_where_they_are() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 1).await;
+        let engine = FakeEngine::in_lines(&[
+            (
+                0,
+                SHORT_UTTERANCE_MS,
+                "allora, direi che possiamo procedere",
+            ),
+            (
+                SHORT_UTTERANCE_MS,
+                SHORT_UTTERANCE_MS + SHORT_GAP_MS,
+                "sì, esatto",
+            ),
+        ]);
+        let report = run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &FakeAudio::with_a_meeting_full_of_speech(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.phantoms_dropped, 0);
+        assert_eq!(report.segments_written, report.windows_decoded * 2);
     }
 
     /// The before-and-after measurement is honest: with the budget at one
@@ -1721,6 +1982,7 @@ mod tests {
             from_ms: 10_000,
             to_ms: 38_000,
             stretches: 3,
+            voiced: VoicedSpans::default(),
         };
         let text = Transcription {
             text: "a b".into(),
@@ -1740,7 +2002,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let rows = split_onto_the_transcript(&text, pack);
+        let rows = split_onto_the_transcript(&text, &pack);
         assert_eq!(rows.len(), 2, "the words at the end were dropped");
         assert_eq!(
             (rows[1].t_start_ms, rows[1].t_end_ms),
@@ -1767,7 +2029,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let rows = split_onto_the_transcript(&overshooting, pack);
+        let rows = split_onto_the_transcript(&overshooting, &pack);
         assert_eq!(rows.len(), 1, "punctuation over silence is not a row");
         assert_eq!(rows[0].t_end_ms, pack.to_ms);
     }
@@ -1778,11 +2040,13 @@ mod tests {
             from_ms: 0,
             to_ms: 4_000,
             stretches: 1,
+            voiced: VoicedSpans::default(),
         };
         let near = Pack {
             from_ms: 20_000,
             to_ms: MAX_PACK_MS,
             stretches: 1,
+            voiced: VoicedSpans::default(),
         };
         assert!(pack.would_hold(&near, MAX_PACK_MS));
         pack.extend(&near);
@@ -1794,6 +2058,7 @@ mod tests {
                 from_ms: MAX_PACK_MS,
                 to_ms: MAX_PACK_MS + 1,
                 stretches: 1,
+                voiced: VoicedSpans::default(),
             },
             MAX_PACK_MS
         ));
@@ -1803,11 +2068,13 @@ mod tests {
             from_ms: 20_000,
             to_ms: 24_000,
             stretches: 1,
+            voiced: VoicedSpans::default(),
         };
         let short = Pack {
             from_ms: 0,
             to_ms: 1_200,
             stretches: 1,
+            voiced: VoicedSpans::default(),
         };
         assert!(short.would_hold(&after_a_long_pause, MAX_PACK_MS));
         // And a budget of one millisecond is the pass as it worked before
@@ -1889,7 +2156,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(report.windows_decoded, 1);
-        assert_eq!(report.fallback_attempts, 1, "one window, one second reading");
+        assert_eq!(
+            report.fallback_attempts, 1,
+            "one window, one second reading"
+        );
 
         // Nothing to explain, nothing to count.
         let db = connect_in_memory().await.unwrap();
@@ -2490,8 +2760,7 @@ mod tests {
         // Let two windows through, then ask it to stop. Two, because each 30 s
         // window is a packed window of its own here and the first one is still
         // open until the second closes it.
-        let watcher: CancelCheck =
-            Arc::new(move || counted.fetch_add(1, Ordering::SeqCst) >= 2);
+        let watcher: CancelCheck = Arc::new(move || counted.fetch_add(1, Ordering::SeqCst) >= 2);
 
         let report = run(
             &FakeEngine::saying("first bit"),

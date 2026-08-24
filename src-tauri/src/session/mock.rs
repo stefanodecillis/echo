@@ -269,6 +269,12 @@ impl MockAsr {
         *self.transcribe_takes.lock().unwrap() = Some(how_long);
     }
 
+    /// What every decode from now on comes back with. Lets a test be the
+    /// meeting where the engine answered a pause with "Grazie." (2026-08-24).
+    pub(crate) fn says(&self, text: &str) {
+        *self.text.lock().unwrap() = text.to_string();
+    }
+
     /// What the next live backlog pass finds on disk and writes down.
     pub(crate) fn backlog_writes(&self, rows: &[(i64, i64, &str)]) {
         *self.backlog_writes.lock().unwrap() = rows

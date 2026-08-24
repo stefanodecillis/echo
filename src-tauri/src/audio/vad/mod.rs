@@ -218,6 +218,17 @@ impl Default for VadSettings {
     }
 }
 
+/// How many milliseconds of the first `samples` of an utterance were speech.
+///
+/// `voiced` holds one decision per 32 ms window, alongside the audio; every
+/// length the segmenter works in is a whole number of windows, so this is a
+/// count rather than an interpolation. Windows the emitted piece does not reach
+/// are not its business.
+fn voiced_ms_of(voiced: &[bool], samples: usize) -> i64 {
+    let windows = (samples / WINDOW_SAMPLES).min(voiced.len());
+    voiced[..windows].iter().filter(|v| **v).count() as i64 * WINDOW_MS
+}
+
 /// Milliseconds as samples, rounded down to whole windows.
 const fn whole_windows_down(ms: i64) -> usize {
     if ms <= 0 {
@@ -247,11 +258,46 @@ pub struct Utterance {
     /// A forced cut that found a real pause to land on is not truncated: nothing
     /// was split and no audio is shared.
     pub truncated: bool,
+    /// How much of `samples` the detector actually called speech.
+    ///
+    /// Normally well under the duration: an utterance is padded at both ends
+    /// and carries the pause it closed on. What it is *for* is telling a stretch of
+    /// real speech apart from a window the detector opened on one cough — which
+    /// is what a decoder turns into "Grazie." (see [`crate::asr::phantom`]).
+    ///
+    /// Zero when nothing measured it, which is why nothing should read this
+    /// field directly; [`Utterance::measured_voice_ms`] answers "no measurement"
+    /// with "assume it was all speech", so a missing detector can never cost
+    /// words.
+    pub voiced_ms: i64,
 }
 
 impl Utterance {
     pub fn duration_ms(&self) -> i64 {
         self.t_end_ms - self.t_start_ms
+    }
+
+    /// How many milliseconds of this stretch were speech.
+    ///
+    /// An utterance nobody measured — no detector on disk, a window handed over
+    /// whole — reads as voice from end to end. Every filter downstream deletes
+    /// on *evidence* of silence, never on the absence of evidence.
+    pub fn measured_voice_ms(&self) -> i64 {
+        let duration = self.duration_ms().max(0);
+        if self.voiced_ms <= 0 {
+            return duration;
+        }
+        self.voiced_ms.min(duration)
+    }
+
+    /// The same answer as a density, 0.0 to 1.0, so a stretch clipped to part of
+    /// itself can carry it — see [`crate::asr::phantom::VoicedSpans`].
+    pub fn voiced_ratio(&self) -> f32 {
+        let duration = self.duration_ms();
+        if duration <= 0 {
+            return 1.0;
+        }
+        (self.measured_voice_ms() as f32 / duration as f32).clamp(0.0, 1.0)
     }
 }
 
@@ -617,12 +663,14 @@ impl Segmenter {
             return None;
         }
         let t_start_ms = self.pos_to_ms(open.start_pos);
+        let voiced_ms = voiced_ms_of(&open.voiced, samples.len());
         Some(Utterance {
             channel: self.channel,
             t_start_ms,
             t_end_ms: self.pos_to_ms(open.start_pos + samples.len() as u64),
             samples,
             truncated,
+            voiced_ms,
         })
     }
 
@@ -657,6 +705,9 @@ impl Segmenter {
         };
         let start_pos = open.start_pos;
         let emitted: Vec<f32> = open.samples[..cut].to_vec();
+        // Read before the open utterance is rewritten below: this is the piece
+        // going out, not the piece staying behind.
+        let emitted_voiced_ms = voiced_ms_of(&open.voiced, cut);
         let rest: Vec<f32> = open.samples[keep_from..].to_vec();
         let rest_voiced: Vec<bool> = open.voiced[keep_from / WINDOW_SAMPLES..].to_vec();
 
@@ -690,6 +741,7 @@ impl Segmenter {
             t_end_ms: self.pos_to_ms(start_pos + emitted.len() as u64),
             samples: emitted,
             truncated: !at_pause,
+            voiced_ms: emitted_voiced_ms,
         })
     }
 
@@ -1431,6 +1483,84 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(u.duration_ms(), 3_500);
+    }
+
+    /// Every utterance carries how much of itself was speech, because that is
+    /// the only evidence anything downstream has that a line was written over a
+    /// pause (2026-08-24; see [`crate::asr::phantom`]).
+    #[test]
+    fn an_utterance_says_how_much_of_it_was_voice() {
+        let settings = VadSettings::mic();
+        let mut seg = Segmenter::with_settings(Channel::Mic, settings);
+        let quiet = vec![0.0f32; WINDOW_SAMPLES];
+        let mut out = Vec::new();
+
+        // A shortest-possible burst: exactly the debounce, then silence until
+        // the utterance closes.
+        for _ in 0..10 {
+            out.extend(seg.push_window(&quiet, false));
+        }
+        let voiced_windows = settings.min_voiced_windows();
+        for _ in 0..voiced_windows {
+            out.extend(seg.push_window(&quiet, true));
+        }
+        for _ in 0..60 {
+            out.extend(seg.push_window(&quiet, false));
+        }
+        out.extend(seg.finish());
+        assert_eq!(out.len(), 1, "{out:#?}");
+        let blip = &out[0];
+        assert_eq!(blip.voiced_ms, voiced_windows as i64 * WINDOW_MS);
+        assert!(
+            blip.measured_voice_ms() < crate::asr::phantom::TOO_LITTLE_VOICE_MS,
+            "a stretch opened by one blip holds {} ms of voice",
+            blip.measured_voice_ms()
+        );
+
+        // And a stretch somebody actually spoke through does not.
+        let mut seg = Segmenter::with_settings(Channel::Mic, settings);
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            out.extend(seg.push_window(&quiet, false));
+        }
+        for _ in 0..20 {
+            out.extend(seg.push_window(&quiet, true));
+        }
+        for _ in 0..60 {
+            out.extend(seg.push_window(&quiet, false));
+        }
+        out.extend(seg.finish());
+        assert_eq!(out.len(), 1, "{out:#?}");
+        let spoken = &out[0];
+        assert_eq!(spoken.voiced_ms, 20 * WINDOW_MS);
+        assert!(
+            spoken.measured_voice_ms() > crate::asr::phantom::TOO_LITTLE_VOICE_MS,
+            "real speech holds {} ms of voice",
+            spoken.measured_voice_ms()
+        );
+    }
+
+    /// Nothing measured it, so nothing may be deleted because of it.
+    #[test]
+    fn an_unmeasured_utterance_reads_as_all_voice() {
+        let unmeasured = Utterance {
+            t_start_ms: 0,
+            t_end_ms: 4_000,
+            ..Default::default()
+        };
+        assert_eq!(unmeasured.measured_voice_ms(), 4_000);
+        assert_eq!(unmeasured.voiced_ratio(), 1.0);
+        assert_eq!(Utterance::default().measured_voice_ms(), 0);
+        assert_eq!(Utterance::default().voiced_ratio(), 1.0);
+        // And a measurement longer than the stretch cannot exceed it.
+        let odd = Utterance {
+            t_start_ms: 0,
+            t_end_ms: 1_000,
+            voiced_ms: 5_000,
+            ..Default::default()
+        };
+        assert_eq!(odd.measured_voice_ms(), 1_000);
+        assert_eq!(odd.voiced_ratio(), 1.0);
     }
 
     #[test]

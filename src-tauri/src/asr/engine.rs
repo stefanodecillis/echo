@@ -271,6 +271,22 @@ fn clamp_threads(cores: usize) -> u32 {
         .clamp(MIN_DECODE_THREADS, MAX_DECODE_THREADS) as u32
 }
 
+/// Whether whisper.cpp may feed a window its own last answer as context —
+/// OpenAI whisper calls this `condition_on_previous_text`, and this says no, on
+/// every lane, live and from disk alike.
+///
+/// It has always been off here, and after the 2026-08-24 meeting it is a named
+/// constant with a test against it rather than a `true` in the middle of forty
+/// lines of setup. That meeting produced 33 lines nobody said and three decoder
+/// loops; had the carry-over been on, one hallucinated "Grazie." would have been
+/// the prompt for the next window, and the next, which is how a handful of
+/// phantoms becomes a page of them.
+///
+/// The only context that ever crosses a boundary is [`DecodePlan::prompt`]: the
+/// tail of the previous final on the same channel, chosen by Echo, and only
+/// across a cut that went through the middle of a sentence.
+const NO_DECODER_CARRY_OVER: bool = true;
+
 /// Beam search or greedy, straight from the preset. This *is* the difference
 /// between the quality presets, together with which weights they load.
 fn sampling_strategy(decode: &DecodeParams) -> SamplingStrategy {
@@ -710,7 +726,7 @@ impl Engine {
         // Each utterance stands alone. Carrying decoder state across a silence is
         // how whisper starts repeating itself for ever; the only context that
         // travels is the prompt below, which we choose.
-        params.set_no_context(true);
+        params.set_no_context(NO_DECODER_CARRY_OVER);
         if let Some(prompt) = plan.prompt.as_deref() {
             // whisper.cpp clears its own history for `no_context` first and then
             // pushes this in, so the utterance gets exactly these words and
@@ -2191,6 +2207,36 @@ mod tests {
             SamplingStrategy::Greedy { best_of } => assert_eq!(best_of, 1),
             other => panic!("a caption should be greedy, got {other:?}"),
         }
+    }
+
+    /// No lane lets whisper.cpp prompt itself with what it just said. A line
+    /// nobody spoke must not become the context for the next window
+    /// (2026-08-24); the only words that cross a boundary are the ones Echo
+    /// chose, and only across a cut through the middle of a sentence.
+    #[test]
+    fn a_hallucinated_line_can_never_become_the_next_windows_prompt() {
+        const {
+            assert!(
+                NO_DECODER_CARRY_OVER,
+                "whisper.cpp's own carry-over is what locks a decoder into repeating itself"
+            )
+        };
+        // The chosen context is opt-in, per job, and blank prompts are dropped
+        // rather than spending tokens on nothing.
+        assert!(DecodePlan::final_utterance().prompt.is_none());
+        assert!(DecodePlan::speculative().prompt.is_none());
+        assert!(DecodePlan::catch_up().prompt.is_none());
+        assert!(DecodePlan::final_utterance()
+            .with_prompt(Some("   ".into()))
+            .prompt
+            .is_none());
+        assert_eq!(
+            DecodePlan::final_utterance()
+                .with_prompt(Some("e il secondo punto".into()))
+                .prompt
+                .as_deref(),
+            Some("e il secondo punto")
+        );
     }
 
     #[test]

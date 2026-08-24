@@ -1136,6 +1136,10 @@ async fn transcribe(
     let t_start_ms = utterance.t_start_ms;
     let t_end_ms = utterance.t_end_ms;
     let truncated = utterance.truncated;
+    // Read before the audio is handed to the engine: how much of this stretch
+    // the speech detector actually called speech is the second half of the test
+    // for a line silence talked the decoder into (see [`crate::asr::phantom`]).
+    let voiced_ms = utterance.measured_voice_ms();
     // The same line the captions were written on, so the final text replaces
     // them instead of appearing underneath them.
     let utterance_id = live_line_id(channel, t_start_ms);
@@ -1277,7 +1281,23 @@ async fn transcribe(
         None => transcription.text.trim().to_string(),
     };
     let text = text.trim();
-    if text.is_empty() {
+    // Nothing but a stock courtesy phrase, over a stretch the detector found
+    // next to no voice in: the meeting of 2026-08-24 wrote "Grazie." twenty-six
+    // times this way, and once "Buonanotte." at half past ten in the morning.
+    // Both halves are required — a real "Grazie" carries several times this much
+    // voice and stays exactly where it is.
+    let phantom = crate::asr::phantom::is_phantom(text, voiced_ms);
+    if text.is_empty() || phantom {
+        if phantom {
+            tracing::debug!(
+                target: "echo::asr",
+                ?channel,
+                t_start_ms,
+                voiced_ms,
+                text,
+                "dropped a courtesy line the recording has no voice under"
+            );
+        }
         carry.forget(channel);
         close_partial(
             inner,
@@ -1521,10 +1541,28 @@ fn tail_words(text: &str, count: usize) -> String {
     words[from..].join(" ")
 }
 
+/// Longest phrase a loop is looked for at.
+///
+/// Six words is about two seconds of speech. Beyond that a "repetition" is
+/// somebody making the same point twice, which is a thing people do.
+const LOOP_MAX_PHRASE_WORDS: usize = 6;
+
 /// Has this text already fallen into a loop?
 ///
 /// Feeding a repetition back in as context is how a stuck decoder stays stuck,
 /// so a piece that looks like one is not carried anywhere.
+///
+/// It used to look for one word three times or one *pair* three times, and that
+/// missed every loop the 2026-08-24 meeting actually produced: "ma è un po'
+/// figgito" three times over is a five-word phrase, and "secondo me secondo me
+/// … dobbiamo dobbiamo" is a two-word phrase whose repeats do not start on an
+/// even word boundary. So the phrase length is no longer assumed — anything
+/// from one word up to [`LOOP_MAX_PHRASE_WORDS`], repeated three times back to
+/// back, anywhere in the line.
+///
+/// Three repeats, not two: "sì, sì" and "no, no" are ordinary Italian, and a
+/// guard that ate them would silently drop the context across every second
+/// forced cut.
 fn looks_repetitive(text: &str) -> bool {
     let words: Vec<String> = text
         .split_whitespace()
@@ -1537,11 +1575,16 @@ fn looks_repetitive(text: &str) -> bool {
     if words.len() < 4 {
         return false;
     }
-    // The same word three times over, or the same pair of words three times.
-    words.windows(3).any(|w| w[0] == w[1] && w[1] == w[2])
-        || words
-            .windows(6)
-            .any(|w| w[0..2] == w[2..4] && w[2..4] == w[4..6])
+    for phrase in 1..=LOOP_MAX_PHRASE_WORDS.min(words.len() / 3) {
+        let run = phrase * 3;
+        if words
+            .windows(run)
+            .any(|w| w[..phrase] == w[phrase..phrase * 2] && w[..phrase] == w[phrase * 2..])
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -2398,6 +2441,113 @@ mod tests {
         assert!(!looks_repetitive("sì sì"), "twice is emphasis, not a loop");
     }
 
+    /// The three loops the 2026-08-24 meeting actually produced. Not one of them
+    /// was caught by the old guard, which only knew about single words and
+    /// even-aligned pairs.
+    #[test]
+    fn the_loops_of_the_twenty_fourth_are_recognised() {
+        assert!(
+            looks_repetitive("ma è un po' figgito ma è un po' figgito ma è un po' figgito"),
+            "a five-word phrase three times over is a loop"
+        );
+        assert!(
+            looks_repetitive("Cambiarlo se se cambiarlo se possiamo se possiamo se possiamo"),
+            "the repeat does not have to start on an even word"
+        );
+        assert!(looks_repetitive(
+            "secondo me secondo me secondo me dobbiamo dobbiamo"
+        ));
+        // And the sentences a meeting is made of are still left alone.
+        assert!(!looks_repetitive(
+            "possiamo cambiarlo se vuoi, ma secondo me va bene così"
+        ));
+        assert!(
+            !looks_repetitive("il punto è il punto di partenza"),
+            "a phrase said twice is somebody making a point"
+        );
+        assert!(
+            !looks_repetitive("uno due tre uno due tre"),
+            "twice is not a loop, at any phrase length"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Silence that came back as words (2026-08-24)
+    // -----------------------------------------------------------------------
+
+    /// One meeting, one utterance, one answer from the engine — and what the
+    /// transcript ends up holding.
+    ///
+    /// `voiced_ms` out of a 1200 ms stretch is the whole difference between the
+    /// two outcomes these tests are about.
+    async fn what_gets_written(said: &str, voiced_ms: i64) -> Vec<String> {
+        let h = crate::session::mock::Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        h.asr.says(said);
+        h.capture
+            .send(crate::session::ports::CaptureSignal::UtteranceReady(
+                Utterance {
+                    channel: Channel::Mic,
+                    t_start_ms: 200,
+                    t_end_ms: 1_400,
+                    samples: vec![0.0; 19_200],
+                    truncated: false,
+                    voiced_ms,
+                },
+            ));
+        h.settle().await;
+        h.commit_chunk(&id, 0, 1_500).await;
+        // Stopping is what flushes the batch of finals to the database, so this
+        // reads the transcript a person would actually be left with.
+        h.session.stop().await.unwrap();
+        repo::get_segments(
+            &h.db,
+            &crate::types::TranscriptQuery {
+                meeting_id: id.clone(),
+                include_partial: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.text)
+        .collect()
+    }
+
+    /// The 2026-08-24 transcript said "Grazie." twenty-six times over dead air.
+    #[tokio::test]
+    async fn a_lone_grazie_over_near_silence_is_not_written_down() {
+        // One cough's worth of voice in 1200 ms.
+        assert!(what_gets_written("Grazie.", 96).await.is_empty());
+        assert!(what_gets_written("Buonanotte.", 96).await.is_empty());
+        assert!(what_gets_written("Ciao ciao", 64).await.is_empty());
+        assert!(
+            what_gets_written("Sottotitoli e revisione a cura di QTSS", 96)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// The other half of the rule, which is what makes it safe to have at all.
+    #[tokio::test]
+    async fn the_same_word_over_real_speech_stays_in_the_transcript() {
+        // Somebody really said it: 600 ms of voice in a 1200 ms stretch.
+        assert_eq!(what_gets_written("Grazie.", 600).await, vec!["Grazie."]);
+        // And the quiet version of the same thing: a soft-spoken "Grazie." the
+        // far-field detector only marked 224 ms of. Judged as a *share* of the
+        // stretch it would be 0.19 and gone — which is what the padding every
+        // mic utterance carries does to a share, and why the bar is a duration
+        // (see [`crate::asr::phantom::TOO_LITTLE_VOICE_MS`]).
+        assert_eq!(what_gets_written("Grazie.", 224).await, vec!["Grazie."]);
+        // And a sentence that merely contains it is never this filter's
+        // business, however quiet the stretch was.
+        assert_eq!(
+            what_gets_written("Grazie, allora vediamo domani.", 96).await,
+            vec!["Grazie, allora vediamo domani."]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // The stop handoff
     // -----------------------------------------------------------------------
@@ -2550,6 +2700,7 @@ mod tests {
                 t_end_ms: t_start_ms + duration,
                 samples,
                 truncated: false,
+                voiced_ms: duration,
             }])
         }
 

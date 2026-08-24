@@ -1931,6 +1931,7 @@ mod tests {
                 t_end_ms: 3_000,
                 samples: vec![0.0; 16_000],
                 truncated: false,
+                voiced_ms: 1_000,
             }));
 
         let stopped = h.session.stop().await.unwrap();
@@ -2119,6 +2120,7 @@ mod tests {
                 t_end_ms: 1_400,
                 samples: vec![0.0; 16_000],
                 truncated: false,
+                voiced_ms: 1_000,
             }));
         h.settle().await;
         h.commit_chunk(&id, 0, 1_500).await;
@@ -2494,6 +2496,7 @@ mod tests {
                 t_end_ms: 3_000,
                 samples: vec![0.0; 16_000],
                 truncated: false,
+                voiced_ms: 1_000,
             }));
 
         h.wait_until("the backlog to be read back", || {
@@ -2515,6 +2518,7 @@ mod tests {
                 t_end_ms: 3_900,
                 samples: vec![0.0; 6_400],
                 truncated: false,
+                voiced_ms: 300,
             }));
         tokio::time::sleep(Duration::from_millis(400)).await;
         h.settle().await;
@@ -2549,6 +2553,7 @@ mod tests {
                 t_end_ms: 37_000,
                 samples: vec![0.0; 16_000],
                 truncated: false,
+                voiced_ms: 1_000,
             }));
         h.wait_until("live text to carry on after the backlog", || {
             h.events
