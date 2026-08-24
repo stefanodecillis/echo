@@ -232,7 +232,7 @@ fn gpu_backend_name() -> Option<&'static str> {
 /// 2026-08-24, where that compile was paid inside a live meeting because
 /// nothing said it was happening. An ordinary load, even off a cold disk, is
 /// seconds; half a minute is already an order of magnitude past that.
-const LIKELY_COMPILED_AT: Duration = Duration::from_secs(30);
+pub(crate) const LIKELY_COMPILED_AT: Duration = Duration::from_secs(30);
 
 /// Best guess that a load just paid the one-time Apple-encoder compile,
 /// rather than just being slow.

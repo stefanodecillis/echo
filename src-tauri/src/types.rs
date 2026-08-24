@@ -196,6 +196,36 @@ pub enum DegradedReason {
     StorageLow,
 }
 
+/// Whether Echo can write down what is being said right now, in plain states a
+/// screen can show without knowing anything about weights or engines.
+///
+/// Worked out fresh from what the engine is holding every time
+/// [`CaptureStatus`] is built, and never remembered anywhere. That is what makes
+/// it survive the failure of 2026-08-24, when the window stopped receiving
+/// events and every remembered flag on the screen froze with the last one that
+/// got through: nothing here can be stale, because there is nothing to go stale.
+///
+/// Being derived only helps if something re-reads it, so the screen does: while
+/// this says `Preparing` or `Unavailable` — the two states a banner is drawn
+/// from — the window asks for the status outright every few seconds
+/// (`useCaptureState`), and a lost event costs a banner a few seconds, not a
+/// meeting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SpeechState {
+    /// Nothing needs it and nothing is loaded. There is nothing to say.
+    #[default]
+    Idle,
+    /// A meeting needs it and it is not up yet: the weights are being read, or
+    /// the one-time setup they need on this machine is being paid.
+    Preparing,
+    /// Loaded. Words appear as they are said.
+    Ready,
+    /// It was needed and it did not come up. The recording carries on and the
+    /// transcript arrives when the meeting ends (mantra 3).
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureStatus {
@@ -213,6 +243,10 @@ pub struct CaptureStatus {
     pub pending_utterances: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<Timestamp>,
+    /// Whether Echo can understand speech right now. Derived on every read from
+    /// what the engine is actually holding, never remembered, so no missed event
+    /// can leave it stale (see [`SpeechState`]).
+    pub speech: SpeechState,
 }
 
 /// Options for `start_recording`. All fields optional so the UI can call it
@@ -820,6 +854,9 @@ pub enum JobKind {
     Download,
     /// Build the mixed file used for playback.
     Mixdown,
+    /// Pay the one-time setup a set of speech weights needs on this machine,
+    /// before a meeting has to pay it (incident of 2026-08-24).
+    PrepareEngine,
 }
 
 impl JobKind {
@@ -831,6 +868,7 @@ impl JobKind {
             JobKind::Export => "export",
             JobKind::Download => "download",
             JobKind::Mixdown => "mixdown",
+            JobKind::PrepareEngine => "prepare_engine",
         }
     }
 
@@ -842,6 +880,7 @@ impl JobKind {
             "export" => Some(JobKind::Export),
             "download" => Some(JobKind::Download),
             "mixdown" => Some(JobKind::Mixdown),
+            "prepare_engine" => Some(JobKind::PrepareEngine),
             _ => None,
         }
     }
@@ -1380,6 +1419,7 @@ mod tests {
             JobKind::Export,
             JobKind::Download,
             JobKind::Mixdown,
+            JobKind::PrepareEngine,
         ] {
             assert_eq!(JobKind::parse(k.as_str()), Some(k));
         }

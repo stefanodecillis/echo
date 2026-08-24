@@ -58,7 +58,7 @@ use crate::paths::AppPaths;
 use crate::session::ports::{CaptureHandle, CaptureStart, EventBus, EventSink, Ports, UiEvent};
 use crate::types::{
     CaptureState, CaptureStatus, Channel, DegradedReason, Id, JobKind, Marker, MarkerKind,
-    MeetingStatus, RecoveryAction, StartRecordingOptions, Timestamp, TrayState,
+    MeetingStatus, RecoveryAction, SpeechState, StartRecordingOptions, Timestamp, TrayState,
 };
 
 /// How long a stop waits for the live pipeline to write what it already has.
@@ -200,6 +200,11 @@ pub(crate) struct LiveState {
     pub(crate) elapsed_ms: i64,
     pub(crate) active_channels: Vec<Channel>,
     pub(crate) degraded_reason: Option<DegradedReason>,
+    /// The engine did not come up for this meeting. Cleared by the next Start,
+    /// because a new meeting is a new attempt — the only remembered half of
+    /// [`speech_state`], and only because "it failed" is not something the
+    /// engine itself keeps.
+    pub(crate) speech_load_failed: bool,
     /// Interrupted meetings waiting for a finish-or-discard answer.
     pub(crate) recovering: Vec<Id>,
 }
@@ -256,6 +261,14 @@ impl Inner {
             degraded_reason: live.degraded_reason,
             pending_utterances: self.pending.load(Ordering::SeqCst),
             started_at: live.started_at.clone(),
+            // Asked of the engine here, every time, rather than remembered by
+            // anything that emits: this status is polled as well as pushed, so
+            // a derived answer is one the UI can always get hold of.
+            speech: speech_state(
+                self.ports.asr.is_loaded(),
+                live.speech_load_failed,
+                live.state,
+            ),
         }
     }
 
@@ -560,6 +573,32 @@ pub fn engine_stays_resident(capturing: bool, outstanding_meeting_jobs: usize) -
     capturing || outstanding_meeting_jobs > 0
 }
 
+/// What to tell the person about speech, from the two facts that decide it.
+///
+/// Pure, so the rule can be read and tested without a meeting, a thread or a
+/// gigabyte of weights — and called on every status read rather than stored, so
+/// nothing here can go stale (see [`crate::types::SpeechState`]).
+///
+/// The order of the arms *is* the rule:
+/// * loaded wins over everything, including a load that failed earlier in this
+///   meeting. A later load repairs an earlier failure, and a banner that
+///   outlives the problem it described is worse than no banner at all.
+/// * a failure is worth saying whether or not a meeting is running: it is the
+///   answer to "why is nothing appearing", and the next Start clears it.
+/// * otherwise, a meeting that needs the engine and has not got it is
+///   `Preparing` — the state that had no way to be shown on 2026-08-24.
+pub fn speech_state(loaded: bool, load_failed: bool, capture: CaptureState) -> SpeechState {
+    if loaded {
+        SpeechState::Ready
+    } else if load_failed {
+        SpeechState::Unavailable
+    } else if engine_is_needed_by_capture(capture) {
+        SpeechState::Preparing
+    } else {
+        SpeechState::Idle
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The manager
 // ---------------------------------------------------------------------------
@@ -675,6 +714,9 @@ impl SessionManager {
             live.elapsed_ms = 0;
             live.active_channels.clear();
             live.degraded_reason = None;
+            // A new meeting is a new attempt at the engine: whatever went wrong
+            // for the last one is not this meeting's news.
+            live.speech_load_failed = false;
         }
         inner.pending.store(0, Ordering::SeqCst);
         inner.emit_state();
@@ -861,9 +903,24 @@ impl SessionManager {
                 // weights had to be read or the graphics compiler had work to do.
                 // Whatever was said in the meantime is on disk, so read it back
                 // into the transcript before carrying on live.
-                Ok(()) => pipeline::catch_up_backlog(engine, engine_meeting, backlog).await,
+                Ok(()) => {
+                    // Before the backlog is read, not after it. Reading minutes
+                    // of audio back can itself take a while, and the thing the
+                    // banner is about — whether Echo can understand speech —
+                    // became true the moment the load returned.
+                    engine.emit_state();
+                    pipeline::catch_up_backlog(engine, engine_meeting, backlog).await
+                }
                 Err(error) => {
                     tracing::warn!(%error, "speech understanding is not ready");
+                    {
+                        let mut live = engine.live.lock().expect("capture state lock");
+                        live.speech_load_failed = true;
+                    }
+                    // The banner and the notice say the same thing, and they say
+                    // it at the same moment: the notice is a message that can be
+                    // missed, this is the state the screen can always ask for.
+                    engine.emit_state();
                     engine.notice(NoticePayload {
                         level: NoticeLevel::Warning,
                         message: "Echo is recording, but it can't write the words down yet. It \
@@ -1208,10 +1265,13 @@ impl SessionManager {
     /// Start the loop that drains the jobs table. Called once at launch;
     /// calling it again does nothing.
     pub async fn start_job_runner(&self) -> Result<(), SessionError> {
+        self.retry_failed_speech_setup().await;
         // A crash leaves rows marked running, and a crash *during a recording*
         // leaves them parked. Neither can still be true, so both go back in the
-        // queue with their progress intact.
-        if let Err(error) = repo::requeue_orphaned_jobs(&self.0.db).await {
+        // queue with their progress intact — except a setup row the process died
+        // inside, which is settled as failed instead so the compile that took
+        // the app down is not started again at this launch and every one after.
+        if let Err(error) = repo::requeue_orphaned_jobs(&self.0.db, jobs::SETUP_INTERRUPTED).await {
             tracing::warn!(%error, "could not tidy the work queue");
         }
         // Nothing owns the machine at launch. Saying so out loud clears the
@@ -1223,6 +1283,41 @@ impl SessionManager {
         }
         self.0.jobs.start();
         Ok(())
+    }
+
+    /// Give the one-time speech setup another go, once, at launch.
+    ///
+    /// The whole automatic escape hatch from the one-attempt policy, and the
+    /// reason a single bad minute cannot leave a machine unwarmed for good.
+    ///
+    /// A setup row that failed without ever reaching the compile took its record
+    /// of the attempt back with it (`jobs::prepare_engine`), so the weights still
+    /// owe this machine a setup and the row is worth another go — and a launch
+    /// is the right distance to try from: far enough apart to be a different
+    /// day, a different disk and a different amount of free memory, where asking
+    /// again on the readiness polls would be a hundred identical failures a
+    /// minute. When the attempt *did* reach the compile, the marker written
+    /// before the load is still standing, this reads as "nothing owed", and the
+    /// row stays failed — which is the whole point of writing it first.
+    async fn retry_failed_speech_setup(&self) {
+        match crate::asr::models::warm_up_needed(&self.0.db).await {
+            Ok(Some(file_name)) => {
+                let Ok(payload) = serde_json::to_string(&file_name) else {
+                    return;
+                };
+                match repo::requeue_failed_setup_jobs(&self.0.db, &payload).await {
+                    Ok(n) if n > 0 => tracing::info!(
+                        rows = n,
+                        model = %file_name,
+                        "giving the one-time speech setup another go"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "could not pick the speech setup back up"),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::debug!(%error, "could not tell whether speech needs setting up"),
+        }
     }
 
     /// Make sure Echo has the speech model it wants, and get rid of any it does
@@ -1304,7 +1399,79 @@ impl SessionManager {
             }
         }
 
+        // Everything is here and nothing is being recorded: the moment to pay
+        // the one-time setup these weights need on this machine, if it has never
+        // been paid. Weights that arrived without a download job — a restore, a
+        // copy from another machine, an out-of-band unpack — have nobody else to
+        // pay it, and on 2026-08-24 that bill was settled by a real meeting,
+        // sixteen minutes of it, with nothing on screen to explain the silence.
+        //
+        // Not while recording: the meeting in progress is already loading the
+        // engine it needs, and a second reason to do the same thing helps
+        // nobody. `queue` deduplicates per kind, so the readiness polls that run
+        // several times a second join the row that exists rather than stacking
+        // rows; once the job has run, the marker it writes is what stops this.
+        if plan.can_serve() && plan.missing.is_empty() && !recording {
+            match crate::asr::models::warm_up_needed(&self.0.db).await {
+                Ok(Some(file_name)) => {
+                    if self.setup_already_failed_for(&file_name).await {
+                        // Tried, and it did not come off. Asking again here would
+                        // ask again a few milliseconds later too, and a few
+                        // milliseconds after that, for as long as the app is
+                        // open. That row gets its next go at the next launch
+                        // (`start_job_runner`), which is far enough away to be a
+                        // different day and a different disk.
+                    } else {
+                        match self
+                            .queue_job_with_payload(None, JobKind::PrepareEngine, &file_name)
+                            .await
+                        {
+                            Ok(_) => tracing::info!(
+                                model = %file_name,
+                                "queued the one-time setup these speech weights need on this machine"
+                            ),
+                            Err(error) => {
+                                tracing::warn!(%error, "could not queue the one-time speech setup")
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => tracing::debug!(
+                    %error,
+                    "could not tell whether the speech weights still need setting up"
+                ),
+            }
+        }
+
         plan.can_serve()
+    }
+
+    /// Whether the one-time setup for exactly these weights has already been
+    /// asked for and failed.
+    ///
+    /// A failed attempt that never reached the compile takes its marker back
+    /// with it, so [`crate::asr::models::warm_up_needed`] starts saying "still
+    /// owed" again the moment it ends — right, but not a reason to try again
+    /// this second. The failed row is the memory of the attempt for the rest of
+    /// the launch; a fresh one is queued for weights nobody has tried yet, so a
+    /// new model is never held back by an old model's bad day.
+    ///
+    /// Trouble reading the queue counts as "already failed": every other answer
+    /// leads to queueing a job, and a database that cannot answer this would
+    /// have it queued again on the next poll, and the next.
+    async fn setup_already_failed_for(&self, file_name: &str) -> bool {
+        let Ok(payload) = serde_json::to_string(file_name) else {
+            return true;
+        };
+        match repo::has_failed_job_with_payload(&self.0.db, JobKind::PrepareEngine, &payload).await
+        {
+            Ok(failed) => failed,
+            Err(error) => {
+                tracing::debug!(%error, "could not read the work queue");
+                true
+            }
+        }
     }
 
     /// Load speech understanding now, because the person asked. Nothing loads on
@@ -2436,6 +2603,323 @@ mod tests {
                 .await
                 .contains(&JobKind::TranscribeCatchup),
             "the finalize job owns it from there"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The one-time setup, and what the screen is told about speech
+    // -----------------------------------------------------------------------
+
+    /// Every file the level needs, on disk, with nothing in the table saying so
+    /// and no download job behind it. That is the machine of 2026-08-24: weights
+    /// that arrived some other way, owing this computer a setup nobody had paid.
+    async fn the_speech_files_are_simply_there(h: &Harness) {
+        crate::asr::models::sync_catalog(&h.db).await.unwrap();
+        for id in crate::asr::catalog::preset_asset_ids(crate::asr::catalog::DEFAULT_PRESET_ID) {
+            let entry = crate::asr::catalog::entry(id).expect("catalogued");
+            let path = crate::asr::models::install_path(&h.paths, entry);
+            if entry.is_bundle() {
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join("coremldata.bin"), b"x").unwrap();
+            } else {
+                std::fs::write(&path, b"weights").unwrap();
+            }
+        }
+    }
+
+    /// Every setup row there has ever been, finished or not.
+    async fn setup_jobs(h: &Harness) -> Vec<crate::types::Job> {
+        repo::list_jobs(
+            &h.db,
+            &JobQuery {
+                kind: Some(JobKind::PrepareEngine),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the work queue")
+    }
+
+    /// The readiness check runs at launch and again on every question the UI
+    /// asks — several times a second while a screen watches it. It has to end up
+    /// with exactly one setup row, and then with none at all.
+    #[tokio::test]
+    async fn the_one_time_speech_setup_is_asked_for_once_and_only_once() {
+        let h = Harness::new().await;
+        the_speech_files_are_simply_there(&h).await;
+
+        assert!(
+            h.session.ensure_speech_current().await,
+            "everything the level needs is on disk"
+        );
+        let queued = setup_jobs(&h).await;
+        assert_eq!(queued.len(), 1, "the setup is asked for: {queued:?}");
+
+        h.session.ensure_speech_current().await;
+        h.session.ensure_speech_current().await;
+        assert_eq!(
+            setup_jobs(&h).await.len(),
+            1,
+            "the readiness polls join the row that exists instead of stacking rows"
+        );
+
+        // And once it has been paid, nothing asks again — not even after the row
+        // is gone from the queue, which is the only thing dedup was doing.
+        repo::set_job_status(&h.db, &queued[0].id, JobStatus::Done, None)
+            .await
+            .unwrap();
+        let file_name = crate::asr::models::installed_speech_file_name(&h.db)
+            .await
+            .unwrap()
+            .expect("something is serving");
+        crate::asr::models::mark_warmed(&h.db, &file_name)
+            .await
+            .unwrap();
+
+        h.session.ensure_speech_current().await;
+        assert_eq!(
+            setup_jobs(&h).await.len(),
+            1,
+            "weights that have been through a load here owe nothing"
+        );
+    }
+
+    /// Mantra 3: a meeting already has the engine's whole attention. Asking for
+    /// the same load twice helps nobody, and the row would be parked anyway.
+    #[tokio::test]
+    async fn the_one_time_speech_setup_is_never_asked_for_during_a_meeting() {
+        let h = Harness::new().await;
+        the_speech_files_are_simply_there(&h).await;
+
+        h.session.start(Default::default()).await.unwrap();
+        h.settle().await;
+        h.session.ensure_speech_current().await;
+        assert!(
+            setup_jobs(&h).await.is_empty(),
+            "a meeting in progress is already loading the engine it needs"
+        );
+
+        // The moment it is over, the same check asks for it.
+        let id = h.session.status().await.meeting_id.expect("a meeting");
+        h.record_a_minute(&id).await;
+        h.session.stop().await.unwrap();
+        h.session.ensure_speech_current().await;
+        assert_eq!(setup_jobs(&h).await.len(), 1);
+    }
+
+    /// A setup that failed for a reason nobody can see from here — no room on
+    /// the disk, an engine that would not start — is asked for again, but at the
+    /// next launch and not a moment sooner. Asking on the readiness polls would
+    /// be the same failure a hundred times a minute, and never asking again
+    /// would hand the sixteen minutes of 2026-08-24 back to a real meeting.
+    #[tokio::test]
+    async fn a_setup_that_failed_gets_its_next_go_at_the_next_launch() {
+        let h = Harness::new().await;
+        the_speech_files_are_simply_there(&h).await;
+
+        h.session.ensure_speech_current().await;
+        let queued = setup_jobs(&h).await;
+        assert_eq!(queued.len(), 1);
+
+        // What a failure that never reached the compile leaves behind: a failed
+        // row, and no record of the attempt (`prepare_engine` takes that back).
+        repo::set_job_status(&h.db, &queued[0].id, JobStatus::Failed, Some("no"))
+            .await
+            .unwrap();
+        assert!(
+            crate::asr::models::warm_up_needed(&h.db)
+                .await
+                .unwrap()
+                .is_some(),
+            "the weights still owe this machine a setup"
+        );
+
+        for _ in 0..5 {
+            h.session.ensure_speech_current().await;
+        }
+        let after = setup_jobs(&h).await;
+        assert_eq!(
+            after.len(),
+            1,
+            "the row that failed is the memory of the attempt for the rest of the launch: {after:?}"
+        );
+        assert_eq!(after[0].status, JobStatus::Failed);
+
+        // And the next launch hands it back — the whole automatic way out of the
+        // one-attempt policy.
+        h.session.retry_failed_speech_setup().await;
+        let revived = setup_jobs(&h).await;
+        assert_eq!(revived.len(), 1, "the same row, not a new one");
+        assert_eq!(revived[0].status, JobStatus::Queued);
+    }
+
+    /// The other side of it: an attempt that got as far as the compile and then
+    /// took the app down with it keeps its marker, and no launch starts that
+    /// quarter of an hour again on its own.
+    #[tokio::test]
+    async fn a_setup_that_died_inside_the_compile_is_not_started_again() {
+        let h = Harness::new().await;
+        the_speech_files_are_simply_there(&h).await;
+
+        h.session.ensure_speech_current().await;
+        let queued = setup_jobs(&h).await;
+        assert_eq!(queued.len(), 1);
+        // Exactly what the process going down mid-compile leaves: a row still
+        // marked running, and the attempt on the record because it was written
+        // before the load.
+        let file_name = crate::asr::models::installed_speech_file_name(&h.db)
+            .await
+            .unwrap()
+            .expect("something is serving");
+        crate::asr::models::mark_warm_attempted(&h.db, &file_name)
+            .await
+            .unwrap();
+        repo::set_job_status(&h.db, &queued[0].id, JobStatus::Running, None)
+            .await
+            .unwrap();
+
+        // The launch that follows.
+        h.session.retry_failed_speech_setup().await;
+        repo::requeue_orphaned_jobs(&h.db, jobs::SETUP_INTERRUPTED)
+            .await
+            .unwrap();
+        let after = setup_jobs(&h).await;
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].status,
+            JobStatus::Failed,
+            "an interrupted compile is settled, not handed straight back"
+        );
+
+        // And nothing queues a fresh one either, however often the screen asks.
+        for _ in 0..5 {
+            h.session.ensure_speech_current().await;
+        }
+        assert_eq!(setup_jobs(&h).await.len(), 1);
+    }
+
+    /// The rule the banner is drawn from, with no meeting, no thread and no
+    /// weights in it.
+    #[test]
+    fn what_the_screen_is_told_about_speech_follows_from_what_is_true_now() {
+        use SpeechState as S;
+
+        // Nothing is being recorded and nothing is loaded: nothing to say.
+        assert_eq!(speech_state(false, false, CaptureState::Idle), S::Idle);
+        assert_eq!(speech_state(false, false, CaptureState::Stopped), S::Idle);
+        // Idle Echo that happens to be holding the weights is not news either
+        // way, but it is honestly ready.
+        assert_eq!(speech_state(true, false, CaptureState::Idle), S::Ready);
+
+        for state in [
+            CaptureState::Starting,
+            CaptureState::Recording,
+            CaptureState::Degraded,
+            CaptureState::Paused,
+            CaptureState::Stopping,
+        ] {
+            assert_eq!(
+                speech_state(false, false, state),
+                S::Preparing,
+                "{state:?}: a meeting waiting on the engine is the thing nobody could see"
+            );
+            assert_eq!(speech_state(true, false, state), S::Ready, "{state:?}");
+        }
+
+        // A load that failed is worth saying, wherever the capture has got to.
+        assert_eq!(
+            speech_state(false, true, CaptureState::Recording),
+            S::Unavailable
+        );
+        assert_eq!(
+            speech_state(false, true, CaptureState::Idle),
+            S::Unavailable
+        );
+
+        // And what is loaded wins over what once failed: a later load repairs an
+        // earlier failure, and a banner outliving its problem is worse than none.
+        assert_eq!(
+            speech_state(true, true, CaptureState::Recording),
+            S::Ready,
+            "the engine is up; nothing on screen may claim otherwise"
+        );
+        assert_eq!(speech_state(true, true, CaptureState::Idle), S::Ready);
+    }
+
+    /// The meeting of 2026-08-24, as the screen would see it now: the engine
+    /// takes its time, and the status says so from the click until it is up.
+    #[tokio::test]
+    async fn a_slow_engine_shows_as_getting_ready_and_then_as_ready() {
+        let h = Harness::new().await;
+        h.asr.prewarm_takes(Duration::from_millis(120));
+
+        h.session.start(Default::default()).await.unwrap();
+        let while_loading = h.events.capture_states();
+        assert!(
+            while_loading
+                .iter()
+                .any(|s| s.speech == SpeechState::Preparing),
+            "the wait is on the screen while it is happening: {while_loading:?}"
+        );
+        assert!(
+            while_loading.iter().all(|s| s.speech != SpeechState::Ready),
+            "nothing may claim to be ready before it is: {while_loading:?}"
+        );
+
+        h.wait_until("the engine to be announced as ready", || {
+            h.events
+                .capture_states()
+                .iter()
+                .any(|s| s.speech == SpeechState::Ready)
+        })
+        .await;
+
+        let seen = h.events.capture_states();
+        let first_ready = seen
+            .iter()
+            .position(|s| s.speech == SpeechState::Ready)
+            .expect("just waited for it");
+        assert!(
+            seen[..first_ready]
+                .iter()
+                .any(|s| s.speech == SpeechState::Preparing),
+            "Preparing comes first, and it is the whole point: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|s| s.speech != SpeechState::Unavailable),
+            "nothing failed here: {seen:?}"
+        );
+        assert_eq!(seen.last().map(|s| s.speech), Some(SpeechState::Ready));
+    }
+
+    /// And when it never comes up, the screen is told that too — in the same
+    /// breath as the banner, so the two cannot disagree.
+    #[tokio::test]
+    async fn a_meeting_whose_engine_never_arrives_says_so_on_the_screen() {
+        let h = Harness::new().await;
+        h.asr.fail_prewarm();
+
+        h.session.start(Default::default()).await.unwrap();
+        h.wait_until("the screen to be told", || {
+            h.events
+                .capture_states()
+                .iter()
+                .any(|s| s.speech == SpeechState::Unavailable)
+        })
+        .await;
+
+        assert!(
+            h.events.notice_tagged("speechNotReady"),
+            "the banner says the same thing at the same moment"
+        );
+        assert_eq!(
+            h.session.status().await.speech,
+            SpeechState::Unavailable,
+            "and asking for the status gives the same answer as the event did"
+        );
+        assert!(
+            is_live(h.session.status().await.state),
+            "mantra 3: the recording carries on regardless"
         );
     }
 

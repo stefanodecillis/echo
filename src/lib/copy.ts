@@ -65,6 +65,21 @@ export const labels = {
     transcriptBehind: "Catching up on the last few minutes.",
     storageLow: "Running low on space. Recording keeps going — free up room soon.",
   },
+  /**
+   * Whether Echo can understand speech right now, said while a meeting is
+   * running. Only the two states worth interrupting somebody for are here:
+   * "ready" needs no words, and "idle" means nothing is asking for it.
+   *
+   * `unavailable` is the same sentence the core sends as a notice when the
+   * engine fails to come up, word for word, so the banner on the screen and the
+   * message that slid past agree instead of sounding like two problems.
+   */
+  speechState: {
+    preparing:
+      "Echo is finishing a one-time setup. It's recording everything, and the words will fill in as soon as that's done.",
+    unavailable:
+      "Echo is recording, but it can't write the words down yet. It will catch up as soon as it can.",
+  },
   provider: {
     onThisComputer: "Ollama",
     gemini: "Google Gemini",
@@ -76,6 +91,9 @@ export const labels = {
     export: "Preparing the file",
     download: "Downloading",
     mixdown: "Preparing playback",
+    /** The one-time setup a set of speech weights needs on this computer, paid
+     * before a meeting has to pay it (incident of 2026-08-24). */
+    prepareEngine: "Getting Echo ready",
   },
   /**
    * A stage inside a job, named because a person would read it as a different

@@ -75,6 +75,18 @@ export type DegradedReason =
   | "transcriptBehind"
   | "storageLow";
 
+/**
+ * Whether Echo can understand speech right now.
+ *
+ * The core works this out fresh from what the engine is holding every time a
+ * `CaptureStatus` is built, and remembers it nowhere. That is what makes it safe
+ * to draw a banner from — but only along with the other half: while it says
+ * "preparing" or "unavailable", `useCaptureState` asks for the status outright
+ * every few seconds, so a missed event costs the banner a moment rather than the
+ * rest of the meeting.
+ */
+export type SpeechState = "idle" | "preparing" | "ready" | "unavailable";
+
 export interface CaptureStatus {
   state: CaptureState;
   meetingId?: Id;
@@ -83,6 +95,8 @@ export interface CaptureStatus {
   degradedReason?: DegradedReason;
   pendingUtterances: number;
   startedAt?: Timestamp;
+  /** Always sent by the core — see `SpeechState`. */
+  speech: SpeechState;
 }
 
 export interface StartRecordingOptions {
@@ -399,7 +413,8 @@ export type JobKind =
   | "summarize"
   | "export"
   | "download"
-  | "mixdown";
+  | "mixdown"
+  | "prepareEngine";
 
 export type JobStatus =
   | "queued"

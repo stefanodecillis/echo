@@ -163,6 +163,11 @@ pub fn label_for(kind: JobKind) -> &'static str {
         // would stop being true halfway through.
         JobKind::Download => "Setting up what Echo needs to understand speech…",
         JobKind::Mixdown => "Getting the recording ready to play back…",
+        // Deliberately not "loading" and not "compiling". What is happening is
+        // that a new set of weights is being made ready for this particular
+        // machine, once; what a person needs to know is that Echo is not able
+        // to write anything down until it finishes.
+        JobKind::PrepareEngine => "Getting Echo ready to understand speech…",
     }
 }
 
@@ -287,6 +292,7 @@ impl JobExecutor for DefaultJobExecutor {
                 JobKind::Summarize => summarize(ctx).await,
                 JobKind::Mixdown => mixdown(ctx).await,
                 JobKind::Download => download(ctx).await,
+                JobKind::PrepareEngine => prepare_engine(ctx).await,
                 // Exports run straight from the command that asked for one;
                 // nothing queues them.
                 JobKind::Export => {
@@ -349,7 +355,14 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
     // fraction to report. Named as its own stage, because "Catching up on the
     // transcript" over a still bar is what a person read for eighteen minutes
     // while this was what was happening (field report of 2026-08-21).
-    ctx.progress.phase(crate::events::JobPhase::PreparingEngine);
+    //
+    // Only when it really is not up, though. After an ordinary meeting the
+    // weights are still in memory and this returns in microseconds, and
+    // announcing a stage for that puts a pill on screen that blinks once at the
+    // end of every meeting for no reason anybody could name.
+    if !ctx.asr.is_loaded() {
+        ctx.progress.phase(crate::events::JobPhase::PreparingEngine);
+    }
     if let Err(error) = ctx.asr.prewarm().await {
         return Err(asr_failure(&ctx.cancel, error));
     }
@@ -849,6 +862,135 @@ async fn download(ctx: &JobContext) -> Result<(), JobFailure> {
         tracing::warn!(%error, "the new weights did not load on the first attempt");
     }
 
+    ctx.progress.set(1.0).await;
+    Ok(())
+}
+
+/// What a setup row that was interrupted by the process going down is left
+/// saying. Not jargon and not a diagnosis: nobody can be told what killed the
+/// app from inside the app that was killed.
+pub(crate) const SETUP_INTERRUPTED: &str =
+    "Echo closed while it was getting ready to understand speech.";
+
+/// Whether the record of an attempt at the one-time setup should be taken back,
+/// given how the load ended and how long it lasted.
+///
+/// Pure, because this is the rule the whole one-attempt policy turns on and it
+/// is worth being able to read on its own.
+///
+/// * a load that ground away and *then* failed is what the marker exists for.
+///   Something on this machine cannot finish that compile, and starting it again
+///   at every launch would cost a quarter of an hour a time and get no further.
+/// * a load that failed inside the time an ordinary load takes never reached the
+///   compile — there were no weights where they should be, the disk was full for
+///   a moment, the engine would not initialise. Nothing was protected by
+///   remembering it, and remembering it would leave this machine unwarmed for
+///   good on the strength of one bad second.
+/// * a recording taking the machine is not a failure at all: the row is parked
+///   and comes back to finish what it started.
+///
+/// The half-minute is [`crate::asr::engine::LIKELY_COMPILED_AT`], the same line
+/// the engine draws between a compile and a slow disk.
+fn attempt_is_worth_forgetting(outcome: &JobFailure, spent: std::time::Duration) -> bool {
+    matches!(outcome, JobFailure::Failed(_)) && spent < crate::asr::engine::LIKELY_COMPILED_AT
+}
+
+/// The one-time setup a set of weights needs on this machine, paid on purpose
+/// and in the open instead of by the next meeting that happens to start.
+///
+/// Queued by [`crate::session::SessionManager::ensure_speech_current`] when the
+/// weights that are serving have never been through a load here — which is how
+/// a model that arrived without a download job (a restore, a copy between
+/// machines, an out-of-band unpack) got as far as a real meeting on 2026-08-24
+/// and spent its first sixteen minutes compiling.
+async fn prepare_engine(ctx: &JobContext) -> Result<(), JobFailure> {
+    // Which weights this row is for travels with it. A row that has outlived a
+    // catalog change asks the disk again rather than recording an attempt
+    // against a name nothing will ever load.
+    let requested: Option<String> = repo::get_job_payload(&ctx.db, &ctx.job.id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<String>(&raw).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    let file_name = match requested {
+        Some(name) => Some(name),
+        None => crate::asr::models::installed_speech_file_name(&ctx.db)
+            .await
+            .unwrap_or(None),
+    };
+    let Some(file_name) = file_name else {
+        // Nothing installed to get ready. Not a failure: the download job is
+        // what this install is waiting for, and it warms the weights itself.
+        tracing::info!("nothing to get ready yet: there are no speech weights installed");
+        ctx.progress.set(1.0).await;
+        return Ok(());
+    };
+
+    // Recorded *before* the load, never after. The compile inside it is minutes
+    // of heavy work, and anything that takes the process down in the middle of
+    // it would otherwise be repeated at every launch for as long as it keeps
+    // happening — see `models::mark_warm_attempted`. What the attempt turns out
+    // to have cost decides whether it is kept; that is settled below, once the
+    // load has come back one way or the other.
+    if let Err(error) = crate::asr::models::mark_warm_attempted(&ctx.db, &file_name).await {
+        // Costs a repeat of this job at the next launch, nothing more.
+        tracing::debug!(%error, "could not remember that the one-time setup was started");
+    }
+
+    // Everything from here has no fraction to report, so it says what it is
+    // instead of leaving a bar somewhere it will sit for a quarter of an hour.
+    ctx.progress.phase(crate::events::JobPhase::PreparingEngine);
+    tracing::info!(model = %file_name, "getting the speech engine ready for this machine");
+
+    // No cancel check around the load, and none after it, on purpose.
+    //
+    // The only thing that interrupts this job is a recording starting, and a
+    // recording needs exactly the load that is already in flight: the engine
+    // runs one load on one thread, so a meeting that preempted this would queue
+    // behind the very compile it just abandoned the row for, and arrive no
+    // sooner. Parking the row would only mean doing the bookkeeping twice, and
+    // leaving it half-marked. Sixteen minutes is sixteen minutes whoever is
+    // waiting for it (incident of 2026-08-24); the difference this job makes is
+    // that nobody is in a meeting while they pass.
+    let started = std::time::Instant::now();
+    if let Err(error) = ctx.asr.prewarm().await {
+        let failure = asr_failure(&ctx.cancel, error);
+        let spent = started.elapsed();
+        let spent_ms = spent.as_millis() as u64;
+        // What the attempt cost decides whether it stands — see
+        // `attempt_is_worth_forgetting`, which is that rule and nothing else.
+        if attempt_is_worth_forgetting(&failure, spent) {
+            if let Err(error) = crate::asr::models::forget_warm_attempt(&ctx.db, &file_name).await {
+                tracing::debug!(%error, "could not take back the record of the attempt");
+            }
+            tracing::warn!(
+                model = %file_name,
+                spent_ms,
+                "getting the speech engine ready failed before it had started; the next launch \
+                 will try again"
+            );
+        } else if matches!(failure, JobFailure::Failed(_)) {
+            tracing::warn!(
+                model = %file_name,
+                spent_ms,
+                "getting the speech engine ready did not finish; it will not be started again on \
+                 its own"
+            );
+        } else {
+            // Stopped rather than failed: the row is parked or cancelled, and
+            // the attempt it recorded stands for whenever it picks back up.
+            tracing::info!(
+                model = %file_name,
+                spent_ms,
+                "getting the speech engine ready stopped short"
+            );
+        }
+        return Err(failure);
+    }
+
+    tracing::info!(model = %file_name, "the speech engine is ready for this machine");
     ctx.progress.set(1.0).await;
     Ok(())
 }
@@ -1618,6 +1760,7 @@ mod tests {
             JobKind::Export,
             JobKind::Download,
             JobKind::Mixdown,
+            JobKind::PrepareEngine,
         ] {
             let label = label_for(kind).to_lowercase();
             for word in banned {
@@ -1631,12 +1774,207 @@ mod tests {
                 assert!(!label.contains(word), "{label:?} leaks {word:?}");
             }
             assert!(phase_label_for(phase).ends_with('…'));
-            assert_ne!(
-                phase_label_for(phase),
-                label_for(JobKind::Download),
-                "a stage worth naming has to read differently from the job"
+            // Against every job, not just the download it started life inside:
+            // a stage is only worth announcing if it reads differently from
+            // whatever sentence is already on screen.
+            for kind in [
+                JobKind::TranscribeCatchup,
+                JobKind::Diarize,
+                JobKind::Summarize,
+                JobKind::Export,
+                JobKind::Download,
+                JobKind::Mixdown,
+                JobKind::PrepareEngine,
+            ] {
+                assert_ne!(
+                    phase_label_for(phase),
+                    label_for(kind),
+                    "a stage worth naming has to read differently from the job"
+                );
+            }
+        }
+    }
+
+    /// The setup job, end to end: it says which stage it is on, it reports no
+    /// fraction while the machine does the one-time work, and the engine comes
+    /// up. This is the sixteen minutes of 2026-08-24, paid before a meeting.
+    #[tokio::test]
+    async fn the_setup_job_names_its_stage_and_reports_no_fraction() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let job = repo::ensure_job_with_payload(
+            &db,
+            None,
+            JobKind::PrepareEngine,
+            Some(&serde_json::to_string("some-weights.bin").unwrap()),
+        )
+        .await
+        .unwrap();
+        let (ctx, seen) = context_for(&db, job).await;
+
+        prepare_engine(&ctx).await.expect("the setup should finish");
+
+        assert!(
+            ctx.asr.is_loaded(),
+            "the point of the job is a loaded engine"
+        );
+        let announced = seen.job_progress();
+        let stage = announced
+            .iter()
+            .find(|p| p.phase == Some(crate::events::JobPhase::PreparingEngine))
+            .expect("the stage was announced");
+        assert!(
+            stage.job.progress.is_none(),
+            "there is no honest fraction for a compile, and a still bar reads as broken"
+        );
+        assert_eq!(
+            stage.label.as_deref(),
+            Some(phase_label_for(crate::events::JobPhase::PreparingEngine))
+        );
+        assert_eq!(
+            announced.last().map(|p| p.job.progress),
+            Some(Some(1.0)),
+            "and it finishes"
+        );
+
+        // The one attempt is on the record, against these weights by name.
+        assert_eq!(
+            repo::get_setting(&db, crate::settings::keys::SPEECH_WARM_ATTEMPTED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("some-weights.bin")
+        );
+    }
+
+    /// A setup row whose weights, name and all, is what the failing job is for.
+    async fn a_setup_job_for(db: &Db, weights: &str) -> Job {
+        repo::ensure_job_with_payload(
+            db,
+            None,
+            JobKind::PrepareEngine,
+            Some(&serde_json::to_string(weights).unwrap()),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A failure that came back before the compile could have started cost
+    /// nothing, so the record of the attempt goes with it: keeping it would
+    /// retire this machine's only automatic setup on the strength of one bad
+    /// second, and hand the sixteen minutes back to the next real meeting.
+    #[tokio::test]
+    async fn a_setup_that_failed_before_it_started_is_not_the_one_attempt() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let job = a_setup_job_for(&db, "some-weights.bin").await;
+        let (mut ctx, _seen) = context_for(&db, job).await;
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        asr.fail_prewarm();
+        ctx.asr = asr;
+
+        let outcome = prepare_engine(&ctx).await;
+        assert!(
+            matches!(outcome, Err(JobFailure::Failed(_))),
+            "a failed setup is a row that failed, not a silent nothing: {outcome:?}"
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::settings::keys::SPEECH_WARM_ATTEMPTED)
+                .await
+                .unwrap(),
+            None,
+            "nothing expensive happened, so the next launch is free to try again"
+        );
+    }
+
+    /// A recording taking the machine is not a failure and settles nothing: the
+    /// row is parked, and it keeps the attempt it has already recorded.
+    #[tokio::test]
+    async fn a_setup_a_recording_took_the_machine_from_is_not_a_failed_attempt() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let job = a_setup_job_for(&db, "some-weights.bin").await;
+        let (mut ctx, _seen) = context_for(&db, job).await;
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        asr.cancel_prewarm();
+        ctx.asr = asr;
+        ctx.cancel.preempt();
+
+        let outcome = prepare_engine(&ctx).await;
+        assert!(matches!(outcome, Err(JobFailure::Preempted)), "{outcome:?}");
+        assert_eq!(
+            repo::get_setting(&db, crate::settings::keys::SPEECH_WARM_ATTEMPTED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("some-weights.bin"),
+            "the row comes back for the rest of it; it does not start over"
+        );
+    }
+
+    /// The rule the one-attempt policy turns on, read on its own: only a load
+    /// that lasted long enough to have been the compile is worth remembering,
+    /// and only a real failure settles anything at all.
+    #[test]
+    fn only_a_failure_that_lasted_counts_as_the_one_attempt() {
+        use std::time::Duration;
+        let failed = JobFailure::failed("nope");
+        let long = crate::asr::engine::LIKELY_COMPILED_AT;
+
+        assert!(attempt_is_worth_forgetting(
+            &failed,
+            Duration::from_millis(40)
+        ));
+        assert!(attempt_is_worth_forgetting(
+            &failed,
+            long - Duration::from_millis(1)
+        ));
+        assert!(!attempt_is_worth_forgetting(&failed, long));
+        assert!(!attempt_is_worth_forgetting(
+            &failed,
+            Duration::from_secs(16 * 60)
+        ));
+
+        for kept in [JobFailure::Preempted, JobFailure::Cancelled] {
+            assert!(
+                !attempt_is_worth_forgetting(&kept, Duration::from_millis(40)),
+                "{kept:?}: the load was stopped, not tried and found wanting"
             );
         }
+    }
+
+    /// Every meeting ends with a catch-up pass, and after an ordinary one the
+    /// weights are still in memory. Announcing a stage for a load that returns
+    /// at once puts a pill on screen that blinks for no reason.
+    #[tokio::test]
+    async fn a_catch_up_with_the_engine_already_up_announces_no_stage() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let meeting = repo::create_meeting(&db, "Weekly sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        let chunk = repo::insert_chunk(
+            &db,
+            &meeting.id,
+            crate::types::Channel::Mic,
+            0,
+            "/tmp/echo-test/mic-000000.flac",
+            0,
+            60_000,
+        )
+        .await
+        .unwrap();
+        repo::commit_chunk(&db, &chunk, 60_000).await.unwrap();
+
+        let job = repo::ensure_job(&db, Some(&meeting.id), JobKind::TranscribeCatchup)
+            .await
+            .unwrap();
+        let (ctx, seen) = context_for(&db, job).await;
+        // The engine this meeting was recorded with is still holding its weights.
+        ctx.asr.prewarm().await.unwrap();
+
+        catch_up(&ctx).await.expect("the catch-up should finish");
+
+        assert!(
+            seen.job_progress().iter().all(|p| p.phase.is_none()),
+            "nothing to announce: the engine was already up"
+        );
     }
 
     /// A stage with no fraction says so, rather than leaving a bar parked at the
@@ -1656,8 +1994,7 @@ mod tests {
         };
         let (ctx, seen) = context_for(&db, job).await;
         ctx.progress.set(1.0).await;
-        ctx.progress
-            .phase(crate::events::JobPhase::PreparingEngine);
+        ctx.progress.phase(crate::events::JobPhase::PreparingEngine);
 
         let announced = seen.job_progress();
         assert_eq!(announced.len(), 2);

@@ -483,7 +483,9 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn repo_requeue(db: &db::Db) -> u64 {
-    db::repo::requeue_orphaned_jobs(db).await.unwrap_or(0)
+    db::repo::requeue_orphaned_jobs(db, session::jobs::SETUP_INTERRUPTED)
+        .await
+        .unwrap_or(0)
 }
 
 /// Register or remove the login item. Returns what the operating system now

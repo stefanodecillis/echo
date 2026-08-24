@@ -37,6 +37,7 @@ const IDLE_CAPTURE_STATE: CaptureStatus = {
   elapsedMs: 0,
   activeChannels: [],
   pendingUtterances: 0,
+  speech: "idle",
 };
 
 function makeToastId(): string {

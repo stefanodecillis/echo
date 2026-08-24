@@ -36,6 +36,22 @@ pub mod keys {
     pub const GEMINI_MODEL: &str = "gemini_model";
     pub const DETECTION_SNOOZED_UNTIL: &str = "detection_snoozed_until";
     pub const MODEL_CATALOG_REVISION: &str = "model_catalog_revision";
+    /// File name of the speech weights that have been through a full load on
+    /// this machine. Written once a load finishes, and the record that the
+    /// one-time setup those weights need here has been paid: on Apple silicon
+    /// the first load of a model builds its encoder for this particular
+    /// machine, which took sixteen minutes on 2026-08-24 — in the middle of a
+    /// meeting, with nothing on screen to say so.
+    pub const SPEECH_WARMED_MODEL: &str = "speech_warmed_model";
+    /// File name of the speech weights Echo has *tried* to set up. Written
+    /// before the load starts, so a crash halfway through that compile cannot
+    /// turn into a quarter of an hour of it at every launch: the row that crash
+    /// interrupted is settled as failed rather than requeued
+    /// ([`crate::db::repo::requeue_orphaned_jobs`]), and this is what keeps
+    /// anything from queueing a fresh one. Taken back again when the attempt
+    /// turned out to have failed before the compile could have started (see
+    /// [`crate::asr::models::mark_warm_attempted`]).
+    pub const SPEECH_WARM_ATTEMPTED: &str = "speech_warm_attempted";
 }
 
 /// Recaps are written on their own once a meeting ends. The happy path is

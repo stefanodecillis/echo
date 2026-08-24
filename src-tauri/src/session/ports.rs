@@ -323,6 +323,36 @@ impl AsrPort for EngineAsr {
             self.worker.configure_from_settings(&self.db).await?;
             let backend = self.worker.load_now().await?;
             tracing::info!(?backend, "speech understanding is ready");
+
+            // The load is over, so whatever this machine had to build for these
+            // weights has been built and cached by the OS. This is the one place
+            // that can be recorded: every load anything asks for by name — a
+            // meeting starting, a download finishing, the setup job — comes
+            // through this method.
+            //
+            // Not quite every load, though: a decode that arrives with nothing
+            // loaded is served by `engine::ensure_loaded` on the engine thread,
+            // which never passes here, so the marker can stay unwritten after a
+            // load that really happened. That costs one redundant setup job,
+            // which finds the weights already in memory, returns in
+            // milliseconds and writes the marker — the repair, rather than a
+            // case to guard against.
+            if let Some(file_name) = self
+                .worker
+                .configured()
+                .and_then(|config| config.model_path.file_name().map(|n| n.to_os_string()))
+            {
+                let file_name = file_name.to_string_lossy().into_owned();
+                if let Err(error) = crate::asr::models::mark_warmed(&self.db, &file_name).await {
+                    // Nothing is broken by this: the worst it costs is doing the
+                    // setup job again, which is fast now.
+                    tracing::debug!(
+                        %error,
+                        model = %file_name,
+                        "could not remember that these weights are ready on this machine"
+                    );
+                }
+            }
             Ok(())
         })
     }

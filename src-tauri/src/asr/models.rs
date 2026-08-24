@@ -347,6 +347,115 @@ pub async fn readiness(db: &Db, paths: &AppPaths) -> Result<SpeechReadiness, Asr
     })
 }
 
+// ---------------------------------------------------------------------------
+// The one-time setup a set of weights needs on this machine
+//
+// On Apple silicon the first load of a speech model compiles its encoder for
+// this particular machine and the OS caches the result: sixteen minutes on
+// 2026-08-24, against three seconds every load after it. The compile happens
+// inside the load, wherever that load is asked for — and on 2026-08-24 it was
+// asked for by a meeting that had already started, so the first sixteen minutes
+// of a real conversation had no live text and nothing on screen explaining why.
+//
+// These functions are the whole memory of it: which weights are installed,
+// whether they have been through a load here, and whether one has been tried
+// and what it cost.
+// What acts on the answer is `JobKind::PrepareEngine`, queued from
+// `SessionManager::ensure_speech_current` while nothing is being recorded.
+// ---------------------------------------------------------------------------
+
+/// File name of the speech weights a load would actually use right now.
+///
+/// The *serving* file, exactly as [`installed_path`] resolves it — while an
+/// upgrade is still downloading that is yesterday's model, and yesterday's model
+/// is the one whose setup has already been paid. The name rather than the path,
+/// because it is what identifies the weights across a change of storage folder.
+pub async fn installed_speech_file_name(db: &Db) -> Result<Option<String>, AsrError> {
+    Ok(installed_path(db, AssetKind::Speech)
+        .await?
+        .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned())))
+}
+
+/// Which weights still owe this machine their one-time setup, if any.
+///
+/// `Some(file_name)` when all three of these hold: those weights are what is
+/// installed and serving, no load of them has ever finished here, and no attempt
+/// has ever been made. Anything else is `None`, including the ordinary case of
+/// weights that came up fine weeks ago.
+pub async fn warm_up_needed(db: &Db) -> Result<Option<String>, AsrError> {
+    let Some(installed) = installed_speech_file_name(db).await? else {
+        // Nothing to serve is not something a warm-up can fix; the download job
+        // is what that install is waiting for.
+        return Ok(None);
+    };
+    let warmed = repo::get_setting(db, settings::keys::SPEECH_WARMED_MODEL).await?;
+    let attempted = repo::get_setting(db, settings::keys::SPEECH_WARM_ATTEMPTED).await?;
+    let matches = |stored: Option<String>| stored.as_deref() == Some(installed.as_str());
+    if matches(warmed) || matches(attempted) {
+        return Ok(None);
+    }
+    Ok(Some(installed))
+}
+
+/// Remember that these weights have been all the way through a load here.
+///
+/// Recorded by [`crate::session::ports::EngineAsr::prewarm`], which every load
+/// anything asks for by name goes through, so weights warmed by a download, by a
+/// meeting or by the setup job all count the same.
+pub async fn mark_warmed(db: &Db, file_name: &str) -> Result<(), AsrError> {
+    repo::set_setting(db, settings::keys::SPEECH_WARMED_MODEL, file_name).await?;
+    Ok(())
+}
+
+/// Remember that the one-time setup for these weights was *started*.
+///
+/// Written before the load begins, never after. The compile it is about is
+/// minutes of heavy work, and anything that kills the process in the middle of
+/// it — an out-of-memory, a driver fault, someone force-quitting an app that
+/// looks frozen — would otherwise be repeated at the next launch, and the one
+/// after that, each time costing a quarter of an hour and getting no further.
+/// The marker is what makes the interrupted attempt count as the attempt, and
+/// the row it belongs to is settled as failed at the next launch rather than
+/// requeued ([`crate::db::repo::fail_interrupted_setup_jobs`]) so that nothing
+/// picks the compile back up on its own.
+///
+/// The cost of being wrong the other way is bounded and already handled: the
+/// meeting that eventually needs these weights pays the compile itself, its
+/// audio is on disk throughout (mantra 3) and the transcript arrives from the
+/// catch-up pass.
+///
+/// It is not, however, "one attempt ever" for a load that cost nothing. An
+/// attempt that came back before the compile could even have begun — no weights
+/// where they should be, a moment of disk pressure, an engine that would not
+/// initialise — has protected nobody by being remembered, and remembering it
+/// would retire this machine's only automatic setup on the strength of one bad
+/// second. Those are forgotten again by [`forget_warm_attempt`], and the failed
+/// row gets one more go at the next launch.
+pub async fn mark_warm_attempted(db: &Db, file_name: &str) -> Result<(), AsrError> {
+    repo::set_setting(db, settings::keys::SPEECH_WARM_ATTEMPTED, file_name).await?;
+    Ok(())
+}
+
+/// Take back an attempt that turned out to have cost nothing.
+///
+/// The other half of [`mark_warm_attempted`]: called only when the load came
+/// back quickly *and* with an error, which means the expensive part never
+/// started and there is nothing for the marker to protect the next launch from.
+/// Forgetting it is what lets that launch try again — without it, a single
+/// transient failure would leave this machine unwarmed for good and hand the
+/// compile back to the next real meeting, which is the whole incident of
+/// 2026-08-24 restored.
+///
+/// Only clears a marker that names these exact weights, so a marker written for
+/// the model somebody has since moved on to is left where it is.
+pub async fn forget_warm_attempt(db: &Db, file_name: &str) -> Result<(), AsrError> {
+    let attempted = repo::get_setting(db, settings::keys::SPEECH_WARM_ATTEMPTED).await?;
+    if attempted.as_deref() == Some(file_name) {
+        repo::delete_setting(db, settings::keys::SPEECH_WARM_ATTEMPTED).await?;
+    }
+    Ok(())
+}
+
 /// Download every asset a preset needs, in order, resuming what is partial.
 ///
 /// Idempotent: calling it while a download is running attaches to that
@@ -2298,6 +2407,143 @@ mod tests {
         assert!(
             expected_total > 0,
             "the mock served something (sanity check)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The one-time setup marker
+    // -----------------------------------------------------------------
+
+    /// The whole life of the marker, in the order a person lives it: nothing
+    /// installed, then installed and never warmed, then attempted, then warmed —
+    /// and a new model that starts the story over.
+    #[tokio::test]
+    async fn weights_owe_this_machine_their_setup_once_and_once_only() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap(),
+            None,
+            "there is nothing to get ready before anything is installed"
+        );
+        assert_eq!(installed_speech_file_name(&db).await.unwrap(), None);
+
+        // What a finished download leaves behind.
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            install(&fx.paths, &db, id).await;
+        }
+        refresh_installed(&db, &fx.paths).await.unwrap();
+        let speech = catalog::entry(catalog::ids::SPEECH).unwrap().file_name;
+        assert_eq!(
+            installed_speech_file_name(&db).await.unwrap().as_deref(),
+            Some(speech)
+        );
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap().as_deref(),
+            Some(speech),
+            "weights nothing has ever loaded here still owe this machine their setup"
+        );
+
+        // The attempt alone settles it: one try per set of weights, ever, so a
+        // compile that kills the process cannot become a launch that never ends.
+        mark_warm_attempted(&db, speech).await.unwrap();
+        assert_eq!(warm_up_needed(&db).await.unwrap(), None);
+
+        // And so does a load that actually finished.
+        mark_warmed(&db, speech).await.unwrap();
+        assert_eq!(warm_up_needed(&db).await.unwrap(), None);
+
+        // Different weights, different bill. Markers naming the model somebody
+        // used to have say nothing about the one they have now.
+        mark_warmed(&db, "some-other-weights.bin").await.unwrap();
+        mark_warm_attempted(&db, "some-other-weights.bin")
+            .await
+            .unwrap();
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap().as_deref(),
+            Some(speech),
+            "a marker for another model must not pass for this one"
+        );
+    }
+
+    /// An attempt that cost nothing is taken back, so the next launch is free to
+    /// try again — one transient failure must not retire this machine's setup
+    /// for good and hand the compile back to a real meeting.
+    #[tokio::test]
+    async fn an_attempt_that_cost_nothing_is_taken_back() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            install(&fx.paths, &db, id).await;
+        }
+        refresh_installed(&db, &fx.paths).await.unwrap();
+        let speech = catalog::entry(catalog::ids::SPEECH).unwrap().file_name;
+
+        mark_warm_attempted(&db, speech).await.unwrap();
+        assert_eq!(warm_up_needed(&db).await.unwrap(), None);
+
+        // A marker naming some other weights is not this attempt, and is left
+        // exactly where it is.
+        forget_warm_attempt(&db, "some-other-weights.bin")
+            .await
+            .unwrap();
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap(),
+            None,
+            "the marker for these weights is still standing"
+        );
+
+        forget_warm_attempt(&db, speech).await.unwrap();
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap().as_deref(),
+            Some(speech),
+            "these weights still owe this machine a setup, and may be asked again"
+        );
+
+        // Forgetting what was never recorded is not an error, and does not
+        // disturb the record of a load that actually finished.
+        forget_warm_attempt(&db, speech).await.unwrap();
+        mark_warmed(&db, speech).await.unwrap();
+        forget_warm_attempt(&db, speech).await.unwrap();
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap(),
+            None,
+            "weights that have been through a load here owe nothing, ever again"
+        );
+    }
+
+    /// The case the incident of 2026-08-24 was: weights that appeared on disk
+    /// with no download job to warm them. Nothing else in the table changes, and
+    /// the answer is still "these owe this machine a setup".
+    #[tokio::test]
+    async fn weights_that_arrived_without_a_download_still_owe_the_setup() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+
+        // Copied in from another machine, or restored from a backup: the file is
+        // simply there, and `refresh_installed` believes the disk.
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            let entry = catalog::entry(id).unwrap();
+            let path = install_path(&fx.paths, entry);
+            if entry.is_bundle() {
+                tokio::fs::create_dir_all(&path).await.unwrap();
+                tokio::fs::write(path.join("coremldata.bin"), b"x")
+                    .await
+                    .unwrap();
+            } else {
+                tokio::fs::write(&path, b"weights").await.unwrap();
+            }
+        }
+        // Nobody marked anything installed; only the disk knows.
+        plan_reconcile(&db, &fx.paths).await.unwrap();
+
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap().as_deref(),
+            Some(catalog::entry(catalog::ids::SPEECH).unwrap().file_name)
         );
     }
 

@@ -199,6 +199,9 @@ pub(crate) struct MockAsr {
     calls: AtomicU32,
     catch_up_segments: AtomicU32,
     fail_prewarm: AtomicBool,
+    /// The load gives up because something else wanted the machine — what a
+    /// recording starting mid-load looks like from here.
+    cancel_prewarm: AtomicBool,
     /// How long loading takes, the way a first-ever launch takes minutes.
     prewarm_takes: std::sync::Mutex<Option<Duration>>,
     /// How long one live decode takes, so a test can still have one in flight
@@ -219,6 +222,7 @@ impl MockAsr {
             calls: AtomicU32::new(0),
             catch_up_segments: AtomicU32::new(0),
             fail_prewarm: AtomicBool::new(false),
+            cancel_prewarm: AtomicBool::new(false),
             prewarm_takes: std::sync::Mutex::new(None),
             transcribe_takes: std::sync::Mutex::new(None),
             text: std::sync::Mutex::new("hello there".to_string()),
@@ -235,6 +239,13 @@ impl MockAsr {
     #[allow(dead_code)]
     pub(crate) fn fail_prewarm(&self) {
         self.fail_prewarm.store(true, Ordering::SeqCst);
+    }
+
+    /// The load stops short because something else claimed the machine, rather
+    /// than because anything went wrong with it.
+    #[allow(dead_code)]
+    pub(crate) fn cancel_prewarm(&self) {
+        self.cancel_prewarm.store(true, Ordering::SeqCst);
     }
 
     /// Is a meeting holding the engine right now?
@@ -278,6 +289,9 @@ impl AsrPort for MockAsr {
             let takes = *self.prewarm_takes.lock().unwrap();
             if let Some(takes) = takes {
                 tokio::time::sleep(takes).await;
+            }
+            if self.cancel_prewarm.load(Ordering::SeqCst) {
+                return Err(AsrError::Cancelled);
             }
             if self.fail_prewarm.load(Ordering::SeqCst) {
                 return Err(AsrError::NotInstalled);
@@ -577,6 +591,21 @@ impl CollectingEvents {
             .iter()
             .filter_map(|event| match event {
                 UiEvent::SpeakersUpdated(payload) => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every capture status that went out, in order — the whole story of one
+    /// meeting as the screen saw it.
+    #[allow(dead_code)]
+    pub(crate) fn capture_states(&self) -> Vec<crate::types::CaptureStatus> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::CaptureState(payload) => Some(payload.clone()),
                 _ => None,
             })
             .collect()

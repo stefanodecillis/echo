@@ -2147,7 +2147,30 @@ pub async fn resume_paused_jobs(db: &Db) -> Result<u64, DbError> {
 /// Both go back in the queue, keeping their progress, or the work a recording
 /// parked would sit there for good and its meeting would never leave
 /// "Processing".
-pub async fn requeue_orphaned_jobs(db: &Db) -> Result<u64, DbError> {
+///
+/// One kind of work is settled rather than requeued, in the same breath so that
+/// no caller can get the order wrong: a `prepare_engine` row that was still
+/// marked running was, in all likelihood, in the middle of the one-time compile
+/// that took a quarter of an hour on 2026-08-24 — and whatever took the process
+/// down in the middle of it (an out-of-memory, a driver fault, somebody
+/// force-quitting an app that looked frozen) would do exactly the same thing to
+/// the next attempt, at this launch and every launch after it. So it is left
+/// failed, wearing `setup_interrupted` as its reason. Nothing is lost: the
+/// meeting that needs the engine still loads it, and the settings marker written
+/// before the load is what keeps anything from queueing a fresh row on its own.
+///
+/// Returns how many rows were touched either way.
+pub async fn requeue_orphaned_jobs(db: &Db, setup_interrupted: &str) -> Result<u64, DbError> {
+    let settled = sqlx::query(
+        "UPDATE jobs SET status = 'failed', error = ?2, updated_at = ?1
+         WHERE status = 'running' AND kind = ?3",
+    )
+    .bind(now())
+    .bind(setup_interrupted)
+    .bind(JobKind::PrepareEngine.as_str())
+    .execute(db)
+    .await?
+    .rows_affected();
     let r = sqlx::query(
         "UPDATE jobs SET status = 'queued', updated_at = ?1
          WHERE status IN ('running', 'paused')",
@@ -2155,7 +2178,50 @@ pub async fn requeue_orphaned_jobs(db: &Db) -> Result<u64, DbError> {
     .bind(now())
     .execute(db)
     .await?;
+    Ok(settled + r.rows_affected())
+}
+
+/// Give the one-time speech setup another go, at launch and only at launch.
+///
+/// Scoped to the weights named by `payload`, so a row that failed for a model
+/// somebody has since moved on from stays where it is. The caller decides
+/// whether a retry is allowed at all — the marker in settings says whether the
+/// last attempt ever reached the compile — and calls this at most once per
+/// launch. A launch apart is the right spacing for a retry of something that
+/// failed for a reason nobody can see from here: it is long enough to be a
+/// different day, a different disk and a different amount of free memory, and it
+/// cannot become the tight loop that queueing on every readiness poll would.
+pub async fn requeue_failed_setup_jobs(db: &Db, payload: &str) -> Result<u64, DbError> {
+    let r = sqlx::query(
+        "UPDATE jobs SET status = 'queued', error = NULL, updated_at = ?1
+         WHERE status = 'failed' AND kind = ?2 AND payload = ?3",
+    )
+    .bind(now())
+    .bind(JobKind::PrepareEngine.as_str())
+    .bind(payload)
+    .execute(db)
+    .await?;
     Ok(r.rows_affected())
+}
+
+/// Whether a job of this kind has already failed carrying exactly this payload.
+///
+/// The record that this precise piece of work has been tried and did not come
+/// off — which is what stops the caller asking for it again a few milliseconds
+/// later, and again, for as long as the app is open.
+pub async fn has_failed_job_with_payload(
+    db: &Db,
+    kind: JobKind,
+    payload: &str,
+) -> Result<bool, DbError> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM jobs WHERE kind = ?1 AND status = 'failed' AND payload = ?2 LIMIT 1",
+    )
+    .bind(kind.as_str())
+    .bind(payload)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.is_some())
 }
 
 /// Oldest queued job, honouring the priority order in DESIGN §3.
@@ -3250,7 +3316,7 @@ mod tests {
 
         // Nothing can legitimately be running or parked at launch: the flag that
         // parks work lives in memory only.
-        assert_eq!(requeue_orphaned_jobs(&db).await.unwrap(), 2);
+        assert_eq!(requeue_orphaned_jobs(&db, "interrupted").await.unwrap(), 2);
         for id in [&running.id, &parked.id] {
             assert_eq!(
                 get_job(&db, id).await.unwrap().unwrap().status,
@@ -3261,6 +3327,111 @@ mod tests {
             get_job(&db, &done.id).await.unwrap().unwrap().status,
             JobStatus::Done,
             "finished work is left alone"
+        );
+    }
+
+    /// The one exception, and the reason it exists: a setup row that was running
+    /// when the process went down is not started again by the launch that
+    /// follows. Whatever ended the app was most likely the compile itself, and
+    /// putting the row back in the queue is how one bad compile becomes a
+    /// quarter of an hour of it at every launch, forever.
+    #[tokio::test]
+    async fn an_interrupted_speech_setup_is_settled_rather_than_started_again() {
+        let (db, m) = seeded().await;
+        let setup = ensure_job_with_payload(&db, None, JobKind::PrepareEngine, Some("\"w.bin\""))
+            .await
+            .unwrap();
+        set_job_status(&db, &setup.id, JobStatus::Running, None)
+            .await
+            .unwrap();
+        // A setup row a *recording* parked is an ordinary park, and goes back in
+        // the queue like anything else: nothing crashed, so nothing is feared.
+        let parked = create_job(&db, None, JobKind::PrepareEngine).await.unwrap();
+        set_job_status(&db, &parked.id, JobStatus::Paused, None)
+            .await
+            .unwrap();
+        let other = create_job(&db, Some(&m.id), JobKind::TranscribeCatchup)
+            .await
+            .unwrap();
+        set_job_status(&db, &other.id, JobStatus::Running, None)
+            .await
+            .unwrap();
+
+        assert_eq!(requeue_orphaned_jobs(&db, "interrupted").await.unwrap(), 3);
+        let settled = get_job(&db, &setup.id).await.unwrap().unwrap();
+        assert_eq!(settled.status, JobStatus::Failed);
+        assert_eq!(settled.error.as_deref(), Some("interrupted"));
+        assert_eq!(
+            get_job(&db, &parked.id).await.unwrap().unwrap().status,
+            JobStatus::Queued,
+            "a park is not a crash"
+        );
+        assert_eq!(
+            get_job(&db, &other.id).await.unwrap().unwrap().status,
+            JobStatus::Queued,
+            "every other kind of work is picked back up as it always was"
+        );
+
+        // And the launch after that can hand it back, once, when the caller says
+        // the weights are still owed a setup — those weights, by name: a row
+        // that failed for a model somebody has moved on from stays where it is.
+        assert_eq!(
+            requeue_failed_setup_jobs(&db, "\"other.bin\"")
+                .await
+                .unwrap(),
+            0,
+            "another model's failed row is not this model's business"
+        );
+        assert_eq!(
+            requeue_failed_setup_jobs(&db, "\"w.bin\"").await.unwrap(),
+            1
+        );
+        let revived = get_job(&db, &setup.id).await.unwrap().unwrap();
+        assert_eq!(revived.status, JobStatus::Queued);
+        assert_eq!(revived.error, None, "an old reason is not still on it");
+    }
+
+    /// The queue itself is the memory of what has been tried: a failed row for
+    /// exactly these weights is what keeps the same job from being asked for
+    /// several times a second for the rest of the launch.
+    #[tokio::test]
+    async fn a_failed_row_is_found_by_the_payload_it_carried() {
+        let (db, _m) = seeded().await;
+        let job = ensure_job_with_payload(
+            &db,
+            None,
+            JobKind::PrepareEngine,
+            Some("\"whisper-large.bin\""),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !has_failed_job_with_payload(&db, JobKind::PrepareEngine, "\"whisper-large.bin\"")
+                .await
+                .unwrap(),
+            "a job that is still queued has not failed at anything yet"
+        );
+
+        set_job_status(&db, &job.id, JobStatus::Failed, Some("no"))
+            .await
+            .unwrap();
+        assert!(
+            has_failed_job_with_payload(&db, JobKind::PrepareEngine, "\"whisper-large.bin\"")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !has_failed_job_with_payload(&db, JobKind::PrepareEngine, "\"other-weights.bin\"")
+                .await
+                .unwrap(),
+            "another model's bad day says nothing about this one"
+        );
+        assert!(
+            !has_failed_job_with_payload(&db, JobKind::Download, "\"whisper-large.bin\"")
+                .await
+                .unwrap(),
+            "and neither does another kind of work"
         );
     }
 
