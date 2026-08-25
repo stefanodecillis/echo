@@ -3,10 +3,12 @@ import { useEffect, useRef, useState } from "react";
 import { Button, EchoMark } from "@/components";
 import { CloseIcon } from "@/components/icons";
 import { cx } from "@/components/lib/cx";
-import { meeting as copy, common } from "@/lib/copy";
+import { meeting as copy, common, knownPeople } from "@/lib/copy";
 import type { Id, PersonInfo, Speaker } from "@/lib/types";
+import { formatLastHeard } from "@/pages/Settings/lib/peopleFormat";
 
 import { speakerColor } from "../lib/speakerColor";
+import { isEchoOwnLabel } from "../lib/speakers";
 import { IconButton } from "./IconButton";
 
 export type ListenState = "idle" | "loading" | "playing";
@@ -138,9 +140,17 @@ const MAX_COMBO_MATCHES = 6;
  * Known-people additions (docs/DESIGN.md §1) layer onto the original
  * rename-on-blur-or-Enter behavior rather than replacing it:
  *  - typing a name that matches no known person still just renames, same as
- *    before, unless "Remember this voice" is checked, which enrolls instead;
- *  - picking a person from the dropdown (click, or Enter on a highlighted
- *    match) links instead of renaming;
+ *    before, unless "Remember this voice" is checked, which enrolls instead.
+ *    The offer stands on the name in the field, not on whether it changed:
+ *    a row that has carried a hand-typed name since an earlier meeting is
+ *    exactly the voice worth saving, and it was the one case that could not
+ *    be. It stands only on a name, though — never on the labels Echo made up
+ *    ("Speaker 2", "You"), which name nobody;
+ *  - picking a person from the dropdown (click, or Enter on the chosen row)
+ *    links instead of renaming. Typing one known person's name in full picks
+ *    them, so Enter links; two people of that name pick nobody, because that
+ *    is a question only the person at the keyboard can answer. Each row says
+ *    when that voice was last heard, for the same reason;
  *  - a suggestion chip offers a one-click Confirm (also a link) with a quiet
  *    dismiss that only hides the chip, never the row;
  *  - a linked row shows a small mark by its name and gets an Unlink menu, and
@@ -184,16 +194,46 @@ export function SpeakerRow({
   const isLinked = !!speaker.personId;
 
   const trimmed = draft.trim();
-  const matchesKnownPerson = people.some(
-    (p) => p.name.toLowerCase() === trimmed.toLowerCase(),
-  );
-  const isNewName = trimmed !== "" && trimmed !== speaker.displayName && !matchesKnownPerson;
+  const needle = trimmed.toLowerCase();
+  const matchesKnownPerson = people.some((p) => p.name.toLowerCase() === needle);
+  // "Remember this voice" is a question about the typed name and nothing else:
+  // is this somebody Echo already knows? It used to also require the field to
+  // differ from the name on the row, which hid the checkbox from exactly the
+  // people most worth remembering — a speaker renamed "Jordan" by hand in an
+  // earlier session carries "Jordan" on the row, so the box never appeared and
+  // that voice could never be saved.
+  const isNewName = trimmed !== "" && !matchesKnownPerson;
+  // Two things it is not a question about. A name Echo made up for this row —
+  // "Speaker 2", or "You" on the microphone — is a placeholder standing in for
+  // a name nobody has given yet, and offering to remember a voice under it
+  // would enroll a person literally called Speaker 2 the moment somebody
+  // clicked into the field to read it. And the offer only belongs on a field
+  // somebody is actually using, so it appears with the cursor and leaves with
+  // it.
+  const isAName = isNewName && !isEchoOwnLabel(trimmed);
+  const showRemember = isAName && editing;
   const matches =
     comboOpen && trimmed !== ""
       ? people
-          .filter((p) => p.name.toLowerCase().includes(trimmed.toLowerCase()))
+          .filter((p) => p.name.toLowerCase().includes(needle))
+          // Somebody with exactly this name is who the typing is most likely
+          // about, so they are never the row the cap cuts off.
+          .sort(
+            (a, b) =>
+              Number(b.name.toLowerCase() === needle) -
+              Number(a.name.toLowerCase() === needle),
+          )
           .slice(0, MAX_COMBO_MATCHES)
       : [];
+
+  // Typing a known person's name in full and pressing Enter should mean that
+  // person, not a local rename that happens to spell the same thing. Only when
+  // there is exactly one of them: two people called Jordan is a question only
+  // the person at the keyboard can answer, so nothing is preselected and they
+  // have to pick. Arrowing or hovering still wins over this.
+  const namesakes = matches.filter((p) => p.name.toLowerCase() === needle);
+  const suggested = namesakes.length === 1 ? matches.indexOf(namesakes[0]) : -1;
+  const activeHighlight = highlight >= 0 ? highlight : suggested;
 
   const closeCombo = () => {
     setComboOpen(false);
@@ -203,14 +243,30 @@ export function SpeakerRow({
   const commit = () => {
     closeCombo();
     const value = draft.trim();
-    if (!value || value === speaker.displayName) {
+    // An empty field is a slip, not a rename: the row keeps the name it had.
+    if (!value) {
       setDraft(speaker.displayName);
       setRemember(false);
       return;
     }
-    const isNew = !people.some((p) => p.name.toLowerCase() === value.toLowerCase());
-    if (remember && isNew) onEnroll(value);
-    else onRename(value);
+    const isNew =
+      !people.some((p) => p.name.toLowerCase() === value.toLowerCase()) &&
+      !isEchoOwnLabel(value);
+    // A ticked box is a request in its own right — "keep this voice under this
+    // name" — and it has to be answered before the "nothing changed" shortcut
+    // below, or a row already carrying the right name could never be
+    // remembered however many times the box was ticked.
+    if (remember && isNew) {
+      onEnroll(value);
+      setRemember(false);
+      return;
+    }
+    if (value === speaker.displayName) {
+      setDraft(speaker.displayName);
+      setRemember(false);
+      return;
+    }
+    onRename(value);
     setRemember(false);
   };
 
@@ -259,19 +315,22 @@ export function SpeakerRow({
               }}
               onKeyDown={(e) => {
                 if (comboOpen && matches.length > 0) {
+                  // Arrowing starts from wherever the list is showing as
+                  // chosen, so the first press moves one step from there
+                  // rather than jumping back to the top.
                   if (e.key === "ArrowDown") {
                     e.preventDefault();
-                    setHighlight((h) => Math.min(h + 1, matches.length - 1));
+                    setHighlight(Math.min(activeHighlight + 1, matches.length - 1));
                     return;
                   }
                   if (e.key === "ArrowUp") {
                     e.preventDefault();
-                    setHighlight((h) => Math.max(h - 1, 0));
+                    setHighlight(Math.max(activeHighlight - 1, 0));
                     return;
                   }
-                  if (e.key === "Enter" && highlight >= 0) {
+                  if (e.key === "Enter" && activeHighlight >= 0) {
                     e.preventDefault();
-                    pick(matches[highlight]);
+                    pick(matches[activeHighlight]);
                     return;
                   }
                 }
@@ -303,17 +362,41 @@ export function SpeakerRow({
                   }}
                   className={cx(
                     "block w-full px-2.5 py-1.5 text-left text-xs",
-                    i === highlight ? "bg-surface-sunken text-ink" : "text-ink-soft hover:bg-surface-sunken",
+                    i === activeHighlight
+                      ? "bg-surface-sunken text-ink"
+                      : "text-ink-soft hover:bg-surface-sunken",
                   )}
                 >
-                  {person.name}
+                  <span className="block truncate">{person.name}</span>
+                  {/* Two people can share a name, and a list of identical rows
+                      asks a question it gives nobody the means to answer. The
+                      same detail Settings shows against a saved voice — when it
+                      was last heard, how much of it Echo is keeping — is enough
+                      to tell them apart. */}
+                  <span className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-ink-faint">
+                    <span>
+                      {person.lastHeardAt
+                        ? knownPeople.lastHeard(formatLastHeard(person.lastHeardAt))
+                        : knownPeople.neverHeard}
+                    </span>
+                    <span aria-hidden>·</span>
+                    <span>{knownPeople.sampleCount(person.sampleCount)}</span>
+                  </span>
                 </button>
               ))}
             </div>
           )}
 
-          {isNewName && (
-            <label className="flex items-center gap-1.5 pl-1.5 text-xs text-ink-faint">
+          {showRemember && (
+            <label
+              className="flex items-center gap-1.5 pl-1.5 text-xs text-ink-faint"
+              // Reaching for the checkbox must not count as leaving the name
+              // field. Without this the pointer going down here blurs the
+              // input, the blur commits a plain rename, and the box is ticked
+              // a moment too late to mean anything — which is why ticking it
+              // never used to do what it says.
+              onMouseDown={(e) => e.preventDefault()}
+            >
               <input
                 type="checkbox"
                 checked={remember}

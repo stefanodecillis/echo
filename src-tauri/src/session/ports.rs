@@ -239,6 +239,12 @@ pub trait AsrPort: Send + Sync + 'static {
     /// starting point: an utterance the live queue dropped sits *inside* the
     /// transcript, and the two channels reach different lengths, so one offset
     /// for both would quietly lose words that are sitting on disk.
+    ///
+    /// The count that comes back is a count from a pass that **finished**. A
+    /// pass stopped part-way — `control.cancel` went true, usually because a
+    /// recording started — answers `Err(AsrError::Cancelled)` and no count at
+    /// all, so a caller cannot read "it wrote some lines" as "it is done" (see
+    /// [`crate::asr::catchup::cut_short`]).
     fn catch_up<'a>(
         &'a self,
         db: &'a Db,

@@ -2079,7 +2079,16 @@ fn run_job(
     if job.language_hint.is_none() {
         // Copy the hint out before doing anything else with the policy, so the
         // borrow ends here rather than covering the branch below.
-        let pinned = policy.hint().map(str::to_string);
+        //
+        // A re-reading is the one job that does not get it: catch-up asks for
+        // one when a stretch looks out of step with the meeting around it, and
+        // handing it the meeting's settled answer would hand it the thing it is
+        // trying to get away from ([`TranscribeJob::detect_afresh`]).
+        let pinned = if job.detect_afresh {
+            None
+        } else {
+            policy.hint().map(str::to_string)
+        };
         if let Some(pinned) = pinned {
             job.language_hint = Some(pinned);
         } else if plan.kind.is_speculative() {
@@ -2087,18 +2096,25 @@ fn run_job(
             // whatever the meeting has settled on, and lets whisper decide when
             // there is nothing to borrow yet. Detection is an encode, and this
             // hypothesis is replaced in three seconds.
-        } else if policy.wants_detection(speech_ms) {
+        } else if job.detect_afresh || policy.wants_detection(speech_ms) {
             match engine.detect_language(&job.samples) {
                 Ok((language, confidence)) => {
                     detected_confidence = Some(confidence);
-                    if let Decision::Pinned(settled) =
-                        policy.observe(&language, confidence, speech_ms)
-                    {
-                        shared
-                            .languages
-                            .lock()
-                            .expect("language map poisoned")
-                            .insert(job.meeting_id.clone(), settled);
+                    // A second reading of a window is not fresh evidence about
+                    // the meeting: those same seconds already voted, through the
+                    // reading this one is checking. Counting them twice would
+                    // let one stretch somebody read out in another language pull
+                    // the whole meeting after it.
+                    if !job.detect_afresh {
+                        if let Decision::Pinned(settled) =
+                            policy.observe(&language, confidence, speech_ms)
+                        {
+                            shared
+                                .languages
+                                .lock()
+                                .expect("language map poisoned")
+                                .insert(job.meeting_id.clone(), settled);
+                        }
                     }
                     // Use what we just found for this utterance even before the
                     // meeting as a whole has settled.

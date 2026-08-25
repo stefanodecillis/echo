@@ -843,6 +843,41 @@ pub async fn split_segment(
     Ok(ids)
 }
 
+/// Drop the live partials sitting over one stretch of one channel, because the
+/// catch-up pass has just read that stretch back off the recording.
+///
+/// Scoped rather than wholesale for one reason: a pass can be stopped part-way
+/// through (a recording starting takes the machine — see `asr::catchup`), and a
+/// live guess is the only text its stretch has until some pass reads it. So the
+/// guesses go where the real reading has actually happened and nowhere else. On
+/// 2026-08-24 the whole meeting's guesses were dropped the moment the pass
+/// began, and a pass that was interrupted three minutes in left twenty-seven
+/// minutes of that meeting with no text of any kind.
+///
+/// Overlap, not containment: a guess that straddles the edge of the window is
+/// about seconds that were just read, and leaving half-superseded text on the
+/// transcript reads as a stutter.
+pub async fn delete_partial_segments_in(
+    db: &Db,
+    meeting_id: &str,
+    channel: Channel,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<u64, DbError> {
+    let r = sqlx::query(
+        "DELETE FROM segments
+         WHERE meeting_id = ?1 AND is_final = 0 AND channel = ?2
+           AND t_start_ms < ?4 AND t_end_ms > ?3",
+    )
+    .bind(meeting_id)
+    .bind(channel.as_str())
+    .bind(from_ms)
+    .bind(to_ms)
+    .execute(db)
+    .await?;
+    Ok(r.rows_affected())
+}
+
 /// Drop live partials once the final pass replaced them.
 pub async fn delete_partial_segments(db: &Db, meeting_id: &str) -> Result<u64, DbError> {
     let r = sqlx::query("DELETE FROM segments WHERE meeting_id = ?1 AND is_final = 0")
@@ -857,6 +892,10 @@ pub async fn delete_partial_segments(db: &Db, meeting_id: &str) -> Result<u64, D
 pub struct ClearedTranscript {
     pub segments_deleted: u64,
     pub speakers_deleted: u64,
+    /// The meeting had a language written against it and no longer does, so the
+    /// pass about to run will work it out again from the recording. False for a
+    /// meeting that never settled on one.
+    pub language_cleared: bool,
     /// One past the revision the transcript was on, so anything watching can
     /// tell that what it holds is stale.
     ///
@@ -869,21 +908,34 @@ pub struct ClearedTranscript {
 }
 
 /// Throw away everything derived from this meeting's audio that a fresh pass
-/// would write again: the transcript and the speakers, aliases included.
+/// would write again: the transcript, the speakers (aliases included), and the
+/// language those words were read in.
 ///
 /// For "listen again" — the audio on disk is the truth (mantra 3), so a
 /// transcript written by a broken pipeline is safe to delete and read back from
 /// the recording. Deliberately **not** the recap or its task list: those are the
 /// person's to keep or rewrite.
 ///
-/// Two details this depends on, both the same as [`delete_meeting`]:
+/// Three details this depends on, the first two the same as [`delete_meeting`]:
 /// * segments are deleted by name so the `segments_fts_ad` trigger fires and
 ///   both search indexes lose the words. A cascade might not fire triggers, and
 ///   somebody's search results are not a thing to bet on a build detail.
 /// * speakers go after segments, so nothing depends on `ON DELETE SET NULL`
 ///   having run first.
+/// * `language` goes with them, in the same transaction. It is not something a
+///   person typed: it is written from the words by the live pass
+///   (`session::pipeline`) and recomputed from the finished segments by the
+///   catch-up job (`session::jobs`), so it is derived from exactly the rows
+///   being deleted here. Leaving it behind is what made a wrong language
+///   permanent — catch-up reads the meeting's language as its prior
+///   (`asr::catchup`), so "listen again" would pin the same wrong answer and
+///   spend a whole pass reproducing the transcript it was asked to replace.
+///   Clearing it in the same transaction means there is never a moment where
+///   the words are gone and the language they were read in is still standing.
 ///
 /// Chunks, markers, summaries and action items are left exactly where they are.
+/// So is the person's own count of how many people were there: that is a fact
+/// about the meeting, not something read out of the audio.
 pub async fn clear_transcript(db: &Db, meeting_id: &str) -> Result<ClearedTranscript, DbError> {
     let mut tx = db.begin().await?;
     let previous: Option<(Option<i64>,)> =
@@ -903,11 +955,19 @@ pub async fn clear_transcript(db: &Db, meeting_id: &str) -> Result<ClearedTransc
         .execute(&mut *tx)
         .await?
         .rows_affected();
+    let language_cleared =
+        sqlx::query("UPDATE meetings SET language = NULL WHERE id = ?1 AND language IS NOT NULL")
+            .bind(meeting_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            > 0;
     tx.commit().await?;
 
     Ok(ClearedTranscript {
         segments_deleted: segments,
         speakers_deleted: speakers,
+        language_cleared,
         revision: previous.saturating_add(1),
     })
 }
@@ -3878,13 +3938,21 @@ mod tests {
         assert_eq!(found(db.clone(), "watermelon").await, 0);
     }
 
-    /// What "listen again" leans on: the transcript and the speakers go, the
-    /// search index goes with them (via the delete trigger, not a cascade), the
-    /// revision it reports moves forward — and the recording, the markers and
-    /// the recap are all still there afterwards.
+    /// What "listen again" leans on: the transcript, the speakers and the
+    /// language all go, the search index goes with them (via the delete
+    /// trigger, not a cascade), the revision it reports moves forward — and the
+    /// recording, the markers, the recap and the person's own people count are
+    /// all still there afterwards.
     #[tokio::test]
     async fn clearing_a_transcript_leaves_the_recording_and_the_recap_alone() {
         let (db, m) = seeded().await;
+        // A meeting that settled on the wrong language: the 75 minutes of
+        // Italian recorded as Danish on 2026-08-24. Reading it again has to be
+        // able to reach a different answer.
+        set_meeting_language(&db, &m.id, "da").await.unwrap();
+        set_speaker_count_override(&db, &m.id, Some(4))
+            .await
+            .unwrap();
         let chunk = insert_chunk(&db, &m.id, Channel::Mic, 0, "/a/0.flac", 0, 30_000)
             .await
             .unwrap();
@@ -3922,7 +3990,13 @@ mod tests {
         let cleared = clear_transcript(&db, &m.id).await.unwrap();
         assert_eq!(cleared.segments_deleted, 1);
         assert_eq!(cleared.speakers_deleted, 2, "the alias row goes too");
+        assert!(cleared.language_cleared);
         assert_eq!(cleared.revision, 5, "one past where the transcript was");
+        assert_eq!(
+            get_meeting(&db, &m.id).await.unwrap().unwrap().language,
+            None,
+            "the wrong language must not be the prior the next pass reads"
+        );
 
         assert!(get_segments(
             &db,
@@ -3957,6 +4031,11 @@ mod tests {
         assert_eq!(
             latest_summary(&db, &m.id).await.unwrap().map(|s| s.id),
             Some(summary.id)
+        );
+        assert_eq!(
+            people_count(&db, &m.id).await.unwrap(),
+            (4, true),
+            "how many people were here is the person's answer, not the pass's"
         );
     }
 

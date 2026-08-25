@@ -1195,6 +1195,8 @@ async fn transcribe(
         // Live work gives way when the queue is full; the catch-up pass picks
         // this stretch up from disk instead (mantra 3).
         droppable: true,
+        // The meeting's own answer is exactly what a live utterance wants.
+        detect_afresh: false,
     };
     let on_partial = (!captioned).then(|| {
         partial_events(
@@ -1850,6 +1852,7 @@ async fn caption(
         // The result *is* the partial; there is nothing to stream out of it.
         want_partials: false,
         droppable: true,
+        detect_afresh: false,
     };
 
     match inner

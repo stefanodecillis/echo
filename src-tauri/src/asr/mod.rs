@@ -201,6 +201,18 @@ pub struct TranscribeJob {
     pub samples: Vec<f32>,
     /// Language hint from earlier in this meeting. `None` asks for detection.
     pub language_hint: Option<String>,
+    /// Work the language out from this audio alone, whatever the meeting has
+    /// settled on.
+    ///
+    /// `language_hint: None` on its own does *not* mean that: the engine keeps
+    /// its own answer for the meeting and fills an empty hint in from it, which
+    /// is the right default for every ordinary utterance. It is wrong for
+    /// exactly one caller — catch-up reading a stretch a second time *because*
+    /// the meeting's answer does not fit it (`catchup::transcribe_with_prior`).
+    /// Without this the second
+    /// reading is handed the very answer it is trying to get away from, and the
+    /// escape hatch is a decode that can never reach a different result.
+    pub detect_afresh: bool,
     /// Emit partial results while decoding. Off for catch-up work.
     pub want_partials: bool,
     /// Live utterances are dropped when the queue is full; catch-up work waits

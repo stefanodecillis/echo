@@ -198,6 +198,12 @@ pub(crate) struct MockAsr {
     resident: AtomicBool,
     calls: AtomicU32,
     catch_up_segments: AtomicU32,
+    /// Hold inside the catch-up pass until something cancels it: how a real
+    /// pass behaves when the next meeting starts while it is still reading.
+    catch_up_waits_to_be_stopped: AtomicBool,
+    /// Set the moment the catch-up pass begins, so a test can wait for the job
+    /// to really be in flight before it takes the machine away.
+    catch_up_started: AtomicBool,
     fail_prewarm: AtomicBool,
     /// The load gives up because something else wanted the machine — what a
     /// recording starting mid-load looks like from here.
@@ -216,6 +222,11 @@ pub(crate) struct MockAsr {
     /// decode it was — so a test can check which lanes are told the words Echo
     /// should know (see [`crate::asr::glossary`]).
     live_plans: std::sync::Mutex<Vec<(crate::asr::engine::JobKind, Option<String>)>>,
+    /// Meetings the session layer asked the engine to forget, in order. The
+    /// real engine holds a meeting's settled language in memory as well as on
+    /// the row, so "was this one forgotten" is the only way to tell that a
+    /// wrong language is really gone.
+    forgotten: std::sync::Mutex<Vec<String>>,
 }
 
 impl MockAsr {
@@ -225,6 +236,8 @@ impl MockAsr {
             resident: AtomicBool::new(false),
             calls: AtomicU32::new(0),
             catch_up_segments: AtomicU32::new(0),
+            catch_up_waits_to_be_stopped: AtomicBool::new(false),
+            catch_up_started: AtomicBool::new(false),
             fail_prewarm: AtomicBool::new(false),
             cancel_prewarm: AtomicBool::new(false),
             prewarm_takes: std::sync::Mutex::new(None),
@@ -233,7 +246,14 @@ impl MockAsr {
             backlog_writes: std::sync::Mutex::new(Vec::new()),
             backlog_calls: std::sync::Mutex::new(Vec::new()),
             live_plans: std::sync::Mutex::new(Vec::new()),
+            forgotten: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Which meetings the engine was told to forget, oldest first.
+    #[allow(dead_code)]
+    pub(crate) fn forgotten(&self) -> Vec<String> {
+        self.forgotten.lock().unwrap().clone()
     }
 
     /// The prompts handed to the live lanes so far, newest last.
@@ -245,6 +265,20 @@ impl MockAsr {
     #[allow(dead_code)]
     pub(crate) fn calls(&self) -> u32 {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Make the catch-up pass sit there until it is told to stop, the way a real
+    /// one does while it still has audio to read.
+    #[allow(dead_code)]
+    pub(crate) fn catch_up_waits_to_be_stopped(&self) {
+        self.catch_up_waits_to_be_stopped
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Has a catch-up pass begun?
+    #[allow(dead_code)]
+    pub(crate) fn catch_up_started(&self) -> bool {
+        self.catch_up_started.load(Ordering::SeqCst)
     }
 
     #[allow(dead_code)]
@@ -366,6 +400,10 @@ impl AsrPort for MockAsr {
         })
     }
 
+    fn forget_meeting(&self, meeting_id: &str) {
+        self.forgotten.lock().unwrap().push(meeting_id.to_string());
+    }
+
     fn catch_up<'a>(
         &'a self,
         _db: &'a Db,
@@ -374,6 +412,14 @@ impl AsrPort for MockAsr {
         control: crate::session::ports::CatchUpControl,
     ) -> BoxFuture<'a, Result<u32, AsrError>> {
         Box::pin(async move {
+            self.catch_up_started.store(true, Ordering::SeqCst);
+            while self.catch_up_waits_to_be_stopped.load(Ordering::SeqCst)
+                && !control.cancel.as_ref().is_some_and(|c| c())
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            // A pass that was stopped part-way has one thing it may say about
+            // itself, and a count of what it managed is not it.
             if control.cancel.as_ref().is_some_and(|c| c()) {
                 return Err(AsrError::Cancelled);
             }

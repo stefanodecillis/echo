@@ -408,6 +408,14 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
         .await
         .map_err(|e| asr_failure(&ctx.cancel, e));
     let _ = drain.await;
+    // Nothing below this line may run for a pass that did not finish, and the
+    // `?` is what enforces it. On 2026-08-24 the pass came back `Ok` after a
+    // recording cut it short: the code below cleared the live text for stretches
+    // that were never read back, set progress to 1.0, and the row went down as
+    // done. The meeting was left 69.4% transcribed and nothing said so. A
+    // cancellation is an error now, and a preempted job is parked instead —
+    // `release()` puts it back in the queue and the next pass reads the holes
+    // this one did not get to.
     let written = written?;
 
     // Live partials are superseded now.
@@ -2237,6 +2245,164 @@ mod tests {
         assert!(
             seen.job_progress().iter().all(|p| p.phase.is_none()),
             "nothing to announce: the engine was already up"
+        );
+    }
+
+    /// A meeting with a minute of committed audio and one live guess sitting
+    /// against the second half of it, plus its catch-up job.
+    async fn a_meeting_mid_catch_up(db: &Db) -> (String, Job) {
+        let meeting = repo::create_meeting(db, "Weekly sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        let chunk = repo::insert_chunk(
+            db,
+            &meeting.id,
+            crate::types::Channel::Mic,
+            0,
+            "/tmp/echo-test/mic-000000.flac",
+            0,
+            60_000,
+        )
+        .await
+        .unwrap();
+        repo::commit_chunk(db, &chunk, 60_000).await.unwrap();
+        repo::insert_segment(
+            db,
+            &crate::types::SegmentDraft {
+                meeting_id: meeting.id.clone(),
+                t_start_ms: 30_000,
+                t_end_ms: 40_000,
+                channel: crate::types::Channel::Mic,
+                text: "a live guess nobody has replaced yet".into(),
+                is_final: false,
+                revision: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let job = repo::ensure_job(db, Some(&meeting.id), JobKind::TranscribeCatchup)
+            .await
+            .unwrap();
+        (meeting.id, job)
+    }
+
+    async fn live_guesses(db: &Db, meeting_id: &str) -> usize {
+        repo::get_segments(
+            db,
+            &crate::types::TranscriptQuery {
+                meeting_id: meeting_id.to_string(),
+                include_partial: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .iter()
+        .filter(|s| !s.is_final)
+        .count()
+    }
+
+    /// The 2026-08-24 data loss, at the handler: a recording took the machine
+    /// part-way through the catch-up pass, and the pass came back saying it was
+    /// finished. The job was recorded done at full progress, the live text was
+    /// cleared for stretches that had never been read back, and the meeting was
+    /// left 69.4% transcribed with nothing anywhere saying so.
+    ///
+    /// A pass cut short is a failure the runner understands: parked, not done.
+    /// And nothing after it in the handler may run — least of all the clearing
+    /// of the live guesses, which are the only text those stretches have until
+    /// the pass that finishes actually reads them.
+    ///
+    /// This is the handler's half of that guarantee, and only that half: the
+    /// pass itself keeps the same promise window by window, and
+    /// `asr::catchup::tests::a_pass_cut_short_keeps_the_live_guesses_over_what_it_never_read`
+    /// is where the pass is held to it.
+    #[tokio::test]
+    async fn a_catch_up_a_recording_stopped_is_parked_and_keeps_the_live_text() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let (meeting_id, job) = a_meeting_mid_catch_up(&db).await;
+        let (ctx, _seen) = context_for(&db, job).await;
+        assert_eq!(live_guesses(&db, &meeting_id).await, 1);
+
+        // A recording starting is a preempt, and it reaches the pass through the
+        // same flag a cancel does.
+        ctx.cancel.preempt();
+        let outcome = catch_up(&ctx).await;
+
+        assert!(
+            matches!(outcome, Err(JobFailure::Preempted)),
+            "a pass a recording interrupted is parked, not finished: {outcome:?}"
+        );
+        assert_eq!(
+            live_guesses(&db, &meeting_id).await,
+            1,
+            "the live guess is all those seconds have until the pass reads them back"
+        );
+        assert!(
+            repo::get_job(&db, &ctx.job.id)
+                .await
+                .unwrap()
+                .and_then(|j| j.progress)
+                .is_none_or(|p| p < 1.0),
+            "an interrupted pass does not leave a full bar behind"
+        );
+    }
+
+    /// The same thing one level up, where the damage was actually recorded: the
+    /// row the runner writes when a recording claims the machine mid-pass. It
+    /// said `done` on 2026-08-24. It has to say paused, so `release()` queues it
+    /// again and the next pass reads the holes this one never reached.
+    #[tokio::test]
+    async fn the_row_a_recording_interrupted_says_paused_and_not_done() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let (meeting_id, job) = a_meeting_mid_catch_up(&db).await;
+
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        // Still reading when the recording starts, which is the whole case.
+        asr.catch_up_waits_to_be_stopped();
+        let events = crate::session::ports::EventBus::new();
+        events.set(Arc::new(super::super::mock::CollectingEvents::default()));
+        let runtime = JobRuntime::new(
+            db.clone(),
+            crate::paths::AppPaths::rooted_at(std::env::temp_dir().join("echo-jobs"), None),
+            crate::session::ports::Ports {
+                capture: Arc::new(super::super::mock::MockCapture::new()),
+                asr: asr.clone(),
+                executor: Arc::new(DefaultJobExecutor),
+                events,
+            },
+        );
+
+        let running = {
+            let runtime = runtime.clone();
+            let job = job.clone();
+            tokio::spawn(async move { runtime.execute(job).await })
+        };
+        while !asr.catch_up_started() {
+            tokio::task::yield_now().await;
+        }
+        runtime.preempt().await.unwrap();
+        running.await.unwrap();
+
+        let row = repo::get_job(&db, &job.id).await.unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            JobStatus::Paused,
+            "the recording has priority, and this work still has to happen"
+        );
+        assert_eq!(
+            live_guesses(&db, &meeting_id).await,
+            1,
+            "nothing after the pass ran, so nothing cleared the live text"
+        );
+
+        // And the runner picks it back up when the recording is over, which is
+        // the half that makes parking it safe.
+        runtime.release().await.unwrap();
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
+            JobStatus::Queued
         );
     }
 

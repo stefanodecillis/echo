@@ -226,6 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 language_hint: Some("it".into()),
                 want_partials: false,
                 droppable: true,
+                detect_afresh: false,
             };
             let started = Instant::now();
             let answer = engine

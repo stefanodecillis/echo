@@ -123,6 +123,50 @@ pub const MIN_GAP_MS: i64 = 250;
 /// carries no information worth keeping.
 const CONFIDENCE_COLLAPSED: f32 = crate::asr::language::MIN_USABLE_CONFIDENCE;
 
+/// How far below the meeting's own median a hinted reading has to sit before it
+/// is read again with nothing pinned.
+///
+/// [`CONFIDENCE_COLLAPSED`] is an absolute floor, and on its own it is close to
+/// useless: the 75-minute meeting of 2026-08-24 was written down entirely in the
+/// wrong language while averaging 0.609, so the escape hatch never opened once.
+/// The number that means something is not an absolute — it is how this meeting,
+/// on this microphone, in this room, normally reads.
+///
+/// Why a quarter below and not simply "below the median": half of every
+/// meeting's windows sit under its median by construction, so "below" as a
+/// trigger would ask the engine to read half the recording twice and double the
+/// cost of every pass for no evidence at all. Ordinary variation — a mumbled
+/// line, a cough, someone leaning away from the microphone — moves a window a
+/// little way down. A window being forced through the wrong vocabulary is not a
+/// dip: every token in it is a second choice, and the mean falls a long way. A
+/// quarter below the meeting's own normal sits outside the first and inside the
+/// second, and it costs one extra decode on the small minority of windows that
+/// reach it. On a meeting reading 0.609 that is a bar of 0.457 — well clear of
+/// the 0.35 floor that never fired.
+const RETRY_BELOW_MEDIAN: f32 = 0.75;
+
+/// How many hinted readings the median needs before it is allowed to decide
+/// anything.
+///
+/// A median over three windows is not "how this meeting reads", it is the first
+/// three windows. Until there are this many, the absolute floor is the only
+/// trigger — which is exactly the behaviour this pass had before. Eight windows
+/// is a couple of minutes of speech, early enough that the rest of a meeting is
+/// still covered and late enough that one odd window cannot set the bar.
+const MEDIAN_NEEDS: usize = 8;
+
+/// How much less text a second reading may carry and still count as an answer
+/// to the same audio.
+///
+/// Two decodes of the same seconds are only comparable when both of them are
+/// *about* those seconds. A retry that gives up after three words and reports
+/// high confidence in them is not a better reading of a full sentence, it is a
+/// worse one that had less to be unsure about — and keeping it would delete
+/// words the person actually said. Half is generous enough that a genuine
+/// re-reading in another language always clears it (languages differ in length,
+/// not by half) and tight enough that a fragment never wins.
+const RETRY_KEEPS_AT_LEAST: f32 = 0.5;
+
 /// How long to wait before looking again, while a recording has priority.
 const YIELD_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -214,6 +258,11 @@ impl CatchUpOptions {
 }
 
 /// What one catch-up pass did.
+///
+/// Only a pass that ran to the end produces one of these. A pass that was told
+/// to stop returns `Err(AsrError::Cancelled)` instead, so there is no shape a
+/// half-finished pass can take that a caller could read as a finished one — see
+/// [`cut_short`] for the meeting that taught us to write it this way.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CatchUpReport {
     pub segments_written: u32,
@@ -246,8 +295,6 @@ pub struct CatchUpReport {
     /// into one span for the log.
     pub from_ms: i64,
     pub to_ms: i64,
-    /// True when it stopped early because it was told to.
-    pub cancelled: bool,
     /// The language the meeting settled on, when the engine worked one out.
     pub language: Option<String>,
 }
@@ -458,9 +505,12 @@ where
         .clone()
         .or_else(|| transcriber.settled_language(meeting_id));
 
-    // Live partials are guesses that never became text. They are not evidence of
-    // anything, and leaving them behind would make this pass skip real audio.
-    repo::delete_partial_segments(db, meeting_id).await?;
+    // Live partials — the guesses that never became text — are dropped a window
+    // at a time, as each window is actually read back (see [`decode_pack`]).
+    // Not here, and not all at once: this pass can be stopped part-way through,
+    // and until some pass reads a stretch back the guess over it is the only
+    // text those seconds have. Clearing the lot up front is what left the
+    // 2026-08-24 meeting with twenty-seven minutes of nothing at all.
 
     // The words Echo should know, read once for the whole pass. This lane gets
     // them for the same reason it gets the meeting's language: it is the text
@@ -513,6 +563,10 @@ where
     let window = options.window();
     let budget = options.pack();
     let mut skipped: u32 = 0;
+    // One record for the whole meeting, both channels: "how confidently does
+    // this recording read" is a fact about the meeting, and the two sides of a
+    // call are the same conversation.
+    let mut reads = HowThisMeetingReads::default();
 
     for (channel, chunks, start, end) in plan {
         report.from_ms = report.from_ms.min(start);
@@ -537,16 +591,12 @@ where
 
         while !read_it_all {
             if options.cancelled() {
-                report.cancelled = true;
-                report.finish(transcriber, meeting_id, &options, done_ms, total_ms);
-                return Ok(report);
+                return Err(cut_short(&report, &options, done_ms, total_ms));
             }
             // A meeting happening now matters more than one that already ended.
             while options.should_wait() {
                 if options.cancelled() {
-                    report.cancelled = true;
-                    report.finish(transcriber, meeting_id, &options, done_ms, total_ms);
-                    return Ok(report);
+                    return Err(cut_short(&report, &options, done_ms, total_ms));
                 }
                 tokio::time::sleep(YIELD_INTERVAL).await;
             }
@@ -598,12 +648,19 @@ where
                             .await?
                     }
                 };
-                match decode_pack(&work, packed, samples, &mut report, &mut skipped).await? {
+                match decode_pack(
+                    &work,
+                    packed,
+                    samples,
+                    &mut report,
+                    &mut skipped,
+                    &mut reads,
+                )
+                .await?
+                {
                     Outcome::Carried => {}
                     Outcome::Cancelled => {
-                        report.cancelled = true;
-                        report.finish(transcriber, meeting_id, &options, done_ms, total_ms);
-                        return Ok(report);
+                        return Err(cut_short(&report, &options, done_ms, total_ms));
                     }
                 }
             }
@@ -634,6 +691,10 @@ where
         windows = report.windows_decoded,
         fallbacks = report.fallback_attempts,
         ladder_cap = crate::asr::catalog::CATCHUP_MAX_FALLBACKS + 1,
+        // What "well below this meeting" turned out to mean here. Without it a
+        // log can say how many second readings were spent but not what set the
+        // bar that spent them.
+        median_confidence = reads.median(),
         written = report.segments_written,
         phantoms_dropped = report.phantoms_dropped,
         words_corrected = report.words_corrected,
@@ -644,6 +705,46 @@ where
     Ok(report)
 }
 
+/// A pass that was told to stop, turned into the only answer a caller cannot
+/// mistake for a finished one.
+///
+/// This is an error rather than a flag on the report because of the meeting of
+/// 2026-08-24. Its catch-up was interrupted three minutes in by the next
+/// meeting starting. The pass handed back `Ok` with a `cancelled` flag set, the
+/// caller read the segment count off the report and never looked at the flag,
+/// and the job was written down as done at full progress. That transcript ended
+/// up 69.4% covered, against 90.8% and 93.2% for meetings whose catch-up ran to
+/// the end: about twenty-seven minutes of speech gone for good, with no error
+/// anywhere for anyone to notice.
+///
+/// An `Err` cannot be dropped by accident — the caller either handles it or
+/// passes it on. Downstream that is all it takes: the job runner reads a
+/// cancellation that came from a recording as a preemption, parks the row, and
+/// the pass that picks it up afterwards works its plan out again from the holes
+/// still left in the transcript.
+fn cut_short(
+    report: &CatchUpReport,
+    options: &CatchUpOptions,
+    done_ms: i64,
+    total_ms: i64,
+) -> AsrError {
+    // Progress still moves to where the pass actually reached. The row is about
+    // to be parked, and it should come back holding that number rather than
+    // starting its bar over.
+    if total_ms > 0 {
+        options.report(done_ms as f32 / total_ms as f32);
+    }
+    tracing::info!(
+        target: "echo::asr",
+        written = report.segments_written,
+        windows = report.windows_decoded,
+        done_ms,
+        total_ms,
+        "catch-up stopped early; the rest of this recording is still to read"
+    );
+    AsrError::Cancelled
+}
+
 /// Everything one packed window needs to become rows, gathered so the
 /// transcribe step reads as one thing rather than nine arguments.
 struct Work<'a, T: Transcriber> {
@@ -651,11 +752,35 @@ struct Work<'a, T: Transcriber> {
     db: &'a Db,
     meeting_id: &'a str,
     channel: Channel,
-    /// The meeting's language, when it has one.
+    /// The meeting's language as the row knew it when the pass began, when it
+    /// had one at all. See [`Work::language_now`] for the answer a window is
+    /// actually read with.
     prior: Option<&'a str>,
     /// The words Echo has been told about. Read once for the whole pass.
     glossary: &'a Glossary,
     options: &'a CatchUpOptions,
+}
+
+impl<T: Transcriber> Work<'_, T> {
+    /// The language this window is read in — the meeting's own answer, wherever
+    /// it is being kept right now.
+    ///
+    /// Asked per window rather than once for the pass, because of "listen
+    /// again". That path deliberately leaves the meeting with no language at all
+    /// (`db::repo::clear_transcript`) so the recording can be read afresh, which
+    /// means [`Work::prior`] is `None` for the whole pass — and the engine then
+    /// works one out for itself within the first few windows and applies it to
+    /// every window after that
+    /// (`asr::language`). Reading only the row would leave this pass believing
+    /// nothing is pinned while every decode is in fact pinned, so the escape
+    /// hatch below would be switched off on precisely the pass that exists to
+    /// repair a wrong language.
+    fn language_now(&self) -> Option<String> {
+        match self.prior {
+            Some(prior) => Some(prior.to_string()),
+            None => self.transcriber.settled_language(self.meeting_id),
+        }
+    }
 }
 
 enum Outcome {
@@ -840,27 +965,58 @@ async fn decode_pack<T: Transcriber>(
     samples: Vec<f32>,
     report: &mut CatchUpReport,
     skipped: &mut u32,
+    reads: &mut HowThisMeetingReads,
 ) -> Result<Outcome, AsrError> {
     if samples.is_empty() {
         return Ok(Outcome::Carried);
     }
+    // Named, and passed down, so the escape hatch judges the reading against the
+    // answer it was actually read with — see [`Work::language_now`].
+    let prior = work.language_now();
     let job = TranscribeJob {
         meeting_id: work.meeting_id.to_string(),
         utterance_id: format!("catchup-{}-{}", work.channel.as_str(), pack.from_ms),
         channel: work.channel,
         t_start_ms: pack.from_ms,
         samples,
-        language_hint: work.prior.map(str::to_string),
+        language_hint: prior.clone(),
         want_partials: work.options.want_partials,
         // Catch-up work is the last chance this audio has, so it waits for the
         // queue instead of being dropped.
         droppable: false,
+        detect_afresh: false,
     };
     report.stretches_packed += pack.stretches;
     report.windows_decoded += 1;
     let prompt = work.glossary.prompt();
-    match transcribe_with_prior(work.transcriber, job, work.prior, prompt, report).await {
+    match transcribe_with_prior(
+        work.transcriber,
+        job,
+        prior.as_deref(),
+        prompt,
+        report,
+        reads,
+    )
+    .await
+    {
         Ok(text) => {
+            // These seconds have now been read off the recording, which is the
+            // truth (mantra 3), so the live guesses over them are superseded —
+            // whether the reading came back with words or with silence. Only
+            // these seconds, though: everything this pass has not reached yet
+            // keeps its guesses, because a pass can be stopped at any window
+            // and those guesses are all that stretch would otherwise have.
+            if let Err(error) = repo::delete_partial_segments_in(
+                work.db,
+                work.meeting_id,
+                work.channel,
+                pack.from_ms,
+                pack.to_ms,
+            )
+            .await
+            {
+                tracing::debug!(%error, t_start_ms = pack.from_ms, "could not clear live text");
+            }
             if text.is_empty() {
                 return Ok(Outcome::Carried);
             }
@@ -967,6 +1123,72 @@ fn split_onto_the_transcript(text: &Transcription, pack: &Pack) -> Vec<Transcrip
     rows
 }
 
+/// How confidently this meeting reads, gathered as the pass goes.
+///
+/// Only **hinted** readings go in, and only the *first* reading of a window —
+/// never the retry that replaced it. The number is used to judge a hinted
+/// reading, so the population it is judged against has to be hinted readings of
+/// the same meeting, decoded the same way. Mixing the unhinted retries in would
+/// be comparing a window against a different question.
+///
+/// The catch this cannot escape, and should not pretend to: when a meeting is
+/// read wrongly *throughout*, the median is wrong too and nothing stands out.
+/// That is the 2026-08-24 meeting, and the repair for it is
+/// [`crate::db::repo::clear_transcript`] dropping the language so the next pass
+/// detects again. This is for the other shape — a meeting that is mostly one
+/// language with stretches that are not.
+///
+/// That repair does not switch this off, which took a fix of its own: the
+/// engine settles on a language of its own within a window or two and pins
+/// every window after it, so the pass keeps asking where the meeting's answer
+/// stands rather than reading the row once ([`Work::language_now`]).
+#[derive(Debug, Default)]
+struct HowThisMeetingReads {
+    confidences: Vec<f32>,
+}
+
+impl HowThisMeetingReads {
+    /// The middle of what has been read so far, once there is enough of it to
+    /// mean anything.
+    fn median(&self) -> Option<f32> {
+        if self.confidences.len() < MEDIAN_NEEDS {
+            return None;
+        }
+        let mut sorted = self.confidences.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let mid = sorted.len() / 2;
+        Some(if sorted.len().is_multiple_of(2) {
+            (sorted[mid - 1] + sorted[mid]) / 2.0
+        } else {
+            sorted[mid]
+        })
+    }
+
+    /// Did this reading fall a long way short of how the meeting normally
+    /// reads? See [`RETRY_BELOW_MEDIAN`] for how far "a long way" is.
+    fn far_below(&self, confidence: Option<f32>) -> bool {
+        match (confidence, self.median()) {
+            (Some(c), Some(median)) => c < median * RETRY_BELOW_MEDIAN,
+            // An engine that reports no confidence is taken at its word, the
+            // same way [`collapsed`] does, and a meeting nobody has read enough
+            // of yet has no normal to be short of.
+            _ => false,
+        }
+    }
+
+    /// This window joins the meeting's own record of how it reads. Empty
+    /// decodes stay out: silence is not the engine being unsure, and counting
+    /// it would drag the bar down until nothing could ever fall below it.
+    fn saw(&mut self, text: &Transcription) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(c) = text.avg_confidence {
+            self.confidences.push(c);
+        }
+    }
+}
+
 /// Decode with the meeting's language pinned, and try again without it when the
 /// answer falls apart.
 ///
@@ -974,16 +1196,36 @@ fn split_onto_the_transcript(text: &Transcription, pack: &Pack) -> Vec<Transcrip
 /// Italian throughout, and telling the engine so is worth more than any decoder
 /// setting. But people quote an English email, a colleague joins and switches
 /// language, someone reads out a product name — and a pinned language turns
-/// those stretches into confident nonsense. Confidence collapsing is the signal
-/// that the prior does not fit *this* stretch, so the stretch is read again with
-/// nothing pinned and the better of the two answers is kept.
+/// those stretches into confident nonsense.
+///
+/// Two things say the prior does not fit *this* stretch. The reading collapsing
+/// outright ([`collapsed`]) is one, and it is the rare one. The other is the
+/// reading being far worse than the rest of this meeting
+/// ([`HowThisMeetingReads`]) — which is the case that matters, because a decoder
+/// forced through the wrong vocabulary usually stays plausible enough to clear
+/// any fixed floor while being obviously out of step with its neighbours. Either
+/// way the stretch is read again with nothing pinned, and the better of the two
+/// answers is kept.
+///
+/// "Nothing pinned" has to be asked for explicitly
+/// ([`TranscribeJob::detect_afresh`]): an empty hint means "use whatever the
+/// meeting settled on", which is the opposite of what a second reading is for.
+///
+/// And the prior is the meeting's answer *wherever it is being kept* — the row,
+/// or the engine's own memory of the meeting ([`Work::language_now`]). Reading
+/// only the row is what made this whole mechanism unreachable on "listen
+/// again", the one pass whose entire purpose is to escape a wrong language.
 async fn transcribe_with_prior<T: Transcriber>(
     transcriber: &T,
     job: TranscribeJob,
     prior: Option<&str>,
     prompt: Option<String>,
     report: &mut CatchUpReport,
+    reads: &mut HowThisMeetingReads,
 ) -> Result<Transcription, AsrError> {
+    // Nothing settled anywhere yet — not on the row, not in the engine — so the
+    // engine works this window out on its own and there is no answer to
+    // second-guess. Only the first window or two of a meeting are ever here.
     if prior.is_none() {
         return transcriber.transcribe(job, prompt).await;
     }
@@ -991,10 +1233,15 @@ async fn transcribe_with_prior<T: Transcriber>(
     // next to a decode of it.
     let retry = TranscribeJob {
         language_hint: None,
+        detect_afresh: true,
         ..job.clone()
     };
     let first = transcriber.transcribe(job, prompt.clone()).await?;
-    if !collapsed(&first) {
+    // Judged against the meeting as it stood *before* this window, then added to
+    // it: a window is never part of the evidence about itself.
+    let worth_a_second_look = collapsed(&first) || reads.far_below(first.avg_confidence);
+    reads.saw(&first);
+    if !worth_a_second_look {
         return Ok(first);
     }
     let t_start_ms = retry.t_start_ms;
@@ -1027,6 +1274,28 @@ fn collapsed(text: &Transcription) -> bool {
             .is_some_and(|c| c < CONFIDENCE_COLLAPSED)
 }
 
+/// The characters a person would read: how much of an answer this is.
+///
+/// Punctuation and spacing are left out because they are the parts two decodes
+/// of the same seconds disagree about for reasons that have nothing to do with
+/// how much was heard.
+fn how_much_was_said(text: &Transcription) -> usize {
+    text.text.chars().filter(|c| c.is_alphanumeric()).count()
+}
+
+/// Is the unpinned reading better than the pinned one — judged on evidence the
+/// two of them actually share?
+///
+/// The two readings are of the same audio, so "better" only means something when
+/// there is something comparable to weigh. Three things have to hold, and the
+/// last two exist because this is now asked about windows that were *fine*
+/// rather than only about wreckage:
+/// * the retry has to have said something at all;
+/// * both readings have to have reported a confidence. A number against no
+///   number is not a comparison, and the pinned reading — which is the meeting's
+///   own language — keeps the window when there is nothing to weigh it against;
+/// * the retry has to be an answer to the same seconds rather than a fragment of
+///   them (see [`RETRY_KEEPS_AT_LEAST`]).
 fn improves_on(second: &Transcription, first: &Transcription) -> bool {
     if second.is_empty() {
         return false;
@@ -1034,7 +1303,15 @@ fn improves_on(second: &Transcription, first: &Transcription) -> bool {
     if first.is_empty() {
         return true;
     }
-    second.avg_confidence.unwrap_or(0.0) > first.avg_confidence.unwrap_or(0.0)
+    let (Some(second_confidence), Some(first_confidence)) =
+        (second.avg_confidence, first.avg_confidence)
+    else {
+        return false;
+    };
+    if second_confidence <= first_confidence {
+        return false;
+    }
+    how_much_was_said(second) as f32 >= how_much_was_said(first) as f32 * RETRY_KEEPS_AT_LEAST
 }
 
 impl CatchUpReport {
@@ -1497,6 +1774,153 @@ mod tests {
 
         fn settled_language(&self, _meeting_id: &str) -> Option<String> {
             self.settled.clone()
+        }
+    }
+
+    /// An engine that reads a meeting steadily except for one stretch, which it
+    /// makes a mess of whenever the meeting's language is pinned.
+    ///
+    /// Every reading it gives — the bad one included — sits well clear of
+    /// [`CONFIDENCE_COLLAPSED`], which is the whole point. The 2026-08-24
+    /// meeting averaged 0.609 and was written down entirely in the wrong
+    /// language without the absolute floor ever being reached.
+    struct SteadyExceptOneStretch {
+        /// Where the stretch the pinned language cannot explain begins, on the
+        /// meeting clock.
+        bad_from_ms: i64,
+        /// What was pinned on each decode, in order.
+        hints: Mutex<Vec<Option<String>>>,
+    }
+
+    impl SteadyExceptOneStretch {
+        /// How this meeting normally reads: comfortably above the floor, and
+        /// close to the real meeting's 0.609.
+        const STEADY: f32 = 0.62;
+        /// What the bad stretch reads at. Nowhere near the floor, and a third
+        /// below the meeting's own normal.
+        const BAD: f32 = 0.42;
+        const IN_ITALIAN: &'static str = "allora vediamo il punto successivo";
+        const NONSENSE: &'static str = "sola in voi che goes a otto fritti";
+        const IN_ENGLISH: &'static str = "so the invoice goes out on Friday";
+
+        fn from(bad_from_ms: i64) -> Self {
+            Self {
+                bad_from_ms,
+                hints: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn hints(&self) -> Vec<Option<String>> {
+            self.hints.lock().unwrap().clone()
+        }
+    }
+
+    impl Transcriber for SteadyExceptOneStretch {
+        async fn transcribe(
+            &self,
+            job: TranscribeJob,
+            _prompt: Option<String>,
+        ) -> Result<Transcription, AsrError> {
+            let pinned = job.language_hint.clone();
+            self.hints.lock().unwrap().push(pinned.clone());
+            let bad = job.t_start_ms == self.bad_from_ms;
+            let (text, confidence, language) = match (pinned.is_some(), bad) {
+                // Read again with nothing pinned: the stretch was English all
+                // along, and says so confidently.
+                (false, _) => (Self::IN_ENGLISH, 0.88, "en"),
+                (true, true) => (Self::NONSENSE, Self::BAD, "it"),
+                (true, false) => (Self::IN_ITALIAN, Self::STEADY, "it"),
+            };
+            Ok(Transcription {
+                channel: job.channel,
+                t_start_ms: job.t_start_ms,
+                t_end_ms: job.t_end_ms(),
+                text: text.into(),
+                language: Some(language.into()),
+                language_confidence: None,
+                avg_confidence: Some(confidence),
+                model_name: Some("test weights".into()),
+                model_revision: Some("rev1".into()),
+                lines: Vec::new(),
+            })
+        }
+    }
+
+    /// The same meeting, read by an engine that keeps a language of its own.
+    ///
+    /// This is what the real one does and what "listen again" leaves behind: the
+    /// row has no language (`db::repo::clear_transcript` took it), so the engine
+    /// works one out from the first window it is handed unhinted and applies it
+    /// to everything after that, out of a place the database cannot see. A pass
+    /// that only looked at the row would believe nothing was pinned while every
+    /// decode was pinned — and would never ask for a second reading of anything.
+    struct PinsItsOwnLanguage {
+        bad_from_ms: i64,
+        settled: Mutex<Option<String>>,
+        /// What each decode was given: the hint, and whether it was asked to
+        /// work the language out from the audio alone.
+        asked: Mutex<Vec<(Option<String>, bool)>>,
+    }
+
+    impl PinsItsOwnLanguage {
+        fn from(bad_from_ms: i64) -> Self {
+            Self {
+                bad_from_ms,
+                settled: Mutex::new(None),
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<(Option<String>, bool)> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    impl Transcriber for PinsItsOwnLanguage {
+        async fn transcribe(
+            &self,
+            job: TranscribeJob,
+            _prompt: Option<String>,
+        ) -> Result<Transcription, AsrError> {
+            let hint = job.language_hint.clone();
+            let afresh = job.detect_afresh;
+            self.asked.lock().unwrap().push((hint.clone(), afresh));
+            if hint.is_none() && !afresh {
+                // Nothing pinned and nobody asking for anything else: it decides,
+                // and it remembers.
+                *self.settled.lock().unwrap() = Some("it".into());
+            }
+            let bad = job.t_start_ms == self.bad_from_ms;
+            let (text, confidence, language) = match (afresh, bad) {
+                // Read from the audio alone, the stretch turns out to be English.
+                (true, _) => (SteadyExceptOneStretch::IN_ENGLISH, 0.88, "en"),
+                (false, true) => (
+                    SteadyExceptOneStretch::NONSENSE,
+                    SteadyExceptOneStretch::BAD,
+                    "it",
+                ),
+                (false, false) => (
+                    SteadyExceptOneStretch::IN_ITALIAN,
+                    SteadyExceptOneStretch::STEADY,
+                    "it",
+                ),
+            };
+            Ok(Transcription {
+                channel: job.channel,
+                t_start_ms: job.t_start_ms,
+                t_end_ms: job.t_end_ms(),
+                text: text.into(),
+                language: Some(language.into()),
+                language_confidence: None,
+                avg_confidence: Some(confidence),
+                model_name: Some("test weights".into()),
+                model_revision: Some("rev1".into()),
+                lines: Vec::new(),
+            })
+        }
+
+        fn settled_language(&self, _meeting_id: &str) -> Option<String> {
+            self.settled.lock().unwrap().clone()
         }
     }
 
@@ -2352,7 +2776,6 @@ mod tests {
         .unwrap();
         assert_eq!(report.segments_written, 0);
         assert_eq!(report.windows_read, 0);
-        assert!(!report.cancelled);
         assert!(engine.seen.lock().unwrap().is_empty());
     }
 
@@ -2778,6 +3201,225 @@ mod tests {
         assert!(improves_on(&shaky, &nothing));
     }
 
+    /// The bar a stretch is really judged against is how the *meeting* reads,
+    /// not a number picked once for every recording there will ever be.
+    #[test]
+    fn a_stretch_is_measured_against_the_meeting_it_is_in() {
+        let read_at = |c: f32| Transcription {
+            text: "allora vediamo il punto successivo".into(),
+            avg_confidence: Some(c),
+            ..Default::default()
+        };
+        let mut reads = HowThisMeetingReads::default();
+
+        // Seven windows is not how a meeting reads, it is seven windows. Until
+        // there are enough of them the absolute floor is the only trigger,
+        // which is exactly what this pass did before.
+        for _ in 0..MEDIAN_NEEDS - 1 {
+            reads.saw(&read_at(0.609));
+        }
+        assert_eq!(reads.median(), None);
+        assert!(!reads.far_below(Some(0.10)));
+
+        reads.saw(&read_at(0.609));
+        assert_eq!(reads.median(), Some(0.609));
+        // A meeting reading 0.609 asks for a second look below 0.457 — a bar
+        // the fixed 0.35 floor could never have reached.
+        assert!(reads.far_below(Some(0.45)));
+        assert!(!reads.far_below(Some(0.47)));
+        assert!(
+            !reads.far_below(Some(0.55)),
+            "ordinary variation is not evidence of anything"
+        );
+        assert!(
+            !reads.far_below(None),
+            "an engine that reports no confidence is taken at its word"
+        );
+
+        // Silence is not the engine being unsure, and it never sets the bar.
+        let before = reads.median();
+        reads.saw(&Transcription {
+            avg_confidence: Some(0.01),
+            ..Default::default()
+        });
+        assert_eq!(reads.median(), before);
+    }
+
+    /// Now that a *fine* window can send a stretch back for a second reading,
+    /// the second reading has to win on evidence it shares with the first.
+    #[test]
+    fn a_second_reading_only_wins_on_evidence_it_shares_with_the_first() {
+        let pinned = Transcription {
+            text: "allora vediamo il punto successivo".into(),
+            avg_confidence: Some(0.45),
+            ..Default::default()
+        };
+        let unpinned = Transcription {
+            text: "so the invoice goes out on Friday".into(),
+            avg_confidence: Some(0.88),
+            ..Default::default()
+        };
+        assert!(improves_on(&unpinned, &pinned));
+
+        // A fragment at high confidence is not a better reading of the same
+        // seconds: it is a shorter one, with less to be unsure about, and
+        // keeping it would delete words somebody said.
+        let fragment = Transcription {
+            text: "Friday".into(),
+            avg_confidence: Some(0.99),
+            ..Default::default()
+        };
+        assert!(!improves_on(&fragment, &pinned));
+
+        // A number against no number is not a comparison. The meeting's own
+        // language keeps the window when there is nothing to weigh.
+        let says_nothing_about_itself = Transcription {
+            text: "so the invoice goes out on Friday".into(),
+            ..Default::default()
+        };
+        assert!(!improves_on(&says_nothing_about_itself, &pinned));
+        assert!(!improves_on(
+            &unpinned,
+            &Transcription {
+                text: "allora vediamo il punto successivo".into(),
+                ..Default::default()
+            }
+        ));
+    }
+
+    /// The case the old escape hatch could not see: a meeting that reads
+    /// perfectly well throughout — nowhere near the absolute floor — with one
+    /// stretch that reads far worse than everything around it. That stretch is
+    /// read again with nothing pinned, and only that stretch.
+    #[tokio::test]
+    async fn a_stretch_far_worse_than_the_rest_of_the_meeting_is_read_again() {
+        const BAD_FROM_MS: i64 = 300_000;
+        let db = connect_in_memory().await.unwrap();
+        // Twelve 30-second windows: enough of them before the bad one that the
+        // meeting has a normal by the time it arrives.
+        let id = meeting_with_audio(&db, 12).await;
+        repo::set_meeting_language(&db, &id, "it").await.unwrap();
+
+        let engine = SteadyExceptOneStretch::from(BAD_FROM_MS);
+        let report = run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &FakeAudio::with_speech(),
+        )
+        .await
+        .unwrap();
+
+        // The point of this meeting is that nothing in it ever collapsed: the
+        // old escape hatch could not have opened here however long it ran.
+        const { assert!(SteadyExceptOneStretch::BAD > CONFIDENCE_COLLAPSED) };
+        assert_eq!(report.windows_decoded, 12);
+        assert_eq!(
+            report.fallback_attempts, 1,
+            "only the stretch that stood out was read twice"
+        );
+        assert_eq!(
+            engine.hints().iter().filter(|h| h.is_none()).count(),
+            1,
+            "every other window kept the meeting's language pinned"
+        );
+
+        let written = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(written.len(), 12);
+        let recovered = written
+            .iter()
+            .find(|s| s.t_start_ms == BAD_FROM_MS)
+            .expect("a row for the stretch that was read again");
+        assert_eq!(recovered.text, SteadyExceptOneStretch::IN_ENGLISH);
+        assert_eq!(recovered.language.as_deref(), Some("en"));
+        assert!(
+            written
+                .iter()
+                .filter(|s| s.t_start_ms != BAD_FROM_MS)
+                .all(|s| s.text == SteadyExceptOneStretch::IN_ITALIAN),
+            "the rest of the meeting is still the meeting's own language"
+        );
+    }
+
+    /// The same escape hatch on the one pass that exists to use it: "listen
+    /// again", which deliberately leaves the meeting with no language at all so
+    /// the recording can be read afresh.
+    ///
+    /// The catch this test pins down: the row having no language does not mean
+    /// nothing is pinned. The engine works one out for itself within the first
+    /// window or two and applies it to every window after that, from memory. A
+    /// pass that read only the row would take its own decodes for unhinted ones,
+    /// skip the check on every single window, and quietly reproduce the wrong
+    /// language it was pressed to repair — which is what it did.
+    #[tokio::test]
+    async fn the_repair_pass_still_watches_the_language_the_engine_picked_itself() {
+        const BAD_FROM_MS: i64 = 300_000;
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 12).await;
+        // No language on the row: exactly what "listen again" leaves behind.
+        assert_eq!(
+            repo::get_meeting(&db, &id).await.unwrap().unwrap().language,
+            None
+        );
+
+        let engine = PinsItsOwnLanguage::from(BAD_FROM_MS);
+        let report = run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &FakeAudio::with_speech(),
+        )
+        .await
+        .unwrap();
+
+        let asked = engine.asked();
+        assert_eq!(
+            asked.iter().filter(|(hint, _)| hint.is_none()).count(),
+            2,
+            "one window decides the language, and the one re-reading asks to \
+             ignore it: {asked:?}"
+        );
+        assert_eq!(
+            asked.iter().filter(|(_, afresh)| *afresh).count(),
+            1,
+            "a second reading has to say so, or the engine hands it the same \
+             answer again: {asked:?}"
+        );
+        assert_eq!(report.fallback_attempts, 1);
+
+        let written = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let recovered = written
+            .iter()
+            .find(|s| s.t_start_ms == BAD_FROM_MS)
+            .expect("a row for the stretch that was read again");
+        assert_eq!(recovered.text, SteadyExceptOneStretch::IN_ENGLISH);
+        assert_eq!(recovered.language.as_deref(), Some("en"));
+    }
+
     #[tokio::test]
     async fn uncommitted_audio_is_never_read() {
         let db = connect_in_memory().await.unwrap();
@@ -2916,7 +3558,8 @@ mod tests {
         // open until the second closes it.
         let watcher: CancelCheck = Arc::new(move || counted.fetch_add(1, Ordering::SeqCst) >= 2);
 
-        let report = run(
+        let audio = FakeAudio::with_speech();
+        let outcome = run(
             &FakeEngine::saying("first bit"),
             &db,
             &id,
@@ -2925,14 +3568,15 @@ mod tests {
                 cancel: Some(watcher),
                 ..Default::default()
             },
-            &FakeAudio::with_speech(),
+            &audio,
         )
-        .await
-        .unwrap();
+        .await;
 
-        assert!(report.cancelled);
-        assert_eq!(report.windows_read, 2, "it stopped at the next boundary");
-        assert_eq!(report.segments_written, 1, "and kept what it had done");
+        assert!(
+            matches!(outcome, Err(AsrError::Cancelled)),
+            "a pass that stopped early is not a pass that finished: {outcome:?}"
+        );
+        assert_eq!(audio.reads().len(), 2, "it stopped at the next boundary");
         let written = repo::get_segments(
             &db,
             &TranscriptQuery {
@@ -2942,7 +3586,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(written.len(), 1);
+        assert_eq!(written.len(), 1, "and kept what it had done");
         assert_eq!(
             written[0].t_start_ms, 0,
             "the window it finished is the one it kept"
@@ -2958,7 +3602,7 @@ mod tests {
             cancel_after: Some(1),
             ..Default::default()
         };
-        let report = run(
+        let outcome = run(
             &engine,
             &db,
             &id,
@@ -2968,10 +3612,260 @@ mod tests {
             },
             &FakeAudio::with_speech(),
         )
+        .await;
+        assert!(
+            matches!(outcome, Err(AsrError::Cancelled)),
+            "the engine gave up on this meeting; the pass did not finish it: {outcome:?}"
+        );
+        // The line it managed before the engine stopped is still on the
+        // transcript — an interrupted pass keeps its work, it just does not
+        // claim to be done.
+        let written = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: id.clone(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
-        assert!(report.cancelled);
-        assert_eq!(report.segments_written, 1);
+        assert_eq!(written.len(), 1);
+    }
+
+    /// The invariant, in words, because it is the one this lane keeps getting
+    /// wrong: **a pass that was cut short must never report success.**
+    ///
+    /// It used to answer `Ok` with a flag set, and on 2026-08-24 the caller read
+    /// the segment count and dropped the flag. The job went down as done at full
+    /// progress, its live text was cleared for stretches nobody had read back,
+    /// and the meeting was left 69.4% transcribed — against 90.8% and 93.2% for
+    /// the meetings either side of it — with no error anywhere. However a pass
+    /// is stopped, there is exactly one thing it is allowed to say about itself.
+    #[tokio::test]
+    async fn a_pass_that_was_cut_short_never_reports_success() {
+        // Told to stop before it ever read a window.
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 2).await;
+        let at_once: CancelCheck = Arc::new(|| true);
+        let outcome = run(
+            &FakeEngine::saying("never got there"),
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                cancel: Some(at_once),
+                ..Default::default()
+            },
+            &FakeAudio::with_speech(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(AsrError::Cancelled)),
+            "stopped before the first window: {outcome:?}"
+        );
+
+        // Told to stop with a window already written down. The lines it wrote
+        // are real and they stay — but they are not the meeting, and saying so
+        // is what cost the 2026-08-24 recording its last twenty-seven minutes.
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 4).await;
+        let checks = Arc::new(AtomicU32::new(0));
+        let counted = checks.clone();
+        let part_way: CancelCheck = Arc::new(move || counted.fetch_add(1, Ordering::SeqCst) >= 2);
+        let outcome = run(
+            &FakeEngine::saying("the first minute"),
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                cancel: Some(part_way),
+                ..Default::default()
+            },
+            &FakeAudio::with_speech(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(AsrError::Cancelled)),
+            "stopped with work already done: {outcome:?}"
+        );
+        assert!(
+            !transcribed_spans(&db, &id, Ch::Mic)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the words it did write are still on the transcript"
+        );
+
+        // The engine itself gave up on the meeting, which reaches the pass by a
+        // different route and has to end the same way.
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 3).await;
+        let outcome = run(
+            &FakeEngine {
+                text: "gone".into(),
+                cancel_after: Some(1),
+                ..Default::default()
+            },
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &FakeAudio::with_speech(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(AsrError::Cancelled)),
+            "the engine stopped mid-pass: {outcome:?}"
+        );
+    }
+
+    /// The other half of the 2026-08-24 loss, and the half that actually deleted
+    /// the words: the pass used to drop **every** live guess in the meeting the
+    /// moment it started, before it had read a single window. Interrupted three
+    /// minutes in, it left the stretches it never reached with no text of any
+    /// kind — not the real reading, not even the guess that had been on screen
+    /// during the meeting.
+    ///
+    /// A guess goes when the seconds under it have been read off the recording,
+    /// and not before.
+    #[tokio::test]
+    async fn a_pass_cut_short_keeps_the_live_guesses_over_what_it_never_read() {
+        let db = connect_in_memory().await.unwrap();
+        // Four windows of microphone audio.
+        let id = meeting_with_audio(&db, 4).await;
+        let guess_at = |t_start_ms: i64, t_end_ms: i64| SegmentDraft {
+            meeting_id: id.clone(),
+            t_start_ms,
+            t_end_ms,
+            channel: Ch::Mic,
+            text: "half heard gue".into(),
+            is_final: false,
+            revision: 1,
+            ..Default::default()
+        };
+        // One over the first window, which this pass reads; one over the last,
+        // which it never gets to.
+        repo::insert_segment(&db, &guess_at(5_000, 10_000))
+            .await
+            .unwrap();
+        repo::insert_segment(&db, &guess_at(95_000, 100_000))
+            .await
+            .unwrap();
+
+        let checks = Arc::new(AtomicU32::new(0));
+        let counted = checks.clone();
+        let a_recording_starts: CancelCheck =
+            Arc::new(move || counted.fetch_add(1, Ordering::SeqCst) >= 2);
+        let audio = FakeAudio::with_speech();
+        let outcome = run(
+            &FakeEngine::saying("the first minute"),
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                cancel: Some(a_recording_starts),
+                ..Default::default()
+            },
+            &audio,
+        )
+        .await;
+        assert!(matches!(outcome, Err(AsrError::Cancelled)), "{outcome:?}");
+        let read = audio.reads();
+        assert!(
+            read.iter().all(|(_, _, to_ms)| *to_ms <= 60_000),
+            "this test is only worth anything if the last window went unread: {read:?}"
+        );
+
+        let left = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: id.clone(),
+                include_partial: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let guesses: Vec<i64> = left
+            .iter()
+            .filter(|s| !s.is_final)
+            .map(|s| s.t_start_ms)
+            .collect();
+        assert_eq!(
+            guesses,
+            vec![95_000],
+            "the guess over audio nobody read back is the only text those seconds have"
+        );
+        assert!(
+            left.iter().any(|s| s.is_final && s.t_start_ms == 0),
+            "and the window that *was* read has its real text, with the guess gone"
+        );
+    }
+
+    /// What makes parking an interrupted pass safe rather than merely honest:
+    /// the pass that comes after it works its plan out again from the holes left
+    /// in the transcript, so the audio the first one never reached is read then.
+    #[tokio::test]
+    async fn the_pass_after_an_interrupted_one_reads_the_holes_it_left() {
+        let db = connect_in_memory().await.unwrap();
+        // Two minutes of microphone audio, four windows of it.
+        let id = meeting_with_audio(&db, 4).await;
+
+        let checks = Arc::new(AtomicU32::new(0));
+        let counted = checks.clone();
+        let a_recording_starts: CancelCheck =
+            Arc::new(move || counted.fetch_add(1, Ordering::SeqCst) >= 2);
+        let first_audio = FakeAudio::with_speech();
+        let outcome = run(
+            &FakeEngine::saying("the first minute"),
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                cancel: Some(a_recording_starts),
+                ..Default::default()
+            },
+            &first_audio,
+        )
+        .await;
+        assert!(matches!(outcome, Err(AsrError::Cancelled)), "{outcome:?}");
+        let read_first = first_audio.reads();
+        assert!(
+            read_first.len() < 4,
+            "this test is only worth anything if the first pass left something behind: {read_first:?}"
+        );
+
+        // What the job runner does with that: park the row, and queue the pass
+        // again when the recording is over. Nothing is handed between them — the
+        // transcript on disk is the whole of the state.
+        let second_audio = FakeAudio::with_speech();
+        let report = run(
+            &FakeEngine::saying("and the rest of it"),
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &second_audio,
+        )
+        .await
+        .expect("nothing stopped the second pass");
+
+        for (_, from_ms, to_ms) in second_audio.reads() {
+            assert!(
+                from_ms >= 30_000,
+                "{from_ms}..{to_ms} was already written down by the first pass"
+            );
+        }
+        assert!(report.segments_written > 0);
+        assert_eq!(
+            transcribed_spans(&db, &id, Ch::Mic).await.unwrap(),
+            vec![(0, 120_000)],
+            "between them the two passes wrote down the whole meeting"
+        );
     }
 
     #[tokio::test]

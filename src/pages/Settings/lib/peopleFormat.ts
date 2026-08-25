@@ -1,8 +1,13 @@
 /**
  * "Last heard <relative date>" for a saved voice — same shape as the
  * meetings list's relative date (`Home/format.ts`) so time reads the same
- * everywhere, kept local rather than imported to stay inside this screen's
- * own ownership.
+ * everywhere, written here rather than imported from there because the two
+ * are about different things and only look alike.
+ *
+ * Also read by the meeting page's speaker rows: two known people can share a
+ * name, and telling them apart in that dropdown means showing the same detail
+ * this screen shows. One answer to "when was this voice last heard", not two
+ * that drift.
  */
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
