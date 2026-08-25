@@ -421,6 +421,13 @@ impl AsrPort for EngineAsr {
             // for the whole meeting (mantra 1).
             let options = crate::asr::catchup::CatchUpOptions {
                 from_ms: not_before_ms.map(|ms| ms.max(0)),
+                // The one caller that opts in. The meeting is over, nothing is
+                // on screen, and nobody is waiting on any single line — so the
+                // detector can hold a stretch open long enough to carry a
+                // sentence across a breath instead of closing at the shortest
+                // tail a live caption could bear
+                // (`crate::audio::vad::Listening`).
+                listening: crate::audio::vad::Listening::FromDisk,
                 cancel: control.cancel,
                 on_progress: control.on_progress,
                 ..Default::default()
@@ -457,6 +464,15 @@ impl AsrPort for EngineAsr {
                 // one is in flight during the meeting (see
                 // [`crate::asr::catchup::LIVE_PACK_MS`]).
                 pack_ms: crate::asr::catchup::LIVE_PACK_MS,
+                // `listening` stays `Live` (the default) for the same reason
+                // `pack_ms` is narrow. This pass reads from disk, but reading
+                // from disk is not the question: somebody is watching this
+                // meeting's transcript fill in right now, and these words go
+                // into it beside the live finals, through the same engine. A
+                // longer tail here would hold every stretch open past the point
+                // a caption should have appeared, to buy a line break nobody is
+                // reading yet. The post-meeting pass rewrites this same audio
+                // with the longer tail once the meeting ends.
                 // `pause_while` stays unset on purpose. The post-meeting pass
                 // yields to a live recording; this one *is* the live recording,
                 // and yielding to itself would mean never running. It stays out

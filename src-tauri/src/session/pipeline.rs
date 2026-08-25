@@ -3431,7 +3431,12 @@ mod tests {
             Ok(vec![0.2; samples as usize])
         }
 
-        fn open_stream(&self, _detector: Option<&std::path::Path>, channel: Channel) -> FakeStream {
+        fn open_stream(
+            &self,
+            _detector: Option<&std::path::Path>,
+            channel: Channel,
+            _listening: crate::audio::vad::Listening,
+        ) -> FakeStream {
             FakeStream { channel }
         }
     }

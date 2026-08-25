@@ -67,7 +67,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use echo_lib::audio::bleed::{self, BleedEvidence, LagEstimate, LagSearch};
-use echo_lib::audio::vad::OfflineDetector;
+use echo_lib::audio::vad::{Listening, OfflineDetector};
 use echo_lib::audio::{read_window, ChunkRef};
 use echo_lib::db::{self, repo};
 use echo_lib::types::{AssetKind, Channel, Segment, TranscriptQuery};
@@ -353,7 +353,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // --- find the speech in the microphone channel ------------------------
-    let mut detection = OfflineDetector::open(detector_path, Channel::Mic)?;
+    // The settings the post-meeting pass uses, because that is the pass whose
+    // numbers this probe exists to predict.
+    let mut detection = OfflineDetector::open(detector_path, Channel::Mic, Listening::FromDisk)?;
     let mut utterances = Vec::new();
     let pages = (mic_ms + PAGE_MS - 1) / PAGE_MS;
     for page in 0..pages {

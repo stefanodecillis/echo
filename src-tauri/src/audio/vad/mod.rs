@@ -90,6 +90,33 @@ pub const SNAPSHOT_TAIL_MS: i64 = 12_000;
 // Per-channel settings
 // ---------------------------------------------------------------------------
 
+/// Who is waiting for the words.
+///
+/// Not "where did the audio come from" — the same recording is read from disk in
+/// both cases (the live pass detects on the buffers on their way to the FLAC
+/// chunks; the catch-up pass reads those chunks back). What differs is whether
+/// anybody is watching a line appear. Live, every millisecond a detector holds
+/// an utterance open is a millisecond of caption nobody has yet; after the
+/// meeting, nothing is on screen and the only thing that matters is where the
+/// sentence really ended.
+///
+/// So this changes *when a stretch is closed*, and nothing else. It must never
+/// change [`VadSettings::enter`] or [`VadSettings::exit`]: whether a given 32 ms
+/// of audio is speech is a fact about the audio, and if the two passes disagreed
+/// about that they would disagree about *what was said* rather than merely about
+/// where the lines break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Listening {
+    /// Somebody is watching the transcript fill in. A held-open utterance is a
+    /// caption that has not arrived.
+    #[default]
+    Live,
+    /// The recording is being read back with nobody waiting on any one line, so
+    /// a longer tail is free: it costs a delay no one can perceive and buys
+    /// sentences that stay whole across a breath.
+    FromDisk,
+}
+
 /// Everything about *when* speech starts and stops, per channel.
 ///
 /// The two channels are not the same problem. The laptop microphone is far-field
@@ -168,6 +195,36 @@ impl VadSettings {
         match channel {
             Channel::System => Self::system(),
             _ => Self::mic(),
+        }
+    }
+
+    /// The settings for one channel, for whoever is waiting on it.
+    ///
+    /// [`Listening::Live`] is [`Self::for_channel`], unchanged. Reading the
+    /// recording back after the meeting only moves the two numbers that decide
+    /// *when a stretch is closed*:
+    ///
+    /// - `silence_tail_ms` × 1.75 (400 → 700 mic, 320 → 560 system). Live, that
+    ///   wait is dead air in front of a caption, so it is set as short as a
+    ///   sentence can bear; a mid-sentence breath in slow speech is longer than
+    ///   400 ms, which live costs a split line and after the meeting costs
+    ///   nothing. The same multiple on both channels on purpose: the microphone
+    ///   closing later than the computer is a fact about far-field noisy audio
+    ///   versus a clean conferencing feed, and that relationship holds whoever
+    ///   is waiting.
+    /// - `post_pad_ms` 288 → 384, so the trailing consonant of the last word
+    ///   before that longer pause is inside the window handed to the engine.
+    ///
+    /// `enter` and `exit` are deliberately identical — see [`Listening`].
+    pub const fn for_channel_when(channel: Channel, listening: Listening) -> Self {
+        let live = Self::for_channel(channel);
+        match listening {
+            Listening::Live => live,
+            Listening::FromDisk => Self {
+                silence_tail_ms: live.silence_tail_ms * 7 / 4,
+                post_pad_ms: 384,
+                ..live
+            },
         }
     }
 
@@ -996,18 +1053,41 @@ impl SpeechDetector {
     /// absent — first launch, download still running, a person who skipped it —
     /// use [`SpeechDetector::without_model`] and keep recording.
     pub fn load(model_path: &Path, channel: Channel) -> Result<Self, AudioError> {
+        Self::load_when(model_path, channel, Listening::Live)
+    }
+
+    /// [`Self::load`], for a caller who says who is waiting. See [`Listening`].
+    pub fn load_when(
+        model_path: &Path,
+        channel: Channel,
+        listening: Listening,
+    ) -> Result<Self, AudioError> {
         let engine = Engine::Silero(Box::new(Silero::load(model_path)?));
-        Ok(Self::with_engine(engine, channel))
+        Ok(Self::with_settings(
+            engine,
+            channel,
+            VadSettings::for_channel_when(channel, listening),
+        ))
     }
 
     /// Detector for when the asset is not on disk. Recording never waits for a
     /// download.
     pub fn without_model(channel: Channel) -> Self {
-        Self::with_engine(Engine::Loudness(LoudnessGate::default()), channel)
+        Self::without_model_when(channel, Listening::Live)
     }
 
-    fn with_engine(engine: Engine, channel: Channel) -> Self {
-        let settings = VadSettings::for_channel(channel);
+    /// [`Self::without_model`], for a caller who says who is waiting.
+    pub fn without_model_when(channel: Channel, listening: Listening) -> Self {
+        Self::with_settings(
+            Engine::Loudness(LoudnessGate::default()),
+            channel,
+            VadSettings::for_channel_when(channel, listening),
+        )
+    }
+
+    /// The one constructor: an engine, a channel, and the settings to segment
+    /// with. Every other constructor here decides those settings and calls this.
+    fn with_settings(engine: Engine, channel: Channel, settings: VadSettings) -> Self {
         Self {
             engine,
             segmenter: Segmenter::with_settings(channel, settings),
@@ -1029,18 +1109,31 @@ impl SpeechDetector {
 
     /// Load the real detector if the asset is there, fall back if it is not.
     pub fn load_or_fallback(model_path: Option<&Path>, channel: Channel) -> Self {
+        Self::load_or_fallback_when(model_path, channel, Listening::Live)
+    }
+
+    /// [`Self::load_or_fallback`], for a caller who says who is waiting.
+    ///
+    /// The fallback gets the same settings as the real thing: the loudness gate
+    /// answers the same question Silero does, and the segmentation around it —
+    /// which is what [`Listening`] moves — is identical either way.
+    pub fn load_or_fallback_when(
+        model_path: Option<&Path>,
+        channel: Channel,
+        listening: Listening,
+    ) -> Self {
         match model_path {
-            Some(path) if path.exists() => match Self::load(path, channel) {
+            Some(path) if path.exists() => match Self::load_when(path, channel, listening) {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(
                         target: "echo::audio",
                         "falling back to loudness-based speech detection: {e}"
                     );
-                    Self::without_model(channel)
+                    Self::without_model_when(channel, listening)
                 }
             },
-            _ => Self::without_model(channel),
+            _ => Self::without_model_when(channel, listening),
         }
     }
 
@@ -1225,12 +1318,25 @@ impl std::fmt::Debug for OfflineDetector {
 impl OfflineDetector {
     /// Start one. `model_path` of `None` — or a path that will not load — falls
     /// back to the loudness gate, exactly as live detection does.
-    pub fn open(model_path: Option<PathBuf>, channel: Channel) -> Result<Self, AudioError> {
+    ///
+    /// `listening` says who is waiting for these words, which is what decides
+    /// how long a stretch is held open — see [`Listening`]. Reading from disk is
+    /// not by itself an answer: the pass that catches up *during* a recording
+    /// reads from disk too, and somebody is watching that one.
+    pub fn open(
+        model_path: Option<PathBuf>,
+        channel: Channel,
+        listening: Listening,
+    ) -> Result<Self, AudioError> {
         let (requests, incoming) = std::sync::mpsc::channel::<DetectRequest>();
         let worker = std::thread::Builder::new()
             .name("echo-speech-offline".into())
             .spawn(move || {
-                let mut detector = SpeechDetector::load_or_fallback(model_path.as_deref(), channel);
+                let mut detector = SpeechDetector::load_or_fallback_when(
+                    model_path.as_deref(),
+                    channel,
+                    listening,
+                );
                 while let Ok(request) = incoming.recv() {
                     match request {
                         DetectRequest::Push {
@@ -1320,8 +1426,9 @@ pub async fn detect_offline(
     samples: &[f32],
     t_offset_ms: i64,
     channel: Channel,
+    listening: Listening,
 ) -> Result<Vec<Utterance>, AudioError> {
-    let mut detector = OfflineDetector::open(Some(model_path.to_path_buf()), channel)?;
+    let mut detector = OfflineDetector::open(Some(model_path.to_path_buf()), channel, listening)?;
     let mut out = Vec::new();
     // Half-second pieces: big enough to be cheap, small enough that a very long
     // recording does not sit in one allocation twice.
@@ -1565,7 +1672,12 @@ mod tests {
 
     #[test]
     fn the_utterance_cap_leaves_room_for_padding() {
-        for settings in [VadSettings::mic(), VadSettings::system()] {
+        for settings in [
+            VadSettings::mic(),
+            VadSettings::system(),
+            VadSettings::for_channel_when(Channel::Mic, Listening::FromDisk),
+            VadSettings::for_channel_when(Channel::System, Listening::FromDisk),
+        ] {
             assert!(settings.max_utterance_ms > settings.pre_pad_ms + settings.post_pad_ms);
             assert!(settings.silence_tail_ms > 0);
             // An utterance plus its padding has to fit the speech engine's
@@ -1629,6 +1741,117 @@ mod tests {
         assert_eq!(
             SpeechDetector::without_model(Channel::Mic).settings(),
             &VadSettings::mic()
+        );
+        // …and the settings of whoever is waiting, when it is told.
+        assert_eq!(
+            SpeechDetector::without_model_when(Channel::Mic, Listening::Live).settings(),
+            &VadSettings::mic()
+        );
+        assert_eq!(
+            SpeechDetector::without_model_when(Channel::Mic, Listening::FromDisk).settings(),
+            &VadSettings::for_channel_when(Channel::Mic, Listening::FromDisk)
+        );
+    }
+
+    /// Reading a recording back changes *when a stretch is called finished*, and
+    /// nothing else.
+    ///
+    /// The two halves of that are both load-bearing. The tail grows because live
+    /// it is dead air in front of a caption and after the meeting it is free —
+    /// and `post_pad_ms` grows with it so the last consonant before the longer
+    /// pause is inside the window handed to the engine. Everything that decides
+    /// *whether a given 32 ms is speech* stays put, because if it moved, the
+    /// live pass and the catch-up pass would disagree about what was said rather
+    /// than merely about where the lines break.
+    #[test]
+    fn reading_a_recording_back_only_moves_when_a_stretch_is_closed() {
+        for channel in [Channel::Mic, Channel::System] {
+            let live = VadSettings::for_channel_when(channel, Listening::Live);
+            let from_disk = VadSettings::for_channel_when(channel, Listening::FromDisk);
+
+            // Live is the unchanged, per-channel answer: this is a second set of
+            // settings, not a re-tuning of the first.
+            assert_eq!(live, VadSettings::for_channel(channel));
+
+            assert!(
+                from_disk.silence_tail_ms > live.silence_tail_ms,
+                "{channel:?}: reading back has to wait longer, not less"
+            );
+            assert!(from_disk.post_pad_ms > live.post_pad_ms);
+
+            // The facts about the audio, identical on both sides.
+            assert_eq!(from_disk.enter, live.enter);
+            assert_eq!(from_disk.exit, live.exit);
+            assert_eq!(from_disk.min_voiced_ms, live.min_voiced_ms);
+            assert_eq!(from_disk.max_utterance_ms, live.max_utterance_ms);
+            assert_eq!(from_disk.pre_pad_ms, live.pre_pad_ms);
+            assert_eq!(from_disk.forced_overlap_ms, live.forced_overlap_ms);
+            assert_eq!(from_disk.min_forced_silence_ms, live.min_forced_silence_ms);
+        }
+
+        let mic = VadSettings::for_channel_when(Channel::Mic, Listening::FromDisk);
+        let system = VadSettings::for_channel_when(Channel::System, Listening::FromDisk);
+        // The microphone still closes later than the computer. That ordering is
+        // a fact about far-field noisy audio against a clean conferencing feed,
+        // so it has to survive whoever is waiting…
+        assert!(mic.silence_tail_ms > system.silence_tail_ms);
+        // …and it does because the tail moves by the same multiple on both,
+        // rather than by a number picked twice. Cross-multiplied so the equality
+        // is exact whatever the multiple becomes.
+        assert_eq!(
+            mic.silence_tail_ms * VadSettings::system().silence_tail_ms,
+            system.silence_tail_ms * VadSettings::mic().silence_tail_ms,
+        );
+        assert_eq!(mic.post_pad_ms, system.post_pad_ms);
+    }
+
+    /// The same recording, read back after the meeting, keeps a sentence whole
+    /// where the live pass broke it in two.
+    ///
+    /// This is the whole of [`Listening::FromDisk`] in one test: a breath in the
+    /// middle of unhurried speech outlasts the tail a live caption can afford to
+    /// wait for, so live it ends a line and afterwards it does not. Modelled on
+    /// `the_computer_channel_closes_sooner_than_the_microphone`: identical audio
+    /// into two detectors, the settings being the only difference between them.
+    #[test]
+    fn a_recording_read_back_keeps_a_sentence_the_live_pass_would_have_split() {
+        // Per channel: a pause longer than the live tail and shorter than the
+        // from-disk one, in whole 32 ms windows (mic 416 → 704, system 320 →
+        // 576).
+        for (channel, pause_ms) in [(Channel::Mic, 560), (Channel::System, 448)] {
+            let mut audio = room_noise(300);
+            audio.extend(tone(1_400, 300.0, 0.3));
+            audio.extend(room_noise(pause_ms));
+            audio.extend(tone(1_400, 300.0, 0.3));
+            audio.extend(room_noise(1_500));
+
+            let mut live = SpeechDetector::without_model_when(channel, Listening::Live);
+            let mut as_it_happened = feed(&mut live, &audio, 0);
+            as_it_happened.extend(live.finish());
+            assert_eq!(
+                as_it_happened.len(),
+                2,
+                "{channel:?}: the live pass was supposed to close at the breath: {as_it_happened:#?}"
+            );
+
+            let mut afterwards = SpeechDetector::without_model_when(channel, Listening::FromDisk);
+            let mut read_back = feed(&mut afterwards, &audio, 0);
+            read_back.extend(afterwards.finish());
+            assert_eq!(
+                read_back.len(),
+                1,
+                "{channel:?}: reading it back still split a sentence at a breath: {read_back:#?}"
+            );
+        }
+    }
+
+    /// Nobody gets the longer tail by accident: a caller has to ask.
+    #[test]
+    fn a_detector_listens_live_unless_it_is_told_otherwise() {
+        assert_eq!(Listening::default(), Listening::Live);
+        assert_eq!(
+            SpeechDetector::without_model(Channel::Mic).settings(),
+            SpeechDetector::without_model_when(Channel::Mic, Listening::default()).settings()
         );
     }
 
@@ -2319,6 +2542,7 @@ mod tests {
                 &audio,
                 10_000,
                 Channel::Mic,
+                Listening::FromDisk,
             ))
             .unwrap();
         assert_eq!(found.len(), 1, "{found:#?}");
@@ -2343,7 +2567,8 @@ mod tests {
             .build()
             .unwrap();
         let found = rt.block_on(async {
-            let mut detector = OfflineDetector::open(None, Channel::Mic).unwrap();
+            let mut detector =
+                OfflineDetector::open(None, Channel::Mic, Listening::FromDisk).unwrap();
             let mut out = Vec::new();
             // Two reads, with the boundary in the middle of the sentence.
             let split = RATE * 2;

@@ -144,7 +144,7 @@ const CONFIDENCE_COLLAPSED: f32 = crate::asr::language::MIN_USABLE_CONFIDENCE;
 /// second, and it costs one extra decode on the small minority of windows that
 /// reach it. On a meeting reading 0.609 that is a bar of 0.457 — well clear of
 /// the 0.35 floor that never fired.
-const RETRY_BELOW_MEDIAN: f32 = 0.75;
+pub(crate) const RETRY_BELOW_MEDIAN: f32 = 0.75;
 
 /// How many hinted readings the median needs before it is allowed to decide
 /// anything.
@@ -209,6 +209,13 @@ pub struct CatchUpOptions {
     pub pack_ms: i64,
     /// Emit live text while catching up. Off by default: nobody is watching.
     pub want_partials: bool,
+    /// Who is waiting for these words, which is what the speech detector's
+    /// closing settings follow ([`crate::audio::vad::Listening`]).
+    ///
+    /// `Live` by default, deliberately: this pass runs *during* a recording as
+    /// well as after one, and the during-a-recording case shares the engine with
+    /// live captions. Only the post-meeting pass opts in to the longer tail.
+    pub listening: crate::audio::vad::Listening,
     pub cancel: Option<CancelCheck>,
     /// Recording preempts everything (DESIGN §3 "Jobs table").
     pub pause_while: Option<PauseCheck>,
@@ -222,6 +229,7 @@ impl std::fmt::Debug for CatchUpOptions {
             .field("to_ms", &self.to_ms)
             .field("window_ms", &self.window_ms)
             .field("want_partials", &self.want_partials)
+            .field("listening", &self.listening)
             .finish_non_exhaustive()
     }
 }
@@ -343,7 +351,17 @@ pub trait AudioSource: Send + Sync {
     /// recurrent state, and a word straddling the boundary split in two by an
     /// accident of buffer sizes. Streamed, the detector never learns that the
     /// audio arrived in pieces.
-    fn open_stream(&self, detector: Option<&Path>, channel: Channel) -> Self::Stream;
+    ///
+    /// `listening` is passed straight through to the detector: it decides how
+    /// long a stretch is held open before it is called finished, and the answer
+    /// differs between the pass that runs after a meeting and the one that runs
+    /// during it (see [`crate::audio::vad::Listening`]).
+    fn open_stream(
+        &self,
+        detector: Option<&Path>,
+        channel: Channel,
+        listening: crate::audio::vad::Listening,
+    ) -> Self::Stream;
 }
 
 /// A speech detector with a memory, fed one window at a time.
@@ -409,9 +427,18 @@ impl AudioSource for DiskAudio {
             .map_err(|e| AsrError::Io(e.to_string()))
     }
 
-    fn open_stream(&self, detector: Option<&Path>, channel: Channel) -> DiskStream {
+    fn open_stream(
+        &self,
+        detector: Option<&Path>,
+        channel: Channel,
+        listening: crate::audio::vad::Listening,
+    ) -> DiskStream {
         let detector = detector.and_then(|path| {
-            match crate::audio::vad::OfflineDetector::open(Some(path.to_path_buf()), channel) {
+            match crate::audio::vad::OfflineDetector::open(
+                Some(path.to_path_buf()),
+                channel,
+                listening,
+            ) {
                 Ok(open) => Some(open),
                 Err(e) => {
                     tracing::warn!(%e, "could not start speech detection; reading the audio whole");
@@ -602,7 +629,7 @@ where
         report.to_ms = report.to_ms.max(end);
         let mut cursor = start;
         // One detector for this whole stretch, however many reads it takes.
-        let mut speech = audio.open_stream(detector.as_deref(), channel);
+        let mut speech = audio.open_stream(detector.as_deref(), channel, options.listening);
         let mut read_it_all = false;
         // The window being filled with consecutive stretches of this channel.
         let mut pack: Option<Pack> = None;
@@ -1703,7 +1730,12 @@ mod tests {
                 .collect())
         }
 
-        fn open_stream(&self, _detector: Option<&Path>, channel: Channel) -> FakeStream {
+        fn open_stream(
+            &self,
+            _detector: Option<&Path>,
+            channel: Channel,
+            _listening: crate::audio::vad::Listening,
+        ) -> FakeStream {
             self.detectors.fetch_add(1, Ordering::SeqCst);
             FakeStream {
                 channel,
@@ -2759,9 +2791,75 @@ mod tests {
         // with room to spare or the saving is spent on a second encode.
         const { assert!(MAX_PACK_MS < 30_000) };
         const { assert!(MAX_PACK_MS >= 24_000) };
-        // And the detector's own cap is inside the budget, so no single stretch
-        // can overflow a window on its own.
-        const { assert!(crate::audio::vad::MAX_UTTERANCE_MS <= MAX_PACK_MS) };
+    }
+
+    /// A stretch wider than the budget is handed over wider than the budget.
+    ///
+    /// KNOWN, PINNED, NOT FIXED — this test exists to state the real behaviour
+    /// rather than a flattering one. [`Pack::would_hold`] is only asked before
+    /// *extending* a window; a pack that is already over budget the moment it is
+    /// made is never asked at all. Under the post-meeting budget that never
+    /// bites, because the detector's own cap fits inside it. Under the narrower
+    /// budget the during-a-meeting pass uses it does: one unbroken stretch at
+    /// [`crate::audio::vad::MAX_UTTERANCE_MS`] (24 s) becomes a 24 s window when
+    /// [`LIVE_PACK_MS`] asked for 12 s, and a live caption queued behind it
+    /// waits out the wider encode.
+    ///
+    /// The cost is carried on purpose, because both available fixes are worse
+    /// than the bug. Splitting a pack *through* a stretch puts back the
+    /// arbitrary boundary [`crate::audio::vad::OfflineDetector`] exists to
+    /// abolish — a line drawn by a buffer size instead of by a pause, which is
+    /// the precise defect streamed detection was built to remove. Capping
+    /// `max_utterance_ms` at the live budget is worse still: it moves the cut
+    /// into the detector, forcing it through speech on every long stretch, in
+    /// both passes, to spare one encode in one of them.
+    #[test]
+    fn a_stretch_wider_than_the_budget_is_still_one_window() {
+        const CAP_MS: i64 = crate::audio::vad::MAX_UTTERANCE_MS;
+        // Under the post-meeting budget the question does not arise…
+        const { assert!(CAP_MS <= MAX_PACK_MS) };
+        // …and under the live one it does.
+        const { assert!(CAP_MS > LIVE_PACK_MS) };
+
+        let monologue = Utterance {
+            t_start_ms: 0,
+            t_end_ms: CAP_MS,
+            samples: vec![0.2; 16],
+            ..Default::default()
+        };
+        let pack = Pack::of(&monologue, (0, 60_000)).expect("the stretch is inside the hole");
+        assert_eq!(
+            pack.len_ms(),
+            CAP_MS,
+            "one stretch, one window — the budget is not consulted here"
+        );
+        assert!(
+            pack.len_ms() > LIVE_PACK_MS,
+            "a {} ms window went out under a {LIVE_PACK_MS} ms budget",
+            pack.len_ms()
+        );
+        // The check that does happen: nothing more may be added to it.
+        assert!(!pack.would_hold(
+            &Pack {
+                from_ms: pack.to_ms,
+                to_ms: pack.to_ms + 1,
+                stretches: 1,
+                voiced: VoicedSpans::default(),
+            },
+            LIVE_PACK_MS
+        ));
+    }
+
+    /// Catching up runs during a meeting as well as after one, and during a
+    /// meeting somebody is watching the transcript fill in. So the live settings
+    /// are the default and the post-meeting caller is the one that opts out of
+    /// them (`session::ports`).
+    #[test]
+    fn catching_up_listens_live_unless_it_is_told_otherwise() {
+        assert_eq!(
+            CatchUpOptions::default().listening,
+            crate::audio::vad::Listening::Live
+        );
     }
 
     #[test]
@@ -4263,7 +4361,12 @@ mod tests {
             Ok(Self::span(track, from_ms, to_ms))
         }
 
-        fn open_stream(&self, _detector: Option<&Path>, channel: Channel) -> BleedStream {
+        fn open_stream(
+            &self,
+            _detector: Option<&Path>,
+            channel: Channel,
+            _listening: crate::audio::vad::Listening,
+        ) -> BleedStream {
             BleedStream { channel }
         }
     }

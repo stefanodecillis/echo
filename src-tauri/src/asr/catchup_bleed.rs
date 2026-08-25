@@ -639,7 +639,12 @@ mod tests {
             Ok(self.far_span(from_ms, to_ms))
         }
 
-        fn open_stream(&self, _detector: Option<&Path>, _channel: Channel) -> NoStream {
+        fn open_stream(
+            &self,
+            _detector: Option<&Path>,
+            _channel: Channel,
+            _listening: crate::audio::vad::Listening,
+        ) -> NoStream {
             NoStream
         }
     }
