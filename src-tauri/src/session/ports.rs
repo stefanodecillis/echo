@@ -221,6 +221,17 @@ pub trait AsrPort: Send + Sync + 'static {
     /// nothing new the memory goes back. Default: nothing to hold.
     fn hold_resident(&self, _resident: bool) {}
 
+    /// What language this meeting has settled on, if it has yet.
+    ///
+    /// The engine decides this, not the session layer: it is the only place that
+    /// hears enough of a meeting to weigh one stretch against the rest of it
+    /// (`crate::asr::language`). Deciding it here — from the first line that
+    /// came back — is what wrote a whole Italian meeting down as Danish on
+    /// 2026-08-24. Default: nothing settled.
+    fn settled_language(&self, _meeting_id: &str) -> Option<String> {
+        None
+    }
+
     /// Throw away captions of speech that is still going. Default: nothing to
     /// throw away.
     fn abandon_speculative(&self, _meeting_id: &str) {}
@@ -382,6 +393,10 @@ impl AsrPort for EngineAsr {
 
     fn hold_resident(&self, resident: bool) {
         self.worker.set_resident(resident);
+    }
+
+    fn settled_language(&self, meeting_id: &str) -> Option<String> {
+        self.worker.meeting_language(meeting_id)
     }
 
     fn abandon_speculative(&self, meeting_id: &str) {

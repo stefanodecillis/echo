@@ -423,8 +423,11 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
         tracing::debug!(%error, "could not clear live text");
     }
     if let Ok(hist) = repo::language_histogram(&ctx.db, &meeting_id).await {
-        if let Some((language, _)) = hist.first() {
-            let _ = repo::set_meeting_language(&ctx.db, &meeting_id, language).await;
+        // Most speaking time wins, but a language holding a sliver of the
+        // transcript never does — one sentence misread as Chinese is not what
+        // the meeting was in (see [`crate::asr::language::spoken_in`]).
+        if let Some(language) = crate::asr::language::spoken_in(&hist).dominant {
+            let _ = repo::set_meeting_language(&ctx.db, &meeting_id, &language).await;
         }
     }
 
@@ -1382,8 +1385,33 @@ impl JobRuntime {
         let parked = repo::pause_active_jobs(&self.db).await?;
         if parked > 0 {
             tracing::info!(parked, "background work parked");
+            // And say so on the screens, not only in the menu bar. A meeting
+            // whose work is parked used to keep whatever it was last told —
+            // "Working out who said what…" over a bar that had stopped moving —
+            // for as long as the recording lasted, which on a day of
+            // back-to-back meetings is most of the day. The rows have already
+            // changed in the table; this is what carries the change to anything
+            // looking at them.
+            self.announce_all_active().await;
         }
         Ok(())
+    }
+
+    /// Re-announce every unfinished job, so screens holding a list of them
+    /// redraw from what the table says now.
+    async fn announce_all_active(&self) {
+        let query = JobQuery {
+            active_only: Some(true),
+            ..Default::default()
+        };
+        match repo::list_jobs(&self.db, &query).await {
+            Ok(jobs) => {
+                for job in jobs {
+                    self.announce(&job);
+                }
+            }
+            Err(error) => tracing::warn!(%error, "could not say which work is waiting"),
+        }
     }
 
     /// The recording finished. Let the parked work continue.
@@ -1392,6 +1420,12 @@ impl JobRuntime {
         let resumed = repo::resume_paused_jobs(&self.db).await?;
         if resumed > 0 {
             tracing::info!(resumed, "background work picked back up");
+            // The other edge of the same sentence. Parking says "paused until
+            // the recording ends"; without this, that line stays on screen
+            // after the recording has ended, on every row except the one that
+            // happens to start running next — which is the same stale sentence
+            // this pair of announcements exists to stop.
+            self.announce_all_active().await;
         }
         // Also the launch path, where work left over from a crash is un-parked:
         // whatever is outstanding now decides whether the engine is held, and
@@ -2404,6 +2438,99 @@ mod tests {
             repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
             JobStatus::Queued
         );
+    }
+
+    /// Parking work is not a silent state change.
+    ///
+    /// The rows go to `paused` the moment a recording starts, but until the
+    /// screens are told, a meeting keeps whatever it last said — "Working out
+    /// who said what…" over a bar that has stopped moving — for as long as the
+    /// recording lasts. On a day of back-to-back meetings that is most of the
+    /// day, and it reads as Echo being stuck rather than as Echo waiting.
+    #[tokio::test]
+    async fn work_parked_for_a_recording_is_announced_as_parked() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let meeting = repo::create_meeting(&db, "Weekly sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        let job = repo::create_job(&db, Some(&meeting.id), JobKind::Diarize)
+            .await
+            .unwrap();
+
+        let collecting = Arc::new(super::super::mock::CollectingEvents::default());
+        let events = crate::session::ports::EventBus::new();
+        events.set(collecting.clone());
+        let runtime = JobRuntime::new(
+            db.clone(),
+            crate::paths::AppPaths::rooted_at(std::env::temp_dir().join("echo-jobs"), None),
+            crate::session::ports::Ports {
+                capture: Arc::new(super::super::mock::MockCapture::new()),
+                asr: Arc::new(super::super::mock::MockAsr::new()),
+                executor: Arc::new(DefaultJobExecutor),
+                events,
+            },
+        );
+
+        runtime.preempt().await.unwrap();
+
+        let said = collecting.job_progress();
+        let parked = said
+            .iter()
+            .find(|p| p.job.id == job.id)
+            .expect("the parked job was announced");
+        assert_eq!(parked.job.status, JobStatus::Paused);
+    }
+
+    /// And neither is un-parking it.
+    ///
+    /// Only one row is announced when work actually starts, so every other row
+    /// would go on saying "paused until the recording ends" with nothing
+    /// recording — the same stale sentence, on the other edge. A meeting with
+    /// two pieces of work outstanding is the ordinary case, so this test has
+    /// two.
+    #[tokio::test]
+    async fn work_let_go_when_the_recording_ends_is_announced_as_waiting() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let meeting = repo::create_meeting(&db, "Weekly sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        let diarize = repo::create_job(&db, Some(&meeting.id), JobKind::Diarize)
+            .await
+            .unwrap();
+        let summarize = repo::create_job(&db, Some(&meeting.id), JobKind::Summarize)
+            .await
+            .unwrap();
+
+        let collecting = Arc::new(super::super::mock::CollectingEvents::default());
+        let events = crate::session::ports::EventBus::new();
+        events.set(collecting.clone());
+        let runtime = JobRuntime::new(
+            db.clone(),
+            crate::paths::AppPaths::rooted_at(std::env::temp_dir().join("echo-jobs"), None),
+            crate::session::ports::Ports {
+                capture: Arc::new(super::super::mock::MockCapture::new()),
+                asr: Arc::new(super::super::mock::MockAsr::new()),
+                executor: Arc::new(DefaultJobExecutor),
+                events,
+            },
+        );
+
+        runtime.preempt().await.unwrap();
+        runtime.release().await.unwrap();
+
+        // The last thing said about each row is what a screen is left showing.
+        let said = collecting.job_progress();
+        for id in [&diarize.id, &summarize.id] {
+            let last = said
+                .iter()
+                .rfind(|p| &p.job.id == id)
+                .expect("the job was announced");
+            assert_eq!(
+                last.job.status,
+                JobStatus::Queued,
+                "a row left saying it is paused with nothing recording"
+            );
+        }
     }
 
     /// A stage with no fraction says so, rather than leaving a bar parked at the

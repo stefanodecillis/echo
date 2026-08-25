@@ -254,6 +254,9 @@ impl LiveLines {
 
 /// The language this meeting has settled on, shared the same way: a caption
 /// borrows it rather than paying for a detection pass of its own.
+///
+/// A mirror of the engine's answer, never a decision of its own — see the note
+/// where it is written in [`transcribe`].
 #[derive(Debug, Default, Clone)]
 struct LiveLanguage(Arc<Mutex<Option<String>>>);
 
@@ -262,8 +265,15 @@ impl LiveLanguage {
         self.0.lock().expect("live language poisoned").clone()
     }
 
-    fn set(&self, language: &str) {
-        *self.0.lock().expect("live language poisoned") = Some(language.to_string());
+    /// Take this answer, and say whether it is news. A meeting that changes
+    /// language mid-way is news twice, which is why this is not "set once".
+    fn changed_to(&self, language: &str) -> bool {
+        let mut held = self.0.lock().expect("live language poisoned");
+        if held.as_deref() == Some(language) {
+            return false;
+        }
+        *held = Some(language.to_string());
+        true
     }
 }
 
@@ -1190,7 +1200,14 @@ async fn transcribe(
         channel,
         t_start_ms,
         samples: utterance.samples,
-        language_hint: hint,
+        // No hint from here. Which language a meeting is in is the engine's
+        // decision, and it is the only place that sees enough of the meeting to
+        // make it — see [`crate::asr::language`] and the note above the mirror
+        // further down this function.
+        language_hint: None,
+        // The padding at both ends of an utterance is not evidence about the
+        // language; this is how much of it the detector called voice.
+        voiced_ms: Some(voiced_ms),
         want_partials: !captioned,
         // Live work gives way when the queue is full; the catch-up pass picks
         // this stretch up from disk instead (mantra 3).
@@ -1330,10 +1347,22 @@ async fn transcribe(
         return None;
     }
 
-    if language.get().is_none() {
-        if let Some(detected) = transcription.language.clone() {
-            language.set(&detected);
-            if let Err(error) = repo::set_meeting_language(&inner.db, meeting_id, &detected).await {
+    // What language the meeting is in is not this line's decision.
+    //
+    // It used to be: whatever the first non-empty final came back as was written
+    // onto the meeting and passed as the hint for everything after it. On
+    // 2026-08-24 the first final was 2.3 seconds long and came back "Danish" at
+    // 0.522 confidence, and seventy-five minutes of Italian were written down as
+    // Danish — 880 segments and a recap — because from that moment on there was
+    // a hint, so nothing ever detected again.
+    //
+    // The engine gathers the evidence and decides (`crate::asr::language`); this
+    // only mirrors the answer, so the live view and the meeting row say what the
+    // engine settled on — including when it settles on something different
+    // halfway through, which is the whole point of asking again.
+    if let Some(settled) = inner.ports.asr.settled_language(meeting_id) {
+        if language.changed_to(&settled) {
+            if let Err(error) = repo::set_meeting_language(&inner.db, meeting_id, &settled).await {
                 tracing::debug!(%error, "could not store the meeting language");
             }
         }
@@ -1384,7 +1413,14 @@ async fn transcribe(
             channel,
             speaker_id,
             text: text.to_string(),
-            language: transcription.language,
+            // What these seconds were *heard* to be in, which is not the same
+            // as what they were read in: a stretch that inherited the meeting's
+            // answer records nothing, so the histogram this feeds is a set of
+            // observations and not a tally of the pin
+            // (`asr::Transcription::observed_language`). The carry above is a
+            // different question — it asks what the words were read in — so it
+            // keeps using the language itself.
+            language: transcription.observed_language(),
             avg_confidence: transcription.avg_confidence,
             revision: 1,
             is_final: true,
@@ -1849,6 +1885,9 @@ async fn caption(
         // Whatever the meeting has settled on. A caption never pays for a
         // detection pass of its own.
         language_hint: language.get(),
+        // Speech that is still going: the detector has not finished measuring
+        // it, and a caption never votes on the language anyway.
+        voiced_ms: None,
         // The result *is* the partial; there is nothing to stream out of it.
         want_partials: false,
         droppable: true,
@@ -2673,6 +2712,108 @@ mod tests {
         assert_eq!(
             what_gets_written("Grazie, allora vediamo domani.", 96).await,
             vec!["Grazie, allora vediamo domani."]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // What language the meeting is in (2026-08-24)
+    // -----------------------------------------------------------------------
+
+    /// One utterance, one answer from the engine, and what the meeting row is
+    /// left saying about the language.
+    async fn language_after(settles_on: Option<&str>) -> Option<String> {
+        let h = crate::session::mock::Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        if let Some(language) = settles_on {
+            h.asr.settles_on(&id, language);
+        }
+        h.capture
+            .send(crate::session::ports::CaptureSignal::UtteranceReady(
+                Utterance {
+                    channel: Channel::Mic,
+                    t_start_ms: 200,
+                    t_end_ms: 2_500,
+                    samples: vec![0.0; 36_800],
+                    truncated: false,
+                    voiced_ms: 2_300,
+                },
+            ));
+        h.settle().await;
+        // Read while the meeting is still going: this is about what the live
+        // pass decides. What the disk pass makes of the finished transcript is
+        // a different question, and a later one.
+        repo::get_meeting(&h.db, &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .language
+    }
+
+    /// The 2026-08-24 meeting, from the outside. The first final came back with
+    /// a language on it — as every final does — and that used to be the end of
+    /// the argument: the meeting was pinned to it and nothing detected again.
+    /// A 2.3-second "sì" made seventy-five minutes of Italian Danish.
+    #[tokio::test]
+    async fn the_first_line_back_does_not_pin_the_meeting_language() {
+        assert_eq!(
+            language_after(None).await,
+            None,
+            "the engine has not settled on anything, so neither has the meeting"
+        );
+    }
+
+    /// And what does decide it: the engine, once it has heard enough to say so.
+    #[tokio::test]
+    async fn the_meeting_takes_the_language_the_engine_settled_on() {
+        assert_eq!(language_after(Some("it")).await.as_deref(), Some("it"));
+    }
+
+    /// People code-switch, so the answer is allowed to change while the meeting
+    /// is still going — and the row has to follow it, or the recap is written in
+    /// the language of the first ten minutes.
+    #[tokio::test]
+    async fn a_meeting_that_changes_language_changes_the_row_with_it() {
+        let h = crate::session::mock::Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        let said = |at: i64| {
+            h.capture
+                .send(crate::session::ports::CaptureSignal::UtteranceReady(
+                    Utterance {
+                        channel: Channel::Mic,
+                        t_start_ms: at,
+                        t_end_ms: at + 2_000,
+                        samples: vec![0.0; 32_000],
+                        truncated: false,
+                        voiced_ms: 1_800,
+                    },
+                ));
+        };
+
+        h.asr.settles_on(&id, "it");
+        said(200);
+        h.settle().await;
+        assert_eq!(
+            repo::get_meeting(&h.db, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .language
+                .as_deref(),
+            Some("it")
+        );
+
+        h.asr.settles_on(&id, "en");
+        said(10_000);
+        h.settle().await;
+        assert_eq!(
+            repo::get_meeting(&h.db, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .language
+                .as_deref(),
+            Some("en"),
+            "the meeting followed the language the engine moved to"
         );
     }
 

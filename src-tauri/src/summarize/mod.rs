@@ -490,20 +490,30 @@ async fn build_transcript_text(db: &Db, meeting_id: &str) -> Result<String, Summ
     Ok(out)
 }
 
-/// The meeting's dominant language: the one with the most speaking time in
-/// final segments, falling back to whatever the meeting row already says.
+/// What language this meeting was held in, read off the transcript: the one
+/// with the most speaking time in final segments, falling back to whatever the
+/// meeting row already says.
+///
+/// Two rules on top of "most speaking time", both from the 2026-08-24 meeting
+/// (see [`crate::asr::language::spoken_in`]): a language holding a sliver of the
+/// transcript never wins, and a second language holding a real share of it is
+/// carried through to the prompt instead of being averaged away.
 async fn dominant_language(
     db: &Db,
     meeting_id: &str,
     fallback: Option<&str>,
-) -> Result<Option<String>, SummarizeError> {
+) -> Result<crate::asr::language::Spoken, SummarizeError> {
     let histogram = repo::language_histogram(db, meeting_id)
         .await
         .map_err(db_err)?;
-    if let Some((lang, _ms)) = histogram.into_iter().next() {
-        return Ok(Some(lang));
+    let spoken = crate::asr::language::spoken_in(&histogram);
+    if spoken.dominant.is_some() {
+        return Ok(spoken);
     }
-    Ok(fallback.map(String::from))
+    Ok(crate::asr::language::Spoken {
+        dominant: fallback.map(String::from),
+        also: None,
+    })
 }
 
 /// A finished recap and the task list that came with it.
@@ -620,14 +630,14 @@ pub async fn summarize_meeting_with_actions(
         .language
         .clone()
         .unwrap_or_else(|| app_settings.summary_language.clone());
-    let meeting_language =
-        dominant_language(db, &req.meeting_id, meeting.language.as_deref()).await?;
+    let spoken = dominant_language(db, &req.meeting_id, meeting.language.as_deref()).await?;
 
     let mut ctx = templates::RenderContext {
         meeting_title: meeting.title.clone(),
         started_at: meeting.started_at.clone(),
         duration_ms: meeting.duration_ms,
-        meeting_language,
+        meeting_language: spoken.dominant,
+        also_spoken: spoken.also,
         output_language,
         speakers,
         transcript_chunk: String::new(),
@@ -1349,6 +1359,76 @@ mod tests {
             action_item_language(Some("  "), &SummaryLanguage::English),
             SummaryLanguage::English
         );
+    }
+
+    // -- what language the meeting was in ----------------------------------
+
+    /// A transcript made of stretches: `(language, milliseconds)`.
+    async fn transcript_of(db: &Db, spoken: &[(&str, i64)]) -> String {
+        use crate::types::{Channel, SegmentDraft};
+
+        let meeting = repo::create_meeting(db, "Weekly sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        let mut at = 0;
+        let drafts: Vec<SegmentDraft> = spoken
+            .iter()
+            .map(|(language, ms)| {
+                let draft = SegmentDraft {
+                    meeting_id: meeting.id.clone(),
+                    t_start_ms: at,
+                    t_end_ms: at + ms,
+                    channel: Channel::Mic,
+                    speaker_id: None,
+                    text: "qualcosa".to_string(),
+                    language: Some((*language).to_string()),
+                    avg_confidence: Some(0.9),
+                    revision: 1,
+                    is_final: true,
+                    model_name: None,
+                    model_revision: None,
+                    corrections: Vec::new(),
+                };
+                at += ms;
+                draft
+            })
+            .collect();
+        repo::insert_segments(db, &drafts).await.unwrap();
+        meeting.id
+    }
+
+    /// One line out of a whole meeting misread as another language decides
+    /// nothing — on 2026-08-24 a single stray segment was the sort of thing
+    /// that could have taken the recap with it.
+    #[tokio::test]
+    async fn a_stray_line_never_decides_what_the_recap_is_written_in() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let meeting_id = transcript_of(&db, &[("it", 3_600_000), ("zh", 30_000)]).await;
+        let spoken = dominant_language(&db, &meeting_id, None).await.unwrap();
+        assert_eq!(spoken.dominant.as_deref(), Some("it"));
+        assert_eq!(spoken.also, None, "one percent is not a language it was in");
+    }
+
+    /// And a meeting really held in two languages says so, so the recap is
+    /// written in one of them rather than averaged between them.
+    #[tokio::test]
+    async fn a_meeting_held_in_two_languages_reaches_the_prompt_as_both() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let meeting_id = transcript_of(&db, &[("it", 700_000), ("en", 300_000)]).await;
+        let spoken = dominant_language(&db, &meeting_id, None).await.unwrap();
+        assert_eq!(spoken.dominant.as_deref(), Some("it"));
+        assert_eq!(spoken.also.as_deref(), Some("en"));
+    }
+
+    /// Nothing on the transcript to go on: whatever the meeting row says.
+    #[tokio::test]
+    async fn a_transcript_with_no_languages_falls_back_to_the_meeting_row() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let meeting_id = transcript_of(&db, &[]).await;
+        let spoken = dominant_language(&db, &meeting_id, Some("de"))
+            .await
+            .unwrap();
+        assert_eq!(spoken.dominant.as_deref(), Some("de"));
     }
 
     // -- one recap, one task-list pass -------------------------------------

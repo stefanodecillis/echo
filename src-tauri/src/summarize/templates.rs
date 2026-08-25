@@ -89,6 +89,11 @@ pub struct RenderContext {
     pub duration_ms: i64,
     /// Detected language of the meeting, for the "same as the meeting" setting.
     pub meeting_language: Option<String>,
+    /// A second language a real part of the meeting was held in, when there was
+    /// one. A meeting that ran a third in English is not the same job as one
+    /// that ran entirely in Italian, and the instruction should say so rather
+    /// than leave the model to average the two.
+    pub also_spoken: Option<String>,
     /// What language to write the recap in.
     pub output_language: SummaryLanguage,
     pub speakers: Vec<Speaker>,
@@ -195,10 +200,21 @@ fn language_directive(ctx: &RenderContext) -> String {
 fn language_directive_for(ctx: &RenderContext, what: &str) -> String {
     match &ctx.output_language {
         SummaryLanguage::SameAsMeeting => match &ctx.meeting_language {
-            Some(lang) => format!(
-                "Write {what} in the same language the meeting was held in, {}.",
-                language_name(lang)
-            ),
+            Some(lang) => {
+                let mut directive = format!(
+                    "Write {what} in the same language the meeting was held in, {}.",
+                    language_name(lang)
+                );
+                if let Some(also) = ctx.also_spoken.as_deref().filter(|a| a != &lang.as_str()) {
+                    directive.push_str(&format!(
+                        " Parts of it were held in {}: write {what} in {} anyway, and keep names \
+                         and quoted words as they were said.",
+                        language_name(also),
+                        language_name(lang)
+                    ));
+                }
+                directive
+            }
             None => format!("Write {what} in the same language the meeting was held in."),
         },
         SummaryLanguage::English => format!("Write {what} in English."),
@@ -545,6 +561,28 @@ mod tests {
             language_directive(&unknown),
             "Write the recap in the same language the meeting was held in."
         );
+    }
+
+    /// A meeting a real part of which was held in another language: the prompt
+    /// says so, and still asks for one recap in one language. Silently averaging
+    /// the two is how a bilingual meeting gets written up in neither.
+    #[test]
+    fn a_meeting_held_in_two_languages_says_so_in_the_prompt() {
+        let ctx = RenderContext {
+            output_language: SummaryLanguage::SameAsMeeting,
+            meeting_language: Some("it".into()),
+            also_spoken: Some("en".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            language_directive(&ctx),
+            "Write the recap in the same language the meeting was held in, Italian. Parts of it \
+             were held in English: write the recap in Italian anyway, and keep names and quoted \
+             words as they were said."
+        );
+        // No codes anywhere in the prompt a model actually reads.
+        let prompt = render(&general_recap(), &ctx);
+        assert!(!prompt.contains("(en)"), "{prompt}");
     }
 
     #[test]

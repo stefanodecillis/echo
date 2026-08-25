@@ -980,6 +980,11 @@ async fn decode_pack<T: Transcriber>(
         t_start_ms: pack.from_ms,
         samples,
         language_hint: prior.clone(),
+        // A packed window is mostly the pauses between the things that were
+        // said. Voting on the language with the width of the window would let
+        // one sentence inside half a minute of silence outweigh half a minute
+        // of somebody actually talking.
+        voiced_ms: Some(pack.voiced.voiced_ms(pack.from_ms, pack.to_ms)),
         want_partials: work.options.want_partials,
         // Catch-up work is the last chance this audio has, so it waits for the
         // queue instead of being dropped.
@@ -1754,6 +1759,7 @@ mod tests {
                 text: self.text.clone(),
                 language: pinned.or(Some("en".into())),
                 language_confidence: None,
+                language_inherited: false,
                 avg_confidence: Some(0.9),
                 model_name: Some("test weights".into()),
                 model_revision: Some("rev1".into()),
@@ -1838,6 +1844,7 @@ mod tests {
                 text: text.into(),
                 language: Some(language.into()),
                 language_confidence: None,
+                language_inherited: false,
                 avg_confidence: Some(confidence),
                 model_name: Some("test weights".into()),
                 model_revision: Some("rev1".into()),
@@ -1912,6 +1919,7 @@ mod tests {
                 text: text.into(),
                 language: Some(language.into()),
                 language_confidence: None,
+                language_inherited: false,
                 avg_confidence: Some(confidence),
                 model_name: Some("test weights".into()),
                 model_revision: Some("rev1".into()),

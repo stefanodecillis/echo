@@ -759,13 +759,7 @@ impl Engine {
         params.set_logprob_thold(decoding.params.logprob_thold);
         params.set_no_speech_thold(decoding.params.no_speech_thold);
 
-        match job.language_hint.as_deref() {
-            Some(lang) => params.set_language(Some(lang)),
-            None => {
-                params.set_language(Some("auto"));
-                params.set_detect_language(true);
-            }
-        }
+        params.set_language(Some(whisper_language(job.language_hint.as_deref())));
 
         self.sink.begin(if job.want_partials {
             on_partial.map(SharedPartial::from)
@@ -1004,6 +998,25 @@ fn install_abort_callback(
         params.set_abort_callback_user_data(user_data);
     }
     (callback, user_data)
+}
+
+/// What to tell whisper.cpp this audio is in.
+///
+/// "auto" is the whole of it, and there is a second switch that must stay off.
+/// whisper.cpp auto-detects when the language is empty or "auto" **or** when
+/// `detect_language` is set — and then, if `detect_language` is set, it returns
+/// straight away with the answer and no segments at all (whisper.cpp
+/// `whisper_full_with_state`: `if (params.detect_language) { return 0; }`). It
+/// is a different request: "tell me the language" rather than "write this
+/// down". Echo asked for both at once, so every decode that had no hint to go on
+/// came back successful and empty — which is the state a meeting is in for its
+/// first few utterances, and the state "listen again" deliberately puts one back
+/// into.
+fn whisper_language(hint: Option<&str>) -> &str {
+    match hint {
+        Some(language) if !language.trim().is_empty() => language,
+        _ => "auto",
+    }
 }
 
 /// Zero-pad the tail so whisper.cpp always gets a window it can encode.
@@ -1498,6 +1511,13 @@ struct Shared {
     abort: Arc<AtomicBool>,
     /// The language each meeting settled on.
     languages: Mutex<HashMap<String, String>>,
+    /// How each meeting in flight is making that decision.
+    ///
+    /// Shared rather than owned by the engine thread, because forgetting a
+    /// meeting has to reach it: "listen again" exists to escape a wrong
+    /// language, and a policy still pinned to Danish in the worker's own memory
+    /// would hand the repair pass the very answer it is running away from.
+    policies: Mutex<HashMap<String, LanguagePolicy>>,
 }
 
 /// Serialises jobs onto one loaded engine, loading on demand and unloading when
@@ -1822,11 +1842,21 @@ impl EngineWorker {
     }
 
     /// Forget a finished meeting's language and cancellation state.
+    ///
+    /// Both halves of the language, deliberately: the answer *and* the evidence
+    /// behind it. "Listen again" exists to escape a wrong language, and leaving
+    /// the settled policy in place would have the next pass detect nothing and
+    /// reproduce the same transcript more expensively.
     pub fn forget_meeting(&self, meeting_id: &str) {
         self.shared
             .languages
             .lock()
             .expect("language map poisoned")
+            .remove(meeting_id);
+        self.shared
+            .policies
+            .lock()
+            .expect("language policies poisoned")
             .remove(meeting_id);
         self.allow_meeting(meeting_id);
     }
@@ -1912,7 +1942,6 @@ fn should_reload_weights(consecutive_failures: u32, already_reloaded: bool) -> b
 fn run(shared: Arc<Shared>) {
     let mut engine: Option<Engine> = None;
     let mut last_needed = Instant::now();
-    let mut policies: HashMap<String, LanguagePolicy> = HashMap::new();
     // Whether new finals are currently narrowing their beam, so the log gets one
     // line per episode rather than one per utterance.
     let mut behind = false;
@@ -1960,7 +1989,7 @@ fn run(shared: Arc<Shared>) {
                         }
                     }
                 }
-                let answer = run_job(&mut engine, &shared, &mut policies, *job, plan, on_partial);
+                let answer = run_job(&mut engine, &shared, *job, plan, on_partial);
                 last_needed = Instant::now();
                 // A run of failures is about the engine, not the audio. Rebuild
                 // the state after each one (that happens in `Engine`), and after
@@ -2049,7 +2078,6 @@ fn ensure_loaded<'a>(
 fn run_job(
     engine: &mut Option<Engine>,
     shared: &Shared,
-    policies: &mut HashMap<String, LanguagePolicy>,
     mut job: TranscribeJob,
     plan: DecodePlan,
     on_partial: Option<PartialFn>,
@@ -2072,70 +2100,158 @@ fn run_job(
     });
     shared.abort.store(false, Ordering::SeqCst);
 
-    // --- language: detect until settled, then pin (review finding 21) ------
+    // --- language: keep asking until the meeting is settled, and keep asking
+    // now and then after that (review finding 21; the 2026-08-24 meeting) -----
+    //
+    // The old shape of this was `if job.language_hint.is_none()`, and the
+    // session layer pinned the meeting from the first line it managed to write.
+    // Between them there was never a second detection: the policy below could
+    // not gather the evidence it needs, and a meeting could not change language
+    // however long somebody spoke another one.
+    let mut policies = shared.policies.lock().expect("language policies poisoned");
     let policy = policies.entry(job.meeting_id.clone()).or_default();
-    let speech_ms = job.duration_ms();
+    // What the detector actually heard, not how wide the window was. A catch-up
+    // window is mostly the pauses between what was said, by construction, and
+    // weighting a language vote by the padding is weighting it by silence.
+    let speech_ms = job.voice_ms();
+    // A caption never pays for a detection pass of its own: it borrows whatever
+    // the meeting has settled on, and lets whisper decide when there is nothing
+    // to borrow yet. Detection is an encode, and this hypothesis is replaced in
+    // three seconds.
+    let a_caption = plan.kind.is_speculative();
+    // A re-reading is asked for precisely *because* the meeting's answer does
+    // not fit this stretch, so it never inherits that answer and never votes
+    // with it either: those same seconds already voted, through the reading this
+    // one is checking ([`TranscribeJob::detect_afresh`]).
+    let a_second_reading = job.detect_afresh;
     let mut detected_confidence = None;
-    if job.language_hint.is_none() {
-        // Copy the hint out before doing anything else with the policy, so the
-        // borrow ends here rather than covering the branch below.
-        //
-        // A re-reading is the one job that does not get it: catch-up asks for
-        // one when a stretch looks out of step with the meeting around it, and
-        // handing it the meeting's settled answer would hand it the thing it is
-        // trying to get away from ([`TranscribeJob::detect_afresh`]).
-        let pinned = if job.detect_afresh {
-            None
-        } else {
-            policy.hint().map(str::to_string)
-        };
-        if let Some(pinned) = pinned {
-            job.language_hint = Some(pinned);
-        } else if plan.kind.is_speculative() {
-            // A caption never pays for a detection pass of its own: it borrows
-            // whatever the meeting has settled on, and lets whisper decide when
-            // there is nothing to borrow yet. Detection is an encode, and this
-            // hypothesis is replaced in three seconds.
-        } else if job.detect_afresh || policy.wants_detection(speech_ms) {
+    // Was the language this stretch is read in heard *in these seconds*, or is
+    // it just the meeting's standing answer handed down? Only the first is an
+    // observation, and only observations belong on the segment row — see the
+    // note where this is used, below the decode.
+    let mut heard_in_this_stretch = false;
+
+    if job.language_hint.is_none() && a_caption {
+        job.language_hint = policy.hint().map(str::to_string);
+    } else if job.language_hint.is_none() {
+        let ask = a_second_reading || policy.wants_detection(speech_ms);
+        let detected = if ask {
             match engine.detect_language(&job.samples) {
                 Ok((language, confidence)) => {
                     detected_confidence = Some(confidence);
-                    // A second reading of a window is not fresh evidence about
-                    // the meeting: those same seconds already voted, through the
-                    // reading this one is checking. Counting them twice would
-                    // let one stretch somebody read out in another language pull
-                    // the whole meeting after it.
-                    if !job.detect_afresh {
-                        if let Decision::Pinned(settled) =
-                            policy.observe(&language, confidence, speech_ms)
-                        {
-                            shared
-                                .languages
-                                .lock()
-                                .expect("language map poisoned")
-                                .insert(job.meeting_id.clone(), settled);
-                        }
-                    }
-                    // Use what we just found for this utterance even before the
-                    // meeting as a whole has settled.
-                    job.language_hint = Some(language);
+                    Some((language, confidence))
                 }
                 Err(e) => {
                     // Detection is an optimisation. Losing it means whisper
                     // detects internally instead, which is fine.
                     tracing::debug!(%e, "could not work out the language; letting the engine decide");
+                    None
                 }
             }
+        } else {
+            None
+        };
+        if let Some((language, confidence)) = detected.as_ref().filter(|_| !a_second_reading) {
+            let decision = policy.observe(language, *confidence, speech_ms);
+            announce(shared, &job.meeting_id, policy, &decision, *confidence);
         }
+        let observed =
+            crate::asr::language::usable(detected.as_ref().map(|(l, c)| (l.as_str(), *c)));
+        // A hint that came out of this stretch's own detection is an
+        // observation of these seconds, whether or not it agrees with the
+        // meeting; the meeting's settled answer handed down is not. And no hint
+        // at all ends in an observation too — whisper detects internally during
+        // the decode and reports what it found.
+        heard_in_this_stretch = if a_second_reading {
+            // A second reading exists precisely to hear these seconds afresh.
+            true
+        } else {
+            observed.is_some() || !policy.is_settled()
+        };
+        // What this stretch is read in: what was just heard in it, when that
+        // was a usable answer, and otherwise the meeting's own. Both roads can
+        // end at `None`, which asks whisper to work it out during the decode.
+        job.language_hint = if a_second_reading {
+            detected.map(|(language, _)| language)
+        } else {
+            observed.or_else(|| policy.hint().map(str::to_string))
+        };
     }
+    // Nothing else may wait on this while the decode runs.
+    drop(policies);
 
     let mut result = engine.transcribe(&job, &plan, on_partial);
     shared.queue.finish();
 
+    let mut policies = shared.policies.lock().expect("language policies poisoned");
+    let policy = policies.entry(job.meeting_id.clone()).or_default();
     if let Ok(transcription) = &mut result {
         transcription.language_confidence = detected_confidence;
+        // Which of the two things the language on this result is: what these
+        // seconds were heard to be in, or the meeting's answer handed down to
+        // them. Seven settled stretches in eight are the second, and a segment
+        // row that records the second is not evidence — it is the pin written
+        // out again, which is what made the histogram the meeting's language is
+        // recomputed from a closed loop (`Transcription::observed_language`).
+        transcription.language_inherited = !heard_in_this_stretch;
+        // Only a finished stretch counts towards the next re-check: a caption is
+        // replaced within seconds, and a second reading is a second look at
+        // seconds that have already been counted. A reading that came back
+        // unsure is how a decoder forced through the wrong language sounds, so
+        // it brings the next question forward.
+        if !a_caption && !a_second_reading {
+            policy.saw_decode(transcription.avg_confidence);
+        }
     }
     result
+}
+
+/// Say out loud what the language policy just decided, and keep the meeting's
+/// answer where the rest of the app reads it.
+///
+/// At `info`, deliberately. Shipped builds log at `info` and no lower, and every
+/// one of these decisions used to be `debug!`: working out how a 75-minute
+/// Italian meeting came to be written down as Danish meant reading 880 database
+/// rows, because nothing in the log said the language had ever been decided.
+fn announce(
+    shared: &Shared,
+    meeting_id: &str,
+    policy: &LanguagePolicy,
+    decision: &Decision,
+    confidence: f32,
+) {
+    let settled = match decision {
+        Decision::Pinned(language) => {
+            tracing::info!(
+                target: "echo::asr",
+                meeting = %meeting_id,
+                language = %language,
+                confidence,
+                voted_speech_ms = policy.voted_speech_ms(),
+                agreement = policy.confidence(),
+                "settled on the language this meeting is being held in"
+            );
+            language.clone()
+        }
+        Decision::Changed { from, to } => {
+            tracing::info!(
+                target: "echo::asr",
+                meeting = %meeting_id,
+                was = %from,
+                language = %to,
+                confidence,
+                voted_speech_ms = policy.voted_speech_ms(),
+                "this meeting has changed language"
+            );
+            to.clone()
+        }
+        Decision::KeepDetecting | Decision::Held => return,
+    };
+    shared
+        .languages
+        .lock()
+        .expect("language map poisoned")
+        .insert(meeting_id.to_string(), settled);
 }
 
 // ---------------------------------------------------------------------------
@@ -2387,6 +2503,47 @@ mod tests {
         );
         let window = vec![0.1f32; RATE * smallest_hole / 1_000];
         assert!(padded_for_decode(&window).len() >= MIN_DECODE_SAMPLES);
+    }
+
+    /// The flag that made every unhinted decode come back empty.
+    ///
+    /// A job with no hint is transcribed with the language left on "auto", which
+    /// whisper.cpp works out for itself and then carries on decoding with. What
+    /// it must never also be told is `detect_language`, which means "tell me the
+    /// language and stop" — see [`whisper_language`]. This test cannot press the
+    /// second switch, and that is the point: there is one place that decides
+    /// what to ask for, and it asks for a transcription.
+    #[test]
+    fn an_unhinted_decode_asks_for_words_not_just_for_a_language() {
+        assert_eq!(whisper_language(None), "auto");
+        assert_eq!(whisper_language(Some("  ")), "auto");
+        assert_eq!(whisper_language(Some("it")), "it");
+    }
+
+    /// A window's language vote is worth the speech in it, not the padding
+    /// around it — the catch-up windows of a long meeting are mostly pause.
+    #[test]
+    fn a_window_votes_with_its_speech_rather_than_its_width() {
+        let thirty_seconds = TranscribeJob {
+            samples: vec![0.0; 16_000 * 30],
+            voiced_ms: Some(4_000),
+            ..Default::default()
+        };
+        assert_eq!(thirty_seconds.duration_ms(), 30_000);
+        assert_eq!(thirty_seconds.voice_ms(), 4_000);
+        // Nobody measured: the window stands in for itself.
+        let unmeasured = TranscribeJob {
+            samples: vec![0.0; 16_000 * 30],
+            ..Default::default()
+        };
+        assert_eq!(unmeasured.voice_ms(), 30_000);
+        // And a measurement can never claim more speech than there is audio.
+        let impossible = TranscribeJob {
+            samples: vec![0.0; 16_000],
+            voiced_ms: Some(99_000),
+            ..Default::default()
+        };
+        assert_eq!(impossible.voice_ms(), 1_000);
     }
 
     #[test]

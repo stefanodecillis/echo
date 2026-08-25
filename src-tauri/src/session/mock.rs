@@ -227,6 +227,10 @@ pub(crate) struct MockAsr {
     /// the row, so "was this one forgotten" is the only way to tell that a
     /// wrong language is really gone.
     forgotten: std::sync::Mutex<Vec<String>>,
+    /// What the engine has settled on for each meeting. Empty until a test says
+    /// otherwise: the real engine settles on evidence, not on the first line it
+    /// managed to write (see [`crate::asr::language`]).
+    settled: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl MockAsr {
@@ -247,7 +251,18 @@ impl MockAsr {
             backlog_calls: std::sync::Mutex::new(Vec::new()),
             live_plans: std::sync::Mutex::new(Vec::new()),
             forgotten: std::sync::Mutex::new(Vec::new()),
+            settled: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The engine has worked out what language this meeting is in — what a real
+    /// one does once it has heard enough speech agreeing.
+    #[allow(dead_code)]
+    pub(crate) fn settles_on(&self, meeting_id: &str, language: &str) {
+        self.settled
+            .lock()
+            .unwrap()
+            .insert(meeting_id.to_string(), language.to_string());
     }
 
     /// Which meetings the engine was told to forget, oldest first.
@@ -356,6 +371,10 @@ impl AsrPort for MockAsr {
         self.resident.store(resident, Ordering::SeqCst);
     }
 
+    fn settled_language(&self, meeting_id: &str) -> Option<String> {
+        self.settled.lock().unwrap().get(meeting_id).cloned()
+    }
+
     fn transcribe_live<'a>(
         &'a self,
         job: TranscribeJob,
@@ -392,6 +411,7 @@ impl AsrPort for MockAsr {
                 text,
                 language: Some("en".into()),
                 language_confidence: Some(0.99),
+                language_inherited: false,
                 avg_confidence: Some(0.9),
                 model_name: Some("test".into()),
                 model_revision: Some("1".into()),
