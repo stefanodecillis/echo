@@ -650,6 +650,90 @@ pub async fn get_transcript(
     Ok(repo::get_segments(&state.db, &query).await?)
 }
 
+/// "No, it heard that right": put one line back the way the engine wrote it.
+///
+/// The other half of a repair. Echo is allowed to change words in a transcript
+/// because every change it makes is written down beside the line and can be
+/// taken back (`migrations/0005_segment_corrections.sql`); until now only the
+/// writing-down half existed, so the promise was half kept.
+///
+/// **Per line, not per word**, and the person clicks a word to get here. The
+/// note kept against a line records *what* was replaced, never *where*, so one
+/// repair among several is not addressable — and a line with one word put back
+/// and the others left is neither what was said nor what Echo wrote, which is
+/// the one outcome nothing here is allowed to produce. Undoing the line is what
+/// the stored data can promise exactly, so it is what this does.
+///
+/// Safe to click twice: a line with nothing recorded against it comes straight
+/// back unchanged. Turned down, rather than guessed at, when the line has moved
+/// on since the repair — a re-transcription, or a speaker turn that cut it in
+/// two — because the alternative is writing a misheard word over one somebody
+/// really said.
+///
+/// Hands back the line as it now stands, and says so on the transcript-revised
+/// event so every open view of the meeting refreshes.
+#[tauri::command]
+pub async fn undo_corrections(state: State<'_, AppState>, segment_id: Id) -> CmdResult<Segment> {
+    check_id(&segment_id)?;
+    let segment = repo::get_segment(&state.db, &segment_id)
+        .await?
+        .ok_or_else(|| UiError::not_found("Echo couldn't find that line."))?;
+    if segment.corrections.is_empty() {
+        // Already back the way it was heard. Nothing to write, nothing to say.
+        return Ok(segment);
+    }
+    let Some(original) = asr::glossary::revert(&segment.text, &segment.corrections) else {
+        return Err(UiError::invalid(LINE_HAS_MOVED_ON));
+    };
+    let undone =
+        repo::undo_segment_corrections(&state.db, &segment_id, &segment.text, &original).await?;
+    if !undone {
+        // Somebody — or some pass — got to the row between the read and the
+        // write. The row is theirs; say so rather than try again over the top.
+        return Err(UiError::invalid(LINE_HAS_MOVED_ON));
+    }
+    announce_transcript_revision(&state, &segment).await;
+    Ok(repo::get_segment(&state.db, &segment_id)
+        .await?
+        .unwrap_or(Segment {
+            text: original,
+            corrections: Vec::new(),
+            ..segment
+        }))
+}
+
+/// What a line that cannot be put back is told, said once so the two ways of
+/// finding that out cannot drift apart.
+///
+/// Both mean the same thing to the person — the words on screen are no longer
+/// the words Echo repaired — whether it was noticed while working out what to
+/// put back or by the write refusing to land on a row that had moved. It asks
+/// for nothing, because there is nothing useful to try.
+const LINE_HAS_MOVED_ON: &str = "This line has been written down again since Echo put those \
+                                 words right, so there's nothing to put back.";
+
+/// One line changed outside a pass, on the event every view of a transcript
+/// already listens to.
+///
+/// Scoped to the line's own window rather than the whole meeting: the Live view
+/// refetches exactly the span it is told about, and a whole-meeting span there
+/// would re-read a two-hour transcript to move one word.
+async fn announce_transcript_revision(state: &AppState, segment: &Segment) {
+    use crate::session::ports::{EventSink, UiEvent};
+    let revision = repo::transcript_revision(&state.db, &segment.meeting_id)
+        .await
+        .unwrap_or(segment.revision);
+    state.session.events().emit(UiEvent::TranscriptRevised(
+        crate::events::TranscriptRevisedPayload {
+            meeting_id: segment.meeting_id.clone(),
+            revision,
+            from_ms: segment.t_start_ms,
+            to_ms: segment.t_end_ms,
+            segment_ids: vec![segment.id.clone()],
+        },
+    ));
+}
+
 /// "Listen again": write this meeting's transcript again from its recording.
 ///
 /// For a meeting recorded while transcription was not working. The audio on disk
@@ -918,6 +1002,45 @@ pub async fn rename_person(
     repo::rename_person(&state.db, &person_id, &name).await?;
     announce_people(&app, &state).await;
     Ok(())
+}
+
+/// "These two are the same person": join two remembered voices into one.
+///
+/// The same voice gets enrolled twice — once heard down a call, once heard in
+/// the room — and the only tidy-up that existed was Forget, which destroys one
+/// of the two voices' samples and clips for good. This keeps both: every sample
+/// moves to whoever is kept, every meeting that was linked to the other name is
+/// linked to them instead, and the voice Echo matches against is rebuilt from
+/// the two sets together.
+///
+/// **This cannot be undone**, and the screen that offers it says so before
+/// anybody clicks: making one voice out of two throws away the samples that
+/// turn out to be near-duplicates of ones already kept, which is what makes the
+/// result one voice rather than a bag of two.
+///
+/// Meetings read exactly as they read before. The names on past speaker rows
+/// were copied there when the link was made and stay as plain text — a meeting
+/// somebody has already read does not rewrite itself, the same rule
+/// [`rename_person`] and [`delete_person`] follow.
+///
+/// Safe to click twice, and safe either way round: two names that are already
+/// one person come straight back unchanged. Hands back the list as it now
+/// stands, and says so to every other open window.
+#[tauri::command]
+pub async fn merge_people(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    keep_id: Id,
+    merge_id: Id,
+) -> CmdResult<Vec<PersonInfo>> {
+    check_id(&keep_id)?;
+    check_id(&merge_id)?;
+    if keep_id == merge_id {
+        return Err(UiError::invalid("Pick two different people to join up."));
+    }
+    diarize::people::merge(&state.db, &keep_id, &merge_id).await?;
+    announce_people(&app, &state).await;
+    Ok(diarize::people::list_people(&state.db).await?)
 }
 
 /// A few seconds of a remembered voice, base64 WAV — the freshest clip kept.
@@ -1773,6 +1896,7 @@ macro_rules! echo_command_handler {
             $crate::commands::delete_meeting,
             $crate::commands::delete_all_data,
             $crate::commands::get_transcript,
+            $crate::commands::undo_corrections,
             $crate::commands::retranscribe_meeting,
             $crate::commands::search_transcripts,
             $crate::commands::get_markers,
@@ -1790,6 +1914,7 @@ macro_rules! echo_command_handler {
             $crate::commands::list_people,
             $crate::commands::delete_person,
             $crate::commands::rename_person,
+            $crate::commands::merge_people,
             $crate::commands::person_sample_audio,
             $crate::commands::link_speaker_person,
             $crate::commands::enroll_speaker_as_person,
@@ -1875,6 +2000,25 @@ mod tests {
             "not-a-uuid-at-all-but-36-chars-long!",
         ] {
             assert!(check_id(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    /// A line that cannot be put back says so in one calm sentence, in the
+    /// person's words: no id, no revision, no talk of a database row, and no
+    /// exclamation mark — nothing here is exciting.
+    #[test]
+    fn a_line_that_cannot_be_put_back_says_so_without_naming_the_machinery() {
+        assert_eq!(
+            LINE_HAS_MOVED_ON,
+            "This line has been written down again since Echo put those words right, \
+             so there's nothing to put back."
+        );
+        assert!(!LINE_HAS_MOVED_ON.contains('!'));
+        for jargon in ["segment", "revision", "row", "database", "correction"] {
+            assert!(
+                !LINE_HAS_MOVED_ON.to_lowercase().contains(jargon),
+                "{jargon:?} is machinery, not something the person sees"
+            );
         }
     }
 

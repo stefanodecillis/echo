@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import {
@@ -18,6 +18,7 @@ import {
   listSpeakers,
   retranscribeMeeting,
   toUiError,
+  undoCorrections,
 } from "@/lib/ipc";
 import {
   common,
@@ -38,6 +39,7 @@ import { IconButton } from "./components/IconButton";
 import { MergeSpeakersModal } from "./components/MergeSpeakersModal";
 import { SpeakerChip } from "./components/SpeakerChip";
 import { SpeakersDialog } from "./components/SpeakersDialog";
+import { correctedSpans } from "./lib/corrections";
 import { formatTimestamp } from "./lib/date";
 import type { MeetingDetailWithPeopleCount } from "./lib/peopleCount";
 import { howSureThisMeetingIs } from "./lib/confidence";
@@ -108,6 +110,10 @@ export function TranscriptTab({
   const [copied, setCopied] = useState(false);
   const [confirmRetranscribe, setConfirmRetranscribe] = useState(false);
   const [retranscribing, setRetranscribing] = useState(false);
+  /** The line whose repairs are being put back right now, so its words stop
+   * taking clicks while the core answers. One at a time is enough: the click
+   * target is a word, and nobody double-clicks two of them. */
+  const [undoingId, setUndoingId] = useState<Id>();
   const listRef = useRef<VirtualListHandle>(null);
   const addToast = useEchoStore((s) => s.addToast);
 
@@ -210,6 +216,35 @@ export function TranscriptTab({
       setTimeout(() => setCopied(false), 2000);
     } catch {
       addToast({ level: "problem", message: notices.somethingWentWrong });
+    }
+  };
+
+  /**
+   * "No, it heard that right" — the whole line goes back to the words the
+   * engine wrote.
+   *
+   * The core also announces the change on `transcriptRevised`, which this tab
+   * answers with a full reload; writing the returned line into place as well
+   * means the word changes under the cursor that clicked it rather than a beat
+   * later. Both land on the same row, so the order they arrive in makes no
+   * difference.
+   *
+   * A refusal is an explanation, not a failure: the core's sentence says the
+   * line has been written down again since, and there is nothing to retry.
+   */
+  const handleUndoCorrections = async (segmentId: Id) => {
+    if (undoingId) return;
+    setUndoingId(segmentId);
+    try {
+      const restored = await undoCorrections(segmentId);
+      setSegments((prev) =>
+        prev?.map((s) => (s.id === restored.id ? restored : s)) ?? prev,
+      );
+      addToast({ level: "info", message: transcriptNote.undone });
+    } catch (err) {
+      addToast({ level: "problem", message: toUiError(err).message });
+    } finally {
+      setUndoingId(undefined);
     }
   };
 
@@ -326,10 +361,25 @@ export function TranscriptTab({
             const unsure = sureness.isShaky(segment.avgConfidence);
             const corrections = segment.corrections ?? [];
             const corrected = corrections.length > 0;
+            // Non-null exactly when the words Echo repaired can still be
+            // pointed at in the line — which is exactly when the core will put
+            // them back. `null` keeps the mark on the whole line and offers
+            // nothing, because there is nothing that can be undone.
+            const spans = corrected ? correctedSpans(segment.text, corrections) : null;
             // Both can be true of one line, so both have to be sayable at once.
             const note = [
               unsure ? transcriptNote.unsure : undefined,
-              corrected ? transcriptNote.corrected(corrections) : undefined,
+              corrected && !spans ? transcriptNote.corrected(corrections) : undefined,
+            ]
+              .filter(Boolean)
+              .join(" ");
+            // The tooltip moves onto the word when the word is the thing you
+            // click: an inner `title` is the one a browser shows, so it has to
+            // carry everything the line's would have said.
+            const wordNote = [
+              unsure ? transcriptNote.unsure : undefined,
+              transcriptNote.corrected(corrections),
+              transcriptNote.undoHint,
             ]
               .filter(Boolean)
               .join(" ");
@@ -365,11 +415,38 @@ export function TranscriptTab({
                       // transcript is not redesigned for this — the repair is
                       // right far more often than not, and a badge on every
                       // third line would be noise.
-                      corrected && "decoration-hairline underline decoration-dotted underline-offset-4",
+                      // Only when the repaired words cannot be pointed at: the
+                      // line still says something on it was put right, and the
+                      // underline stays where it has always been. When they can,
+                      // the underline moves onto the words themselves — same
+                      // mark, same meaning, now also the thing you click.
+                      corrected &&
+                        !spans &&
+                        "decoration-hairline underline decoration-dotted underline-offset-4",
                     )}
                     title={note || undefined}
                   >
-                    {highlightMatches(segment.text, filter)}
+                    {spans
+                      ? spans.map((span, index) =>
+                          span.corrected ? (
+                            <button
+                              key={index}
+                              type="button"
+                              title={wordNote}
+                              aria-label={transcriptNote.undoLabel}
+                              disabled={undoingId !== undefined}
+                              onClick={() => handleUndoCorrections(segment.id)}
+                              className="inline rounded-sm underline decoration-hairline decoration-dotted underline-offset-4 transition-colors hover:text-ink hover:decoration-ink-ghost focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 disabled:cursor-wait"
+                            >
+                              {highlightMatches(span.text, filter)}
+                            </button>
+                          ) : (
+                            <Fragment key={index}>
+                              {highlightMatches(span.text, filter)}
+                            </Fragment>
+                          ),
+                        )
+                      : highlightMatches(segment.text, filter)}
                   </p>
                 </div>
               </div>

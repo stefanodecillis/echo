@@ -25,7 +25,7 @@ import { resolveSpeaker } from "./speakers";
  * still carrying lines this matches whatever it is called. The offline pass
  * drops it on a mic-only meeting, and from then on nothing says "You".
  */
-function micFallbackLabel(segments: Segment[], speakers: Speaker[]): string {
+export function micFallbackLabel(segments: Segment[], speakers: Speaker[]): string {
   if (segments.some((s) => s.channel === "system")) return channels.mic;
   for (const segment of segments) {
     if (segment.channel !== "mic" || !segment.speakerId) continue;

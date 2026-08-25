@@ -394,6 +394,108 @@ pub struct Corrected {
     pub changes: Vec<Correction>,
 }
 
+// ---------------------------------------------------------------------------
+// Putting a line back
+// ---------------------------------------------------------------------------
+
+/// Undo every repair on one line: put each `from` back where its `to` is, and
+/// hand back the line the engine actually produced.
+///
+/// The other half of the promise the module header makes and
+/// `migrations/0005_segment_corrections.sql` writes down — *"put every `from`
+/// back and the line is byte for byte the line the engine produced"*. Whole
+/// line, never one word of it: see [`Correction`], which records **what** was
+/// replaced and not **where**, so a single word is not addressable and a
+/// half-reverted line would be neither what was heard nor what Echo wrote.
+///
+/// `None` means **refuse**, and it is the answer to every case where the line no
+/// longer matches the note kept against it:
+///
+/// * a replacement that is not in the line at all — some later pass rewrote it,
+///   and putting a word back into text nobody recognises would corrupt it;
+/// * a replacement that is in the line **more often than it was made**, which is
+///   the ambiguity this fails closed on: if the decoder wrote "Langola" itself
+///   in the same sentence Echo repaired one into, nothing stored here can say
+///   which of the two is the repair, and guessing has a one-in-two chance of
+///   putting *Nongula* over a word somebody really said.
+///
+/// Order: the repairs were made left to right over disjoint stretches of the
+/// line ([`Glossary::correct`] walks the words once and skips past each claim),
+/// so undoing them left to right behind a cursor is exactly undoing them in the
+/// reverse order they were applied — the same assignment, arrived at from the
+/// other end. The count check above is what makes that assignment the only one.
+pub fn revert(text: &str, corrections: &[Correction]) -> Option<String> {
+    if corrections.is_empty() {
+        return None;
+    }
+    // Every replacement has to be in the line exactly as many times as it was
+    // made. More is ambiguous, fewer means the line moved on; both refuse.
+    for change in corrections {
+        if change.to.is_empty() {
+            return None;
+        }
+        let made = corrections.iter().filter(|c| c.to == change.to).count();
+        if whole_word_hits(text, &change.to) != made {
+            return None;
+        }
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for change in corrections {
+        let at = next_whole_word(text, &change.to, cursor)?;
+        out.push_str(&text[cursor..at]);
+        out.push_str(&change.from);
+        cursor = at + change.to.len();
+    }
+    out.push_str(&text[cursor..]);
+    Some(out)
+}
+
+/// Where `needle` next sits in `text` as a word of its own, at or after `from`.
+///
+/// "A word of its own" is only about letters and digits on either side, not
+/// about [`is_word_char`]: a repair is written over a stretch that
+/// [`word_spans`] had already trimmed to letters, so the line keeps whatever
+/// punctuation hung off it — "Langola." and "«Langola»" are both the word, and
+/// "Langola" is not.
+fn next_whole_word(text: &str, needle: &str, from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let mut at = from;
+    while let Some(offset) = text.get(at..)?.find(needle) {
+        let start = at + offset;
+        let end = start + needle.len();
+        let before_is_letter = text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        let after_is_letter = text[end..]
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric);
+        if !before_is_letter && !after_is_letter {
+            return Some(start);
+        }
+        // Past this hit, not past the whole of it: overlapping occurrences of a
+        // repeated word are still separate words.
+        at = start + text[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+/// How many times `needle` is a word of its own in `text`.
+fn whole_word_hits(text: &str, needle: &str) -> usize {
+    let mut count = 0;
+    let mut at = 0usize;
+    while let Some(hit) = next_whole_word(text, needle, at) {
+        count += 1;
+        at = hit + needle.len();
+    }
+    count
+}
+
 impl Reach {
     fn for_length(folded_chars: usize) -> Self {
         if folded_chars < SHORTEST_NEAR_MISS_ENTRY {
@@ -2005,6 +2107,116 @@ mod tests {
         assert_eq!(
             corrected(&glossary, "il meeting di oggi"),
             "il Meeting di oggi"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Putting a line back
+    // -------------------------------------------------------------------
+
+    fn change(from: &str, to: &str) -> Correction {
+        Correction {
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    /// The promise `migrations/0005_segment_corrections.sql` makes, checked
+    /// against the repairs this module actually produces rather than against a
+    /// hand-written list: correct a line, put it back, and it is the line the
+    /// engine wrote, byte for byte.
+    #[test]
+    fn every_repaired_line_goes_back_byte_for_byte() {
+        let glossary = Glossary::new(["Langola", "Obsidara", "Voglia Mutui Casa"]);
+        let lines = [
+            "Allora, Nongula è quello che usiamo.",
+            "sull'angolo e obssidara insieme",
+            "«Nongulo», diceva, e poi Voglia Mutui Casa.",
+            "Nongula, Nongulo, sempre Nongula.",
+        ];
+        for line in lines {
+            let Some(repaired) = glossary.correct(line) else {
+                panic!("{line:?} was not repaired, so this test proves nothing");
+            };
+            assert_ne!(repaired.text, line, "{line:?} came back unchanged");
+            assert_eq!(
+                revert(&repaired.text, &repaired.changes).as_deref(),
+                Some(line),
+                "{line:?} did not come back"
+            );
+        }
+    }
+
+    /// Nothing recorded, nothing to put back — and the caller is told that with
+    /// `None` rather than with a copy of the line it already has.
+    #[test]
+    fn a_line_nothing_was_changed_in_has_nothing_to_put_back() {
+        assert_eq!(revert("niente da fare", &[]), None);
+    }
+
+    /// The line moved on — a re-transcription, a speaker turn that cut it in
+    /// two. The words that are there now are somebody's real words and this
+    /// refuses rather than writing a misheard one over them.
+    #[test]
+    fn a_line_that_has_been_written_down_again_is_refused() {
+        assert_eq!(
+            revert("tutt'altra frase", &[change("Nongula", "Langola")]),
+            None
+        );
+    }
+
+    /// The ambiguity this fails closed on. The decoder wrote *Langola* itself in
+    /// the same line Echo repaired one into, so there are two of them and only
+    /// one note: nothing stored says which is which, and a guess has an even
+    /// chance of putting *Nongula* over a word somebody really said.
+    #[test]
+    fn a_word_the_engine_got_right_itself_makes_the_undo_refuse() {
+        let line = "Langola, cioè Langola.";
+        assert_eq!(revert(line, &[change("Nongula", "Langola")]), None);
+        // Two notes and two occurrences is not ambiguous at all, and both go
+        // back where they came from.
+        assert_eq!(
+            revert(
+                line,
+                &[change("Nongula", "Langola"), change("Nongulo", "Langola")]
+            )
+            .as_deref(),
+            Some("Nongula, cioè Nongulo.")
+        );
+    }
+
+    /// A repair is written over a whole word, so putting it back reads whole
+    /// words: "Langola" is not the repair and is left alone — which, there
+    /// being no other occurrence, means the whole undo is refused.
+    #[test]
+    fn a_longer_word_that_merely_contains_the_repair_is_not_the_repair() {
+        assert_eq!(
+            revert("i Langola sono due", &[change("Nongula", "Langola")]),
+            None
+        );
+        // The punctuation the line kept around the word is not part of it.
+        assert_eq!(
+            revert("«Langola», diceva", &[change("Nongula", "Langola")]).as_deref(),
+            Some("«Nongula», diceva")
+        );
+    }
+
+    /// Undoing is total: every repair on the line goes back, in the places they
+    /// were made, and the words around them are untouched.
+    #[test]
+    fn several_repairs_on_one_line_all_go_back_where_they_came_from() {
+        let line = "Langola e Obsidara, poi Langola ancora.";
+        assert_eq!(
+            revert(
+                line,
+                &[
+                    change("Nongula", "Langola"),
+                    change("obssidara", "Obsidara"),
+                    change("Nongulo", "Langola"),
+                ]
+            )
+            .as_deref(),
+            Some("Nongula e obssidara, poi Nongulo ancora.")
         );
     }
 }

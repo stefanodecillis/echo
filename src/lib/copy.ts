@@ -173,6 +173,21 @@ export const transcriptNote = {
    * and "low confidence" is jargon for the same number.
    */
   unsure: "Echo wasn't sure it heard this line. The words may be wrong.",
+  /**
+   * The last sentence of the same tooltip, on a line whose repaired words can
+   * still be found in it — which is to say, on a line Echo can put back.
+   *
+   * Says *line*, not *word*, because that is what happens: the note kept
+   * against a line records what was replaced and never where, so one repair
+   * among several cannot be undone on its own. Nothing new is drawn for this;
+   * the underline that already means "a word was put right" is the thing you
+   * click, so a line that is also shaky keeps its dimmed text saying only that.
+   */
+  undoHint: "Click it to put this line back the way Echo first heard it.",
+  /** The same offer for anyone not looking at a tooltip. */
+  undoLabel: "Put this line back the way Echo first heard it",
+  /** Said once, quietly, after the words go back. */
+  undone: "Put back the way Echo heard it.",
 } as const;
 
 export const jobLine = {
@@ -598,6 +613,25 @@ export const settings = {
   peopleForgetButton: "Forget",
   peopleDeleteConfirmTitle: "Forget this voice?",
   peopleDeleteConfirmDescription: "The saved samples are deleted too.",
+  /**
+   * Combining two saved voices — the same shape as "Combine two speakers" in a
+   * meeting, and deliberately the same words, because it is the same idea said
+   * about the list that outlives the meeting.
+   *
+   * The one difference is that this one cannot be taken back, so it gets a
+   * second step that says so before anything happens. What it says there is
+   * what the core actually does: both sets of saved sound are kept as one, the
+   * overlapping bits are dropped, meetings already read do not change.
+   */
+  peopleMergeButton: "Combine two voices",
+  peopleMergeTitle: "Which two are the same person?",
+  peopleMergeDescription:
+    "Pick two names below, and the one whose name to keep. Everything Echo has saved for the other moves across.",
+  peopleMergeKeepLabel: "Keep this name",
+  peopleMergeNeedTwo: "Pick exactly two names to combine.",
+  peopleMergeConfirmTitle: "Combine these two voices?",
+  peopleMergeConfirmButton: "Combine",
+  peopleMergeBackButton: "Back",
   /** `needsRefresh` on a saved person: never actionable, just said once and
    * quietly — Echo runs the refresh itself. */
   peopleRefreshingNote: "Echo is refreshing how it recognizes voices.",
@@ -835,6 +869,18 @@ export const knownPeople = {
   /** A recurring unnamed voice: how many meetings it has turned up in. Without
    * this, two rows of "Unnamed voice" give nobody anything to decide with. */
   heardIn: (n: number) => `Heard in ${n} ${n === 1 ? "meeting" : "meetings"}`,
+  /**
+   * The second step of combining two saved voices, which names them because
+   * the whole risk of the thing is combining the wrong two.
+   *
+   * Every clause is something the core really does: both sets of saved sound
+   * end up behind one name, the overlapping bits are dropped (that dropping is
+   * what makes the result one voice rather than two), and meetings somebody has
+   * already read are left exactly as they read. It ends on the sentence that
+   * decides whether anybody should click.
+   */
+  combineConfirm: (keep: string, merge: string) =>
+    `Echo keeps “${keep}” and puts everything it has saved for “${merge}” behind that one name. Some of it is dropped along the way, where the two voices overlap. Meetings you've already read stay exactly as they read. This can't be undone.`,
 } as const;
 
 /** Words for the two microphone-versus-computer channels. */

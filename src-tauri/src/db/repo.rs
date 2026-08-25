@@ -732,6 +732,43 @@ pub async fn revise_segment(
     Ok(())
 }
 
+/// Put one line back the way the engine wrote it, and forget the note about it.
+///
+/// The write half of "a repair can be put back"
+/// (`migrations/0005_segment_corrections.sql`). Deliberately narrower than
+/// [`revise_segment`], in three ways that are all the same way — this is not a
+/// pass, it is a person saying *no, it heard that right*:
+///
+/// * **The revision does not move.** Nothing better has been read; the words are
+///   going back to the ones the engine produced. Moving it would tell every
+///   later pass that this line is newer than their work.
+/// * **`was` is the whole guard.** The update only lands on a row whose text is
+///   still character for character the text the caller reverted, so a
+///   re-transcription, a split or a second click that got there first leaves the
+///   row alone and this returns `false` instead of writing somebody else's words
+///   over it.
+/// * **`corrections IS NOT NULL`** makes a second call a no-op rather than a
+///   rewrite: a line with nothing recorded against it has nothing to put back.
+///
+/// `false` means nothing was written and the caller should say so, not retry.
+pub async fn undo_segment_corrections(
+    db: &Db,
+    id: &str,
+    was: &str,
+    original: &str,
+) -> Result<bool, DbError> {
+    let r = sqlx::query(
+        "UPDATE segments SET text = ?3, corrections = NULL
+         WHERE id = ?1 AND text = ?2 AND corrections IS NOT NULL",
+    )
+    .bind(id)
+    .bind(was)
+    .bind(original)
+    .execute(db)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
 /// Point a batch of segments at a speaker, what the offline speaker pass does.
 pub async fn assign_speaker(
     db: &Db,
@@ -1394,6 +1431,10 @@ pub struct PersonRow {
     pub name: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Somebody merged this name into another one, and that other one is who
+    /// they are now (`migrations/0006_person_merge.sql`). `None` for everybody
+    /// Echo actually remembers, which is almost everybody.
+    pub alias_of: Option<Id>,
 }
 
 /// Row of `person_samples`, without its audio.
@@ -1458,6 +1499,7 @@ pub async fn create_person(db: &Db, name: &str) -> Result<PersonRow, DbError> {
         name: name.to_string(),
         created_at: now(),
         updated_at: now(),
+        alias_of: None,
     };
     sqlx::query("INSERT INTO people (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)")
         .bind(&row.id)
@@ -1470,16 +1512,42 @@ pub async fn create_person(db: &Db, name: &str) -> Result<PersonRow, DbError> {
 }
 
 pub async fn get_person(db: &Db, id: &str) -> Result<Option<PersonRow>, DbError> {
-    let row = sqlx::query("SELECT id, name, created_at, updated_at FROM people WHERE id = ?1")
-        .bind(id)
-        .fetch_optional(db)
-        .await?;
+    let row =
+        sqlx::query("SELECT id, name, created_at, updated_at, alias_of FROM people WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(db)
+            .await?;
     row.map(row_to_person).transpose()
 }
 
+/// Follow `alias_of` to the person somebody was merged into.
+///
+/// The twin of [`resolve_speaker`], hop-limited for the same reason: an id can
+/// arrive from a window that has been open since before a merge, and the honest
+/// answer to "who is this?" is the person they are now. A chain longer than the
+/// limit — which [`merge_people`] cannot create — resolves to as far as it got
+/// rather than looping.
+pub async fn resolve_person(db: &Db, id: &str) -> Result<Option<PersonRow>, DbError> {
+    let mut current = get_person(db, id).await?;
+    let mut hops = 0;
+    while let Some(person) = current.clone() {
+        match person.alias_of {
+            Some(next) if hops < 8 => {
+                hops += 1;
+                current = get_person(db, &next).await?;
+            }
+            _ => return Ok(Some(person)),
+        }
+    }
+    Ok(None)
+}
+
+/// Everybody Echo remembers. Names that were merged into another one are not
+/// people any more and do not appear.
 pub async fn list_people(db: &Db) -> Result<Vec<PersonRow>, DbError> {
     let rows = sqlx::query(
-        "SELECT id, name, created_at, updated_at FROM people ORDER BY name, created_at",
+        "SELECT id, name, created_at, updated_at, alias_of FROM people
+         WHERE alias_of IS NULL ORDER BY name, created_at",
     )
     .fetch_all(db)
     .await?;
@@ -1497,6 +1565,168 @@ pub async fn rename_person(db: &Db, id: &str, name: &str) -> Result<(), DbError>
         return Err(DbError::NotFound(format!("person {id}")));
     }
     Ok(())
+}
+
+/// What one merge actually moved, so the caller can log it and say nothing
+/// happened when nothing did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MergedPeople {
+    /// False when the two were already one person — a second click, or a merge
+    /// somebody else's window already made. Everything else is zero then.
+    pub merged: bool,
+    pub samples_moved: u64,
+    pub speakers_relinked: u64,
+    pub suggestions_relinked: u64,
+    /// Names that had already been merged into `merge_id` and now point at the
+    /// survivor instead, so no chain is ever more than one hop long.
+    pub aliases_flattened: u64,
+}
+
+/// Make one person out of two: `merge_id` becomes `keep_id`.
+///
+/// Every table that named the merged person is re-pointed and their row is left
+/// behind pointing at the survivor (`migrations/0006_person_merge.sql` says why
+/// the row stays). What moves:
+///
+/// * **`person_samples`** — the whole point. A duplicate deleted loses its
+///   clips and its fingerprints; merged, both voices' samples end up in one set
+///   for the caller to curate into one profile.
+/// * **`speakers.person_id`** — every meeting that had been linked to the
+///   merged name is now linked to the survivor. The *display names* on those
+///   rows are not touched: they were copied onto the row when the link was made
+///   and a meeting somebody has read does not rewrite itself (DESIGN §1, the
+///   same rule [`rename_person`] and [`delete_person`] follow).
+/// * **`speakers.suggested_person_id`** — a pending "looks like Marco?" about a
+///   name that no longer exists would be unanswerable. A suggestion that lands
+///   on the person the row is already linked to is dropped instead, because
+///   "looks like Marco" beside "Marco" is noise ([`set_speaker_person`] takes
+///   the same view).
+/// * **`people.alias_of`** — anything already merged into `merge_id` is
+///   re-pointed at the survivor, so chains stay one hop deep exactly as
+///   [`merge_speakers`] keeps them.
+///
+/// The merged person's profile row goes: its samples are somebody else's now,
+/// and a centroid with no samples under it is a number describing nothing.
+/// Recomputing the **survivor's** profile is the caller's job — it needs to know
+/// which network the numbers belong to, which this layer does not
+/// (`diarize::people::merge`).
+///
+/// Refusals, both settled — the same request always gets the same answer:
+///
+/// * **A person cannot be merged into themselves.** Unlike [`merge_speakers`],
+///   which shrugs at it, this is refused out loud: the only way to send the same
+///   id twice is a UI that has lost track of which row is which, and silently
+///   succeeding would tell it everything is fine.
+/// * **No rings.** Both ids are first resolved through any merges already made
+///   on them, so each one means "the person this name is now". If the two land
+///   on the same person they already are one, and this is a no-op
+///   (`merged: false`) — which is also what makes calling it twice safe, in
+///   either order.
+pub async fn merge_people(db: &Db, keep_id: &str, merge_id: &str) -> Result<MergedPeople, DbError> {
+    if keep_id == merge_id {
+        return Err(DbError::Invalid(
+            "a person cannot be merged into themselves".into(),
+        ));
+    }
+    let mut tx = db.begin().await?;
+
+    // Both ids are read as "the person this name is now", so a merge asked for
+    // from a window that has been open since an earlier one still means what it
+    // says. Whichever way round, the work happens between the two survivors.
+    let root = person_root(&mut tx, keep_id).await?;
+    let doomed = person_root(&mut tx, merge_id).await?;
+    if root == doomed {
+        // Already one person — a second click, or a merge somebody else's window
+        // already made. Merging now would be the ring the hop limit exists for.
+        tx.rollback().await?;
+        return Ok(MergedPeople::default());
+    }
+    let merge_id = doomed.as_str();
+
+    let samples_moved =
+        sqlx::query("UPDATE person_samples SET person_id = ?2 WHERE person_id = ?1")
+            .bind(merge_id)
+            .bind(&root)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    let speakers_relinked = sqlx::query("UPDATE speakers SET person_id = ?2 WHERE person_id = ?1")
+        .bind(merge_id)
+        .bind(&root)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let suggestions_relinked =
+        sqlx::query("UPDATE speakers SET suggested_person_id = ?2 WHERE suggested_person_id = ?1")
+            .bind(merge_id)
+            .bind(&root)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    sqlx::query(
+        "UPDATE speakers SET suggested_person_id = NULL, suggestion_score = NULL
+         WHERE person_id = ?1 AND suggested_person_id = ?1",
+    )
+    .bind(&root)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM person_profiles WHERE person_id = ?1")
+        .bind(merge_id)
+        .execute(&mut *tx)
+        .await?;
+    let aliases_flattened = sqlx::query("UPDATE people SET alias_of = ?2 WHERE alias_of = ?1")
+        .bind(merge_id)
+        .bind(&root)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let r = sqlx::query("UPDATE people SET alias_of = ?2, updated_at = ?3 WHERE id = ?1")
+        .bind(merge_id)
+        .bind(&root)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+    if r.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Err(DbError::NotFound(format!("person {merge_id}")));
+    }
+    tx.commit().await?;
+
+    Ok(MergedPeople {
+        merged: true,
+        samples_moved,
+        speakers_relinked,
+        suggestions_relinked,
+        aliases_flattened,
+    })
+}
+
+/// Follow one person's merges to the name they are kept under now, inside a
+/// transaction. Hop-limited so a hand-edited ring cannot spin here.
+async fn person_root(tx: &mut sqlx::Transaction<'_, Sqlite>, id: &str) -> Result<String, DbError> {
+    let start: (Option<String>,) = sqlx::query_as("SELECT alias_of FROM people WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("person {id}")))?;
+    let mut root = id.to_string();
+    let mut next = start.0;
+    let mut hops = 0;
+    while let Some(candidate) = next {
+        if candidate == root || hops >= 8 {
+            break;
+        }
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT alias_of FROM people WHERE id = ?1")
+                .bind(&candidate)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let Some((alias_of,)) = row else { break };
+        root = candidate;
+        next = alias_of;
+        hops += 1;
+    }
+    Ok(root)
 }
 
 /// Forget a person: the profile, the samples and the clips.
@@ -1562,6 +1792,7 @@ pub async fn list_person_infos(
                 f.embedder_asset_id AS embedder_asset_id
          FROM people p
          LEFT JOIN person_profiles f ON f.person_id = p.id
+         WHERE p.alias_of IS NULL
          ORDER BY p.name, p.created_at",
     )
     .fetch_all(db)
@@ -1700,6 +1931,22 @@ pub async fn upsert_person_profile(
     Ok(())
 }
 
+/// This person's profile row, or nothing when they have none — which is what an
+/// enrolment Echo could not fingerprint looks like, and what a profile
+/// [`crate::diarize::people::curate`] gave up on looks like.
+pub async fn person_profile(db: &Db, person_id: &str) -> Result<Option<PersonProfileRow>, DbError> {
+    let row = sqlx::query(
+        "SELECT f.person_id, p.name, f.centroid, f.sample_count, f.embedder_asset_id,
+                f.updated_at
+         FROM person_profiles f JOIN people p ON p.id = f.person_id
+         WHERE f.person_id = ?1",
+    )
+    .bind(person_id)
+    .fetch_optional(db)
+    .await?;
+    row.map(row_to_person_profile).transpose()
+}
+
 pub async fn delete_person_profile(db: &Db, person_id: &str) -> Result<(), DbError> {
     sqlx::query("DELETE FROM person_profiles WHERE person_id = ?1")
         .bind(person_id)
@@ -1715,6 +1962,7 @@ pub async fn list_person_profiles(db: &Db) -> Result<Vec<PersonProfileRow>, DbEr
         "SELECT f.person_id, p.name, f.centroid, f.sample_count, f.embedder_asset_id,
                 f.updated_at
          FROM person_profiles f JOIN people p ON p.id = f.person_id
+         WHERE p.alias_of IS NULL
          ORDER BY p.name, f.person_id",
     )
     .fetch_all(db)
@@ -2787,6 +3035,7 @@ fn row_to_person(row: sqlx::sqlite::SqliteRow) -> Result<PersonRow, DbError> {
         name: row.try_get("name").map_err(decode)?,
         created_at: row.try_get("created_at").map_err(decode)?,
         updated_at: row.try_get("updated_at").map_err(decode)?,
+        alias_of: row.try_get("alias_of").map_err(decode)?,
     })
 }
 
@@ -4353,6 +4602,284 @@ mod tests {
         let salvaged = get_segment(&db, &repaired.id).await.unwrap().unwrap();
         assert_eq!(salvaged.text, "Allora Langola è quello che usiamo.");
         assert!(salvaged.corrections.is_empty());
+    }
+
+    /// The other half of the promise: a repaired line can be put back, exactly
+    /// once, and only while it is still the line that was repaired.
+    #[tokio::test]
+    async fn a_repaired_line_can_be_put_back_once_and_only_while_it_is_that_line() {
+        let (db, m) = seeded().await;
+        let repaired = insert_segment(
+            &db,
+            &SegmentDraft {
+                meeting_id: m.id.clone(),
+                t_start_ms: 0,
+                t_end_ms: 2_000,
+                channel: Channel::Mic,
+                text: "Allora Langola è quello che usiamo.".into(),
+                revision: 3,
+                is_final: true,
+                corrections: vec![Correction {
+                    from: "Nongula".into(),
+                    to: "Langola".into(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(undo_segment_corrections(
+            &db,
+            &repaired.id,
+            "Allora Langola è quello che usiamo.",
+            "Allora Nongula è quello che usiamo.",
+        )
+        .await
+        .unwrap());
+
+        let after = get_segment(&db, &repaired.id).await.unwrap().unwrap();
+        assert_eq!(after.text, "Allora Nongula è quello che usiamo.");
+        assert!(after.corrections.is_empty(), "the note goes with the words");
+        assert_eq!(
+            after.revision, 3,
+            "putting a line back is not a later, better pass"
+        );
+
+        // Twice is a no-op, not a second rewrite: there is nothing left to undo.
+        assert!(!undo_segment_corrections(
+            &db,
+            &repaired.id,
+            "Allora Nongula è quello che usiamo.",
+            "something else entirely",
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            get_segment(&db, &repaired.id).await.unwrap().unwrap().text,
+            "Allora Nongula è quello che usiamo."
+        );
+
+        // And the words that are there now are the ones search finds.
+        let hits = search_segments(
+            &db,
+            &SearchQuery {
+                text: "Nongula".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 1, "the index followed the line back");
+    }
+
+    /// A pass got to the row between the read and the write. The row is theirs;
+    /// putting a misheard word over it would be the one thing an undo must never
+    /// do.
+    #[tokio::test]
+    async fn a_line_that_moved_under_the_undo_keeps_the_words_it_has_now() {
+        let (db, m) = seeded().await;
+        let repaired = insert_segment(
+            &db,
+            &SegmentDraft {
+                meeting_id: m.id.clone(),
+                t_start_ms: 0,
+                t_end_ms: 2_000,
+                channel: Channel::Mic,
+                text: "Allora Langola è quello che usiamo.".into(),
+                revision: 1,
+                is_final: true,
+                corrections: vec![Correction {
+                    from: "Nongula".into(),
+                    to: "Langola".into(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        revise_segment(&db, &repaired.id, Some("un'altra frase"), None, 2, true)
+            .await
+            .unwrap();
+
+        assert!(!undo_segment_corrections(
+            &db,
+            &repaired.id,
+            "Allora Langola è quello che usiamo.",
+            "Allora Nongula è quello che usiamo.",
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            get_segment(&db, &repaired.id).await.unwrap().unwrap().text,
+            "un'altra frase"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Two names, one voice
+    // -----------------------------------------------------------------------
+
+    /// Everything that named the merged person moves, and the meetings that
+    /// have already been read are left reading exactly as they read.
+    #[tokio::test]
+    async fn merging_two_people_moves_the_voice_and_leaves_the_meetings_alone() {
+        let (db, m) = seeded().await;
+        let keep = create_person(&db, "Marco").await.unwrap();
+        let dup = create_person(&db, "Marco (call)").await.unwrap();
+        insert_person_sample(
+            &db,
+            &NewPersonSample {
+                person_id: &dup.id,
+                embedding: &[0.5f32; 4],
+                clip: b"wav",
+                condition: Channel::System,
+                source_meeting_id: None,
+                t_start_ms: 0,
+                t_end_ms: 6_000,
+            },
+        )
+        .await
+        .unwrap();
+        let speaker = upsert_speaker(&db, &m.id, "c1", "Speaker 1", false)
+            .await
+            .unwrap();
+        set_speaker_person(&db, &speaker.id, Some(&dup.id))
+            .await
+            .unwrap();
+        rename_speaker(&db, &speaker.id, "Marco").await.unwrap();
+        let other = upsert_speaker(&db, &m.id, "c2", "Speaker 2", false)
+            .await
+            .unwrap();
+        set_speaker_suggestion(&db, &other.id, Some(&dup.id), Some(0.6))
+            .await
+            .unwrap();
+
+        let done = merge_people(&db, &keep.id, &dup.id).await.unwrap();
+        assert!(done.merged);
+        assert_eq!(done.samples_moved, 1);
+        assert_eq!(done.speakers_relinked, 1);
+        assert_eq!(done.suggestions_relinked, 1);
+
+        assert_eq!(list_person_samples(&db, &keep.id).await.unwrap().len(), 1);
+        assert!(list_person_samples(&db, &dup.id).await.unwrap().is_empty());
+        let linked = get_speaker(&db, &speaker.id).await.unwrap().unwrap();
+        assert_eq!(linked.person_id.as_deref(), Some(keep.id.as_str()));
+        assert_eq!(
+            linked.display_name, "Marco",
+            "a meeting somebody has read does not rewrite itself"
+        );
+        assert_eq!(
+            get_speaker(&db, &other.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .suggested_person_id
+                .as_deref(),
+            Some(keep.id.as_str())
+        );
+
+        // The merged name stops being somebody, and still resolves to whoever
+        // it is now.
+        let people = list_people(&db).await.unwrap();
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].id, keep.id);
+        assert_eq!(
+            resolve_person(&db, &dup.id).await.unwrap().map(|p| p.id),
+            Some(keep.id.clone())
+        );
+
+        // Twice, and the other way round, both change nothing.
+        assert!(!merge_people(&db, &keep.id, &dup.id).await.unwrap().merged);
+        assert!(!merge_people(&db, &dup.id, &keep.id).await.unwrap().merged);
+        assert_eq!(list_person_samples(&db, &keep.id).await.unwrap().len(), 1);
+        assert_eq!(list_people(&db).await.unwrap().len(), 1);
+    }
+
+    /// A person is never merged into themselves, and a chain never gets longer
+    /// than one hop — the same two rules `merge_speakers` keeps.
+    #[tokio::test]
+    async fn a_person_is_never_merged_into_themselves_and_chains_stay_flat() {
+        let db = connect_in_memory().await.unwrap();
+        let a = create_person(&db, "A").await.unwrap();
+        let b = create_person(&db, "B").await.unwrap();
+        let c = create_person(&db, "C").await.unwrap();
+
+        let err = merge_people(&db, &a.id, &a.id).await.unwrap_err();
+        assert!(matches!(err, DbError::Invalid(_)), "{err:?}");
+        assert!(get_person(&db, &a.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .alias_of
+            .is_none());
+
+        merge_people(&db, &b.id, &c.id).await.unwrap();
+        merge_people(&db, &a.id, &b.id).await.unwrap();
+        for merged in [&b, &c] {
+            assert_eq!(
+                get_person(&db, &merged.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .alias_of
+                    .as_deref(),
+                Some(a.id.as_str()),
+                "every merged name points straight at the survivor"
+            );
+        }
+        assert_eq!(list_people(&db).await.unwrap().len(), 1);
+
+        // A name that has already been merged means the person it is now, so
+        // merging it again lands on the survivor rather than making a ring.
+        let d = create_person(&db, "D").await.unwrap();
+        merge_people(&db, &d.id, &c.id).await.unwrap();
+        assert_eq!(
+            resolve_person(&db, &c.id).await.unwrap().map(|p| p.id),
+            Some(d.id.clone())
+        );
+        assert!(!merge_people(&db, &c.id, &d.id).await.unwrap().merged);
+    }
+
+    /// A suggestion that would land on the person the row is already linked to
+    /// is noise, so it goes — the same thing `set_speaker_person` does.
+    #[tokio::test]
+    async fn a_suggestion_that_the_merge_makes_redundant_is_dropped() {
+        let (db, m) = seeded().await;
+        let keep = create_person(&db, "Marco").await.unwrap();
+        let dup = create_person(&db, "Marco again").await.unwrap();
+        let speaker = upsert_speaker(&db, &m.id, "c1", "Speaker 1", false)
+            .await
+            .unwrap();
+        set_speaker_person(&db, &speaker.id, Some(&keep.id))
+            .await
+            .unwrap();
+        set_speaker_suggestion(&db, &speaker.id, Some(&dup.id), Some(0.55))
+            .await
+            .unwrap();
+
+        merge_people(&db, &keep.id, &dup.id).await.unwrap();
+
+        let after = get_speaker(&db, &speaker.id).await.unwrap().unwrap();
+        assert_eq!(after.person_id.as_deref(), Some(keep.id.as_str()));
+        assert_eq!(after.suggested_person_id, None);
+        assert_eq!(after.suggestion_score, None);
+    }
+
+    /// Forgetting the survivor forgets the name that was folded into them.
+    /// Unlike a merged speaker, a merged person owns nothing of their own, so
+    /// releasing the row would put an empty person back in the list.
+    #[tokio::test]
+    async fn forgetting_the_survivor_forgets_the_name_folded_into_them() {
+        let db = connect_in_memory().await.unwrap();
+        let keep = create_person(&db, "Marco").await.unwrap();
+        let dup = create_person(&db, "Marco (call)").await.unwrap();
+        merge_people(&db, &keep.id, &dup.id).await.unwrap();
+
+        delete_person(&db, &keep.id).await.unwrap();
+
+        assert!(get_person(&db, &dup.id).await.unwrap().is_none());
+        assert!(list_people(&db).await.unwrap().is_empty());
     }
 
     /// Cutting a line in two has to leave search knowing about both halves and

@@ -189,6 +189,27 @@ export const getTranscript = (query: TranscriptQuery) =>
 export const retranscribeMeeting = (meetingId: Id) =>
   call<void>("retranscribe_meeting", { meetingId });
 
+/**
+ * "No, it heard that right": put one line back the way the engine wrote it.
+ *
+ * The other half of a repair. Every word Echo changes against "Words Echo
+ * should know" is written down beside the line, so every one of them can be
+ * taken back — until now only the writing-down half existed.
+ *
+ * **Per line, not per word**, however the person got here. The note kept
+ * against a line records *what* was replaced and never *where*, so one repair
+ * among several is not addressable, and a line with one word put back and the
+ * rest left is neither what was said nor what Echo wrote.
+ *
+ * Resolves to the line as it now stands — safe to call twice, since a line with
+ * nothing recorded against it comes straight back unchanged. Rejects, in a
+ * sentence worth showing as an explanation rather than a failure, when the line
+ * has been written down again since the repair. Every open view of the meeting
+ * refreshes off `transcriptRevised`.
+ */
+export const undoCorrections = (segmentId: Id) =>
+  call<Segment>("undo_corrections", { segmentId });
+
 export const searchTranscripts = (query: SearchQuery) =>
   call<SearchHit[]>("search_transcripts", { query });
 
@@ -294,6 +315,28 @@ export const deletePerson = (personId: Id) =>
  */
 export const renamePerson = (personId: Id, name: string) =>
   call<void>("rename_person", { personId, name });
+
+/**
+ * "These two are the same person": join two remembered voices into one.
+ *
+ * The same voice gets enrolled twice — once heard down a call, once heard in
+ * the room — and until now the only tidy-up was Forget, which destroys one of
+ * the two voices' samples for good. This keeps both: everything saved for
+ * `mergeId` moves to `keepId`, every meeting that was linked to the first is
+ * linked to the second, and the voice Echo matches against is rebuilt from the
+ * two sets together.
+ *
+ * **This cannot be undone** — making one voice out of two throws away the
+ * samples that turn out to be near-duplicates — so ask before calling it.
+ * Meetings already read do not rewrite themselves: the names on their speaker
+ * rows were copied there when the link was made and stay as plain text, the
+ * same rule `renamePerson` and `deletePerson` follow.
+ *
+ * Resolves to the whole list as it now stands, so the screen that shows it does
+ * not have to ask again. Safe to call twice and either way round.
+ */
+export const mergePeople = (keepId: Id, mergeId: Id) =>
+  call<PersonInfo[]>("merge_people", { keepId, mergeId });
 
 /**
  * A few seconds of this remembered voice — **base64 WAV**, no prefix, same as
