@@ -283,6 +283,47 @@ fn overlap(mic_len: usize, sys_len: usize, offset: i64) -> Option<(usize, usize)
     Some((start as usize, end as usize))
 }
 
+/// Is there a partner for **every** hop of the mic envelope, at every delay the
+/// search may choose?
+///
+/// [`overlap`] answers about partial intersections on purpose: a correlation
+/// over the part two buffers have in common is a perfectly good correlation,
+/// and at the far ends of the search the overlap always shrinks. That is right
+/// for measuring agreement, and it is *wrong* for deciding to delete something.
+/// Every condition in [`is_bleed`] except the correlation is a **veto** —
+/// [`BleedEvidence::unexplained_ms`] above all — and a veto is only worth
+/// anything if it was shown the whole stretch it is vetoing. Hand it the first
+/// five seconds of an eight-second utterance and it reports, quite honestly,
+/// that it found no own voice in what it was given; the three seconds of
+/// somebody in the room talking, which nothing was ever compared against, are
+/// then deleted on the strength of the five seconds that were.
+///
+/// So a caller that suppresses on the answer must ask this first. Missing far
+/// side is a reason to decline — never a reason to judge a fraction of a
+/// sentence and let the verdict stand for all of it.
+///
+/// The condition is exactly *lead ≥ [`LAG_MAX_MS`] and tail ≥ −[`LAG_MIN_MS`]*
+/// on the system buffer either side of the mic stretch, which is what a caller
+/// reading a ring back should have asked for in the first place; this checks
+/// the arrays it actually got, so a clamped read or a rounded millisecond
+/// cannot slip past the reasoning. It is written against [`overlap`] itself
+/// rather than re-deriving the arithmetic, because two copies of a geometry are
+/// two things to keep in step.
+pub fn covers_every_lag(
+    mic_len: usize,
+    sys_len: usize,
+    sys_lead_ms: i64,
+    search: LagSearch,
+) -> bool {
+    if mic_len == 0 {
+        return false;
+    }
+    let lead = hops_of(sys_lead_ms);
+    search
+        .hops()
+        .all(|lag| overlap(mic_len, sys_len, lead - lag) == Some((0, mic_len)))
+}
+
 /// Pearson correlation of the two envelopes where they overlap at `offset`.
 fn correlation_at(mic_env: &[f32], sys_env: &[f32], offset: i64) -> f32 {
     let Some((start, end)) = overlap(mic_env.len(), sys_env.len(), offset) else {
@@ -892,7 +933,7 @@ impl LagEstimate {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::asr::phantom;
 
@@ -956,7 +997,7 @@ mod tests {
     /// syllables inside each. Every parameter comes from `seed` through the LCG
     /// above, so two seeds give two unrelated speakers and the same seed gives
     /// the same audio on every machine, for ever, with no dependency.
-    fn speech(ms: usize, seed: u64) -> Vec<f32> {
+    pub(crate) fn speech(ms: usize, seed: u64) -> Vec<f32> {
         let n = RATE * ms / 1_000;
         let mut out: Vec<f32> = (0..n)
             .map(|i| ((i as f32 * 0.37).sin() + (i as f32 * 1.13).sin()) * NOISE)
@@ -989,7 +1030,7 @@ mod tests {
 
     /// The same audio, `lag_ms` later and `gain` quieter, in a buffer of the same
     /// length on the same clock. A negative lag moves it earlier.
-    fn delayed(source: &[f32], lag_ms: i64, gain: f32) -> Vec<f32> {
+    pub(crate) fn delayed(source: &[f32], lag_ms: i64, gain: f32) -> Vec<f32> {
         let shift = lag_ms * RATE as i64 / 1_000;
         (0..source.len())
             .map(|i| {
@@ -1091,6 +1132,47 @@ mod tests {
                 ev.correlation
             );
         }
+    }
+
+    /// What it takes for a verdict to be about the whole stretch: the far side
+    /// on hand from [`LAG_MAX_MS`] before it to `-`[`LAG_MIN_MS`] after it, and
+    /// **exactly** that — one hop short at either end and some delay in the
+    /// search would be comparing part of the utterance against nothing.
+    ///
+    /// This is the arithmetic `bleed_guard::BleedGuard::judge` reads back from
+    /// its ring, and the reason a partial read is declined rather than judged:
+    /// the own-voice veto can only veto seconds it was shown.
+    #[test]
+    fn a_verdict_needs_the_whole_search_either_side_of_the_stretch() {
+        let hops_for = |ms: i64| {
+            let mut env = Vec::new();
+            envelope(&vec![0.5f32; RATE * ms as usize / 1_000], &mut env);
+            env.len()
+        };
+        let mic = hops_for(6_000);
+        let covers = |lead_ms: i64, tail_ms: i64| {
+            covers_every_lag(
+                mic,
+                hops_for(6_000 + lead_ms + tail_ms),
+                lead_ms,
+                LagSearch::cold(),
+            )
+        };
+
+        assert!(covers(LAG_MAX_MS, -LAG_MIN_MS));
+        assert!(
+            !covers(LAG_MAX_MS - ENVELOPE_HOP_MS, -LAG_MIN_MS),
+            "at the latest delay in the search the opening of the utterance — \
+             the words that opened the detector — has no partner"
+        );
+        assert!(
+            !covers(LAG_MAX_MS, -LAG_MIN_MS - ENVELOPE_HOP_MS),
+            "at the earliest delay in the search the end of the utterance runs \
+             off the end of the far side"
+        );
+        // The stream that died mid-sentence: three seconds of the utterance
+        // with nothing at all to compare them against.
+        assert!(!covers(LAG_MAX_MS, -3_000));
     }
 
     /// The two buffers do not have to start at the same moment, and saying so

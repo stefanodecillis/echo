@@ -30,10 +30,12 @@
 //! waiting on the speech engine.
 
 pub mod bleed;
+pub mod bleed_guard;
 pub mod clock;
 pub mod mic;
 pub mod resample;
 pub mod ring;
+pub mod route;
 pub mod vad;
 pub mod writer;
 
