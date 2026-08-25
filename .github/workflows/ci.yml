@@ -88,6 +88,11 @@ jobs:
       - name: Type-check the frontend
         run: npx tsc --noEmit
 
+      # Pure-function tests: no DOM, no app build. They pin the handful of
+      # frontend functions whose docblocks record a bug that actually shipped.
+      - name: Test the frontend
+        run: npx vitest run
+
       # cargo needs `dist/` to exist, and this proves the bundle builds.
       - name: Build the frontend
         run: npx vite build
@@ -138,12 +143,20 @@ jobs:
       # code review (mantra 2). The three files under src/lib are the contract
       # layer: they carry machine enum values and the tone rules themselves, and
       # nothing in them is rendered. Everything else is read by a person.
+      # `-o` prints the offending string rather than the whole line, so the two
+      # exclusions below can be about strings instead of about lines: the three
+      # contract files under src/lib, and `"diarize"` on its own, which is a
+      # `JobKind` wire value out of types.ts and not something anybody reads.
+      # A screen naming a job kind is unavoidable — `inProgressJob` is asked
+      # which kinds it is about — and the label beside it comes from
+      # `labels.jobKind`, which this check still reads.
       - name: No jargon in user-facing strings
         run: |
           set -uo pipefail
-          hits=$(grep -rniE '"[^"]*(whisper|onnx|diariz|screencapturekit|pipewire|ggml|coreml|silero|pyannote)' \
+          hits=$(grep -rnoiE '"[^"]*(whisper|onnx|diariz|screencapturekit|pipewire|ggml|coreml|silero|pyannote)[^"]*"' \
                    src --include='*.tsx' --include='*.ts' \
-                   | grep -vE 'src/lib/(copy|types|ipc)\.ts' || true)
+                   | grep -vE 'src/lib/(copy|types|ipc)\.ts' \
+                   | grep -vE ':"diarize"$' || true)
           if [ -n "$hits" ]; then
             echo "$hits"
             echo "::error::A user-facing string names the machinery. Say what the person sees instead."
