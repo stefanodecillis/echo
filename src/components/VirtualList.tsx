@@ -86,7 +86,11 @@ function VirtualListInner<T>(
       scrollToBottom() {
         const el = containerRef.current;
         if (!el) return;
-        el.scrollTop = items.length * itemHeight;
+        // The element's own height, not one worked out from the row count: the
+        // count in this closure is whatever it was when the handle was last
+        // built, and being one row short of the bottom is what leaves a live
+        // transcript looking like it stopped following along.
+        el.scrollTop = el.scrollHeight;
       },
     }),
     [itemHeight, items.length, viewportHeight],
@@ -114,7 +118,18 @@ function VirtualListInner<T>(
   };
 
   return (
-    <div ref={measure} className={cx("relative overflow-y-auto", className)} onScroll={handleScroll}>
+    <div
+      ref={measure}
+      // Deliberately no `relative` here. The rows position against the spacer
+      // below, which is relative in its own right — and a caller that places
+      // this list with `absolute inset-0` was losing that fight, because
+      // Tailwind emits `.relative` after `.absolute` and the later rule wins.
+      // The container then had no height of its own to scroll inside: the live
+      // transcript could not be scrolled, and following the newest line did
+      // nothing, because there was nowhere to scroll to.
+      className={cx("overflow-y-auto", className)}
+      onScroll={handleScroll}
+    >
       <div style={{ height: totalHeight, position: "relative" }}>
         {items.slice(startIndex, endIndex).map((item, i) => {
           const index = startIndex + i;
