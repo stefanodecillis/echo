@@ -50,3 +50,50 @@ pulseRadii.forEach((dotR, i) => {
     `../tray-recording-${i}.png`,
   );
 });
+
+// The working state: the meeting is over and Echo is still finishing it off.
+//
+// Deliberately a different motif from the recording pulse rather than a
+// variant of it. Both animate at the same 2fps in the same corner of the same
+// menu bar, so if "working" were the same mark breathing differently, the one
+// question the icon exists to answer — is this thing still listening to me? —
+// would need a second look. A dot with something going round it cannot be
+// mistaken for a dot with arcs beside it.
+//
+// Echo's dot stays, small (it is the app's mark, not a recording light), and a
+// single arc travels a faint track around it, a quarter turn per frame.
+const SPIN_CENTRE = 22;
+const SPIN_RADIUS = 13;
+// How much of the circle is lit at once. Long enough to read as an arc rather
+// than a tick, short enough to leave the track visible behind it.
+const SPIN_SWEEP = 110;
+
+function trayWorkingSvg(step, steps) {
+  // 0° is twelve o'clock, and the arc runs clockwise from there.
+  const point = (degrees) => {
+    const radians = ((degrees - 90) * Math.PI) / 180;
+    return [
+      (SPIN_CENTRE + SPIN_RADIUS * Math.cos(radians)).toFixed(2),
+      (SPIN_CENTRE + SPIN_RADIUS * Math.sin(radians)).toFixed(2),
+    ];
+  };
+  const from = (step * 360) / steps;
+  const [x0, y0] = point(from);
+  const [x1, y1] = point(from + SPIN_SWEEP);
+  const large = SPIN_SWEEP > 180 ? 1 : 0;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 44 44">
+    <circle cx="${SPIN_CENTRE}" cy="${SPIN_CENTRE}" r="${SPIN_RADIUS}"
+            fill="none" stroke="#000" stroke-width="4" opacity="0.22"/>
+    <path d="M ${x0} ${y0} A ${SPIN_RADIUS} ${SPIN_RADIUS} 0 ${large} 1 ${x1} ${y1}"
+          fill="none" stroke="#000" stroke-width="4" stroke-linecap="round"/>
+    <circle cx="${SPIN_CENTRE}" cy="${SPIN_CENTRE}" r="4" fill="#000"/></svg>`;
+}
+
+// Frame 0 doubles as the still icon, the same way tray-recording.png is the
+// first frame of the pulse: whatever paints the state and whatever paints the
+// frames then agree, so a repaint mid-animation cannot make the icon jump.
+const workingSteps = 4;
+for (let i = 0; i < workingSteps; i += 1) {
+  render(trayWorkingSvg(i, workingSteps), 44, `../tray-processing-${i}.png`);
+}
+render(trayWorkingSvg(0, workingSteps), 44, "../tray-processing.png");

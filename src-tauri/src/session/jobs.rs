@@ -1164,6 +1164,11 @@ pub struct JobRuntime {
     /// something to hang on a flag (review of 2026-08-20, finding 2). This asks
     /// the capture state machine, which is the fact itself.
     capturing: std::sync::Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    /// Asked "does Echo think a meeting is happening right now?" — the third
+    /// fact the tray rule needs, and the only one that lives outside this
+    /// runtime and the capture state machine. Asked, never remembered, for the
+    /// same reason as [`JobRuntime::capturing`].
+    detecting: std::sync::Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
     stopped: AtomicBool,
     started: AtomicBool,
     wake: Notify,
@@ -1178,6 +1183,7 @@ impl JobRuntime {
             running: std::sync::Mutex::new(None),
             blocked: AtomicBool::new(false),
             capturing: std::sync::Mutex::new(None),
+            detecting: std::sync::Mutex::new(None),
             stopped: AtomicBool::new(false),
             started: AtomicBool::new(false),
             wake: Notify::new(),
@@ -1213,8 +1219,12 @@ impl JobRuntime {
         let job = repo::ensure_job_with_payload(&self.db, meeting_id, kind, payload).await?;
         self.announce(&job);
         // Work for a meeting is a reason to keep the speech engine, whether or
-        // not this loop gets to it in the next second.
+        // not this loop gets to it in the next second — and a reason for the
+        // menu bar to say so. This is also the edge that starts the working
+        // icon for every path that finishes a meeting: a normal stop, an
+        // interrupted meeting being picked back up, a transcript being redone.
         self.refresh_engine_residency().await;
+        self.refresh_tray_state().await;
         self.wake.notify_one();
         Ok(job)
     }
@@ -1223,6 +1233,13 @@ impl JobRuntime {
     /// the session spine builds itself.
     pub(crate) fn watch_capture(&self, is_live: Arc<dyn Fn() -> bool + Send + Sync>) {
         *self.capturing.lock().expect("capture hook poisoned") = Some(is_live);
+    }
+
+    /// Point the tray rule at the meeting watcher. Called once, at launch,
+    /// because the watcher lives with the app handle rather than with the
+    /// session spine. Never wired in tests, where nothing is detected.
+    pub(crate) fn watch_detection(&self, is_detected: Arc<dyn Fn() -> bool + Send + Sync>) {
+        *self.detecting.lock().expect("detection hook poisoned") = Some(is_detected);
     }
 
     /// Is a capture running right now?
@@ -1240,6 +1257,20 @@ impl JobRuntime {
         }
     }
 
+    /// Does Echo think a meeting is happening right now?
+    fn meeting_is_detected(&self) -> bool {
+        let hook = self
+            .detecting
+            .lock()
+            .expect("detection hook poisoned")
+            .clone();
+        // No watcher to ask means nothing has been detected — which is the truth
+        // on a machine where detection is turned off, and the safe answer
+        // everywhere else: the worst it costs is a badge the watcher's own poll
+        // puts back within [`crate::detect::POLL_INTERVAL_SECS`].
+        hook.is_some_and(|is_detected| is_detected())
+    }
+
     /// Hold the speech engine while a recording or a meeting's work is
     /// outstanding, and let the grace period start once neither is true.
     ///
@@ -1255,6 +1286,31 @@ impl JobRuntime {
         self.ports
             .asr
             .hold_resident(super::engine_stays_resident(capturing, outstanding));
+    }
+
+    /// Say what the menu bar should be showing, recomputed from scratch.
+    ///
+    /// The tray's half of [`JobRuntime::refresh_engine_residency`], and
+    /// deliberately built the same way: every caller — queue, cancel, retry, a
+    /// job ending however it ended, a recording being released — asks the same
+    /// question of the same three fresh facts. Nothing here accumulates, so
+    /// there is no edge that could be "the one that was missed" and leave the
+    /// menu bar claiming Echo is busy with a meeting it finished an hour ago.
+    ///
+    /// Cancelled and failed work stops counting for free: `active_only` means
+    /// queued, running or parked, so the row that ends any of those three ways
+    /// is the row that lets the icon settle.
+    pub(crate) async fn refresh_tray_state(&self) {
+        let capturing = self.capture_is_live();
+        let detected = self.meeting_is_detected();
+        let outstanding = outstanding_meeting_jobs(&self.db).await;
+        self.ports
+            .events
+            .emit(UiEvent::TrayState(super::tray_state_for(
+                capturing,
+                detected,
+                outstanding,
+            )));
     }
 
     /// Cancel a job. Already finished is success.
@@ -1281,6 +1337,7 @@ impl JobRuntime {
         // nobody reported: the engine stayed held with nothing left to do and no
         // later edge that could ever clear it.
         self.refresh_engine_residency().await;
+        self.refresh_tray_state().await;
         Ok(())
     }
 
@@ -1300,6 +1357,7 @@ impl JobRuntime {
         // And the mirror image: a meeting with work in the queue again needs the
         // engine again, whether or not the loop reaches the row this second.
         self.refresh_engine_residency().await;
+        self.refresh_tray_state().await;
         self.wake.notify_one();
         Ok(())
     }
@@ -1328,8 +1386,12 @@ impl JobRuntime {
             tracing::info!(resumed, "background work picked back up");
         }
         // Also the launch path, where work left over from a crash is un-parked:
-        // whatever is outstanding now decides whether the engine is held.
+        // whatever is outstanding now decides whether the engine is held, and
+        // what the menu bar says. A launch that finds a meeting's work still in
+        // the table is a launch that should say "still working on it" before
+        // anyone asks.
         self.refresh_engine_residency().await;
+        self.refresh_tray_state().await;
         self.wake.notify_one();
         Ok(())
     }
@@ -1543,8 +1605,17 @@ impl JobRuntime {
         }
         // This may have been the meeting's last job. If it was, and nothing is
         // being recorded, this is the moment the engine's grace period starts
-        // (mantra 1's amendment of 2026-08-20).
+        // (mantra 1's amendment of 2026-08-20) and the moment the menu bar stops
+        // saying Echo is working on something.
+        //
+        // Here rather than in `settle_meeting`, deliberately: that one only runs
+        // for work that finished, and a meeting whose last job was cancelled or
+        // failed is just as finished as far as the icon is concerned. The
+        // meeting row stays Processing in that case — which is true, something
+        // did not get done — but nothing is being worked on, and an icon that
+        // spun forever after a cancel would be a lie nobody could clear.
         self.refresh_engine_residency().await;
+        self.refresh_tray_state().await;
         if matches!(status, JobStatus::Done) {
             if let Some(meeting_id) = job.meeting_id.as_deref() {
                 self.settle_meeting(meeting_id).await;
@@ -1610,6 +1681,53 @@ mod tests {
         // Preempt no longer takes over a cancelled job.
         c.preempt();
         assert!(!c.is_preempted());
+    }
+
+    /// The icon must settle when the meeting's work is *over*, not when it
+    /// happened to succeed. A cancelled or failed row ends the work just as
+    /// truly as a finished one — `active_only` is what makes that free, and a
+    /// regression here would leave the menu bar claiming Echo is still busy
+    /// with a meeting nobody is working on any more.
+    #[tokio::test]
+    async fn work_stops_counting_however_it_ended() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let meeting = repo::create_meeting(&db, "", "/tmp", None).await.unwrap();
+        assert_eq!(outstanding_meeting_jobs(&db).await, 0);
+
+        let catch_up = repo::create_job(&db, Some(&meeting.id), JobKind::TranscribeCatchup)
+            .await
+            .unwrap();
+        let diarize = repo::create_job(&db, Some(&meeting.id), JobKind::Diarize)
+            .await
+            .unwrap();
+        let recap = repo::create_job(&db, Some(&meeting.id), JobKind::Summarize)
+            .await
+            .unwrap();
+        // Work that belongs to no meeting never held the icon in the first
+        // place: a model download is not "still finishing your meeting".
+        repo::create_job(&db, None, JobKind::Download)
+            .await
+            .unwrap();
+        assert_eq!(outstanding_meeting_jobs(&db).await, 3);
+
+        repo::set_job_status(&db, &catch_up.id, JobStatus::Done, None)
+            .await
+            .unwrap();
+        assert_eq!(outstanding_meeting_jobs(&db).await, 2);
+        repo::set_job_status(&db, &diarize.id, JobStatus::Cancelled, None)
+            .await
+            .unwrap();
+        assert_eq!(outstanding_meeting_jobs(&db).await, 1);
+
+        // The last one, and it failed. The meeting is still over.
+        repo::set_job_status(&db, &recap.id, JobStatus::Failed, Some("no"))
+            .await
+            .unwrap();
+        assert_eq!(outstanding_meeting_jobs(&db).await, 0);
+        assert_eq!(
+            super::super::tray_state_for(false, false, 0),
+            crate::types::TrayState::Idle
+        );
     }
 
     #[test]

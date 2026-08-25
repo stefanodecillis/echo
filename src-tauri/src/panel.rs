@@ -11,8 +11,9 @@
 //!   hidden, never destroyed, so the second appearance is instant.
 //! * **The pulse** — while capture is recording, one 500ms timer swaps the tray
 //!   icon between four frames. Paused holds a single frame with no timer at all,
-//!   and stopping tears the timer down. There is no timer when nothing is being
-//!   recorded.
+//!   and stopping tears the timer down. The same timer, with the other frame
+//!   set, is the spinner that says Echo is still working on a meeting that has
+//!   finished ([`IconMotion::Working`]). There is no timer when neither is true.
 //!
 //! Everything that needs a real window is a thin wrapper around a pure
 //! function: [`top_right_of`] and [`under_anchor`] decide where the panel goes,
@@ -124,10 +125,15 @@ fn clamp_into(work: Area, panel: (f64, f64), margin: f64, wanted: (f64, f64)) ->
 // The tray icon's pulse
 // ---------------------------------------------------------------------------
 
-/// How often the recording icon changes frame.
+/// How often a moving tray icon changes frame. One cadence for both animations:
+/// they are never on screen at the same time, and a second speed would be a
+/// second timer to get wrong for no gain anyone can see at 44 pixels.
 pub const FRAME_INTERVAL_MS: u64 = 500;
 
-/// `icons/tray-recording-0.png` … `-3.png`.
+/// How many frames a tray animation has: `icons/tray-recording-0.png` … `-3.png`
+/// for the pulse, `icons/tray-processing-0.png` … `-3.png` for the spinner. The
+/// frame sets are interchangeable as far as everything below is concerned — the
+/// painter carries the one it belongs to (see [`TrayPainter`]).
 pub const FRAME_COUNT: usize = 4;
 
 /// Whether the tray icon should be moving, still, or left alone.
@@ -141,9 +147,26 @@ pub enum IconMotion {
     /// Paused: one frame, held. A paused recording is not a moving thing, and a
     /// timer that exists to change nothing is a timer that should not exist.
     Held,
+    /// The meeting is over and Echo is still working on it: the same timer, the
+    /// other frame set.
+    ///
+    /// Its own variant rather than [`IconMotion::Running`] with a different
+    /// painter, and that is the whole reason it exists: [`TrayAnimation::apply`]
+    /// is idempotent *per motion*, so a recording that ended and went straight
+    /// into being worked on would ask for `Running` again and be told nothing
+    /// had changed — leaving the recording pulse breathing away over a meeting
+    /// that had stopped. What is on screen has to be part of what the animation
+    /// thinks it is doing.
+    Working,
 }
 
 /// What capture being in `state` means for the icon.
+///
+/// Only ever `Off`, `Running` or `Held`: [`IconMotion::Working`] is not
+/// something capture can ask for, because by the time it runs the recording is
+/// over. That one comes from the tray *state* instead
+/// ([`crate::schedule_tray_state`]), which is the only thing that knows a
+/// finished meeting still has work outstanding.
 pub fn motion_for(state: CaptureState) -> IconMotion {
     match state {
         // Degraded is still recording, just with less than we wanted.
@@ -209,13 +232,19 @@ pub trait FramePainter: Send + Sync + 'static {
 /// The real painter: the same atomic icon-and-template swap
 /// [`crate::set_tray_state`] does, because setting the icon alone drops the
 /// template flag and a non-template icon is a black blob in a dark menu bar.
+///
+/// Which animation this is belongs to the painter rather than to the animation:
+/// [`Pulse`], [`FrameToken`] and the timer only ever deal in frame *numbers*, so
+/// a second animation costs a second frame set and nothing else.
 pub struct TrayPainter {
     app: AppHandle,
+    frames: &'static [&'static [u8]],
 }
 
 impl TrayPainter {
-    pub fn new(app: AppHandle) -> Self {
-        Self { app }
+    /// `frames` is the set this painter paints from — `crate::TRAY_ICON_*_FRAMES`.
+    pub fn new(app: AppHandle, frames: &'static [&'static [u8]]) -> Self {
+        Self { app, frames }
     }
 }
 
@@ -232,6 +261,7 @@ impl FramePainter for TrayPainter {
         // pulse, and if the main thread has gone there is no menu bar left to
         // paint anyway.
         let app = self.app.clone();
+        let frames = self.frames;
         let token = token.clone();
         let _ = self.app.run_on_main_thread(move || {
             // Last possible moment, and the only honest one: whatever else is
@@ -241,7 +271,7 @@ impl FramePainter for TrayPainter {
             if !token.is_current() {
                 return;
             }
-            crate::set_tray_frame(&app, frame);
+            crate::set_tray_frame(&app, frames, frame);
         });
     }
 }
@@ -397,7 +427,9 @@ impl TrayAnimation {
                 self.pulse.reset();
                 painter.paint(0, &token);
             }
-            IconMotion::Running => {
+            // One timer, two animations. Which frames it paints is the painter's
+            // business, and the painter is the caller's choice.
+            IconMotion::Running | IconMotion::Working => {
                 self.pulse.reset();
                 painter.paint(0, &token);
                 // `tokio::spawn` used to be here, and it panics when there is no
@@ -423,7 +455,8 @@ impl TrayAnimation {
                         }));
                     }
                     Err(_) => tracing::warn!(
-                        "the recording icon will hold still: nothing here can run its timer"
+                        ?motion,
+                        "the tray icon will hold still: nothing here can run its timer"
                     ),
                 }
             }

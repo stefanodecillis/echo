@@ -1384,7 +1384,11 @@ pub struct OnboardingState {
 // Tray
 // ---------------------------------------------------------------------------
 
-/// Tray icon appearance, driven by capture + detection.
+/// Tray icon appearance, driven by capture, detection and the work queue.
+///
+/// Which one is showing is never remembered anywhere: it is recomputed from
+/// those three facts by [`crate::session::tray_state_for`] every time one of
+/// them moves.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TrayState {
@@ -1392,6 +1396,11 @@ pub enum TrayState {
     Idle,
     Detected,
     Recording,
+    /// The meeting is over and Echo is still finishing it: the rest of the
+    /// transcript, who spoke, the playback file, the recap. Worth its own icon
+    /// because the work outlives the recording by minutes and, until this
+    /// existed, the menu bar said "nothing is happening" throughout.
+    Processing,
 }
 
 /// What the person picked in the tray menu, forwarded to the UI.

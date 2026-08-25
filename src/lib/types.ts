@@ -683,7 +683,9 @@ export interface OnboardingState {
   localSummariesAvailable: boolean;
 }
 
-export type TrayState = "idle" | "detected" | "recording";
+/** Mirrors `TrayState` in types.rs. "processing" means the meeting has ended
+ *  and Echo is still finishing it off. */
+export type TrayState = "idle" | "detected" | "recording" | "processing";
 
 export type TrayAction = "start" | "stop" | "open" | "pauseDetection" | "quit";
 

@@ -575,6 +575,39 @@ pub fn engine_stays_resident(capturing: bool, outstanding_meeting_jobs: usize) -
     capturing || outstanding_meeting_jobs > 0
 }
 
+/// What the menu bar should be showing, from the three facts that decide it.
+///
+/// The same discipline as [`engine_stays_resident`], for the same reason: the
+/// icon is a rule over facts read fresh at every edge, never a flag somebody has
+/// to remember to clear. Two places ask it — the job runtime when the queue
+/// moves, the detection watcher on its poll — and because they ask the same
+/// question of the same facts they cannot disagree for longer than it takes the
+/// facts to settle.
+///
+/// The order of the arms *is* the rule:
+/// * a live recording outranks everything. It is the one state where the icon
+///   is answering "is this thing listening to me right now?", and nothing may
+///   take that answer away.
+/// * unfinished work outranks a detected meeting. "Still working on the last
+///   one" is news; "you could start recording" already has a panel and a
+///   notification of its own, and an icon is a poor place to nudge from.
+/// * detected outranks idle, which is what it has always meant.
+pub fn tray_state_for(
+    capturing: bool,
+    detected: bool,
+    outstanding_meeting_jobs: usize,
+) -> TrayState {
+    if capturing {
+        TrayState::Recording
+    } else if outstanding_meeting_jobs > 0 {
+        TrayState::Processing
+    } else if detected {
+        TrayState::Detected
+    } else {
+        TrayState::Idle
+    }
+}
+
 /// What to tell the person about speech, from the two facts that decide it.
 ///
 /// Pure, so the rule can be read and tested without a meeting, a thread or a
@@ -677,6 +710,16 @@ impl SessionManager {
     /// The bus other modules can emit on.
     pub fn events(&self) -> Arc<EventBus> {
         self.0.ports.events.clone()
+    }
+
+    /// Let the tray rule ask the meeting watcher whether a meeting is happening.
+    ///
+    /// Wired at launch rather than in [`SessionManager::with_ports`] because the
+    /// watcher is the app's, not the session's — and asked on every recompute
+    /// rather than mirrored here, so there is nothing to go stale
+    /// (see [`tray_state_for`]).
+    pub fn watch_detection(&self, is_detected: Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.0.jobs.watch_detection(is_detected);
     }
 
     /// Start recording. Writes the meeting row before opening any device.
@@ -1035,7 +1078,12 @@ impl SessionManager {
         inner.pending.store(0, Ordering::SeqCst);
         inner.transition(&CaptureEvent::Stopped);
         inner.emit_state();
-        inner.ports.events.emit(UiEvent::TrayState(TrayState::Idle));
+        // Not "idle": the recording is over but the meeting is not. Whatever
+        // `queue_finalization` just put in the table is outstanding work, and
+        // the icon says so until the last of it settles. Asked rather than
+        // asserted, so the discarded case — nothing queued, nothing to work on —
+        // answers itself.
+        inner.jobs.refresh_tray_state().await;
 
         if discarded {
             // `queue_finalization` already told the UI the row is gone, and
@@ -2217,6 +2265,29 @@ mod tests {
         assert!(engine_stays_resident(false, 1));
         // And only then does the grace period start.
         assert!(!engine_stays_resident(false, 0));
+    }
+
+    /// The menu bar answers one question at a time, and the order of the
+    /// answers is the whole rule. A person glancing at the icon while a
+    /// meeting is being recorded must never be told about the last one.
+    #[test]
+    fn the_icon_says_recording_first_working_second_and_only_then_offers_a_meeting() {
+        // Listening outranks everything, including its own leftover work.
+        assert_eq!(tray_state_for(true, false, 0), TrayState::Recording);
+        assert_eq!(tray_state_for(true, true, 4), TrayState::Recording);
+
+        // The recording is over and the meeting is not: this is the state that
+        // did not exist, and the menu bar used to claim nothing was happening
+        // through every minute of it.
+        assert_eq!(tray_state_for(false, false, 1), TrayState::Processing);
+        // Still working outranks a meeting somebody could start: that nudge has
+        // a panel and a notification of its own.
+        assert_eq!(tray_state_for(false, true, 2), TrayState::Processing);
+
+        // And when nothing is outstanding the icon goes back to what it always
+        // meant.
+        assert_eq!(tray_state_for(false, true, 0), TrayState::Detected);
+        assert_eq!(tray_state_for(false, false, 0), TrayState::Idle);
     }
 
     /// The same predicate guards the model cleanup, and for the same reason: an
