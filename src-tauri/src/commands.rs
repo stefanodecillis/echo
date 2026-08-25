@@ -1514,6 +1514,62 @@ pub async fn update_settings(
     Ok(updated)
 }
 
+// ---------------------------------------------------------------------------
+// Words Echo should know
+//
+// A vocabulary the person keeps: names, products, places — the words the 2026-08-24
+// meeting spelled six different ways. Reading it is cheap and it changes rarely,
+// so there is no event here: the one screen that shows the list is the one that
+// changes it, and every command hands the whole list back.
+// ---------------------------------------------------------------------------
+
+/// The whole list: what was typed, then the names of the people Echo remembers.
+#[tauri::command]
+pub async fn list_vocabulary(state: State<'_, AppState>) -> CmdResult<Vec<VocabularyWord>> {
+    Ok(settings::words_to_know(&state.db).await?)
+}
+
+/// Add a word. Returns the list as it now stands.
+#[tauri::command]
+pub async fn add_vocabulary_word(
+    state: State<'_, AppState>,
+    word: String,
+) -> CmdResult<Vec<VocabularyWord>> {
+    let word = checked_vocabulary_word(&word)?;
+    Ok(settings::add_word_to_know(&state.db, &word).await?)
+}
+
+/// Take a word off the list — including one Echo put there itself, which is why
+/// removal is remembered rather than just done (see
+/// [`crate::settings::keys::VOCABULARY_REMOVED`]).
+#[tauri::command]
+pub async fn remove_vocabulary_word(
+    state: State<'_, AppState>,
+    word: String,
+) -> CmdResult<Vec<VocabularyWord>> {
+    let word = trim_limited(&word, VOCABULARY_WORD_MAX_CHARS, "A word")?;
+    Ok(settings::remove_word_to_know(&state.db, &word).await?)
+}
+
+/// Longest word Echo will keep. A name, a product, a street — never a sentence:
+/// the whole list has to fit in a prompt of a couple of hundred tokens, and one
+/// entry filling it would push every other word out.
+const VOCABULARY_WORD_MAX_CHARS: usize = 40;
+
+/// Turn what the webview sent into a word worth keeping, or say why not.
+fn checked_vocabulary_word(word: &str) -> CmdResult<String> {
+    let word = trim_limited(word, VOCABULARY_WORD_MAX_CHARS, "A word")?;
+    if !word.chars().any(char::is_alphanumeric) {
+        return Err(UiError::invalid("That doesn't have any letters in it."));
+    }
+    if word.split_whitespace().count() > 4 {
+        return Err(UiError::invalid(
+            "Add one name at a time — a few words at most.",
+        ));
+    }
+    Ok(word)
+}
+
 /// Check a folder before the person commits to it. Returns the free space.
 #[tauri::command]
 pub async fn validate_storage_location(path: String) -> CmdResult<u64> {
@@ -1781,6 +1837,9 @@ macro_rules! echo_command_handler {
             $crate::commands::get_settings,
             $crate::commands::update_settings,
             $crate::commands::validate_storage_location,
+            $crate::commands::list_vocabulary,
+            $crate::commands::add_vocabulary_word,
+            $crate::commands::remove_vocabulary_word,
             $crate::commands::list_input_devices,
             // permissions and onboarding
             $crate::commands::get_permission_status,
@@ -1817,6 +1876,29 @@ mod tests {
         ] {
             assert!(check_id(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    /// The field is one word, or a name that is a few. Anything else is turned
+    /// down in a sentence rather than stored and quietly ignored.
+    #[test]
+    fn a_word_to_know_is_taken_as_typed_or_turned_down_with_a_sentence() {
+        assert_eq!(checked_vocabulary_word("  Langola  ").unwrap(), "Langola");
+        assert_eq!(
+            checked_vocabulary_word("Voglia Mutui Casa").unwrap(),
+            "Voglia Mutui Casa"
+        );
+        for refused in [
+            "",
+            "   ",
+            "!!!",
+            "una frase intera che non è affatto un nome",
+        ] {
+            let error = checked_vocabulary_word(refused).expect_err("{refused:?} was accepted");
+            assert_eq!(error.kind, UiErrorKind::InvalidInput);
+            assert!(!error.message.is_empty());
+        }
+        let too_long = "a".repeat(VOCABULARY_WORD_MAX_CHARS + 1);
+        assert!(checked_vocabulary_word(&too_long).is_err());
     }
 
     /// The number the person types is stored exactly or refused exactly —

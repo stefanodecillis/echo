@@ -11,6 +11,7 @@ import {
   type VirtualListHandle,
 } from "@/components";
 import { CheckIcon, CombineIcon, CopyIcon, ReplayIcon } from "@/components/icons";
+import { cx } from "@/components/lib/cx";
 import {
   EVENTS,
   getTranscript,
@@ -25,6 +26,7 @@ import {
   meeting as copy,
   notices,
   peopleCount as peopleCountCopy,
+  transcriptNote,
 } from "@/lib/copy";
 import { inProgressJob, isActive, lastFailure, presentJob } from "@/lib/jobs";
 import { useEvent } from "@/hooks/useEvent";
@@ -327,7 +329,23 @@ export function TranscriptTab({
                     fallbackId={segment.speakerId}
                     onOpen={() => setSpeakersOpen(true)}
                   />
-                  <p className="line-clamp-3 text-sm leading-relaxed text-ink-soft">
+                  <p
+                    className={cx(
+                      "line-clamp-3 text-sm leading-relaxed text-ink-soft",
+                      // A word Echo put right against the list in Settings. The
+                      // whole indication: a dotted underline and a sentence on
+                      // hover saying what was written and what it became. The
+                      // transcript is not redesigned for this — the repair is
+                      // right far more often than not, and a badge on every
+                      // third line would be noise.
+                      segment.corrections?.length && "decoration-hairline underline decoration-dotted underline-offset-4",
+                    )}
+                    title={
+                      segment.corrections?.length
+                        ? transcriptNote.corrected(segment.corrections)
+                        : undefined
+                    }
+                  >
                     {highlightMatches(segment.text, filter)}
                   </p>
                 </div>

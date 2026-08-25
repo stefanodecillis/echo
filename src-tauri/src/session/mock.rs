@@ -212,6 +212,10 @@ pub(crate) struct MockAsr {
     backlog_writes: std::sync::Mutex<Vec<(i64, i64, String)>>,
     /// The `to_ms` each live backlog pass was asked for.
     backlog_calls: std::sync::Mutex<Vec<i64>>,
+    /// What was put in front of the audio on each live decode, and what kind of
+    /// decode it was — so a test can check which lanes are told the words Echo
+    /// should know (see [`crate::asr::glossary`]).
+    live_plans: std::sync::Mutex<Vec<(crate::asr::engine::JobKind, Option<String>)>>,
 }
 
 impl MockAsr {
@@ -228,7 +232,14 @@ impl MockAsr {
             text: std::sync::Mutex::new("hello there".to_string()),
             backlog_writes: std::sync::Mutex::new(Vec::new()),
             backlog_calls: std::sync::Mutex::new(Vec::new()),
+            live_plans: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// The prompts handed to the live lanes so far, newest last.
+    #[allow(dead_code)]
+    pub(crate) fn live_plans(&self) -> Vec<(crate::asr::engine::JobKind, Option<String>)> {
+        self.live_plans.lock().unwrap().clone()
     }
 
     #[allow(dead_code)]
@@ -309,6 +320,19 @@ impl AsrPort for MockAsr {
 
     fn hold_resident(&self, resident: bool) {
         self.resident.store(resident, Ordering::SeqCst);
+    }
+
+    fn transcribe_live<'a>(
+        &'a self,
+        job: TranscribeJob,
+        plan: crate::asr::engine::DecodePlan,
+        on_partial: Option<PartialFn>,
+    ) -> BoxFuture<'a, Result<Transcription, AsrError>> {
+        self.live_plans
+            .lock()
+            .unwrap()
+            .push((plan.kind, plan.prompt.clone()));
+        self.transcribe(job, on_partial)
     }
 
     fn transcribe<'a>(
@@ -411,6 +435,7 @@ impl AsrPort for MockAsr {
                     is_final: true,
                     model_name: Some("test".into()),
                     model_revision: Some("1".into()),
+                    corrections: Vec::new(),
                 };
                 if crate::db::repo::insert_segment(db, &draft).await.is_ok() {
                     written += 1;

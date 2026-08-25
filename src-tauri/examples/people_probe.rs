@@ -432,6 +432,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 is_final: true,
                 model_name: s.model_name.clone(),
                 model_revision: s.model_revision.clone(),
+                corrections: s.corrections.clone(),
             })
             .collect();
         repo::insert_segments(&db, &drafts).await?;

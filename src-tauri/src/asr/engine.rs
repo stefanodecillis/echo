@@ -347,8 +347,17 @@ impl JobKind {
 #[derive(Debug, Clone, Default)]
 pub struct DecodePlan {
     pub kind: JobKind,
-    /// Explicit left context — the tail of the previous final on this channel,
-    /// when this audio is the continuation of speech that was force-cut.
+    /// Explicit left context: the text Echo chose to put in front of this audio.
+    ///
+    /// Two things travel here, and they are composed by the caller (see
+    /// [`crate::asr::glossary::Glossary::context`]) because from the decoder's
+    /// side they are one thing — words it has just "read":
+    ///
+    /// * the words a person told Echo to know, capped well below the length at
+    ///   which whisper starts writing a prompt back out into the transcript;
+    /// * then the tail of the previous final on this channel, when this audio is
+    ///   the continuation of speech that was force-cut. It goes last, because it
+    ///   is the sentence this audio is in the middle of.
     ///
     /// Explicit, never automatic: whisper.cpp's own carry-over
     /// (`no_context = false`) is what locks it into repeating itself, so Echo
@@ -386,8 +395,9 @@ impl DecodePlan {
         }
     }
 
-    /// Carry the tail of the previous final across a forced cut. Blank prompts
-    /// are dropped: an empty one still costs tokens.
+    /// Set the left context — the vocabulary, the tail carried across a forced
+    /// cut, or the two together. Blank prompts are dropped: an empty one still
+    /// costs tokens.
     pub fn with_prompt(mut self, prompt: Option<String>) -> Self {
         self.prompt = prompt.filter(|p| !p.trim().is_empty());
         self

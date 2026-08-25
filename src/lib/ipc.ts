@@ -44,10 +44,10 @@ import type {
   PanelState,
   PanelStatePayload,
   PeopleUpdatedPayload,
-  PersonInfo,
   PermissionState,
   PermissionStatus,
   PermissionTarget,
+  PersonInfo,
   Provider,
   ProviderConfig,
   ProviderInfo,
@@ -78,6 +78,7 @@ import type {
   TrayActionPayload,
   TrayStatePayload,
   UiError,
+  VocabularyWord,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -495,6 +496,22 @@ export const validateStorageLocation = (path: string) =>
   call<number>("validate_storage_location", { path });
 
 export const listInputDevices = () => call<AudioDevice[]>("list_input_devices");
+
+// ---------------------------------------------------------------------------
+// Words Echo should know
+//
+// The list is what somebody typed plus the names of the voices Echo was asked
+// to remember. Every one of these hands the whole list back, so the screen that
+// shows it never has to ask twice.
+// ---------------------------------------------------------------------------
+
+export const listVocabulary = () => call<VocabularyWord[]>("list_vocabulary");
+
+export const addVocabularyWord = (word: string) =>
+  call<VocabularyWord[]>("add_vocabulary_word", { word });
+
+export const removeVocabularyWord = (word: string) =>
+  call<VocabularyWord[]>("remove_vocabulary_word", { word });
 
 // ---------------------------------------------------------------------------
 // Permissions and onboarding

@@ -16,8 +16,8 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 
 use super::{Db, DbError};
 use crate::types::{
-    ActionItem, ActionItemPatch, AssetKind, AudioChunk, Channel, Id, Job, JobKind, JobQuery,
-    JobStatus, Marker, MarkerKind, Meeting, MeetingDetail, MeetingQuery, MeetingStatus,
+    ActionItem, ActionItemPatch, AssetKind, AudioChunk, Channel, Correction, Id, Job, JobKind,
+    JobQuery, JobStatus, Marker, MarkerKind, Meeting, MeetingDetail, MeetingQuery, MeetingStatus,
     MeetingSummary, ModelInfo, Provider, SearchHit, SearchQuery, Segment, SegmentDraft, Speaker,
     Summary, Template, TranscriptQuery,
 };
@@ -645,8 +645,8 @@ pub async fn insert_segments(db: &Db, drafts: &[SegmentDraft]) -> Result<Vec<Id>
         sqlx::query(
             "INSERT INTO segments (id, meeting_id, t_start_ms, t_end_ms, channel, speaker_id, text,
                                    language, avg_confidence, revision, is_final, model_name,
-                                   model_revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                   model_revision, corrections)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )
         .bind(&id)
         .bind(&d.meeting_id)
@@ -661,6 +661,7 @@ pub async fn insert_segments(db: &Db, drafts: &[SegmentDraft]) -> Result<Vec<Id>
         .bind(d.is_final)
         .bind(d.model_name.as_deref())
         .bind(d.model_revision.as_deref())
+        .bind(corrections_json(&d.corrections))
         .execute(&mut *tx)
         .await?;
         ids.push(id);
@@ -672,7 +673,7 @@ pub async fn insert_segments(db: &Db, drafts: &[SegmentDraft]) -> Result<Vec<Id>
 pub async fn get_segment(db: &Db, id: &str) -> Result<Option<Segment>, DbError> {
     let row = sqlx::query(
         "SELECT id, meeting_id, t_start_ms, t_end_ms, channel, speaker_id, text, language,
-                avg_confidence, revision, is_final, model_name, model_revision
+                avg_confidence, revision, is_final, model_name, model_revision, corrections
          FROM segments WHERE id = ?1",
     )
     .bind(id)
@@ -684,7 +685,7 @@ pub async fn get_segment(db: &Db, id: &str) -> Result<Option<Segment>, DbError> 
 pub async fn get_segments(db: &Db, q: &TranscriptQuery) -> Result<Vec<Segment>, DbError> {
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
         "SELECT id, meeting_id, t_start_ms, t_end_ms, channel, speaker_id, text, language,
-                avg_confidence, revision, is_final, model_name, model_revision
+                avg_confidence, revision, is_final, model_name, model_revision, corrections
          FROM segments WHERE meeting_id = ",
     );
     qb.push_bind(q.meeting_id.clone());
@@ -817,8 +818,8 @@ pub async fn split_segment(
         sqlx::query(
             "INSERT INTO segments (id, meeting_id, t_start_ms, t_end_ms, channel, speaker_id, text,
                                    language, avg_confidence, revision, is_final, model_name,
-                                   model_revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                   model_revision, corrections)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )
         .bind(&piece_id)
         .bind(&p.meeting_id)
@@ -833,6 +834,7 @@ pub async fn split_segment(
         .bind(p.is_final)
         .bind(p.model_name.as_deref())
         .bind(p.model_revision.as_deref())
+        .bind(corrections_json(&p.corrections))
         .execute(&mut *tx)
         .await?;
         ids.push(piece_id);
@@ -2663,7 +2665,29 @@ fn row_to_segment(row: sqlx::sqlite::SqliteRow) -> Result<Segment, DbError> {
         is_final: row.try_get("is_final").map_err(decode)?,
         model_name: row.try_get("model_name").map_err(decode)?,
         model_revision: row.try_get("model_revision").map_err(decode)?,
+        corrections: corrections_of(row.try_get("corrections").map_err(decode)?),
     })
+}
+
+/// The corrections column, as JSON — or nothing at all, which is what the
+/// overwhelming majority of lines have and is stored as NULL rather than as an
+/// empty array.
+fn corrections_json(corrections: &[Correction]) -> Option<String> {
+    if corrections.is_empty() {
+        return None;
+    }
+    serde_json::to_string(corrections).ok()
+}
+
+/// A line whose corrections column is NULL, or holds something unreadable, is a
+/// line nothing was changed in as far as anyone reading it is concerned. The
+/// note about a repair is worth nothing next to the words themselves, so a
+/// corrupt one is dropped rather than allowed to fail the query carrying them.
+fn corrections_of(stored: Option<String>) -> Vec<Correction> {
+    stored
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default()
 }
 
 fn row_to_speaker(row: sqlx::sqlite::SqliteRow) -> Result<Speaker, DbError> {
@@ -4116,6 +4140,67 @@ mod tests {
         );
     }
 
+    /// A repaired line has to come back saying it was repaired — and a line
+    /// nobody touched has to come back saying nothing, which is the state every
+    /// row written before this column existed is in.
+    #[tokio::test]
+    async fn what_echo_put_right_travels_with_the_line_and_survives_a_bad_row() {
+        let (db, m) = seeded().await;
+        let draft = |text: &str, corrections: Vec<Correction>| SegmentDraft {
+            meeting_id: m.id.clone(),
+            t_start_ms: 0,
+            t_end_ms: 2_000,
+            channel: Channel::Mic,
+            text: text.into(),
+            revision: 1,
+            is_final: true,
+            corrections,
+            ..Default::default()
+        };
+        let repaired = insert_segment(
+            &db,
+            &draft(
+                "Allora Langola è quello che usiamo.",
+                vec![Correction {
+                    from: "Nongula".into(),
+                    to: "Langola".into(),
+                }],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repaired.corrections.len(), 1);
+        assert_eq!(repaired.corrections[0].from, "Nongula");
+        // Round trip through a fresh read, not just the insert's own answer.
+        let read_back = get_segment(&db, &repaired.id).await.unwrap().unwrap();
+        assert_eq!(read_back.corrections, repaired.corrections);
+
+        let untouched = insert_segment(&db, &draft("niente da segnalare", Vec::new()))
+            .await
+            .unwrap();
+        assert!(untouched.corrections.is_empty());
+        let (stored,): (Option<String>,) =
+            sqlx::query_as("SELECT corrections FROM segments WHERE id = ?1")
+                .bind(&untouched.id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(stored, None, "nothing changed is NULL, not an empty list");
+
+        // And a row somebody's disk or an older build left unreadable is a line
+        // with no note on it, never a query that fails and takes the words with
+        // it.
+        sqlx::query("UPDATE segments SET corrections = ?2 WHERE id = ?1")
+            .bind(&repaired.id)
+            .bind("{not json")
+            .execute(&db)
+            .await
+            .unwrap();
+        let salvaged = get_segment(&db, &repaired.id).await.unwrap().unwrap();
+        assert_eq!(salvaged.text, "Allora Langola è quello che usiamo.");
+        assert!(salvaged.corrections.is_empty());
+    }
+
     /// Cutting a line in two has to leave search knowing about both halves and
     /// nothing about the line they came from. The index is external content, so a
     /// stale entry is invisible as a row — it has to be read out of the index.
@@ -4137,6 +4222,7 @@ mod tests {
                 is_final: true,
                 model_name: Some("whisper large-v3 (ggml)".into()),
                 model_revision: Some("abc123".into()),
+                corrections: Vec::new(),
             },
         )
         .await
@@ -4155,6 +4241,7 @@ mod tests {
             is_final: true,
             model_name: Some("whisper large-v3 (ggml)".into()),
             model_revision: Some("abc123".into()),
+            corrections: Vec::new(),
         };
         let ids = split_segment(
             &db,

@@ -1376,6 +1376,7 @@ mod tests {
                 is_final: true,
                 model_name: None,
                 model_revision: None,
+                corrections: Vec::new(),
             })
             .collect();
         repo::insert_segments(db, &drafts).await.unwrap();

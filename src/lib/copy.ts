@@ -154,6 +154,21 @@ export const labels = {
  * started says so, in words, instead of borrowing the sentence — and the bar —
  * of the one that is running.
  */
+/**
+ * The note on a line Echo repaired against "Words Echo should know".
+ *
+ * Deliberately a whole sentence and deliberately quiet — a title, nothing more.
+ * The transcript is what a person reads as the record of the meeting, so a word
+ * Echo changed on its own has to be able to say so; but the change is right far
+ * more often than not, and a badge on every third line would be noise. Says what
+ * was written and what it became, in that order, so the sentence reads the way
+ * it happened.
+ */
+export const transcriptNote = {
+  corrected: (changes: { from: string; to: string }[]) =>
+    changes.map((c) => `Echo wrote “${c.from}” and changed it to “${c.to}”.`).join(" "),
+} as const;
+
 export const jobLine = {
   running: (label: string) => `${label}…`,
   waiting: (label: string) => `${label} — waiting its turn`,
@@ -545,6 +560,25 @@ export const settings = {
    * next to a Save button said what the button does twice instead. */
   peopleSaveAsPlaceholder: "Their name",
   peopleSaveAsButton: "Save",
+
+  // Words Echo should know
+  sectionWords: "Words",
+  /** Mantra 2 all the way through: no "vocabulary", no "glossary", no
+   * "prompt" — just the names, and what typing one does. The second sentence is
+   * the honest limit: this makes those words far more likely to come out right,
+   * and promising more than that would be a promise a listener cannot keep. */
+  wordsIntro:
+    "Names Echo tends to get wrong: a product, a company, a street, someone you work with. Add them here and Echo will watch for them while it writes your meetings down.",
+  wordsAddPlaceholder: "A name or a word",
+  wordsAddButton: "Add",
+  wordsEmptyTitle: "Nothing here yet",
+  wordsEmptyDescription:
+    "Add the names that come up in your meetings, and Echo will spell them the way you do.",
+  /** On a row Echo added itself, from an enrolled voice. Says where it came
+   * from, not how it got there — and it can be removed like any other. */
+  wordsFromPersonNote: "From a voice you saved",
+  wordsRemoveButton: "Remove",
+  wordsTooLongError: "That's longer than a name. Add one word or two.",
 } as Record<string, string>;
 
 /**

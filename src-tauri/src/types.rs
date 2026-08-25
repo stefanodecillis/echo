@@ -439,8 +439,51 @@ pub struct AudioChunk {
 }
 
 // ---------------------------------------------------------------------------
+// Words Echo should know
+// ---------------------------------------------------------------------------
+
+/// One word in the vocabulary, and where it came from.
+///
+/// The two sources behave differently when somebody deletes one, which is the
+/// whole reason this is not a plain list of strings: a typed word is deleted by
+/// forgetting it, while a name that comes from an enrolled person has to be
+/// remembered *as deleted* or the next launch would derive it all over again.
+/// See [`crate::settings::words_to_know`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VocabularyWord {
+    pub word: String,
+    pub source: VocabularySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VocabularySource {
+    /// Somebody typed it.
+    Typed,
+    /// The name of a person whose voice Echo was asked to remember.
+    Person,
+}
+
+// ---------------------------------------------------------------------------
 // Segments
 // ---------------------------------------------------------------------------
+
+/// One word Echo put right after the engine wrote it down, and what it had
+/// written.
+///
+/// Kept with the line rather than thrown away, for two reasons that are really
+/// the same reason: a person reading a transcript is entitled to know that a
+/// word in it is not the word the engine produced, and anything Echo changed on
+/// its own has to be reversible. `from` is exactly the run of text that was
+/// replaced, `to` exactly what replaced it — put `from` back and the line is the
+/// line the engine wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Correction {
+    pub from: String,
+    pub to: String,
+}
 
 /// Row of `segments`. `revision` increases when a later, better pass replaces
 /// the text or the speaker (live partial → final → diarization-refined).
@@ -466,6 +509,10 @@ pub struct Segment {
     pub model_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_revision: Option<String>,
+    /// Words put right against the list in Settings, empty on the vast majority
+    /// of lines. See [`Correction`] and [`crate::asr::glossary`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub corrections: Vec<Correction>,
 }
 
 /// A segment as it is being written, before it lands in the database.
@@ -484,6 +531,9 @@ pub struct SegmentDraft {
     pub is_final: bool,
     pub model_name: Option<String>,
     pub model_revision: Option<String>,
+    /// See [`Segment::corrections`].
+    #[serde(default)]
+    pub corrections: Vec<Correction>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -249,6 +249,7 @@ mod tests {
                 is_final: true,
                 model_name: None,
                 model_revision: None,
+                corrections: Vec::new(),
             }],
         )
         .await

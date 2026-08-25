@@ -2509,6 +2509,7 @@ mod tests {
                 is_final: true,
                 model_name: Some("test".into()),
                 model_revision: Some("1".into()),
+                corrections: Vec::new(),
             },
         )
         .await

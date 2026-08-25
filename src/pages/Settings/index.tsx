@@ -12,12 +12,21 @@ import { People } from "./sections/People";
 import { Recaps } from "./sections/Recaps";
 import { Speech } from "./sections/Speech";
 import { Templates } from "./sections/Templates";
+import { Words } from "./sections/Words";
 
-type SectionId = "general" | "speech" | "people" | "recaps" | "templates" | "data";
+type SectionId =
+  | "general"
+  | "speech"
+  | "words"
+  | "people"
+  | "recaps"
+  | "templates"
+  | "data";
 
 const sections: { id: SectionId; label: string }[] = [
   { id: "general", label: copy.sectionGeneral },
   { id: "speech", label: copy.sectionSpeech },
+  { id: "words", label: copy.sectionWords },
   { id: "people", label: copy.sectionPeople },
   { id: "recaps", label: copy.sectionSummaries },
   { id: "templates", label: copy.sectionTemplates },
@@ -84,6 +93,7 @@ export default function SettingsPage() {
         <div className="pb-10">
           {active === "general" && <General settings={settings} patch={patch} />}
           {active === "speech" && <Speech settings={settings} patch={patch} />}
+          {active === "words" && <Words />}
           {active === "people" && <People />}
           {active === "recaps" && <Recaps settings={settings} patch={patch} />}
           {active === "templates" && <Templates settings={settings} patch={patch} />}

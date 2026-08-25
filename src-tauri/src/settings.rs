@@ -11,7 +11,9 @@ use std::path::PathBuf;
 
 use crate::db::{repo, Db, DbError};
 use crate::paths;
-use crate::types::{Provider, Settings, SettingsPatch, SummaryLanguage};
+use crate::types::{
+    Provider, Settings, SettingsPatch, SummaryLanguage, VocabularySource, VocabularyWord,
+};
 
 /// Column keys. Snake_case, stable, renaming one is a migration.
 pub mod keys {
@@ -52,6 +54,17 @@ pub mod keys {
     /// turned out to have failed before the compile could have started (see
     /// [`crate::asr::models::mark_warm_attempted`]).
     pub const SPEECH_WARM_ATTEMPTED: &str = "speech_warm_attempted";
+    /// The words somebody typed into "Words Echo should know", as a JSON array
+    /// of strings, newest last. See [`crate::settings::words_to_know`].
+    pub const VOCABULARY_TYPED: &str = "vocabulary_typed";
+    /// The words somebody took *off* that list, as a JSON array of strings.
+    ///
+    /// This exists because half the list is not stored at all: the names of
+    /// enrolled people are read from the `people` table every time, so a rename
+    /// is picked up for free and a name can never go stale. The cost of deriving
+    /// them is that deleting one would achieve nothing — the next launch would
+    /// put it straight back. This is the record that it was deleted on purpose.
+    pub const VOCABULARY_REMOVED: &str = "vocabulary_removed";
 }
 
 /// Recaps are written on their own once a meeting ends. The happy path is
@@ -173,6 +186,124 @@ pub async fn apply(db: &Db, patch: &SettingsPatch) -> Result<Settings, DbError> 
 
     repo::set_settings(db, &pairs).await?;
     load(db).await
+}
+
+// ---------------------------------------------------------------------------
+// Words Echo should know
+// ---------------------------------------------------------------------------
+
+/// Everything in the vocabulary, in the order the decoder should be offered it.
+///
+/// Two halves, and only one of them is stored:
+///
+/// * what somebody typed, from [`keys::VOCABULARY_TYPED`], first — a word
+///   worth typing is worth more than one Echo guessed at;
+/// * then the name of every enrolled person, read live from the `people` table.
+///   Those are the words this feature was born for: "Gianluca" came back from
+///   the 2026-08-24 meeting as "Jan Luca", and Echo had been told that name
+///   months earlier, by somebody saving that voice.
+///
+/// Minus anything in [`keys::VOCABULARY_REMOVED`], which is how a derived name
+/// stays deleted.
+///
+/// A row that will not parse is an empty list, never an error: nothing about
+/// this is worth failing a meeting over.
+pub async fn words_to_know(db: &Db) -> Result<Vec<VocabularyWord>, DbError> {
+    let typed = stored_list(db, keys::VOCABULARY_TYPED).await;
+    let removed = stored_list(db, keys::VOCABULARY_REMOVED).await;
+    let people = repo::list_people(db).await?;
+
+    let mut words: Vec<VocabularyWord> = Vec::new();
+    let mut push = |word: &str, source: VocabularySource| {
+        let word = word.trim();
+        if word.is_empty() || words.len() >= crate::asr::glossary::MAX_ENTRIES {
+            return;
+        }
+        if removed.iter().any(|r| same_word(r, word)) {
+            return;
+        }
+        if words.iter().any(|w| same_word(&w.word, word)) {
+            return;
+        }
+        words.push(VocabularyWord {
+            word: word.to_string(),
+            source,
+        });
+    };
+    for word in &typed {
+        push(word, VocabularySource::Typed);
+    }
+    for person in &people {
+        push(&person.name, VocabularySource::Person);
+    }
+    Ok(words)
+}
+
+/// The same list, ready to prompt and match with. Never fails: a database that
+/// cannot answer leaves the decoder exactly as it was before this feature.
+pub async fn glossary(db: &Db) -> crate::asr::glossary::Glossary {
+    match words_to_know(db).await {
+        Ok(words) => crate::asr::glossary::Glossary::new(words.into_iter().map(|w| w.word)),
+        Err(error) => {
+            tracing::warn!(%error, "could not read the words Echo should know");
+            crate::asr::glossary::Glossary::default()
+        }
+    }
+}
+
+/// Add a word, and return the list as it now stands.
+///
+/// Adding a word that was removed earlier takes it off the removed list, so the
+/// two commands are exact opposites however many times they are used.
+pub async fn add_word_to_know(db: &Db, word: &str) -> Result<Vec<VocabularyWord>, DbError> {
+    let word = word.trim();
+    let mut typed = stored_list(db, keys::VOCABULARY_TYPED).await;
+    let mut removed = stored_list(db, keys::VOCABULARY_REMOVED).await;
+    removed.retain(|r| !same_word(r, word));
+    if !word.is_empty() && !typed.iter().any(|t| same_word(t, word)) {
+        typed.push(word.to_string());
+    }
+    typed.truncate(crate::asr::glossary::MAX_ENTRIES);
+    store_list(db, keys::VOCABULARY_TYPED, &typed).await?;
+    store_list(db, keys::VOCABULARY_REMOVED, &removed).await?;
+    words_to_know(db).await
+}
+
+/// Take a word off the list — whichever half it came from — and return what is
+/// left.
+pub async fn remove_word_to_know(db: &Db, word: &str) -> Result<Vec<VocabularyWord>, DbError> {
+    let word = word.trim();
+    let mut typed = stored_list(db, keys::VOCABULARY_TYPED).await;
+    let mut removed = stored_list(db, keys::VOCABULARY_REMOVED).await;
+    typed.retain(|t| !same_word(t, word));
+    if !word.is_empty() && !removed.iter().any(|r| same_word(r, word)) {
+        removed.push(word.to_string());
+    }
+    removed.truncate(crate::asr::glossary::MAX_ENTRIES);
+    store_list(db, keys::VOCABULARY_TYPED, &typed).await?;
+    store_list(db, keys::VOCABULARY_REMOVED, &removed).await?;
+    words_to_know(db).await
+}
+
+/// Two spellings of the same word as far as this list is concerned. Case and
+/// surrounding space only — "Langola" and "Langola" are one entry, "Langola"
+/// and "Lovabile" are two.
+fn same_word(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
+async fn stored_list(db: &Db, key: &str) -> Vec<String> {
+    repo::get_setting(db, key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+async fn store_list(db: &Db, key: &str, words: &[String]) -> Result<(), DbError> {
+    let json = serde_json::to_string(words).unwrap_or_else(|_| "[]".to_string());
+    repo::set_setting(db, key, &json).await
 }
 
 /// Absolute storage directory, resolved through [`crate::paths`].
@@ -363,6 +494,135 @@ mod tests {
         let s = load(&db).await.unwrap();
         assert!(!s.close_to_tray);
         assert!(s.show_advanced);
+    }
+
+    // -----------------------------------------------------------------------
+    // Words Echo should know
+    // -----------------------------------------------------------------------
+
+    /// The half nobody has to type: Echo already knows the names of the people
+    /// whose voices it was asked to remember, and those are exactly the words it
+    /// gets wrong — "Gianluca" came back from the 2026-08-24 meeting as "Joe
+    /// Franco".
+    #[tokio::test]
+    async fn the_names_of_remembered_people_are_in_the_list_without_anybody_typing_them() {
+        let db = connect_in_memory().await.unwrap();
+        assert!(words_to_know(&db).await.unwrap().is_empty());
+
+        repo::create_person(&db, "Gianluca").await.unwrap();
+        let words = words_to_know(&db).await.unwrap();
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].word, "Gianluca");
+        assert_eq!(
+            words[0].source,
+            VocabularySource::Person,
+            "a derived name has to be tellable from a typed one"
+        );
+    }
+
+    /// Typed first, and a typed word is never listed twice because somebody of
+    /// that name is also enrolled.
+    #[tokio::test]
+    async fn what_was_typed_comes_first_and_a_name_is_only_listed_once() {
+        let db = connect_in_memory().await.unwrap();
+        repo::create_person(&db, "Marco").await.unwrap();
+        add_word_to_know(&db, "Langola").await.unwrap();
+        add_word_to_know(&db, "marco").await.unwrap();
+
+        let words = words_to_know(&db).await.unwrap();
+        assert_eq!(
+            words
+                .iter()
+                .map(|w| (w.word.as_str(), w.source))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Langola", VocabularySource::Typed),
+                ("marco", VocabularySource::Typed),
+            ],
+            "the typed spelling wins, and the enrolled name does not come back a second time"
+        );
+    }
+
+    /// The reason the removed list exists at all. Half the vocabulary is derived
+    /// from the `people` table every time it is read, so deleting a derived name
+    /// has to be *remembered* or the next read would put it straight back.
+    #[tokio::test]
+    async fn removing_a_name_echo_added_itself_makes_it_stay_removed() {
+        let db = connect_in_memory().await.unwrap();
+        repo::create_person(&db, "Gianluca").await.unwrap();
+
+        let left = remove_word_to_know(&db, "Gianluca").await.unwrap();
+        assert!(left.is_empty());
+        // The read that would resurrect it, and every one after it.
+        assert!(words_to_know(&db).await.unwrap().is_empty());
+        assert!(words_to_know(&db).await.unwrap().is_empty());
+
+        // Adding it back is the exact opposite, however many times either
+        // happens — and it is typed now, because somebody typed it.
+        let back = add_word_to_know(&db, "Gianluca").await.unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].source, VocabularySource::Typed);
+    }
+
+    #[tokio::test]
+    async fn a_typed_word_is_added_once_and_removed_for_good() {
+        let db = connect_in_memory().await.unwrap();
+        add_word_to_know(&db, "Obsidara").await.unwrap();
+        add_word_to_know(&db, "  Obsidara  ").await.unwrap();
+        assert_eq!(words_to_know(&db).await.unwrap().len(), 1);
+
+        assert!(remove_word_to_know(&db, "Obsidara")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(words_to_know(&db).await.unwrap().is_empty());
+    }
+
+    /// Nothing about a list of words is worth failing to open the app for.
+    #[tokio::test]
+    async fn a_corrupt_vocabulary_row_is_an_empty_list_rather_than_an_error() {
+        let db = connect_in_memory().await.unwrap();
+        repo::set_setting(&db, keys::VOCABULARY_TYPED, "{not json")
+            .await
+            .unwrap();
+        repo::set_setting(&db, keys::VOCABULARY_REMOVED, "[1, 2, 3]")
+            .await
+            .unwrap();
+        assert!(words_to_know(&db).await.unwrap().is_empty());
+        assert!(glossary(&db).await.is_empty());
+
+        // …and writing to it puts it back in a state that parses.
+        add_word_to_know(&db, "Langola").await.unwrap();
+        assert_eq!(words_to_know(&db).await.unwrap().len(), 1);
+    }
+
+    /// The list feeds a prompt with a hard cap on it, so the list itself has one
+    /// too — otherwise a thousand words would be stored to have fifty read.
+    #[tokio::test]
+    async fn the_list_stops_at_the_cap() {
+        let db = connect_in_memory().await.unwrap();
+        for i in 0..crate::asr::glossary::MAX_ENTRIES + 20 {
+            add_word_to_know(&db, &format!("Parola{i}")).await.unwrap();
+        }
+        assert_eq!(
+            words_to_know(&db).await.unwrap().len(),
+            crate::asr::glossary::MAX_ENTRIES
+        );
+    }
+
+    /// The one every decode path leans on: with nothing in the list, the
+    /// vocabulary is not in the way of anything.
+    #[tokio::test]
+    async fn an_untouched_install_has_nothing_to_say_to_the_decoder() {
+        let db = connect_in_memory().await.unwrap();
+        let glossary = glossary(&db).await;
+        assert!(glossary.is_empty());
+        assert_eq!(glossary.prompt(), None);
+        assert_eq!(
+            glossary.context(Some("e il secondo punto")).as_deref(),
+            Some("e il secondo punto")
+        );
+        assert_eq!(glossary.correct("Nongula e Ingola"), None);
     }
 
     #[tokio::test]

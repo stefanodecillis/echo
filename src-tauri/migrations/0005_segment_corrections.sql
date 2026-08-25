@@ -1,0 +1,21 @@
+-- Words Echo put right after the engine wrote them down.
+--
+-- The meeting of 2026-08-24 spelled one product name six different ways in
+-- eight mentions. Echo can now be told the words that matter ("Words Echo
+-- should know", Settings), prompt the decoder with them, and repair the near
+-- misses afterwards — see `src-tauri/src/asr/glossary.rs`.
+--
+-- A repair is a rewrite of text somebody reads as the record of what was said,
+-- so it is not allowed to be invisible. This column holds the list of
+-- `{"from": "Nongula", "to": "Langola"}` pairs that were applied to this line,
+-- as JSON, in the order they were applied. Put every `from` back and the line
+-- is byte for byte the line the engine produced.
+--
+-- Why a column rather than a table: it is written exactly once, by the same
+-- INSERT that writes the line, and read only with the line it belongs to.
+-- Nothing ever queries across corrections, and a row per correction would mean
+-- a join on the one query the transcript view runs constantly.
+--
+-- NULL is the normal case and means "nothing was changed" — which is what every
+-- row written before today is, correctly and without a backfill.
+ALTER TABLE segments ADD COLUMN corrections TEXT;

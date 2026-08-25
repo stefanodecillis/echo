@@ -41,7 +41,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::asr::engine::EngineWorker;
+use crate::asr::engine::{DecodePlan, EngineWorker};
+use crate::asr::glossary::Glossary;
 use crate::asr::phantom::VoicedSpans;
 use crate::asr::{models, AsrError, TranscribeJob, Transcription};
 use crate::audio::vad::Utterance;
@@ -236,6 +237,11 @@ pub struct CatchUpReport {
     /// [`crate::asr::phantom`]). Counted so a pass that starts throwing away
     /// real speech is visible in the log rather than only in the transcript.
     pub phantoms_dropped: u32,
+    /// Words put right against the vocabulary — "Nongula" back to "Langola"
+    /// (see [`crate::asr::glossary`]). Counted for the same reason the phantoms
+    /// are: this pass changes words a person will read, so how often it does
+    /// belongs in the log next to how much it wrote.
+    pub words_corrected: u32,
     /// Where the pass began and ended on the meeting clock, per channel summed
     /// into one span for the log.
     pub from_ms: i64,
@@ -293,9 +299,14 @@ pub trait SpeechStream: Send {
 
 /// Whatever turns audio into text. The real one is [`EngineWorker`].
 pub trait Transcriber: Send + Sync {
+    /// `prompt` is the text to put in front of this audio — the words Echo was
+    /// told about (see [`crate::asr::glossary`]). Nothing is carried across
+    /// windows here: this pass reads a recording that already exists, window by
+    /// window, and the only context it hands over is context somebody typed.
     fn transcribe(
         &self,
         job: TranscribeJob,
+        prompt: Option<String>,
     ) -> impl Future<Output = Result<Transcription, AsrError>> + Send;
 
     /// The language the meeting settled on, if it has.
@@ -305,8 +316,13 @@ pub trait Transcriber: Send + Sync {
 }
 
 impl Transcriber for EngineWorker {
-    async fn transcribe(&self, job: TranscribeJob) -> Result<Transcription, AsrError> {
-        self.submit(job, None).await
+    async fn transcribe(
+        &self,
+        job: TranscribeJob,
+        prompt: Option<String>,
+    ) -> Result<Transcription, AsrError> {
+        self.submit_with(job, DecodePlan::catch_up().with_prompt(prompt), None)
+            .await
     }
 
     fn settled_language(&self, meeting_id: &str) -> Option<String> {
@@ -446,6 +462,13 @@ where
     // anything, and leaving them behind would make this pass skip real audio.
     repo::delete_partial_segments(db, meeting_id).await?;
 
+    // The words Echo should know, read once for the whole pass. This lane gets
+    // them for the same reason it gets the meeting's language: it is the text
+    // people keep, nothing is waiting on it, and its windows are long enough
+    // that a couple of hundred tokens of names is a small part of what the
+    // decoder is reading.
+    let glossary = crate::settings::glossary(db).await;
+
     let detector = models::installed_path(db, AssetKind::SpeechDetector).await?;
     let mut report = CatchUpReport {
         from_ms: i64::MAX,
@@ -508,6 +531,7 @@ where
             meeting_id,
             channel,
             prior: prior.as_deref(),
+            glossary: &glossary,
             options: &options,
         };
 
@@ -612,6 +636,7 @@ where
         ladder_cap = crate::asr::catalog::CATCHUP_MAX_FALLBACKS + 1,
         written = report.segments_written,
         phantoms_dropped = report.phantoms_dropped,
+        words_corrected = report.words_corrected,
         audio_ms = total_ms,
         "catch-up pass finished"
     );
@@ -628,6 +653,8 @@ struct Work<'a, T: Transcriber> {
     channel: Channel,
     /// The meeting's language, when it has one.
     prior: Option<&'a str>,
+    /// The words Echo has been told about. Read once for the whole pass.
+    glossary: &'a Glossary,
     options: &'a CatchUpOptions,
 }
 
@@ -831,7 +858,8 @@ async fn decode_pack<T: Transcriber>(
     };
     report.stretches_packed += pack.stretches;
     report.windows_decoded += 1;
-    match transcribe_with_prior(work.transcriber, job, work.prior, report).await {
+    let prompt = work.glossary.prompt();
+    match transcribe_with_prior(work.transcriber, job, work.prior, prompt, report).await {
         Ok(text) => {
             if text.is_empty() {
                 return Ok(Outcome::Carried);
@@ -871,7 +899,17 @@ async fn decode_pack<T: Transcriber>(
                     );
                     continue;
                 }
-                repo::insert_segment(work.db, &line.to_draft(work.meeting_id)).await?;
+                // Near misses against the words Echo was told about, put right
+                // on the way to the database — and recorded on the row, because
+                // this text is what a person reads afterwards as the record of
+                // the meeting (see [`crate::asr::glossary`]).
+                let mut draft = line.to_draft(work.meeting_id);
+                if let Some(fixed) = work.glossary.correct(&draft.text) {
+                    report.words_corrected += fixed.changes.len() as u32;
+                    draft.text = fixed.text;
+                    draft.corrections = fixed.changes;
+                }
+                repo::insert_segment(work.db, &draft).await?;
                 report.segments_written += 1;
             }
         }
@@ -943,10 +981,11 @@ async fn transcribe_with_prior<T: Transcriber>(
     transcriber: &T,
     job: TranscribeJob,
     prior: Option<&str>,
+    prompt: Option<String>,
     report: &mut CatchUpReport,
 ) -> Result<Transcription, AsrError> {
     if prior.is_none() {
-        return transcriber.transcribe(job).await;
+        return transcriber.transcribe(job, prompt).await;
     }
     // Held back only so the retry can happen; a copy of the audio costs nothing
     // next to a decode of it.
@@ -954,13 +993,13 @@ async fn transcribe_with_prior<T: Transcriber>(
         language_hint: None,
         ..job.clone()
     };
-    let first = transcriber.transcribe(job).await?;
+    let first = transcriber.transcribe(job, prompt.clone()).await?;
     if !collapsed(&first) {
         return Ok(first);
     }
     let t_start_ms = retry.t_start_ms;
     report.fallback_attempts += 1;
-    match transcriber.transcribe(retry).await {
+    match transcriber.transcribe(retry, prompt).await {
         Ok(second) if improves_on(&second, &first) => {
             tracing::debug!(
                 target: "echo::asr",
@@ -1350,6 +1389,9 @@ mod tests {
         /// Sentences to answer with, as offsets into the window it is given:
         /// what a real engine hands back for a packed window.
         lines: Vec<(i64, i64, String)>,
+        /// Every prompt it was handed, in order: what the vocabulary put in
+        /// front of the audio.
+        prompts: Mutex<Vec<Option<String>>>,
     }
 
     impl FakeEngine {
@@ -1400,7 +1442,12 @@ mod tests {
     }
 
     impl Transcriber for FakeEngine {
-        async fn transcribe(&self, job: TranscribeJob) -> Result<Transcription, AsrError> {
+        async fn transcribe(
+            &self,
+            job: TranscribeJob,
+            prompt: Option<String>,
+        ) -> Result<Transcription, AsrError> {
+            self.prompts.lock().unwrap().push(prompt);
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if self.cancel_after.is_some_and(|limit| n >= limit) {
                 return Err(AsrError::Cancelled);
@@ -1530,7 +1577,11 @@ mod tests {
     }
 
     impl Transcriber for WhisperLike {
-        async fn transcribe(&self, job: TranscribeJob) -> Result<Transcription, AsrError> {
+        async fn transcribe(
+            &self,
+            job: TranscribeJob,
+            _prompt: Option<String>,
+        ) -> Result<Transcription, AsrError> {
             self.asked.fetch_add(1, Ordering::SeqCst);
             let readable = job.samples.iter().any(|s| *s != 0.0);
             if !readable {
@@ -1689,6 +1740,109 @@ mod tests {
         // of `MAX_PACK_MS` for no reason is encoder time spent on zeros.
         let widest = jobs.iter().map(|(_, d)| *d).max().unwrap_or(0);
         assert!(widest > MAX_PACK_MS / 2, "widest window was {widest} ms");
+    }
+
+    // -----------------------------------------------------------------------
+    // Words Echo should know
+    // -----------------------------------------------------------------------
+
+    /// This pass is the one whose text a person keeps, so it is the one that has
+    /// to get the names right: the vocabulary goes in front of the audio, and
+    /// what still comes back mangled is put right on the way to the database.
+    #[tokio::test]
+    async fn the_words_echo_was_told_about_reach_the_engine_and_fix_what_it_still_gets_wrong() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 1).await;
+        crate::settings::add_word_to_know(&db, "Langola")
+            .await
+            .unwrap();
+        // Exactly what the 2026-08-24 recording produced for that word.
+        let engine = FakeEngine::saying("Allora Nongula è quello che usiamo.");
+
+        let report = run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions::default(),
+            &FakeAudio::with_speech(),
+        )
+        .await
+        .unwrap();
+        assert!(report.segments_written > 0, "the pass wrote nothing");
+        assert_eq!(
+            report.words_corrected, report.segments_written,
+            "every line it wrote held the name once"
+        );
+
+        let prompts = engine.prompts.lock().unwrap().clone();
+        assert!(!prompts.is_empty(), "the pass decoded nothing");
+        for prompt in &prompts {
+            assert_eq!(
+                prompt.as_deref(),
+                Some("Langola."),
+                "every window of this pass gets the vocabulary"
+            );
+        }
+
+        let rows = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row = rows.first().expect("a line was written");
+        assert_eq!(row.text, "Allora Langola è quello che usiamo.");
+        assert_eq!(
+            row.corrections,
+            vec![crate::types::Correction {
+                from: "Nongula".into(),
+                to: "Langola".into()
+            }],
+            "the row has to say what was changed in it"
+        );
+    }
+
+    /// The invariant every path leans on: an install where nobody has typed
+    /// anything decodes and writes exactly what it did before this existed.
+    #[tokio::test]
+    async fn with_nothing_in_the_list_the_pass_is_untouched() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 1).await;
+        let engine = FakeEngine::saying("Allora Nongula è quello che usiamo.");
+
+        let report = run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions::default(),
+            &FakeAudio::with_speech(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.words_corrected, 0);
+        for prompt in engine.prompts.lock().unwrap().iter() {
+            assert_eq!(
+                prompt.as_deref(),
+                None,
+                "nothing goes in front of the audio"
+            );
+        }
+
+        let rows = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row = rows.first().expect("a line was written");
+        assert_eq!(row.text, "Allora Nongula è quello che usiamo.");
+        assert!(row.corrections.is_empty());
     }
 
     /// The 2026-08-24 failure, on the disk lane: the same courtesy phrase, once

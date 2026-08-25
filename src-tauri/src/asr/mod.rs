@@ -25,6 +25,7 @@
 pub mod catalog;
 pub mod catchup;
 pub mod engine;
+pub mod glossary;
 pub mod language;
 pub mod models;
 pub mod phantom;
@@ -182,6 +183,7 @@ impl Transcription {
             is_final: true,
             model_name: self.model_name.clone(),
             model_revision: self.model_revision.clone(),
+            corrections: Vec::new(),
         }
     }
 }

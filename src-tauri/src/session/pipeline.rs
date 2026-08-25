@@ -942,6 +942,12 @@ async fn speech_loop(
     let mut failures = FailureRun::default();
     let mut carry = ContextCarry::default();
     let mut handoff = Handoff::default();
+    // The words Echo has been told about, read once as the meeting starts (see
+    // [`crate::asr::glossary`]). Once: this is a hot loop with a decode in it,
+    // and a word typed while a meeting is running is meant for the next one —
+    // the catch-up pass over this recording reads the list again anyway, so it
+    // still reaches this meeting's transcript in the end.
+    let glossary = crate::settings::glossary(&inner.db).await;
     // Whether the handshake with the disk pass has been answered yet.
     let mut answered_backlog = false;
 
@@ -1012,6 +1018,7 @@ async fn speech_loop(
             &mut speakers,
             &mut failures,
             &mut carry,
+            &glossary,
             &mut capture_over,
             &mut handoff,
             &stopping,
@@ -1128,6 +1135,7 @@ async fn transcribe(
     speakers: &mut SpeakerCache,
     failures: &mut FailureRun,
     carry: &mut ContextCarry,
+    glossary: &crate::asr::glossary::Glossary,
     capture_over: &mut tokio::sync::watch::Receiver<bool>,
     handoff: &mut Handoff,
     stopping: &AtomicBool,
@@ -1146,10 +1154,13 @@ async fn transcribe(
     let hint = language.get();
     // Only across a forced cut, and only from the same channel in the same
     // language a moment earlier (codex §3 "Context and prompts").
-    let prompt = carry.prompt_for(channel, t_start_ms, hint.as_deref());
-    // The same words serve twice: as context going in, and as the thing the
-    // overlap at the front of this utterance is matched against coming out.
-    let carried = prompt.clone();
+    // The same tail serves twice — as context going in, and as the thing the
+    // overlap at the front of this utterance is matched against coming out —
+    // but not in the same wording: the prompt wants the spelling the transcript
+    // settled on, and the overlap has to be matched against what the engine
+    // actually wrote, because that is the alphabet this decode will arrive in.
+    let carried = carry.prompt_for(channel, t_start_ms, hint.as_deref());
+    let prompt = carried.as_ref().map(|tail| tail.words.clone());
 
     // What the captions were showing for this channel is this utterance's
     // business now, one way or another.
@@ -1200,7 +1211,14 @@ async fn transcribe(
         inner,
         meeting_id,
         job,
-        DecodePlan::final_utterance().with_prompt(prompt),
+        // The vocabulary and the carried tail travel in the same slot, because
+        // they are the same thing: text Echo chose to put in front of this
+        // audio. This lane gets it and the caption lane does not — a caption is
+        // replaced within seconds by the final below, it is the cheapest and
+        // most latency-bound decode there is, and it is the one decoded as a
+        // single segment, which is where a prompt is most likely to be written
+        // back out into the text instead of read as context.
+        DecodePlan::final_utterance().with_prompt(glossary.context(prompt.as_deref())),
         on_partial,
         capture_over,
         handoff,
@@ -1276,8 +1294,8 @@ async fn transcribe(
     // one was cut through speech, this one restarted inside it and has just
     // re-read the last of its words; saying them twice is the artefact the
     // overlap trades a sliced word for, and this is where it is paid back.
-    let text = match carried.as_deref() {
-        Some(carried) => strip_overlap(transcription.text.trim(), carried),
+    let text = match carried.as_ref() {
+        Some(tail) => strip_overlap(transcription.text.trim(), &tail.heard),
         None => transcription.text.trim().to_string(),
     };
     let text = text.trim();
@@ -1319,6 +1337,27 @@ async fn transcribe(
         }
     }
 
+    // Near misses against the words Echo was told about: "Nongula" and
+    // "sull'angolo" are Langola, and this is where they become it. After the
+    // phantom filter, so a line that is about to be thrown away is not repaired
+    // first; before the carry below, so the continuation of a cut sentence is
+    // prompted with the right spelling rather than the wrong one.
+    let heard = text;
+    let corrected = glossary.correct(text);
+    let (text, corrections) = match &corrected {
+        Some(fixed) => {
+            tracing::debug!(
+                target: "echo::asr",
+                ?channel,
+                t_start_ms,
+                changes = fixed.changes.len(),
+                "put right words the vocabulary knows"
+            );
+            (fixed.text.as_str(), fixed.changes.clone())
+        }
+        None => (text, Vec::new()),
+    };
+
     let speaker_id = channel_speaker(inner, meeting_id, channel, speakers).await;
     // What the engine actually read, never what we hoped it read
     // (review finding 1).
@@ -1328,7 +1367,7 @@ async fn transcribe(
     carry.remember(
         channel,
         truncated,
-        text,
+        Wordings { kept: text, heard },
         transcription.language.as_deref(),
         transcription.avg_confidence,
         span_end_ms,
@@ -1349,6 +1388,7 @@ async fn transcribe(
             is_final: true,
             model_name: transcription.model_name,
             model_revision: transcription.model_revision,
+            corrections,
         },
     ))
 }
@@ -1404,9 +1444,34 @@ struct ContextCarry {
     held: Vec<(Channel, Carry)>,
 }
 
+/// One finished line in both of its wordings.
+///
+/// They differ only where the vocabulary put a name right, and the carry needs
+/// each of them for a different job — see [`Carry`].
+#[derive(Debug, Clone, Copy)]
+struct Wordings<'a> {
+    /// The line as the transcript will keep it.
+    kept: &'a str,
+    /// The line as the engine wrote it.
+    heard: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Carry {
+    /// The tail as the transcript keeps it — the vocabulary already applied —
+    /// which is what the next decode is prompted with, so a name spelled right
+    /// once goes on being spelled right across the join.
     words: String,
+    /// The same tail exactly as the engine wrote it, before any repair.
+    ///
+    /// This is what the overlap at the front of the next utterance is matched
+    /// against, and it has to be the raw wording because the thing it is matched
+    /// *to* is raw: the continuation is a fresh decode of the same audio, and it
+    /// arrives before anything has been put right. Comparing a repaired tail
+    /// against a raw re-read finds no overlap at all — and the words most likely
+    /// to have been repaired are exactly the names a decoder stumbles over, so
+    /// the join would break precisely where this file works hardest.
+    heard: String,
     language: Option<String>,
     ends_at_ms: i64,
 }
@@ -1419,7 +1484,7 @@ impl ContextCarry {
         channel: Channel,
         starts_at_ms: i64,
         language: Option<&str>,
-    ) -> Option<String> {
+    ) -> Option<Carry> {
         let at = self.held.iter().position(|(c, _)| *c == channel)?;
         let (_, carry) = self.held.remove(at);
         // A pause, a lost source, a resumed recording: all of them show up here
@@ -1434,7 +1499,7 @@ impl ContextCarry {
                 return None;
             }
         }
-        Some(carry.words)
+        Some(carry)
     }
 
     /// Remember the tail of a final — or deliberately forget, which is most of
@@ -1443,7 +1508,7 @@ impl ContextCarry {
         &mut self,
         channel: Channel,
         truncated: bool,
-        text: &str,
+        line: Wordings<'_>,
         language: Option<&str>,
         confidence: Option<f32>,
         ends_at_ms: i64,
@@ -1453,18 +1518,19 @@ impl ContextCarry {
         // how whisper starts repeating itself.
         if !truncated
             || confidence.is_some_and(|c| c < CARRY_MIN_CONFIDENCE)
-            || looks_repetitive(text)
+            || looks_repetitive(line.kept)
         {
             self.forget(channel);
             return;
         }
-        let words = tail_words(text, CARRY_WORDS);
+        let words = tail_words(line.kept, CARRY_WORDS);
         if words.is_empty() {
             self.forget(channel);
             return;
         }
         let carry = Carry {
             words,
+            heard: tail_words(line.heard, CARRY_WORDS),
             language: language.map(str::to_string),
             ends_at_ms,
         };
@@ -2024,6 +2090,12 @@ fn segment_of(id: Id, draft: SegmentDraft) -> Segment {
         is_final: draft.is_final,
         model_name: draft.model_name,
         model_revision: draft.model_revision,
+        // A repair is not allowed to be invisible, and this is the payload the
+        // live view reads: dropping the list here left the dotted underline and
+        // its note off every line of a running meeting, and they appeared only
+        // if somebody reopened the transcript afterwards and it was re-read from
+        // the database.
+        corrections: draft.corrections,
     }
 }
 
@@ -2325,7 +2397,10 @@ mod tests {
         carry.remember(
             Channel::Mic,
             false,
-            "e quindi ci siamo",
+            Wordings {
+                kept: "e quindi ci siamo",
+                heard: "e quindi ci siamo",
+            },
             Some("it"),
             Some(0.9),
             8_000,
@@ -2336,7 +2411,10 @@ mod tests {
         carry.remember(
             Channel::Mic,
             true,
-            "allora il punto principale della riunione è",
+            Wordings {
+                kept: "allora il punto principale della riunione è",
+                heard: "allora il punto principale della riunione è",
+            },
             Some("it"),
             Some(0.9),
             28_000,
@@ -2344,9 +2422,44 @@ mod tests {
         let prompt = carry
             .prompt_for(Channel::Mic, 28_000, Some("it"))
             .expect("the continuation of a cut sentence gets its context");
-        assert!(prompt.ends_with("riunione è"));
+        assert!(prompt.words.ends_with("riunione è"));
         // Consumed: it can never resurface later in the meeting.
         assert!(carry.prompt_for(Channel::Mic, 28_000, Some("it")).is_none());
+    }
+
+    /// The tail is carried twice over, and the two copies are not the same
+    /// words.
+    ///
+    /// The prompt gets the spelling the transcript settled on, so the
+    /// continuation is nudged towards the right name. The overlap matcher gets
+    /// what the engine actually wrote, because the continuation it is compared
+    /// against is a raw decode: a repaired tail and a raw re-read share no
+    /// words, so the join would silently stop working — and it would stop
+    /// working on exactly the lines a name was repaired in.
+    #[test]
+    fn the_overlap_is_matched_against_what_the_engine_wrote_not_what_was_stored() {
+        let mut carry = ContextCarry::default();
+        carry.remember(
+            Channel::Mic,
+            true,
+            Wordings {
+                kept: "e quindi usiamo Langola",
+                heard: "e quindi usiamo Nongula",
+            },
+            Some("it"),
+            Some(0.9),
+            28_000,
+        );
+        let tail = carry
+            .prompt_for(Channel::Mic, 28_000, Some("it"))
+            .expect("a cut sentence carries");
+        assert!(tail.words.ends_with("usiamo Langola"));
+        assert!(tail.heard.ends_with("usiamo Nongula"));
+        // And the re-read of the overlap, which arrives raw, is stripped.
+        assert_eq!(
+            strip_overlap("usiamo Nongula per i dati", &tail.heard),
+            "per i dati"
+        );
     }
 
     #[test]
@@ -2355,7 +2468,10 @@ mod tests {
             carry.remember(
                 Channel::Mic,
                 true,
-                "e il secondo punto invece",
+                Wordings {
+                    kept: "e il secondo punto invece",
+                    heard: "e il secondo punto invece",
+                },
                 Some("it"),
                 Some(0.9),
                 28_000,
@@ -2387,7 +2503,10 @@ mod tests {
         carry.remember(
             Channel::Mic,
             true,
-            "forse qualcosa cosi",
+            Wordings {
+                kept: "forse qualcosa cosi",
+                heard: "forse qualcosa cosi",
+            },
             Some("it"),
             Some(0.2),
             28_000,
@@ -2399,7 +2518,10 @@ mod tests {
         carry.remember(
             Channel::Mic,
             true,
-            "sì sì sì sì",
+            Wordings {
+                kept: "sì sì sì sì",
+                heard: "sì sì sì sì",
+            },
             Some("it"),
             Some(0.95),
             28_000,
@@ -2412,7 +2534,10 @@ mod tests {
         carry.remember(
             Channel::Mic,
             true,
-            "e il secondo punto invece",
+            Wordings {
+                kept: "e il secondo punto invece",
+                heard: "e il secondo punto invece",
+            },
             None,
             None,
             28_000,
@@ -2545,6 +2670,122 @@ mod tests {
         assert_eq!(
             what_gets_written("Grazie, allora vediamo domani.", 96).await,
             vec!["Grazie, allora vediamo domani."]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Words Echo should know (2026-08-24)
+    // -----------------------------------------------------------------------
+
+    /// The live lane end to end: the words go in front of the audio, and what
+    /// still comes back as "Nongula" is written down as "Langola" — with the
+    /// change recorded on the row, because this is text somebody reads as the
+    /// record of what was said.
+    #[tokio::test]
+    async fn a_live_final_is_prompted_with_the_words_and_the_line_is_put_right() {
+        let h = crate::session::mock::Harness::new().await;
+        crate::settings::add_word_to_know(&h.db, "Langola")
+            .await
+            .unwrap();
+        let id = h.session.start(Default::default()).await.unwrap();
+        h.asr.says("Allora Nongula è quello che usiamo.");
+        h.capture
+            .send(crate::session::ports::CaptureSignal::UtteranceReady(
+                Utterance {
+                    channel: Channel::Mic,
+                    t_start_ms: 200,
+                    t_end_ms: 1_400,
+                    samples: vec![0.0; 19_200],
+                    truncated: false,
+                    voiced_ms: 600,
+                },
+            ));
+        h.settle().await;
+        h.commit_chunk(&id, 0, 1_500).await;
+        h.session.stop().await.unwrap();
+
+        let rows = repo::get_segments(
+            &h.db,
+            &crate::types::TranscriptQuery {
+                meeting_id: id.clone(),
+                include_partial: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row = rows.first().expect("the utterance was written down");
+        assert_eq!(row.text, "Allora Langola è quello che usiamo.");
+        assert_eq!(
+            row.corrections,
+            vec![crate::types::Correction {
+                from: "Nongula".into(),
+                to: "Langola".into()
+            }]
+        );
+
+        let plans = h.asr.live_plans();
+        assert!(
+            plans
+                .iter()
+                .any(|(kind, prompt)| *kind == crate::asr::engine::JobKind::Final
+                    && prompt.as_deref() == Some("Langola.")),
+            "the lane whose text is kept was told the words: {plans:?}"
+        );
+        // …and the caption lane never is, whether or not this meeting produced
+        // one: a caption is replaced within seconds, it is the decode with the
+        // least time to spare, and it is the one asked for a single segment —
+        // which is where a prompt is likeliest to come back out as text.
+        assert!(
+            plans
+                .iter()
+                .filter(|(kind, _)| kind.is_speculative())
+                .all(|(_, prompt)| prompt.is_none()),
+            "a caption was given the vocabulary: {plans:?}"
+        );
+    }
+
+    /// With nothing in the list, the live pass decodes and writes exactly what
+    /// it did before any of this existed.
+    #[tokio::test]
+    async fn with_nothing_in_the_list_a_live_meeting_is_untouched() {
+        let h = crate::session::mock::Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        h.asr.says("Allora Nongula è quello che usiamo.");
+        h.capture
+            .send(crate::session::ports::CaptureSignal::UtteranceReady(
+                Utterance {
+                    channel: Channel::Mic,
+                    t_start_ms: 200,
+                    t_end_ms: 1_400,
+                    samples: vec![0.0; 19_200],
+                    truncated: false,
+                    voiced_ms: 600,
+                },
+            ));
+        h.settle().await;
+        h.commit_chunk(&id, 0, 1_500).await;
+        h.session.stop().await.unwrap();
+
+        let rows = repo::get_segments(
+            &h.db,
+            &crate::types::TranscriptQuery {
+                meeting_id: id.clone(),
+                include_partial: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row = rows.first().expect("the utterance was written down");
+        assert_eq!(row.text, "Allora Nongula è quello che usiamo.");
+        assert!(row.corrections.is_empty());
+        assert!(
+            h.asr
+                .live_plans()
+                .iter()
+                .all(|(_, prompt)| prompt.is_none()),
+            "nothing goes in front of the audio"
         );
     }
 
@@ -2716,7 +2957,11 @@ mod tests {
     }
 
     impl crate::asr::catchup::Transcriber for Recorder {
-        async fn transcribe(&self, job: TranscribeJob) -> Result<Transcription, AsrError> {
+        async fn transcribe(
+            &self,
+            job: TranscribeJob,
+            _prompt: Option<String>,
+        ) -> Result<Transcription, AsrError> {
             let span = (job.t_start_ms, job.t_end_ms());
             self.asked.lock().expect("recorder").push(span);
             Ok(Transcription {
@@ -2766,6 +3011,7 @@ mod tests {
                 is_final: true,
                 model_name: Some("test".into()),
                 model_revision: Some("1".into()),
+                corrections: Vec::new(),
             },
         )
         .await

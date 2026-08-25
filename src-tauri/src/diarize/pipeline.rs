@@ -1386,9 +1386,13 @@ async fn persist(
         let span: Span = (segment.t_start_ms, segment.t_end_ms);
         match attribution {
             Attribution::Split(pieces) => {
+                // A note about a word Echo put right belongs to the half of the
+                // line that still holds that word, and to exactly one half.
+                let mut notes = corrections_by_piece(&segment.corrections, &pieces);
                 let drafts: Vec<crate::types::SegmentDraft> = pieces
                     .iter()
-                    .map(|piece| crate::types::SegmentDraft {
+                    .zip(notes.drain(..))
+                    .map(|(piece, corrections)| crate::types::SegmentDraft {
                         meeting_id: segment.meeting_id.clone(),
                         t_start_ms: piece.span.0,
                         t_end_ms: piece.span.1,
@@ -1404,6 +1408,7 @@ async fn persist(
                         is_final: true,
                         model_name: segment.model_name.clone(),
                         model_revision: segment.model_revision.clone(),
+                        corrections,
                     })
                     .collect();
                 if drafts.iter().all(|d| d.speaker_id.is_some())
@@ -1604,6 +1609,50 @@ pub fn display_name(index: usize) -> String {
 /// Narrower than [`people::is_default_name`], which also counts "You": a remote
 /// row somebody has named "You" is a name they chose, and this must not take it
 /// off them.
+/// Hand each of a line's corrections to the one piece of the split that still
+/// holds the word it wrote.
+///
+/// Asking each piece whether it *contains* the corrected word is not enough,
+/// and the case it gets wrong is not exotic: one ASR line can hold two separate
+/// manglings of the same name — the 2026-08-24 meeting spelled Langola six ways
+/// and used two of them within a sentence of each other — and both notes then
+/// say "Langola", so both pieces claim both of them. The reader is told the
+/// half in front of them was repaired twice when it was repaired once.
+///
+/// The pieces tile the line left to right with no gap and no overlap
+/// ([`split::Piece`]), and the corrections were recorded left to right as the
+/// line was read, so the two orders agree: this walks them together and gives
+/// each note the next occurrence of its word that no earlier note has taken.
+/// A note whose word is nowhere in the pieces is dropped rather than guessed at.
+fn corrections_by_piece(
+    corrections: &[crate::types::Correction],
+    pieces: &[split::Piece],
+) -> Vec<Vec<crate::types::Correction>> {
+    let mut out = vec![Vec::new(); pieces.len()];
+    // How far the sweep has read: which piece, and how far into it.
+    let (mut piece, mut at) = (0usize, 0usize);
+    for correction in corrections {
+        if correction.to.is_empty() {
+            continue;
+        }
+        while piece < pieces.len() {
+            let text = &pieces[piece].text;
+            match text.get(at..).and_then(|rest| rest.find(&correction.to)) {
+                Some(hit) => {
+                    out[piece].push(correction.clone());
+                    at += hit + correction.to.len();
+                    break;
+                }
+                None => {
+                    piece += 1;
+                    at = 0;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn is_numbered_name(display_name: &str) -> bool {
     (0..cluster::MAX_SPEAKERS).any(|i| display_name == self::display_name(i))
 }
@@ -1625,6 +1674,74 @@ mod tests {
             fingerprint: vec![None; n],
             continues: vec![None; n],
         }
+    }
+
+    fn piece(text: &str) -> split::Piece {
+        split::Piece {
+            span: (0, 0),
+            text: text.to_string(),
+            speaker: 0,
+        }
+    }
+
+    fn note(from: &str, to: &str) -> crate::types::Correction {
+        crate::types::Correction {
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    /// Two manglings of the same name in one line, and a cut between them.
+    ///
+    /// Both notes read "Langola", so asking each half whether it contains
+    /// "Langola" hands both notes to both halves — and the reader is told a
+    /// sentence was repaired twice when one word in it was repaired once. Each
+    /// note belongs to the occurrence it actually made.
+    #[test]
+    fn a_repaired_word_follows_the_half_of_the_line_it_is_actually_in() {
+        let pieces = [piece("Langola è ok."), piece("Poi Langola è tornato.")];
+        let notes = corrections_by_piece(
+            &[note("Nongula", "Langola"), note("lana gola", "Langola")],
+            &pieces,
+        );
+        assert_eq!(
+            notes,
+            vec![
+                vec![note("Nongula", "Langola")],
+                vec![note("lana gola", "Langola")]
+            ]
+        );
+    }
+
+    /// The ordinary shapes: one note, and a note whose word the cut left in the
+    /// other half entirely.
+    #[test]
+    fn a_repaired_word_is_never_claimed_by_a_half_that_does_not_hold_it() {
+        let pieces = [
+            piece("Non lo so."),
+            piece("Quelli di Langola hanno scritto."),
+        ];
+        assert_eq!(
+            corrections_by_piece(&[note("Nongula", "Langola")], &pieces),
+            vec![vec![], vec![note("Nongula", "Langola")]]
+        );
+        // Two different names, one in each half, in the order they were read.
+        let pieces = [piece("Usiamo Langola."), piece("E poi Obsidara.")];
+        assert_eq!(
+            corrections_by_piece(
+                &[note("Nongula", "Langola"), note("obsidera", "Obsidara")],
+                &pieces
+            ),
+            vec![
+                vec![note("Nongula", "Langola")],
+                vec![note("obsidera", "Obsidara")]
+            ]
+        );
+        // And a note for a word no piece kept is dropped, not guessed at.
+        assert_eq!(
+            corrections_by_piece(&[note("Nongula", "Langola")], &[piece("Non lo so.")]),
+            vec![Vec::new()]
+        );
     }
 
     #[test]

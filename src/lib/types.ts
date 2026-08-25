@@ -216,7 +216,27 @@ export interface Segment {
   isFinal: boolean;
   modelName?: string;
   modelRevision?: string;
+  /**
+   * Words Echo put right against the list in Settings, absent on nearly every
+   * line. `from` is what was written down, `to` what replaced it — enough to
+   * show what happened and to put it back.
+   */
+  corrections?: Correction[];
 }
+
+export interface Correction {
+  from: string;
+  to: string;
+}
+
+/** One word in "Words Echo should know", and where it came from. */
+export interface VocabularyWord {
+  word: string;
+  source: VocabularySource;
+}
+
+/** `person` means Echo added it itself, from a voice somebody saved. */
+export type VocabularySource = "typed" | "person";
 
 export interface TranscriptQuery {
   meetingId: Id;
