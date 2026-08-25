@@ -12,8 +12,8 @@ import {
   speakerSample,
   toUiError,
 } from "@/lib/ipc";
-import { common, jobLine, meeting as copy, peopleCount as peopleCountCopy } from "@/lib/copy";
-import { presentJob } from "@/lib/jobs";
+import { common, meeting as copy, peopleCount as peopleCountCopy } from "@/lib/copy";
+import { jobSentence, presentJob } from "@/lib/jobs";
 import { useEchoStore } from "@/lib/store";
 import type { Id, Job, PersonInfo, Speaker } from "@/lib/types";
 
@@ -278,7 +278,7 @@ export function SpeakersDialog({
           <div className="flex flex-col gap-1.5">
             <ProgressBar value={shown?.fraction} label={shown?.label ?? ""} />
             <span className="text-xs text-ink-faint">
-              {shown && (shown.running ? jobLine.running(shown.label) : jobLine.waiting(shown.label))}
+              {shown && jobSentence(shown)}
             </span>
           </div>
         ) : pending ? (

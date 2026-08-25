@@ -28,7 +28,7 @@ import {
   peopleCount as peopleCountCopy,
   transcriptNote,
 } from "@/lib/copy";
-import { inProgressJob, isActive, lastFailure, presentJob } from "@/lib/jobs";
+import { inProgressJob, isActive, jobSentence, lastFailure, presentJob } from "@/lib/jobs";
 import { useEvent } from "@/hooks/useEvent";
 import { useEchoStore } from "@/lib/store";
 import type { Id, MeetingDetail, Segment } from "@/lib/types";
@@ -289,9 +289,7 @@ export function TranscriptTab({
             />
           )}
           <span className="text-xs text-ink-faint">
-            {transcribeProgress.running
-              ? jobLine.running(transcribeProgress.label)
-              : jobLine.waiting(transcribeProgress.label)}
+            {jobSentence(transcribeProgress)}
           </span>
         </div>
       )}

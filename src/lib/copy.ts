@@ -182,6 +182,17 @@ export const jobLine = {
    * reason underneath it comes from the core, already in plain words.
    */
   stopped: (label: string) => `${label} — didn't finish`,
+  /**
+   * Work that is set aside because a recording is going on.
+   *
+   * Recording always gets the machine first, so on a day of back-to-back
+   * meetings the previous meeting's work sits still for as long as the next one
+   * lasts. Until now the screen kept whatever it last said — a job name over a
+   * bar that had stopped moving — which reads as Echo being stuck. This says
+   * what is actually true and that it will carry on by itself, so nobody has to
+   * decide whether to press anything.
+   */
+  deferred: (label: string) => `${label} — paused until the recording ends`,
 } as const;
 
 /** Words used across more than one screen: dialogs, toasts, generic buttons. */

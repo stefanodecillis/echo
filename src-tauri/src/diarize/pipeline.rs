@@ -20,7 +20,9 @@
 //! 1. **It never touches the audio.** Everything is read-only on disk; the pass
 //!    can be run again, or abandoned, without losing anything (mantra 3).
 //! 2. **It yields.** A recording starting outranks it absolutely, and it drops
-//!    both models when it does (mantra 1).
+//!    both models when it does (mantra 1). What it worked out first is written
+//!    down ([`super::scan_cache`]), so stepping aside costs the meeting a delay
+//!    and not the work.
 //! 3. **It never invents a name.** A voice Echo separated out but cannot identify
 //!    is "Speaker N", never a guess at who it was.
 //!
@@ -77,6 +79,7 @@ use super::cluster::{self, ClusterItem};
 use super::embedding::{self, Embedder};
 use super::pcm::ChunkPcm;
 use super::people;
+use super::scan_cache;
 use super::segmentation::{self, Segmenter};
 use super::split;
 use super::timeline::{self, Span};
@@ -163,6 +166,16 @@ impl DiarizeControl {
     }
 }
 
+/// Why a step that had to be interruptible stopped.
+///
+/// Asked of the control after the fact, because the clustering only reports
+/// *that* it was told to stop. If the reason has already gone away — a yield
+/// closure that has since changed its mind — this still parks rather than
+/// carrying on, because the work that was in flight has already been dropped.
+fn stopped(control: &DiarizeControl) -> DiarizeError {
+    control.checkpoint().err().unwrap_or(DiarizeError::Yielded)
+}
+
 /// How many cores to give the models.
 ///
 /// Half of them, capped at four. This is background work: leaving headroom means
@@ -217,17 +230,20 @@ impl Source {
 
 /// What one sliding window produced. Local speaker indices are meaningless
 /// outside the window they came from.
-#[derive(Debug, Clone, Default)]
-struct WindowResult {
-    start_ms: i64,
+///
+/// Serialisable, and visible to [`super::scan_cache`], because a park keeps
+/// these rather than throwing the models' work away.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WindowResult {
+    pub(crate) start_ms: i64,
     /// Per local speaker, the stretches it was talking, on the meeting clock.
-    tracks: Vec<Vec<Span>>,
+    pub(crate) tracks: Vec<Vec<Span>>,
     /// Per local speaker, mean activation while it was talking.
-    confidence: Vec<f32>,
+    pub(crate) confidence: Vec<f32>,
     /// Per local speaker, its fingerprint's index, when it spoke enough alone.
-    fingerprint: Vec<Option<usize>>,
+    pub(crate) fingerprint: Vec<Option<usize>>,
     /// Per local speaker, the previous window's local speaker it continues.
-    continues: Vec<Option<usize>>,
+    pub(crate) continues: Vec<Option<usize>>,
 }
 
 /// Everything the models had to say about one meeting, before any decision about
@@ -424,6 +440,24 @@ impl Scan {
     /// real speech unattributed to make an arithmetic come out right is worse
     /// than one voice too many.
     pub fn cut_guided(&self, guided: &Guided, target: Option<usize>) -> ScanCut {
+        self.cut_guided_until(guided, target, &DiarizeControl::new())
+            .expect("a cut nothing can stop always finishes")
+    }
+
+    /// [`Self::cut_guided`], which a recording can interrupt.
+    ///
+    /// The clustering is the one stretch of the pass that reads nothing off
+    /// disk, so without a checkpoint inside it a park would be honoured only
+    /// once the whole merge tree had been built — minutes, on a long meeting,
+    /// with a recording already running. Stopping gives back
+    /// [`DiarizeError::Yielded`] or [`DiarizeError::Cancelled`] and no cut at
+    /// all: half a merge tree is not a smaller answer, it is a wrong one.
+    pub fn cut_guided_until(
+        &self,
+        guided: &Guided,
+        target: Option<usize>,
+        control: &DiarizeControl,
+    ) -> Result<ScanCut, DiarizeError> {
         let known = guided.groups.len();
         let leftovers: Vec<usize> = (0..self.items.len())
             .filter(|i| guided.assignment.get(*i).copied().flatten().is_none())
@@ -439,15 +473,18 @@ impl Scan {
             }
         });
 
+        let stop = || control.checkpoint().is_err();
         let (clustering, choice, forced) = match (items.is_empty(), strangers) {
             (true, _) => (cluster::Clustering::default(), None, None),
             (false, Some(0)) => (cluster::Clustering::default(), None, None),
             (false, Some(k)) => {
-                let (clustering, forced) = cluster::cluster_fixed(&items, k);
+                let (clustering, forced) = cluster::cluster_fixed_until(&items, k, &stop)
+                    .ok_or_else(|| stopped(control))?;
                 (clustering, None, Some(forced))
             }
             (false, None) => {
-                let (clustering, choice) = cluster::cluster_auto(&items);
+                let (clustering, choice) =
+                    cluster::cluster_auto_until(&items, &stop).ok_or_else(|| stopped(control))?;
                 (clustering, Some(choice), None)
             }
         };
@@ -499,7 +536,7 @@ impl Scan {
             cluster_count: known + clustering.cluster_count,
             threshold: clustering.threshold,
         };
-        self.tracks_of(combined, choice, forced, guided)
+        Ok(self.tracks_of(combined, choice, forced, guided))
     }
 
     /// Turn one clustering of the fingerprints into per-person timelines.
@@ -630,6 +667,77 @@ async fn voice_channel(
     Ok(Some((Source::MicOnly, mic)))
 }
 
+/// What the models do to one window.
+///
+/// A trait with exactly one real implementation, so the resumable walk below can
+/// be exercised without two ONNX sessions — which is the only way a test can
+/// state the thing that matters here: after a park and a resume, no window is
+/// analysed twice.
+trait WindowModels: Send {
+    fn analyse(
+        &mut self,
+        samples: &[f32],
+        start_ms: i64,
+        window_ms: i64,
+        previous: Option<&WindowResult>,
+        items: &mut Vec<ClusterItem>,
+    ) -> Result<WindowResult, DiarizeError>;
+}
+
+/// The real one: the segmentation network and the fingerprint network.
+struct OnnxModels {
+    segmenter: Segmenter,
+    embedder: Embedder,
+}
+
+impl WindowModels for OnnxModels {
+    fn analyse(
+        &mut self,
+        samples: &[f32],
+        start_ms: i64,
+        window_ms: i64,
+        previous: Option<&WindowResult>,
+        items: &mut Vec<ClusterItem>,
+    ) -> Result<WindowResult, DiarizeError> {
+        analyse_window(
+            &mut self.segmenter,
+            &mut self.embedder,
+            samples,
+            start_ms,
+            window_ms,
+            previous,
+            items,
+        )
+    }
+}
+
+/// How much work may be lost to something that is not a park — a crash, a
+/// force-quit, the power going.
+///
+/// A park writes the scan down on its way out, so this interval is only about
+/// the ways of stopping that get no warning. A minute of ONNX arithmetic is a
+/// tolerable loss; writing after every window would not be, because the file
+/// holds every fingerprint found so far and grows all pass.
+const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Where the window walk got to, and everything it found on the way.
+#[derive(Debug)]
+struct Walk {
+    items: Vec<ClusterItem>,
+    windows: Vec<WindowResult>,
+    next_start_ms: i64,
+}
+
+impl Walk {
+    fn fresh() -> Self {
+        Self {
+            items: Vec::new(),
+            windows: Vec::new(),
+            next_start_ms: 0,
+        }
+    }
+}
+
 /// Segment and fingerprint one meeting's audio. Writes nothing.
 ///
 /// The expensive half of [`refine`], and the half a calibration run wants on its
@@ -642,15 +750,38 @@ pub async fn scan(
     embedder_path: &std::path::Path,
     control: &DiarizeControl,
 ) -> Result<Option<Scan>, DiarizeError> {
+    scan_resumable(db, meeting_id, segmenter_path, embedder_path, None, control).await
+}
+
+/// [`scan`], with somewhere to keep the work.
+///
+/// `audio_dir` is the meeting's own directory. Given one, the walk picks up
+/// where a parked run stopped and writes down where this one gets to; given
+/// `None` — the calibration tools — it behaves exactly as it always did.
+/// [`super::scan_cache`] carries the argument for why resuming is safe, and what
+/// makes a kept scan get thrown away instead.
+pub(crate) async fn scan_resumable(
+    db: &Db,
+    meeting_id: &str,
+    segmenter_path: &std::path::Path,
+    embedder_path: &std::path::Path,
+    audio_dir: Option<&std::path::Path>,
+    control: &DiarizeControl,
+) -> Result<Option<Scan>, DiarizeError> {
     control.checkpoint()?;
 
-    let Some((_source, mut pcm)) = voice_channel(db, meeting_id).await? else {
+    let Some((source, mut pcm)) = voice_channel(db, meeting_id).await? else {
         return Ok(None);
     };
 
-    let threads = inference_threads();
-    let mut segmenter = Segmenter::load(segmenter_path, threads)?;
-    let mut embedder = Embedder::load(embedder_path, threads)?;
+    // The key first: it decides whether there is anything to resume, and a
+    // model file that cannot even be stat'ed switches the whole cache off
+    // rather than being guessed at.
+    let key = match audio_dir {
+        Some(_) => scan_key(db, &pcm, source, segmenter_path, embedder_path).await,
+        None => None,
+    };
+    let slot = audio_dir.zip(key);
 
     let covered = pcm.covered();
     let total_ms = pcm.total_ms();
@@ -658,53 +789,215 @@ pub async fn scan(
     let window_ms = segmentation::WINDOW_MS;
     let planned = ((total_ms + step - 1) / step).max(1);
 
-    let mut items: Vec<ClusterItem> = Vec::new();
-    let mut windows: Vec<WindowResult> = Vec::new();
+    let mut walk = Walk::fresh();
+    if let Some((dir, key)) = &slot {
+        if let Some(kept) = scan_cache::load(dir, key).await {
+            tracing::info!(
+                meeting = %meeting_id,
+                from_ms = kept.next_start_ms,
+                fingerprints = kept.items.len(),
+                "picking this meeting's separation up where it stopped"
+            );
+            walk = Walk {
+                items: kept.items,
+                windows: kept.windows,
+                next_start_ms: kept.next_start_ms,
+            };
+        }
+    }
 
-    let mut start_ms = 0i64;
-    let mut index = 0i64;
-    while start_ms < total_ms {
-        control.checkpoint()?;
+    if walk.next_start_ms < total_ms {
+        let threads = inference_threads();
+        let mut models = OnnxModels {
+            // Loaded only when there are windows left to analyse: a scan that
+            // was finished before the park goes straight to clustering without
+            // opening an ONNX session at all (mantra 1).
+            segmenter: Segmenter::load(segmenter_path, threads)?,
+            embedder: Embedder::load(embedder_path, threads)?,
+        };
+        walk = walk_windows(
+            &mut pcm,
+            &mut models,
+            walk,
+            &covered,
+            total_ms,
+            window_ms,
+            step,
+            planned,
+            slot.as_ref().map(|(dir, key)| (*dir, key)),
+            control,
+        )
+        .await?;
+    }
 
+    // Both models are done. Drop the decoded audio before clustering, so the
+    // heaviest part of this pass is not also the part holding two ONNX sessions
+    // open (mantra 1).
+    pcm.release();
+    control.checkpoint()?;
+    control.report(0.85);
+
+    Ok(Some(Scan {
+        items: walk.items,
+        windows: walk.windows,
+        covered,
+    }))
+}
+
+/// The window walk itself: forward, one step at a time, from wherever it starts.
+///
+/// Parked at a checkpoint like everything else in this pass — but on the way out
+/// it writes down what it has, which is the difference between a meeting that
+/// eventually gets its speakers and one that restarts from zero every time
+/// somebody takes a call.
+#[allow(clippy::too_many_arguments)]
+async fn walk_windows(
+    pcm: &mut ChunkPcm,
+    models: &mut (dyn WindowModels + Send),
+    mut walk: Walk,
+    covered: &[Span],
+    total_ms: i64,
+    window_ms: i64,
+    step: i64,
+    planned: i64,
+    slot: Option<(&std::path::Path, &scan_cache::Key)>,
+    control: &DiarizeControl,
+) -> Result<Walk, DiarizeError> {
+    let mut last_saved = std::time::Instant::now();
+    while walk.next_start_ms < total_ms {
+        if let Err(stopped) = control.checkpoint() {
+            // A park is Echo stepping aside and coming back, so what it worked
+            // out is written down. A cancel is not: the commonest reason for
+            // one is the person deleting this meeting, whose folder is being
+            // removed at that very moment — and a write landing in the middle of
+            // that recreates the file the delete just took away, leaving this
+            // meeting's voice fingerprints behind after somebody asked Echo to
+            // forget the recording.
+            keep(slot, &walk, covered, control).await;
+            return Err(stopped);
+        }
+
+        let start_ms = walk.next_start_ms;
         let window: Span = (start_ms, start_ms + window_ms);
         // Skip stretches of clock with no audio behind them at all.
         let has_audio = covered.iter().any(|&c| timeline::overlap_ms(window, c) > 0);
         if has_audio {
             let samples = pcm.window(start_ms, window_ms).await?;
             if segmentation::has_signal(&samples) {
-                let result = analyse_window(
-                    &mut segmenter,
-                    &mut embedder,
+                let result = models.analyse(
                     &samples,
                     start_ms,
                     window_ms,
-                    windows.last(),
-                    &mut items,
+                    walk.windows.last(),
+                    &mut walk.items,
                 )?;
-                windows.push(result);
+                walk.windows.push(result);
             }
         }
 
-        index += 1;
+        walk.next_start_ms = start_ms + step;
         // Reserve the last fifth of the bar for clustering and the database.
-        control.report(0.8 * (index as f32 / planned as f32));
-        start_ms += step;
+        let done = (walk.next_start_ms + step - 1) / step;
+        control.report(0.8 * (done as f32 / planned as f32));
+
+        if last_saved.elapsed() >= SAVE_EVERY {
+            keep(slot, &walk, covered, control).await;
+            last_saved = std::time::Instant::now();
+        }
     }
+    // Finished: the file now says so, and a park during the clustering that
+    // follows resumes without touching a model again.
+    keep(slot, &walk, covered, control).await;
+    Ok(walk)
+}
 
-    // Both models are done. Drop them and the decoded audio before clustering,
-    // so the heaviest part of this pass is not also the part holding two ONNX
-    // sessions open (mantra 1).
-    drop(segmenter);
-    drop(embedder);
-    pcm.release();
-    control.checkpoint()?;
-    control.report(0.85);
+/// Write the walk down, when there is somewhere to write it and the meeting is
+/// still there to write it for.
+///
+/// Cancelled means stop, and the reason is usually that this meeting is being
+/// deleted — its folder emptied by `commands::delete_meeting` while this runs.
+/// Checked here as well as at the checkpoint above, because a save that came due
+/// on a timer has no checkpoint in front of it.
+async fn keep(
+    slot: Option<(&std::path::Path, &scan_cache::Key)>,
+    walk: &Walk,
+    covered: &[Span],
+    control: &DiarizeControl,
+) {
+    let Some((dir, key)) = slot else {
+        return;
+    };
+    if control.is_cancelled() {
+        return;
+    }
+    scan_cache::store(
+        dir,
+        &scan_cache::Cached {
+            key: key.clone(),
+            next_start_ms: walk.next_start_ms,
+            items: walk.items.clone(),
+            windows: walk.windows.clone(),
+            covered: covered.to_vec(),
+        },
+    )
+    .await;
+}
 
-    Ok(Some(Scan {
-        items,
-        windows,
-        covered,
-    }))
+/// Everything that has to be the same for a kept scan to still be true of this
+/// meeting, or `None` when one of the model files cannot be identified — in
+/// which case nothing is kept and nothing is resumed.
+async fn scan_key(
+    db: &Db,
+    pcm: &ChunkPcm,
+    source: Source,
+    segmenter_path: &std::path::Path,
+    embedder_path: &std::path::Path,
+) -> Option<scan_cache::Key> {
+    Some(scan_cache::Key {
+        format: scan_cache::FORMAT,
+        source: source.as_str().to_string(),
+        audio: pcm.stamp(),
+        total_ms: pcm.total_ms(),
+        window_ms: segmentation::WINDOW_MS,
+        step_ms: segmentation::STEP_MS,
+        segmenter: scan_cache::model_stamp(segmenter_path)?,
+        embedder: scan_cache::model_stamp(embedder_path)?,
+        embedder_tag: people::embedder_tag(db, embedder_path).await,
+    })
+}
+
+/// Where a meeting's own directory is, for the things that live beside its
+/// audio. `None` when the meeting has gone — the pass then keeps nothing and
+/// still works.
+async fn audio_dir_of(db: &Db, meeting_id: &str) -> Option<std::path::PathBuf> {
+    let recorded = match repo::get_meeting(db, meeting_id).await {
+        Ok(Some(meeting)) => std::path::PathBuf::from(meeting.audio_dir),
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::debug!(%error, "could not read where this meeting's audio lives");
+            return None;
+        }
+    };
+    // Only a folder that names this meeting. The row is written before the
+    // per-meeting folder is recorded on it and the second write is allowed to
+    // fail (`session::start`), so a row can name the storage root instead — and
+    // deleting the meeting only ever removes the folder named after it
+    // (`commands::meeting_audio_dir`, which guards the same way for the same
+    // reason). Keeping voice fingerprints anywhere else would leave them behind
+    // when somebody asks Echo to forget a recording, and would have every such
+    // meeting overwriting the same file. Nothing kept is the correct answer
+    // here: the pass costs time and loses nothing.
+    let names_this_meeting = recorded
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(meeting_id));
+    if !names_this_meeting {
+        tracing::debug!(
+            meeting = %meeting_id,
+            "this meeting has no folder of its own; its separation will not be kept"
+        );
+        return None;
+    }
+    Some(recorded)
 }
 
 /// The canonical offline pass. See the module docs for the shape of it.
@@ -770,7 +1063,19 @@ pub async fn refine(
         }
     }
 
-    let Some(scanned) = scan(db, meeting_id, segmenter_path, embedder_path, control).await? else {
+    // The meeting's own directory is where a parked scan is kept, so twelve
+    // minutes of ONNX work survives somebody taking the next call.
+    let audio_dir = audio_dir_of(db, meeting_id).await;
+    let Some(scanned) = scan_resumable(
+        db,
+        meeting_id,
+        segmenter_path,
+        embedder_path,
+        audio_dir.as_deref(),
+        control,
+    )
+    .await?
+    else {
         return Err(DiarizeError::Failed(
             "the meeting's audio disappeared while the pass was starting".into(),
         ));
@@ -797,7 +1102,10 @@ pub async fn refine(
         speech_ms = scanned.fingerprinted_ms(),
         "separating this meeting's voices"
     );
-    let mut cut = scanned.cut_guided(&guided, target);
+    // Solid arithmetic with no I/O in it, and minutes of it on a long meeting:
+    // off the async worker, and interruptible, or a recording starting would
+    // wait for the whole merge tree.
+    let mut cut = run_blocking(|| scanned.cut_guided_until(&guided, target, control))?;
     people::match_remaining(&mut cut, &enrolment);
     if let Some(choice) = &cut.choice {
         for candidate in &choice.candidates {
@@ -3212,5 +3520,540 @@ mod tests {
         .await
         .unwrap();
         assert!(segments.iter().all(|s| s.speaker_id.is_none()));
+    }
+}
+
+// ===========================================================================
+// Keeping the expensive half across a park
+// ===========================================================================
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use crate::types::Channel;
+
+    async fn db() -> Db {
+        let db = crate::db::connect_in_memory().await.expect("in-memory db");
+        crate::db::migrate(&db).await.expect("migrations");
+        db
+    }
+
+    /// Stands in for the two ONNX networks and counts what it was asked to do.
+    ///
+    /// Every window it sees costs real seconds in the app; the whole point of
+    /// the cache is that a parked meeting does not pay for the same window
+    /// twice, and a counter is the only way to state that as a test.
+    #[derive(Default)]
+    struct CountingModels {
+        seen: Vec<i64>,
+    }
+
+    impl WindowModels for CountingModels {
+        fn analyse(
+            &mut self,
+            _samples: &[f32],
+            start_ms: i64,
+            _window_ms: i64,
+            previous: Option<&WindowResult>,
+            items: &mut Vec<ClusterItem>,
+        ) -> Result<WindowResult, DiarizeError> {
+            self.seen.push(start_ms);
+            let continues = previous.map(|_| Some(0usize)).unwrap_or(None);
+            let index = items.len();
+            items.push(ClusterItem {
+                embedding: vec![1.0, start_ms as f32 / 100_000.0],
+                weight_ms: 4_000,
+            });
+            Ok(WindowResult {
+                start_ms,
+                tracks: vec![vec![(start_ms, start_ms + 4_000)]],
+                confidence: vec![0.9],
+                fingerprint: vec![Some(index)],
+                continues: vec![continues],
+            })
+        }
+    }
+
+    /// A meeting whose audio is one chunk of noise, long enough for several
+    /// windows.
+    async fn meeting_with_audio(db: &Db, dir: &std::path::Path, ms: i64) -> String {
+        let meeting = repo::create_meeting(db, "Standup", &dir.to_string_lossy(), None)
+            .await
+            .unwrap();
+        let path = dir.join("mic-0.wav");
+        // Something every window can find a signal in; the fake models never
+        // look at it, but `has_signal` does.
+        let samples: Vec<f32> = (0..(ms * 16))
+            .map(|i| if i % 2 == 0 { 0.4 } else { -0.4 })
+            .collect();
+        crate::audio::writer::write_wav_16k_mono(&path, &samples).unwrap();
+        let id = repo::insert_chunk(
+            db,
+            &meeting.id,
+            Channel::Mic,
+            0,
+            &path.to_string_lossy(),
+            0,
+            ms,
+        )
+        .await
+        .unwrap();
+        repo::commit_chunk(db, &id, ms).await.unwrap();
+        meeting.id
+    }
+
+    /// Two files that exist, so the cache key can identify "the models" without
+    /// this test loading a hundred megabytes of ONNX.
+    fn model_files(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let segmenter = dir.join("segmenter.onnx");
+        let embedder = dir.join("embedder.onnx");
+        std::fs::write(&segmenter, b"segmenter").unwrap();
+        std::fs::write(&embedder, b"embedder").unwrap();
+        (segmenter, embedder)
+    }
+
+    async fn key_for(
+        db: &Db,
+        meeting_id: &str,
+        segmenter: &std::path::Path,
+        embedder: &std::path::Path,
+    ) -> scan_cache::Key {
+        let (source, pcm) = voice_channel(db, meeting_id).await.unwrap().unwrap();
+        scan_key(db, &pcm, source, segmenter, embedder)
+            .await
+            .expect("both model files are there")
+    }
+
+    /// Run the walk over a whole meeting, resuming from whatever was kept, and
+    /// with a recording either in the way or not.
+    async fn walk(
+        db: &Db,
+        meeting_id: &str,
+        dir: &std::path::Path,
+        key: &scan_cache::Key,
+        models: &mut CountingModels,
+        recording: bool,
+    ) -> Result<Walk, DiarizeError> {
+        let (_, mut pcm) = voice_channel(db, meeting_id).await.unwrap().unwrap();
+        let covered = pcm.covered();
+        let total_ms = pcm.total_ms();
+        let step = segmentation::STEP_MS;
+        let planned = ((total_ms + step - 1) / step).max(1);
+
+        // A recording holding the machine, expressed the way the session layer
+        // expresses it: a flag the pass reads at its next checkpoint.
+        let control = if recording {
+            DiarizeControl::new().yield_when(Arc::new(|| true))
+        } else {
+            DiarizeControl::new()
+        };
+
+        let mut walk = Walk::fresh();
+        if let Some(kept) = scan_cache::load(dir, key).await {
+            walk = Walk {
+                items: kept.items,
+                windows: kept.windows,
+                next_start_ms: kept.next_start_ms,
+            };
+        }
+
+        walk_windows(
+            &mut pcm,
+            models,
+            walk,
+            &covered,
+            total_ms,
+            segmentation::WINDOW_MS,
+            step,
+            planned,
+            Some((dir, key)),
+            &control,
+        )
+        .await
+    }
+
+    /// The claim of the whole workstream: a park does not throw away the
+    /// minutes of model work that were already paid for.
+    #[tokio::test]
+    async fn a_parked_scan_picks_up_where_it_stopped_instead_of_starting_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+        let meeting = meeting_with_audio(&db, dir.path(), 60_000).await;
+        let (segmenter, embedder) = model_files(dir.path());
+        let key = key_for(&db, &meeting, &segmenter, &embedder).await;
+
+        // First run: park it before it has done anything.
+        let mut first = CountingModels::default();
+        let parked = walk(&db, &meeting, dir.path(), &key, &mut first, true).await;
+        assert!(
+            matches!(parked, Err(DiarizeError::Yielded)),
+            "a recording has to park the walk"
+        );
+
+        // Prove the file is there and says where to pick up.
+        let kept = scan_cache::load(dir.path(), &key)
+            .await
+            .expect("the parked scan was kept");
+        assert_eq!(kept.next_start_ms, 0);
+
+        // Second run: no recording in the way, so it finishes.
+        let mut second = CountingModels::default();
+        let done = walk(&db, &meeting, dir.path(), &key, &mut second, false)
+            .await
+            .expect("the resumed scan finished");
+        assert_eq!(done.next_start_ms, 60_000);
+
+        // Third run over the finished cache: every window is already done, so
+        // the models are asked for nothing at all.
+        let mut third = CountingModels::default();
+        let again = walk(&db, &meeting, dir.path(), &key, &mut third, false)
+            .await
+            .expect("nothing left to do");
+        assert!(
+            third.seen.is_empty(),
+            "a finished scan was walked again: {:?}",
+            third.seen
+        );
+        assert_eq!(again.windows.len(), done.windows.len());
+        assert_eq!(again.items.len(), done.items.len());
+    }
+
+    /// Halfway is the case that matters on a real machine: some windows paid
+    /// for, the rest still owed. Neither window is analysed twice, and the
+    /// fingerprints of both halves end up in one scan.
+    #[tokio::test]
+    async fn the_windows_already_paid_for_are_not_paid_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+        let meeting = meeting_with_audio(&db, dir.path(), 60_000).await;
+        let (segmenter, embedder) = model_files(dir.path());
+        let key = key_for(&db, &meeting, &segmenter, &embedder).await;
+
+        // Do the first half by hand, then keep it exactly as a park would.
+        let mut first = CountingModels::default();
+        let (_, mut pcm) = voice_channel(&db, &meeting).await.unwrap().unwrap();
+        let covered = pcm.covered();
+        let control = DiarizeControl::new();
+        let half = walk_windows(
+            &mut pcm,
+            &mut first,
+            Walk::fresh(),
+            &covered,
+            30_000,
+            segmentation::WINDOW_MS,
+            segmentation::STEP_MS,
+            12,
+            Some((dir.path(), &key)),
+            &control,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.seen, vec![0, 5_000, 10_000, 15_000, 20_000, 25_000]);
+        assert_eq!(half.next_start_ms, 30_000);
+
+        let mut second = CountingModels::default();
+        let whole = walk(&db, &meeting, dir.path(), &key, &mut second, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.seen,
+            vec![30_000, 35_000, 40_000, 45_000, 50_000, 55_000],
+            "the second run redid work the first one had already done"
+        );
+        assert_eq!(
+            whole.windows.len(),
+            12,
+            "both halves are in the finished scan"
+        );
+        assert_eq!(whole.items.len(), 12);
+    }
+
+    /// A cancel is not a park. The commonest reason for one is somebody
+    /// deleting the meeting, and `commands::delete_meeting` cancels the work and
+    /// then removes the folder without waiting — so a scan that wrote itself
+    /// down on its way out could recreate the very file the delete had just
+    /// taken away, leaving this meeting's voice fingerprints on disk after
+    /// somebody asked Echo to forget the recording.
+    #[tokio::test]
+    async fn a_cancelled_scan_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+        let meeting = meeting_with_audio(&db, dir.path(), 30_000).await;
+        let (segmenter, embedder) = model_files(dir.path());
+        let key = key_for(&db, &meeting, &segmenter, &embedder).await;
+
+        let (_, mut pcm) = voice_channel(&db, &meeting).await.unwrap().unwrap();
+        let covered = pcm.covered();
+        let control = DiarizeControl::new();
+        control.cancel();
+        let mut models = CountingModels::default();
+        let stopped = walk_windows(
+            &mut pcm,
+            &mut models,
+            Walk::fresh(),
+            &covered,
+            30_000,
+            segmentation::WINDOW_MS,
+            segmentation::STEP_MS,
+            6,
+            Some((dir.path(), &key)),
+            &control,
+        )
+        .await;
+
+        assert!(
+            matches!(stopped, Err(DiarizeError::Cancelled)),
+            "{stopped:?}"
+        );
+        assert!(
+            !scan_cache::path_in(dir.path()).exists(),
+            "a cancelled pass wrote itself into a folder that may be being deleted"
+        );
+    }
+
+    /// Where the fingerprints are allowed to live: a folder named after this
+    /// meeting and nothing else.
+    ///
+    /// A meeting row is created against the storage root and only afterwards
+    /// told about its own folder, and that second write is allowed to fail
+    /// (`session::start`). A row still naming the root would put this meeting's
+    /// voice fingerprints where deleting the meeting never looks — and where
+    /// every other such meeting writes the same file.
+    #[tokio::test]
+    async fn a_meeting_with_no_folder_of_its_own_keeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+
+        let stray = repo::create_meeting(&db, "Standup", &dir.path().to_string_lossy(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            audio_dir_of(&db, &stray.id).await,
+            None,
+            "a row naming the storage root must not be written into"
+        );
+
+        let own = dir.path().join("meeting-of-its-own");
+        std::fs::create_dir_all(&own).unwrap();
+        let proper = repo::create_meeting(&db, "Standup", &own.to_string_lossy(), None)
+            .await
+            .unwrap();
+        // The folder has to be named after the meeting; rename it to the id the
+        // row was actually given.
+        let named = dir.path().join(&proper.id);
+        std::fs::rename(&own, &named).unwrap();
+        repo::set_meeting_audio_dir(&db, &proper.id, &named.to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(audio_dir_of(&db, &proper.id).await, Some(named));
+    }
+
+    /// The safety property. A cache that no longer describes this meeting's
+    /// audio is worth less than nothing — it would put one person's voice on
+    /// another person's lines — so it is thrown away and the work is done
+    /// again.
+    #[tokio::test]
+    async fn audio_that_arrived_late_throws_the_kept_scan_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+        let meeting = meeting_with_audio(&db, dir.path(), 30_000).await;
+        let (segmenter, embedder) = model_files(dir.path());
+        let key = key_for(&db, &meeting, &segmenter, &embedder).await;
+
+        let mut first = CountingModels::default();
+        walk(&db, &meeting, dir.path(), &key, &mut first, false)
+            .await
+            .unwrap();
+        assert_eq!(first.seen.len(), 6);
+
+        // A second chunk lands — a recovery after a crash, a late commit — and
+        // the meeting is no longer the one that was scanned.
+        let path = dir.path().join("mic-1.wav");
+        let samples: Vec<f32> = (0..(30_000 * 16))
+            .map(|i| if i % 2 == 0 { 0.4 } else { -0.4 })
+            .collect();
+        crate::audio::writer::write_wav_16k_mono(&path, &samples).unwrap();
+        let id = repo::insert_chunk(
+            &db,
+            &meeting,
+            Channel::Mic,
+            1,
+            &path.to_string_lossy(),
+            30_000,
+            60_000,
+        )
+        .await
+        .unwrap();
+        repo::commit_chunk(&db, &id, 60_000).await.unwrap();
+
+        let fresh_key = key_for(&db, &meeting, &segmenter, &embedder).await;
+        assert_ne!(fresh_key, key, "the key has to notice the new audio");
+        assert!(
+            scan_cache::load(dir.path(), &fresh_key).await.is_none(),
+            "the old scan must not be resumed over audio it never saw"
+        );
+
+        let mut second = CountingModels::default();
+        walk(&db, &meeting, dir.path(), &fresh_key, &mut second, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.seen.first().copied(),
+            Some(0),
+            "a stale cache has to mean a full rescan, from the first window"
+        );
+        assert_eq!(second.seen.len(), 12);
+    }
+
+    /// A finished scan is the one case where the pass can answer without a
+    /// model at all — which is also how this test can prove it: the model paths
+    /// are files no ONNX runtime could ever load, so reaching for them fails
+    /// loudly.
+    #[tokio::test]
+    async fn a_finished_scan_is_read_back_without_loading_a_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+        let meeting = meeting_with_audio(&db, dir.path(), 30_000).await;
+        let (segmenter, embedder) = model_files(dir.path());
+        let key = key_for(&db, &meeting, &segmenter, &embedder).await;
+
+        let mut models = CountingModels::default();
+        walk(&db, &meeting, dir.path(), &key, &mut models, false)
+            .await
+            .unwrap();
+
+        let scanned = scan_resumable(
+            &db,
+            &meeting,
+            &segmenter,
+            &embedder,
+            Some(dir.path()),
+            &DiarizeControl::new(),
+        )
+        .await
+        .expect("the kept scan answered")
+        .expect("there is audio");
+        assert_eq!(scanned.fingerprints(), 6);
+
+        // And without the cache, the same call has to load the models and
+        // fails on these files — which is what makes the assertion above mean
+        // "it did not load them".
+        std::fs::remove_file(scan_cache::path_in(dir.path())).unwrap();
+        let without_the_cache = scan_resumable(
+            &db,
+            &meeting,
+            &segmenter,
+            &embedder,
+            Some(dir.path()),
+            &DiarizeControl::new(),
+        )
+        .await;
+        match without_the_cache {
+            Err(DiarizeError::Load(_)) => {}
+            Err(other) => panic!("{other:?}"),
+            Ok(_) => panic!("these files are not models; loading them cannot succeed"),
+        }
+    }
+
+    /// A model file that cannot be identified switches the cache off entirely
+    /// rather than being guessed at.
+    #[tokio::test]
+    async fn without_a_model_to_name_nothing_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+        let meeting = meeting_with_audio(&db, dir.path(), 10_000).await;
+        let (_, pcm) = voice_channel(&db, &meeting).await.unwrap().unwrap();
+        assert!(scan_key(
+            &db,
+            &pcm,
+            Source::MicOnly,
+            std::path::Path::new("/nonexistent/segmenter.onnx"),
+            std::path::Path::new("/nonexistent/embedder.onnx"),
+        )
+        .await
+        .is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // A park during the clustering
+    // -----------------------------------------------------------------------
+
+    /// Enough fingerprints that building the merge tree is real work.
+    fn many_prints(n: usize) -> Scan {
+        let mut items = Vec::new();
+        let mut windows = Vec::new();
+        for i in 0..n {
+            let start = i as i64 * 1_000;
+            let mut embedding = vec![0.0f32; 64];
+            embedding[i % 64] = 1.0;
+            embedding[(i * 7) % 64] += 0.5;
+            cluster::l2_normalize(&mut embedding);
+            windows.push(WindowResult {
+                start_ms: start,
+                tracks: vec![vec![(start, start + 900)]],
+                confidence: vec![0.9],
+                fingerprint: vec![Some(items.len())],
+                continues: vec![None],
+            });
+            items.push(ClusterItem {
+                embedding,
+                weight_ms: 900,
+            });
+        }
+        Scan {
+            items,
+            windows,
+            covered: vec![(0, n as i64 * 1_000)],
+        }
+    }
+
+    /// The clustering reads nothing off disk, so before this it was minutes
+    /// during which a starting recording simply had to wait. Now it stops at the
+    /// first thing it does, and stops with no answer rather than half of one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recording_starting_during_the_clustering_is_honoured_at_once() {
+        let scanned = many_prints(400);
+        let guided = Guided::default();
+
+        let undisturbed = std::time::Instant::now();
+        let full = scanned.cut_guided(&guided, None);
+        let full_took = undisturbed.elapsed();
+        assert!(!full.tracks.is_empty());
+
+        let parked = std::time::Instant::now();
+        let control = DiarizeControl::new().yield_when(Arc::new(|| true));
+        let err = scanned
+            .cut_guided_until(&guided, None, &control)
+            .expect_err("the recording wins");
+        let parked_took = parked.elapsed();
+        assert!(matches!(err, DiarizeError::Yielded), "{err:?}");
+        assert!(
+            parked_took * 4 < full_took,
+            "the clustering ran on regardless: {parked_took:?} against {full_took:?}"
+        );
+    }
+
+    /// The same, for the path a count correction takes.
+    #[test]
+    fn a_forced_count_stops_for_a_recording_too() {
+        let scanned = many_prints(200);
+        let control = DiarizeControl::new().yield_when(Arc::new(|| true));
+        let err = scanned
+            .cut_guided_until(&Guided::default(), Some(3), &control)
+            .expect_err("the recording wins");
+        assert!(matches!(err, DiarizeError::Yielded), "{err:?}");
+    }
+
+    /// Cancelling is not parking, and the two must not be confused: one is the
+    /// person saying stop, the other is Echo standing aside.
+    #[test]
+    fn cancelling_during_the_clustering_says_cancelled() {
+        let scanned = many_prints(50);
+        let control = DiarizeControl::new();
+        control.cancel();
+        let err = scanned
+            .cut_guided_until(&Guided::default(), None, &control)
+            .expect_err("the person stopped it");
+        assert!(matches!(err, DiarizeError::Cancelled), "{err:?}");
     }
 }

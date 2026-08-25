@@ -2335,7 +2335,23 @@ pub async fn has_failed_job_with_payload(
     Ok(row.is_some())
 }
 
-/// Oldest queued job, honouring the priority order in DESIGN §3.
+/// The queued job to run next, honouring the priority order in DESIGN §3.
+///
+/// Kind first — catch-up before speakers before the mixdown before the recap —
+/// and then **the newest meeting first**.
+///
+/// The tie-break used to be the oldest, which sounds fair and is not what a
+/// person wants: finishing a meeting costs about a sixth of its length, so on a
+/// day of back-to-back meetings the queue always held work from more than one.
+/// Oldest-first meant the meeting somebody had just walked out of — the one they
+/// are about to open, the one they want the recap of — waited behind a meeting
+/// from two hours ago they have already read. Newest-first serves the meeting
+/// they are looking at, and the older one loses nothing by waiting: it keeps its
+/// place, its progress and its parked scan.
+///
+/// This is only safe to say because an interrupted catch-up now parks rather
+/// than dropping what it had; before that, changing this order changed which
+/// meeting lost transcript.
 pub async fn next_queued_job(db: &Db) -> Result<Option<Job>, DbError> {
     let row = sqlx::query(
         "SELECT id, meeting_id, kind, status, progress, error, created_at, updated_at
@@ -2348,7 +2364,7 @@ pub async fn next_queued_job(db: &Db) -> Result<Option<Job>, DbError> {
                     WHEN 'summarize' THEN 4
                     ELSE 5
                   END,
-                  created_at
+                  created_at DESC
          LIMIT 1",
     )
     .fetch_optional(db)
@@ -3655,6 +3671,14 @@ mod tests {
         assert_ne!(a.id, c.id);
     }
 
+    /// The contract of the queue, both halves of it: **kind first, then the
+    /// newest meeting**.
+    ///
+    /// Kind is the important half and has not changed — a transcript before
+    /// speakers before a recap, because each is worth less without the one
+    /// before it. The tie-break within a kind is the half that did: the newest
+    /// work goes first, so the meeting somebody has just walked out of is not
+    /// stuck behind one they finished two hours ago.
     #[tokio::test]
     async fn next_queued_job_prefers_catchup_over_summarize() {
         let (db, m) = seeded().await;
@@ -3662,6 +3686,57 @@ mod tests {
             .await
             .unwrap();
         let catchup = create_job(&db, Some(&m.id), JobKind::TranscribeCatchup)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_queued_job(&db).await.unwrap().unwrap().id,
+            catchup.id,
+            "kind outranks age: a recap never goes before a transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn within_one_kind_the_meeting_you_just_left_goes_first() {
+        let (db, earlier) = seeded().await;
+        let later = create_meeting(&db, "The one that just ended", "/tmp/audio/m2", None)
+            .await
+            .unwrap();
+
+        let old_work = create_job(&db, Some(&earlier.id), JobKind::Diarize)
+            .await
+            .unwrap();
+        // `created_at` is stamped to the millisecond, and these two rows would
+        // otherwise be indistinguishable in age. Real meetings are minutes
+        // apart.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let new_work = create_job(&db, Some(&later.id), JobKind::Diarize)
+            .await
+            .unwrap();
+
+        assert_eq!(next_queued_job(&db).await.unwrap().unwrap().id, new_work.id);
+
+        // And the older meeting is next, not forgotten: it keeps its place, its
+        // progress and whatever its parked pass already worked out.
+        set_job_status(&db, &new_work.id, JobStatus::Done, None)
+            .await
+            .unwrap();
+        assert_eq!(next_queued_job(&db).await.unwrap().unwrap().id, old_work.id);
+    }
+
+    /// Newest-first inside a kind must not reorder the kinds themselves: a
+    /// recap of the meeting that just ended still waits for the transcript of
+    /// the one before it, because a recap is written from a transcript.
+    #[tokio::test]
+    async fn the_newest_meeting_still_does_not_jump_ahead_of_an_earlier_kind() {
+        let (db, earlier) = seeded().await;
+        let later = create_meeting(&db, "The one that just ended", "/tmp/audio/m2", None)
+            .await
+            .unwrap();
+        let catchup = create_job(&db, Some(&earlier.id), JobKind::TranscribeCatchup)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        create_job(&db, Some(&later.id), JobKind::Summarize)
             .await
             .unwrap();
         assert_eq!(next_queued_job(&db).await.unwrap().unwrap().id, catchup.id);

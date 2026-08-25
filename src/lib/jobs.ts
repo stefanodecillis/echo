@@ -1,4 +1,4 @@
-import { labels } from "./copy";
+import { jobLine, labels } from "./copy";
 import type { Job, JobKind, JobPhase } from "./types";
 
 /**
@@ -96,6 +96,15 @@ export interface JobPresentation {
   fraction?: number;
   /** True while this is actually happening, false while it waits. */
   running: boolean;
+  /**
+   * True when this is parked because a recording is going on.
+   *
+   * A job is only ever `paused` for that one reason — starting a capture parks
+   * everything, and anything left parked by a crash is put back in the queue at
+   * launch — so the status carries the whole meaning, and a screen can say why
+   * the bar is not moving without asking anything else.
+   */
+  deferred: boolean;
 }
 
 /**
@@ -114,5 +123,19 @@ export function presentJob(job: Job, phase: JobPhase | undefined = job.phase): J
     label,
     fraction: running ? job.progress : undefined,
     running,
+    deferred: job.status === "paused",
   };
+}
+
+/**
+ * The one line a screen shows about a job: happening, waiting its turn, or set
+ * aside for a recording.
+ *
+ * One function so the three cases cannot drift apart between the four places
+ * that show them — and so that adding the third case did not mean adding a
+ * third branch to four different ternaries.
+ */
+export function jobSentence(shown: JobPresentation): string {
+  if (shown.deferred) return jobLine.deferred(shown.label);
+  return shown.running ? jobLine.running(shown.label) : jobLine.waiting(shown.label);
 }

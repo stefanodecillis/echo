@@ -392,10 +392,14 @@ impl Inner {
         let worth_keeping = recovery::meeting_has_content(self, meeting_id)
             .await
             .unwrap_or(true);
+        // The same rule as the ordinary close, for the same reason: a sliver of
+        // the transcript never decides what a meeting was in, and a row with no
+        // observed language on it leaves whatever was settled alone
+        // (`asr::language::spoken_in`).
         let language = repo::language_histogram(&self.db, meeting_id)
             .await
             .ok()
-            .and_then(|h| h.first().map(|(l, _)| l.clone()));
+            .and_then(|h| crate::asr::language::spoken_in(&h).dominant);
         let status = if worth_keeping {
             MeetingStatus::Processing
         } else {
@@ -1041,10 +1045,17 @@ impl SessionManager {
             .await
             .unwrap_or(0);
         let duration_ms = duration_ms.max(committed);
+        // Most speaking time wins, but a language holding a sliver of the
+        // transcript never does — one sentence misread as Chinese is not what
+        // the meeting was in (`asr::language::spoken_in`). And nothing here is
+        // a copy of what the engine already settled on: a segment row only
+        // carries a language it was actually *heard* to be in
+        // (`asr::Transcription::observed_language`), so an empty answer leaves
+        // the row as it stands rather than writing the pin over itself.
         let language = repo::language_histogram(&inner.db, &meeting_id)
             .await
             .ok()
-            .and_then(|h| h.first().map(|(l, _)| l.clone()));
+            .and_then(|h| crate::asr::language::spoken_in(&h).dominant);
 
         repo::finish_meeting(
             &inner.db,

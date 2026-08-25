@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 
 import { Button, ProgressBar } from "@/components";
 import { cx } from "@/components/lib/cx";
-import { jobLine, labels, meeting as copy } from "@/lib/copy";
-import { isActive } from "@/lib/jobs";
+import { labels, meeting as copy } from "@/lib/copy";
+import { isActive, jobSentence, presentJob } from "@/lib/jobs";
 import { generateSummary, listTemplates } from "@/lib/ipc";
 import type { Id, Job, Template } from "@/lib/types";
 
@@ -101,9 +101,7 @@ export function RecapControls({ meetingId, hasSummary, activeJob, onQueued, subt
             <ProgressBar value={activeJob.progress} label={labels.jobKind.summarize} />
           )}
           <span className="text-xs text-ink-faint">
-            {activeJob.status === "running"
-              ? jobLine.running(labels.jobKind.summarize)
-              : jobLine.waiting(labels.jobKind.summarize)}
+            {jobSentence(presentJob(activeJob))}
           </span>
         </div>
       )}

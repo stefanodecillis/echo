@@ -5,8 +5,12 @@
 //! *recording has absolute resource priority; background jobs pause*).
 //!
 //! Stepping aside means `paused`, not `failed`: `repo::resume_paused_jobs` will
-//! queue it again when the recording ends, and because the pass reads only
-//! finished audio off disk it simply starts over with nothing lost.
+//! queue it again when the recording ends, and the pass reads only finished
+//! audio off disk, so nothing is lost either way. What it does *not* do any more
+//! is start over: the expensive half is written down on the way out and picked
+//! up at the window it stopped on ([`super::scan_cache`]), because finishing a
+//! meeting costs about a sixth of its length and a day of back-to-back meetings
+//! never leaves that much of a gap.
 
 use std::sync::Arc;
 

@@ -110,6 +110,7 @@ pub mod pcm;
 pub mod people;
 pub mod pipeline;
 pub mod sample;
+pub(crate) mod scan_cache;
 pub mod segmentation;
 pub mod split;
 pub mod timeline;
@@ -159,8 +160,10 @@ pub enum DiarizeError {
     #[error("cancelled")]
     Cancelled,
     /// A recording started. Not a failure: the pass reads only finished audio
-    /// off disk, so it can be redone from scratch whenever the machine is free
-    /// again (mantra 1, and DESIGN §3 "recording preempts all").
+    /// off disk, so it can be picked up again whenever the machine is free
+    /// (mantra 1, and DESIGN §3 "recording preempts all") — and it picks up
+    /// where it stopped rather than at the beginning, because the windows it
+    /// had already paid for are kept ([`scan_cache`]).
     #[error("paused because a recording started")]
     Yielded,
     #[error("speaker analysis failed: {0}")]

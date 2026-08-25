@@ -240,8 +240,29 @@ const POOL_RADIUS_DIVISOR: f32 = 3.0;
 /// meeting entirely, and nothing in the UI can bring a voice back.
 pub const COHERENT_SPREAD: f32 = 0.35;
 
+/// A cheap question the clustering asks itself between steps: has something
+/// more important come along?
+///
+/// The clustering is the one stretch of the pass with no I/O in it — no window
+/// to read off disk, no model to run — so without this it is minutes of solid
+/// arithmetic that nothing can interrupt: a recording starting would wait for
+/// it, and on a multi-threaded runtime the worker it runs on is held for the
+/// whole of it. Every `_until` function below asks between steps and hands back
+/// `None` when the answer is yes, because half a merge tree is not an answer
+/// about who was in a meeting.
+pub type Stop<'a> = &'a (dyn Fn() -> bool + 'a);
+
+/// The stop that never fires — what every caller outside the app's own pass
+/// (tests, the calibration sweeps) gets.
+fn never_stops() -> bool {
+    false
+}
+
 /// One fingerprint with the amount of speech behind it.
-#[derive(Debug, Clone, Default)]
+///
+/// Serialisable because the expensive half of the pass is kept across a park
+/// (see [`super::scan_cache`]): these vectors *are* the minutes of ONNX work.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClusterItem {
     pub embedding: Vec<f32>,
     /// How much speech the fingerprint was computed from. Longer is more
@@ -521,9 +542,20 @@ impl ForcedOutcome {
 /// separate. `k` is clamped into `1..=`[`MAX_SPEAKERS`] by the caller and again
 /// here.
 pub fn cluster_fixed(items: &[ClusterItem], k: usize) -> (Clustering, ForcedOutcome) {
+    cluster_fixed_until(items, k, &never_stops)
+        .expect("a clustering nothing can stop always finishes")
+}
+
+/// [`cluster_fixed`], interruptible. `None` means `stop` said yes part-way
+/// through and there is no answer — never a partial one.
+pub fn cluster_fixed_until(
+    items: &[ClusterItem],
+    k: usize,
+    stop: Stop<'_>,
+) -> Option<(Clustering, ForcedOutcome)> {
     let asked = k.clamp(1, MAX_SPEAKERS);
     if items.is_empty() {
-        return (
+        return Some((
             Clustering {
                 labels: Vec::new(),
                 cluster_count: 0,
@@ -533,13 +565,13 @@ pub fn cluster_fixed(items: &[ClusterItem], k: usize) -> (Clustering, ForcedOutc
                 asked,
                 ..Default::default()
             },
-        );
+        ));
     }
 
     let Some(embeddings) = normalised(items) else {
         // Nothing usable to measure with: one speaker rather than a crash, the
         // same answer every other path here gives.
-        return (
+        return Some((
             Clustering {
                 labels: vec![0; items.len()],
                 cluster_count: 1,
@@ -551,7 +583,7 @@ pub fn cluster_fixed(items: &[ClusterItem], k: usize) -> (Clustering, ForcedOutc
                 mass_ms: vec![items.iter().map(|i| i.weight_ms.max(0)).sum()],
                 ..Default::default()
             },
-        );
+        ));
     };
 
     // Same pre-pass as the automatic path, and for the same reason: an exact
@@ -560,7 +592,7 @@ pub fn cluster_fixed(items: &[ClusterItem], k: usize) -> (Clustering, ForcedOutc
     // would certainly have grouped, so it cannot change where the cut lands.
     let leaf_nodes = leaves(items, &embeddings, DISTANCE_THRESHOLD / POOL_RADIUS_DIVISOR);
     let mut working = leaf_nodes.clone();
-    let merges = record_merges(&mut working);
+    let merges = record_merges(&mut working, stop)?;
     drop(working);
 
     let weights: Vec<i64> = items.iter().map(|i| i.weight_ms.max(0)).collect();
@@ -572,6 +604,9 @@ pub fn cluster_fixed(items: &[ClusterItem], k: usize) -> (Clustering, ForcedOutc
     let pooled = items.len() > MAX_EXACT_ITEMS;
     let mut best: Option<(Vec<Node>, f32, usize, f32)> = None;
     for cut_clusters in 1..=CUT_HEIGHTS.min(leaf_nodes.len()) {
+        if stop() {
+            return None;
+        }
         let mut nodes = leaf_nodes.clone();
         let cut_at = replay(&mut nodes, &merges, cut_clusters);
         absorb_fragments(&mut nodes, FORCED_FLOOR_MS, &embeddings, pooled);
@@ -595,7 +630,7 @@ pub fn cluster_fixed(items: &[ClusterItem], k: usize) -> (Clustering, ForcedOutc
     // which is never more than `asked`), so `None` here is unreachable; answer
     // it the way every other unusable input is answered rather than panicking.
     let Some((nodes, cut_at, got, silhouette)) = best else {
-        return (
+        return Some((
             Clustering {
                 labels: vec![0; items.len()],
                 cluster_count: 1,
@@ -606,7 +641,7 @@ pub fn cluster_fixed(items: &[ClusterItem], k: usize) -> (Clustering, ForcedOutc
                 got: 1,
                 ..Default::default()
             },
-        );
+        ));
     };
 
     let mut mass_ms: Vec<i64> = nodes
@@ -616,7 +651,7 @@ pub fn cluster_fixed(items: &[ClusterItem], k: usize) -> (Clustering, ForcedOutc
         .collect();
     mass_ms.sort_unstable_by(|a, b| b.cmp(a));
 
-    (
+    Some((
         finish(nodes, items.len(), cut_at),
         ForcedOutcome {
             asked,
@@ -625,7 +660,7 @@ pub fn cluster_fixed(items: &[ClusterItem], k: usize) -> (Clustering, ForcedOutc
             mass_ms,
             silhouette,
         },
-    )
+    ))
 }
 
 // ===========================================================================
@@ -917,21 +952,31 @@ const CUT_HEIGHTS: usize = MAX_SPEAKERS * 3;
 /// Returns the clustering and the whole decision, so a probe can print it and a
 /// person can argue with it.
 pub fn cluster_auto(items: &[ClusterItem]) -> (Clustering, CountChoice) {
+    cluster_auto_until(items, &never_stops).expect("a clustering nothing can stop always finishes")
+}
+
+/// [`cluster_auto`], interruptible. `None` means `stop` said yes part-way
+/// through: the caller asked for the machine back, and a merge tree that was
+/// only half built says nothing about how many people were in the meeting.
+pub fn cluster_auto_until(
+    items: &[ClusterItem],
+    stop: Stop<'_>,
+) -> Option<(Clustering, CountChoice)> {
     if items.is_empty() {
-        return (
+        return Some((
             Clustering {
                 labels: Vec::new(),
                 cluster_count: 0,
                 threshold: 0.0,
             },
             CountChoice::default(),
-        );
+        ));
     }
 
     let Some(embeddings) = normalised(items) else {
         // Nothing usable to measure with: one speaker rather than a crash, the
         // same answer every other path here gives.
-        return (
+        return Some((
             Clustering {
                 labels: vec![0; items.len()],
                 cluster_count: 1,
@@ -941,7 +986,7 @@ pub fn cluster_auto(items: &[ClusterItem]) -> (Clustering, CountChoice) {
                 count: 1,
                 ..Default::default()
             },
-        );
+        ));
     };
 
     // The leaves, and the whole hierarchy above them recorded once. Merging all
@@ -950,12 +995,13 @@ pub fn cluster_auto(items: &[ClusterItem]) -> (Clustering, CountChoice) {
     // — a pair search over a handful of clusters.
     let leaf_nodes = leaves(items, &embeddings, DISTANCE_THRESHOLD / POOL_RADIUS_DIVISOR);
     let mut working = leaf_nodes.clone();
-    let merges = record_merges(&mut working);
+    let merges = record_merges(&mut working, stop)?;
     drop(working);
 
     let bar = fragment_bar(leaf_nodes.iter().map(|l| l.weight_ms.max(0)).sum());
     let ladder = ladder_of(&merges, leaf_nodes.len());
-    let (candidates, gap_answer) = weigh_counts(items, &embeddings, &leaf_nodes, &merges, bar);
+    let (candidates, gap_answer) =
+        weigh_counts(items, &embeddings, &leaf_nodes, &merges, bar, stop)?;
     let (chosen, runner_up) = pick(&candidates);
     let (count, silhouette, cut_clusters) =
         chosen.map_or((1, 0.0, 1), |c| (c.count, c.silhouette, c.cut_clusters));
@@ -966,7 +1012,7 @@ pub fn cluster_auto(items: &[ClusterItem]) -> (Clustering, CountChoice) {
     let cut_at = replay(&mut nodes, &merges, cut_clusters);
     absorb_fragments(&mut nodes, bar, &embeddings, items.len() > MAX_EXACT_ITEMS);
 
-    (
+    Some((
         finish(nodes, items.len(), cut_at),
         CountChoice {
             ladder,
@@ -978,18 +1024,26 @@ pub fn cluster_auto(items: &[ClusterItem]) -> (Clustering, CountChoice) {
             fragment_bar_ms: bar,
             gap_answer,
         },
-    )
+    ))
 }
 
 /// Merge the closest pair over and over until one cluster is left, recording
 /// every step. Leaves `nodes` fully merged; [`replay`] is what rebuilds a cut.
-fn record_merges(nodes: &mut [Node]) -> Vec<Merge> {
+///
+/// The longest single stretch of arithmetic in the whole pass — every merge
+/// searches every surviving pair — so this is where a park has to be able to
+/// land, and it is asked between merges rather than inside the pair search:
+/// often enough to be prompt, rarely enough to cost nothing.
+fn record_merges(nodes: &mut [Node], stop: Stop<'_>) -> Option<Vec<Merge>> {
     let mut out = Vec::with_capacity(nodes.len().saturating_sub(1));
     while let Some((a, b, distance)) = closest_pair(nodes) {
+        if stop() {
+            return None;
+        }
         out.push(Merge { a, b, distance });
         fold(nodes, a, b);
     }
-    out
+    Some(out)
 }
 
 /// Apply a recorded hierarchy's merges to fresh leaves until `keep` clusters are
@@ -1049,7 +1103,8 @@ fn weigh_counts(
     leaves: &[Node],
     merges: &[Merge],
     bar: i64,
-) -> (Vec<Candidate>, Option<Candidate>) {
+    stop: Stop<'_>,
+) -> Option<(Vec<Candidate>, Option<Candidate>)> {
     let n = leaves.len();
     let weights: Vec<i64> = items.iter().map(|i| i.weight_ms.max(0)).collect();
     // How many clusters the ceiling insists on: enough that the merge which
@@ -1063,6 +1118,12 @@ fn weigh_counts(
     let mut out: Vec<Candidate> = Vec::new();
     let mut widest: Option<Candidate> = None;
     for cut_clusters in 1..=CUT_HEIGHTS.min(n) {
+        // One replay, one folding pass and one silhouette per height. Cheap
+        // beside the merge tree, but on a long meeting still seconds of work
+        // that a recording should not have to wait for.
+        if stop() {
+            return None;
+        }
         let want = n - cut_clusters;
         let accepted = want.checked_sub(1).map_or(0.0, |i| merges[i].distance);
         let refused = merges.get(want).map_or(0.0, |m| m.distance);
@@ -1143,7 +1204,7 @@ fn weigh_counts(
         }
     }
     out.sort_by_key(|c| c.count);
-    (out, widest)
+    Some((out, widest))
 }
 
 /// Weighted mean silhouette of one cut, against cluster centroids.
