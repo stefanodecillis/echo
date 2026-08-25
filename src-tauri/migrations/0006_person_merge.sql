@@ -1,0 +1,40 @@
+-- Two names, one voice.
+--
+-- Echo enrols people from meetings, and the same person gets enrolled twice: a
+-- voice heard down a call one week and in the room the next separates into two
+-- speakers, and both get named. There was one way to fix that — delete one of
+-- them — and it destroyed that half of the voice: the samples, the clips, and
+-- with them the ability to re-fingerprint the voice when the network changes
+-- (see `0004_known_people.sql`, "Why the clips are stored"). Merging keeps
+-- both halves and makes one person out of them.
+--
+-- ## Why an alias column and not a delete
+--
+-- `speakers.alias_of` is the shape this copies, and for the same reason: a
+-- merge somebody clicked once is a claim about identity, and a claim is better
+-- recorded than acted out and forgotten. Keeping the row means calling merge
+-- twice is a no-op instead of an error about a person who no longer exists,
+-- means an id still open in another window resolves to the survivor instead of
+-- to nothing, and means the database can always say what became of a name
+-- somebody typed.
+--
+-- The two differ in one place, deliberately. `speakers.alias_of` is
+-- ON DELETE SET NULL — a merged speaker still owns lines of a transcript, so
+-- releasing it leaves something real behind. A merged **person** owns nothing:
+-- the merge moved every sample and every link to the survivor, so all that is
+-- left is the name and the fact of the merge. Releasing that would put an empty
+-- person back in Settings → People with no voice in them, which is a ghost, not
+-- a recovery. So this one CASCADEs: forget the survivor and the name that was
+-- folded into them goes too.
+--
+-- ## What merging is not
+--
+-- It is not reversible. The samples move to the survivor and are then curated
+-- as one set — the outliers and the near-duplicates past
+-- `diarize::people::MAX_SAMPLES` are deleted, which is what makes the surviving
+-- profile a description of one voice rather than a bag of two. That deletion is
+-- the point of the merge and it cannot be undone, so the UI asks before it
+-- happens. This column is what makes the *identity* recoverable, not the audio.
+ALTER TABLE people ADD COLUMN alias_of TEXT REFERENCES people (id) ON DELETE CASCADE;
+
+CREATE INDEX idx_people_alias ON people (alias_of);

@@ -1045,8 +1045,10 @@ pub async fn refine(
     };
 
     // Who Echo has been told to remember, before anything is counted (DESIGN §1).
-    // A profile computed by an older network is re-embedded from its kept clips
-    // first, quietly, so a change of network costs nobody their people.
+    // A voice that is not being matched right now but could be — its numbers
+    // came from an older network, or two names were made one and the centroid
+    // was dropped rather than averaged — is re-embedded from its kept clips
+    // first, quietly, so neither costs anybody their people.
     let embedder_tag = people::embedder_tag(db, embedder_path).await;
     let mut enrolment = people::enrolled(db, &embedder_tag).await?;
     if enrolment.stale > 0 {
