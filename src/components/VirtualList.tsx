@@ -1,7 +1,18 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
 import type { ForwardedRef, ReactElement, ReactNode, UIEvent } from "react";
 
 import { cx } from "./lib/cx";
+
+/** What to assume a viewport holds before it has been measured. Generous on
+ * purpose: too many rows is a wasted paint, too few is a hidden meeting. */
+const UNMEASURED_VIEWPORT_PX = 2000;
 
 export interface VirtualListHandle {
   scrollToIndex: (index: number, opts?: { align?: "start" | "end" }) => void;
@@ -35,20 +46,33 @@ function VirtualListInner<T>(
   }: VirtualListProps<T>,
   ref: ForwardedRef<VirtualListHandle>,
 ) {
-  const containerRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
 
-  useEffect(() => {
-    const el = containerRef.current;
+  // Measured through a callback ref, not a mount effect, because the container
+  // is not always there at mount: a transcript starts empty, the empty state
+  // renders instead, and a `[]` effect would look once, find no element and
+  // never look again. The height then stays 0 for the life of the meeting, and
+  // 0 plus the overscan is exactly four rows — which is what a person saw
+  // instead of their meeting on 2026-08-24 and again on 2026-08-25.
+  const observerRef = useRef<ResizeObserver | null>(null);
+  const measure = useCallback((el: HTMLDivElement | null) => {
+    containerRef.current = el;
+    observerRef.current?.disconnect();
     if (!el) return;
+    // Read it once directly: a ResizeObserver reports the first size on its own
+    // schedule, and until then the window would be empty.
+    setViewportHeight(el.clientHeight);
     const observer = new ResizeObserver((entries) => {
       const entry = entries[0];
       if (entry) setViewportHeight(entry.contentRect.height);
     });
     observer.observe(el);
-    return () => observer.disconnect();
+    observerRef.current = observer;
   }, []);
+
+  useEffect(() => () => observerRef.current?.disconnect(), []);
 
   useImperativeHandle(
     ref,
@@ -74,9 +98,13 @@ function VirtualListInner<T>(
 
   const totalHeight = items.length * itemHeight;
   const startIndex = Math.max(0, Math.floor(scrollTop / itemHeight) - overscan);
+  // A viewport that has not been measured yet draws a screenful rather than
+  // nothing: being wrong by rendering a few too many rows costs a moment of
+  // layout, while being wrong the other way hides the meeting.
+  const window = viewportHeight > 0 ? viewportHeight : UNMEASURED_VIEWPORT_PX;
   const endIndex = Math.min(
     items.length,
-    Math.ceil((scrollTop + viewportHeight) / itemHeight) + overscan,
+    Math.ceil((scrollTop + window) / itemHeight) + overscan,
   );
 
   const handleScroll = (event: UIEvent<HTMLDivElement>) => {
@@ -86,7 +114,7 @@ function VirtualListInner<T>(
   };
 
   return (
-    <div ref={containerRef} className={cx("relative overflow-y-auto", className)} onScroll={handleScroll}>
+    <div ref={measure} className={cx("relative overflow-y-auto", className)} onScroll={handleScroll}>
       <div style={{ height: totalHeight, position: "relative" }}>
         {items.slice(startIndex, endIndex).map((item, i) => {
           const index = startIndex + i;
