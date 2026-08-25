@@ -2166,7 +2166,18 @@ fn run_job(
             // A second reading exists precisely to hear these seconds afresh.
             true
         } else {
-            observed.is_some() || !policy.is_settled()
+            // Only seconds actually read in what they were heard to be are an
+            // observation of those seconds; a detection that lost to the
+            // meeting's answer was not used, so it is not evidence either.
+            (observed.is_some() && !policy.is_settled())
+                || (observed.is_some()
+                    && crate::asr::language::reading_for_stretch(
+                        policy.hint(),
+                        detected.as_ref().map(|(l, c)| (l.as_str(), *c)),
+                        speech_ms,
+                    )
+                    .as_deref()
+                        == observed.as_deref())
         };
         // What this stretch is read in: what was just heard in it, when that
         // was a usable answer, and otherwise the meeting's own. Both roads can
@@ -2174,7 +2185,16 @@ fn run_job(
         job.language_hint = if a_second_reading {
             detected.map(|(language, _)| language)
         } else {
-            observed.or_else(|| policy.hint().map(str::to_string))
+            // Strong evidence, or the meeting's own answer. A stretch may be
+            // read in another language, but it has to have earned it — see
+            // `reading_for_stretch`, and the meeting of 2026-08-25 that came
+            // out in four languages because a one-second "Mm-hmm" was allowed
+            // to outvote twenty minutes of Italian.
+            crate::asr::language::reading_for_stretch(
+                policy.hint(),
+                detected.as_ref().map(|(l, c)| (l.as_str(), *c)),
+                speech_ms,
+            )
         };
     }
     // Nothing else may wait on this while the decode runs.

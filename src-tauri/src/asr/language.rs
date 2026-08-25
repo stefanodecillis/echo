@@ -597,6 +597,58 @@ pub fn spoken_in(histogram: &[(String, i64)]) -> Spoken {
     spoken
 }
 
+/// How sure a detection has to be before one stretch may be read in a language
+/// the meeting has already decided against.
+///
+/// Measured, not guessed. In a 21-minute Italian meeting on 2026-08-25 every
+/// stretch that came back in the wrong language — Turkish, Chinese, Spanish,
+/// Russian — was short filler heard unsurely: "Mm-hmm", "Yeah", "or", the sound
+/// somebody makes while thinking. The seventeen of them averaged a second of
+/// speech at 0.57, and the worst was 0.80. The stretches genuinely in Italian
+/// averaged seven seconds at 0.87. There is a wide gap between those two
+/// populations and these two numbers sit inside it.
+pub const OVERRIDE_MIN_CONFIDENCE: f32 = 0.85;
+
+/// …and how much speech it has to be sure about.
+///
+/// Someone changing language mid-meeting says a sentence, not a syllable. The
+/// longest wrong answer in that meeting was 2.7 seconds of "Mm-hmm", so this
+/// sits above it — and far below the seven seconds a real Italian stretch ran
+/// to, so a genuine switch still gets through on its own evidence.
+pub const OVERRIDE_MIN_SPEECH_MS: i64 = 3_000;
+
+/// What one stretch of speech should be read in.
+///
+/// The meeting's settled answer is the default, and a fresh detection may take
+/// a single stretch away from it — that is what lets a bilingual meeting read
+/// as one. But only on strong evidence. Letting *any* usable detection win was
+/// how a wholly Italian meeting came out with lines in four other languages on
+/// 2026-08-25: whisper will name a language for a one-second "Mm-hmm", and it
+/// is not wrong to, it simply has almost nothing to go on.
+///
+/// Agreeing with the meeting is free — no bar to clear, because nothing is
+/// being contradicted.
+pub fn reading_for_stretch(
+    settled: Option<&str>,
+    detected: Option<(&str, f32)>,
+    speech_ms: i64,
+) -> Option<String> {
+    let observed = usable(detected);
+    let (Some(heard), Some(settled)) = (observed.as_deref(), settled) else {
+        // Nothing settled yet, or nothing heard: there is no disagreement to
+        // arbitrate, so the ordinary answer stands.
+        return observed.or_else(|| settled.map(str::to_string));
+    };
+    if heard == settled {
+        return Some(heard.to_string());
+    }
+    let confidence = detected.map_or(0.0, |(_, c)| c);
+    if confidence >= OVERRIDE_MIN_CONFIDENCE && speech_ms >= OVERRIDE_MIN_SPEECH_MS {
+        return Some(heard.to_string());
+    }
+    Some(settled.to_string())
+}
+
 /// A detection worth reading a stretch in: a real language code, said with
 /// enough confidence to carry any information at all.
 ///
@@ -975,6 +1027,61 @@ mod tests {
         assert_eq!(p.reading(None).as_deref(), Some("it"));
         // And with nothing settled and nothing detected, the engine decides.
         assert_eq!(LanguagePolicy::new().reading(None), None);
+    }
+
+    /// The meeting of 2026-08-25: twenty-one minutes of Italian that came out
+    /// with lines in English, Turkish, Chinese, Spanish and Russian, because a
+    /// fresh detection on a one-second filler word was allowed to take a
+    /// stretch away from the meeting's own answer. These are the real values
+    /// from the seventeen stretches it got wrong.
+    #[test]
+    fn a_second_of_filler_cannot_take_a_stretch_away_from_the_meeting() {
+        let settled = Some("it");
+        for (language, confidence, speech_ms, said) in [
+            ("zh", 0.45, 1_120, "我去"),
+            ("tr", 0.46, 1_632, "Bence inlem iyi bir şey."),
+            ("tr", 0.51, 1_720, "Menem menen ayım."),
+            ("es", 0.52, 660, "Que sí, gracias."),
+            ("en", 0.55, 1_180, "I'm going to say this."),
+            ("ru", 0.57, 1_120, "ээ"),
+            ("zh", 0.59, 500, "拜拜"),
+            ("es", 0.66, 480, "¿no?"),
+            ("tr", 0.66, 2_080, "var çırağı."),
+            ("en", 0.70, 2_688, "Mm-hmm."),
+            ("en", 0.74, 1_120, "Mm-hmm."),
+            ("en", 0.80, 576, "Yeah."),
+        ] {
+            assert_eq!(
+                reading_for_stretch(settled, Some((language, confidence)), speech_ms).as_deref(),
+                Some("it"),
+                "{said:?} ({language} at {confidence}, {speech_ms} ms) took the stretch"
+            );
+        }
+    }
+
+    /// …and somebody who really does change language still gets through, on the
+    /// evidence a person actually produces: a sentence, said clearly.
+    #[test]
+    fn a_sentence_in_another_language_is_still_heard_as_itself() {
+        assert_eq!(
+            reading_for_stretch(Some("it"), Some(("en", 0.92)), 7_000).as_deref(),
+            Some("en")
+        );
+        // Agreeing with the meeting costs nothing to prove.
+        assert_eq!(
+            reading_for_stretch(Some("it"), Some(("it", 0.40)), 600).as_deref(),
+            Some("it")
+        );
+        // Before the meeting has decided, an observation is all there is.
+        assert_eq!(
+            reading_for_stretch(None, Some(("en", 0.50)), 900).as_deref(),
+            Some("en")
+        );
+        // Heard nothing usable: the meeting's answer stands.
+        assert_eq!(
+            reading_for_stretch(Some("it"), Some(("en", 0.20)), 9_000).as_deref(),
+            Some("it")
+        );
     }
 
     // -- what a finished transcript says the meeting was in -----------------
