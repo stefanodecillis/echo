@@ -24,6 +24,7 @@
 
 pub mod catalog;
 pub mod catchup;
+pub mod catchup_bleed;
 pub mod engine;
 pub mod glossary;
 pub mod language;

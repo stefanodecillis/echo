@@ -41,6 +41,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::asr::catchup_bleed::OfflineBleed;
 use crate::asr::engine::{DecodePlan, EngineWorker};
 use crate::asr::glossary::Glossary;
 use crate::asr::phantom::VoicedSpans;
@@ -286,6 +287,19 @@ pub struct CatchUpReport {
     /// [`crate::asr::phantom`]). Counted so a pass that starts throwing away
     /// real speech is visible in the log rather than only in the transcript.
     pub phantoms_dropped: u32,
+    /// Stretches of the microphone that were the microphone's own copy of what
+    /// the computer played, left unread because the transcript already has
+    /// those words from the computer's own side (see
+    /// [`crate::asr::catchup_bleed`]).
+    ///
+    /// Counted for the same reason `phantoms_dropped` is: this is the pass
+    /// deciding *not* to write down audio a person's microphone really
+    /// recorded, so how often it does belongs in the log next to how much it
+    /// wrote. It should be of the same order as the live pass's own
+    /// `suppressed` count for the same meeting — the two halves are the same
+    /// predicate over the same audio, and a large disagreement between them is
+    /// worth looking at.
+    pub bleed_suppressed: u32,
     /// Words put right against the vocabulary — "Nongula" back to "Langola"
     /// (see [`crate::asr::glossary`]). Counted for the same reason the phantoms
     /// are: this pass changes words a person will read, so how often it does
@@ -530,6 +544,9 @@ where
     // against it.
     let floor = options.from_ms.unwrap_or(0).max(0);
     let mut plan: Vec<(Channel, Vec<ChunkRef>, i64, i64)> = Vec::new();
+    // The computer's own audio, which is the only thing a stretch of the
+    // microphone could ever be a copy of.
+    let mut far_side: Vec<ChunkRef> = Vec::new();
     for channel in [Channel::Mic, Channel::System] {
         let chunks: Vec<ChunkRef> = repo::list_chunks(db, meeting_id, Some(channel))
             .await?
@@ -537,6 +554,9 @@ where
             .filter(|c| c.committed)
             .map(ChunkRef::from_journal)
             .collect();
+        if channel == Channel::System {
+            far_side = chunks.clone();
+        }
         if chunks.is_empty() {
             continue;
         }
@@ -567,6 +587,15 @@ where
     // this recording read" is a fact about the meeting, and the two sides of a
     // call are the same conversation.
     let mut reads = HowThisMeetingReads::default();
+    // …and one for the whole meeting for the same reason: the delay between
+    // what the speakers played and what the microphone heard is a property of
+    // the machine that recorded it, not of one hole in the transcript.
+    //
+    // `None` for a meeting with no computer audio in it, which skips every
+    // part of this — see [`crate::asr::catchup_bleed`]. Without it, this pass
+    // would read back exactly the seconds the live pass suppressed and write
+    // them down at the end of every meeting.
+    let mut bleed = OfflineBleed::over(&far_side);
 
     for (channel, chunks, start, end) in plan {
         report.from_ms = report.from_ms.min(start);
@@ -623,12 +652,40 @@ where
             // still open when the hole runs out is decoded then.
             let mut ready: Vec<Pack> = Vec::new();
             for utterance in utterances {
-                if let Some(next) = Pack::of(&utterance, (start, end)) {
-                    match pack.as_mut() {
-                        Some(open) if open.would_hold(&next, budget) => open.extend(&next),
-                        _ => {
-                            ready.extend(pack.replace(next));
-                        }
+                let Some(next) = Pack::of(&utterance, (start, end)) else {
+                    continue;
+                };
+                // Asked here, before the stretch joins a window, because that
+                // is what makes it free: a copy judged after packing has
+                // already cost the encode it was packed into, and the window it
+                // was packed into carries seconds nobody will ever read.
+                //
+                // Nothing is written and nothing is deleted — these words are
+                // already in the transcript, from the computer's own side of
+                // the call. Leaving the seconds without text means a later pass
+                // over the same meeting reads them again and reaches the same
+                // verdict, exactly as a dropped courtesy line does.
+                if let Some(bleed) = bleed.as_mut() {
+                    if bleed.suppresses(audio, &utterance).await {
+                        report.bleed_suppressed += 1;
+                        // …and it closes the window that was being packed,
+                        // which is the half of this that is easy to miss. A
+                        // pack is a *span*: leaving it open would carry these
+                        // seconds through the middle of the next window, the
+                        // engine would read them along with everything else,
+                        // and the copy would come back as a line at its own
+                        // time — suppressed from the plan and written down
+                        // anyway. Closing here costs one more encode on a
+                        // meeting full of bleed and is the only way the window
+                        // never contains audio nobody is meant to read.
+                        ready.extend(pack.take());
+                        continue;
+                    }
+                }
+                match pack.as_mut() {
+                    Some(open) if open.would_hold(&next, budget) => open.extend(&next),
+                    _ => {
+                        ready.extend(pack.replace(next));
                     }
                 }
             }
@@ -697,6 +754,7 @@ where
         median_confidence = reads.median(),
         written = report.segments_written,
         phantoms_dropped = report.phantoms_dropped,
+        bleed_suppressed = report.bleed_suppressed,
         words_corrected = report.words_corrected,
         audio_ms = total_ms,
         "catch-up pass finished"
@@ -1979,6 +2037,22 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// How many final lines this channel ended up with.
+    async fn lines_on(db: &Db, meeting_id: &str, channel: Ch) -> usize {
+        repo::get_segments(
+            db,
+            &TranscriptQuery {
+                meeting_id: meeting_id.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.channel == channel)
+        .count()
     }
 
     /// Verbatim what whisper.cpp answers when it will not encode a window.
@@ -4069,6 +4143,288 @@ mod tests {
             }
             .window(),
             5_000
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // The microphone's copy of what the computer played
+    // -------------------------------------------------------------------
+
+    /// A meeting where the computer is playing through its own speakers.
+    ///
+    /// The system channel is speech-shaped audio; the microphone channel is
+    /// that same audio 180 ms late and 25 dB down, which is a laptop speaker
+    /// across a desk. Both come out of the one seam the pass reads through, so
+    /// what these tests exercise is the real
+    /// [`crate::asr::catchup_bleed::OfflineBleed`] over the real plan — the
+    /// only difference from a meeting on disk is that the FLAC is generated
+    /// rather than decoded.
+    struct BleedingAudio {
+        far_side: Vec<f32>,
+        microphone: Vec<f32>,
+        reads: Mutex<Vec<(Channel, i64, i64)>>,
+    }
+
+    impl BleedingAudio {
+        fn of(ms: usize) -> Self {
+            let far_side = crate::audio::bleed::tests::speech(ms, 21);
+            let microphone = crate::audio::bleed::tests::delayed(&far_side, 180, 0.056);
+            Self {
+                far_side,
+                microphone,
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The same meeting, with somebody in the room talking over these
+        /// spans instead — their own words, on no other channel at all.
+        fn with_someone_talking(ms: usize, spans: &[(i64, i64)]) -> Self {
+            let mut audio = Self::of(ms);
+            for (seed, (from_ms, to_ms)) in spans.iter().enumerate() {
+                let theirs = crate::audio::bleed::tests::speech(
+                    (to_ms - from_ms) as usize,
+                    900 + seed as u64,
+                );
+                let at = (*from_ms as usize * SR) / 1_000;
+                for (i, sample) in theirs.iter().enumerate() {
+                    if at + i < audio.microphone.len() {
+                        audio.microphone[at + i] = *sample;
+                    }
+                }
+            }
+            audio
+        }
+
+        fn reads(&self) -> Vec<(Channel, i64, i64)> {
+            self.reads.lock().unwrap().clone()
+        }
+
+        /// One window of one channel, padded out to exactly the length asked
+        /// for the way a real read past the end of a chunk is.
+        fn span(track: &[f32], from_ms: i64, to_ms: i64) -> Vec<f32> {
+            let wanted = ((to_ms - from_ms).max(0) as usize * SR) / 1_000;
+            let from = (from_ms.max(0) as usize * SR) / 1_000;
+            let mut out = vec![0.0f32; wanted];
+            if from < track.len() {
+                let take = wanted.min(track.len() - from);
+                out[..take].copy_from_slice(&track[from..from + take]);
+            }
+            out
+        }
+    }
+
+    /// One utterance per window, as a detector that hears a room full of
+    /// speech does.
+    ///
+    /// `voiced_ms` is half the window, which is what a real stretch looks like:
+    /// it is padded at both ends and carries the pause it closed on. Claiming
+    /// every millisecond was voice would not be the conservative choice — the
+    /// coverage condition in [`crate::audio::bleed::is_bleed`] asks for far
+    /// side over six tenths of the *measured voice*, so a window that claims to
+    /// be voice from end to end sets itself a bar the far side can only clear
+    /// by talking continuously.
+    struct BleedStream {
+        channel: Channel,
+    }
+
+    impl SpeechStream for BleedStream {
+        async fn push(
+            &mut self,
+            samples: Vec<f32>,
+            t_start_ms: i64,
+        ) -> Result<Vec<Utterance>, AsrError> {
+            let mut found = whole_window(&samples, t_start_ms, self.channel);
+            for utterance in &mut found {
+                utterance.voiced_ms = utterance.duration_ms() / 2;
+            }
+            Ok(found)
+        }
+
+        async fn finish(&mut self) -> Result<Vec<Utterance>, AsrError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl AudioSource for BleedingAudio {
+        type Stream = BleedStream;
+
+        async fn read_window(
+            &self,
+            chunks: &[ChunkRef],
+            from_ms: i64,
+            to_ms: i64,
+        ) -> Result<Vec<f32>, AsrError> {
+            let channel = chunks.first().map(|c| c.channel).unwrap_or(Channel::Mic);
+            self.reads.lock().unwrap().push((channel, from_ms, to_ms));
+            let track = match channel {
+                Channel::System => &self.far_side,
+                _ => &self.microphone,
+            };
+            Ok(Self::span(track, from_ms, to_ms))
+        }
+
+        fn open_stream(&self, _detector: Option<&Path>, channel: Channel) -> BleedStream {
+            BleedStream { channel }
+        }
+    }
+
+    /// **The reason the offline half exists at all.**
+    ///
+    /// Catch-up plans its work as "the audio on disk minus what has text
+    /// against it", and a stretch the live pass suppressed has no text against
+    /// it by construction. Without this, every pass over the meeting would read
+    /// those seconds back and write down the microphone's copy of what the
+    /// computer played — undoing the live suppression a few minutes later, in
+    /// the copy of the transcript people keep.
+    ///
+    /// So the pass is run twice, which is what an interrupted-and-resumed job
+    /// really does: the second one must find nothing left to say about the
+    /// microphone, and must not ask the engine for anything at all.
+    #[tokio::test]
+    async fn a_stretch_that_is_only_the_computers_own_audio_is_never_written_down() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 4).await;
+        commit_chunks(&db, &id, Ch::System, 4).await;
+        let audio = BleedingAudio::of(120_000);
+        let engine = WhisperLike::default();
+        let options = || CatchUpOptions {
+            window_ms: 8_000,
+            ..Default::default()
+        };
+
+        let first = run(&engine, &db, &id, options(), &audio).await.unwrap();
+        assert!(
+            first.bleed_suppressed >= 13,
+            "only {} of fifteen microphone stretches were recognised as the \
+             computer's own audio coming back",
+            first.bleed_suppressed
+        );
+        // The far side itself is written down in full: suppression is
+        // deduplication, so the words are in the transcript from the cleaner
+        // copy. That is the whole of what makes it defensible.
+        let written = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            written.iter().any(|s| s.channel == Ch::System),
+            "the computer's own side of the call was not written down"
+        );
+        // …and exactly two stretches of the microphone: the two at the ends of
+        // the recording, which want far side from before it began and from
+        // after it stopped. Neither can be judged in full, so both are written
+        // down — which is the direction this whole design leans, and the reason
+        // the number is two rather than none.
+        let mic_after_first = lines_on(&db, &id, Ch::Mic).await;
+        assert_eq!(
+            mic_after_first, 2,
+            "the microphone's own copy of the computer was written down anyway"
+        );
+
+        let asked = engine.asked();
+        let second = run(&engine, &db, &id, options(), &audio).await.unwrap();
+        assert_eq!(
+            engine.asked(),
+            asked,
+            "the pass after an interrupted one read the suppressed stretches \
+             back to the engine"
+        );
+        assert_eq!(second.segments_written, 0);
+        assert_eq!(second.bleed_suppressed, first.bleed_suppressed);
+        assert_eq!(lines_on(&db, &id, Ch::Mic).await, mic_after_first);
+    }
+
+    /// A pack is a **span**, so a suppressed stretch in the middle of one would
+    /// be read to the engine along with everything around it — and the copy
+    /// would come back as a line at its own time, suppressed from the plan and
+    /// written down anyway.
+    ///
+    /// The meeting here is the ordinary shape of a call on laptop speakers: the
+    /// far side coming back through the microphone, with two stretches of
+    /// somebody in the room talking in between. Those two stretches are
+    /// twenty-four seconds apart, which is inside the packing budget, so before
+    /// this they went to the engine as one window with eight seconds of the
+    /// computer's own audio down the middle of it.
+    #[tokio::test]
+    async fn a_suppressed_stretch_is_never_carried_through_the_middle_of_a_window() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 2).await;
+        commit_chunks(&db, &id, Ch::System, 2).await;
+        // The far side is already written down — which is what makes the
+        // microphone's copy a duplicate rather than the only record of it.
+        already_written(&db, &id, Ch::System, 0, 60_000).await;
+        let audio =
+            BleedingAudio::with_someone_talking(60_000, &[(16_000, 24_000), (32_000, 40_000)]);
+        let engine = FakeEngine::saying("quello che ha detto");
+
+        let report = run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 8_000,
+                ..Default::default()
+            },
+            &audio,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.bleed_suppressed, 4);
+        assert_eq!(
+            engine.spans(),
+            vec![
+                // The opening stretch, which wants far side from before the
+                // recording began and so is never judged.
+                (0, 8_000),
+                (16_000, 8_000),
+                (32_000, 8_000),
+                // …and the closing one, for the same reason at the other end.
+                (56_000, 4_000),
+            ],
+            "a window carried seconds of the computer's own audio to the engine"
+        );
+    }
+
+    /// The mic-only meeting: with no computer audio there is nothing for a
+    /// stretch of the microphone to be a copy of, so none of this work happens
+    /// — not a page, not a read, not a correlation.
+    #[tokio::test]
+    async fn a_meeting_with_no_computer_audio_is_never_asked_about_copies() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 2).await;
+        let audio = BleedingAudio::of(60_000);
+
+        let report = run(
+            &WhisperLike::default(),
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 8_000,
+                ..Default::default()
+            },
+            &audio,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.bleed_suppressed, 0);
+        assert!(
+            report.segments_written > 0,
+            "the meeting was not written down"
+        );
+        assert!(
+            audio
+                .reads()
+                .iter()
+                .all(|(channel, _, _)| *channel == Channel::Mic),
+            "a meeting with no computer audio went looking for some: {:?}",
+            audio.reads()
         );
     }
 }
