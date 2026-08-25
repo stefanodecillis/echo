@@ -11,6 +11,8 @@
 //! * [`engine`] runs it: one loaded engine, one job at a time.
 //! * [`language`] decides when the meeting's language is settled.
 //! * [`catchup`] transcribes from disk whatever the live pass missed.
+//! * [`confidence`] decides which lines Echo should admit it is unsure about,
+//!   and is the one bar both the transcript screen and the recap ask.
 //! * [`phantom`] recognises the lines silence talked the decoder into, after
 //!   the fact, and drops them.
 //!
@@ -25,6 +27,7 @@
 pub mod catalog;
 pub mod catchup;
 pub mod catchup_bleed;
+pub mod confidence;
 pub mod engine;
 pub mod glossary;
 pub mod language;

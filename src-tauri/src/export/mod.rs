@@ -252,6 +252,24 @@ fn default_speaker_label(channel: Channel, mic_fallback: &str) -> String {
     }
 }
 
+/// The transcript as a file will carry it: timestamp, speaker, words.
+///
+/// **An export deliberately does not mark the lines Echo was unsure of**, even
+/// though [`crate::asr::confidence`] can tell it which ones they are and both
+/// the transcript screen and the recap prompt use exactly that. The two are
+/// different objects. The screen is Echo's own window, where a dimmed line and a
+/// hover is Echo talking to the person about its own work; a recap prompt is
+/// read by a machine and thrown away. An export is a document somebody pastes
+/// into Slack or sends to a client, and `[unclear]` scattered through it is Echo
+/// talking about itself inside somebody else's document — sentences the reader
+/// did not ask for, about a tool they may not have heard of, next to words that
+/// are usually right.
+///
+/// This module's one honesty rule is that it never *claims* something false —
+/// which is why [`mic_fallback_label`] exists a few lines up. An absent mark is
+/// not a claim, so the rule is kept. If this ever changes, it should change
+/// because somebody asked for a marked export, and it should be a choice in the
+/// export dialog rather than the new default.
 async fn build_transcript_lines(
     db: &Db,
     meeting_id: &str,

@@ -102,6 +102,15 @@ pub struct RenderContext {
     /// Which piece this is, for map-reduce prompts.
     pub chunk_index: u32,
     pub chunk_count: u32,
+    /// Does this meeting's transcript carry any `[unclear]` marker — lines Echo
+    /// was not sure it heard (see [`crate::asr::confidence`])?
+    ///
+    /// The clause explaining the marker is emitted **only when this is true**.
+    /// An instruction about a notation that never appears in the text below it
+    /// is an invitation to hedge a recap that had nothing to hedge about, and
+    /// every hedge a model adds unprompted is a sentence the person has to read
+    /// past. Most meetings never set this.
+    pub some_lines_unclear: bool,
 }
 
 /// The languages Echo can name outright, by the code speech detection reports.
@@ -224,6 +233,29 @@ fn language_directive_for(ctx: &RenderContext, what: &str) -> String {
     }
 }
 
+/// What to say about the `[unclear]` marker, when there is one to say it about.
+///
+/// Two wordings, because the two prompts are looking at different things. The
+/// map/single prompt has the marked transcript right there and can be told what
+/// the marker means. The reduce prompt has only working notes the model wrote
+/// itself, and nothing carries the markers forward into those — so it is told
+/// that parts of the meeting were unclear and warned off exactness, which is all
+/// that is honestly true at that point (see the comment at the reduce call site
+/// in [`crate::summarize`]).
+fn unclear_clause(over_notes: bool) -> &'static str {
+    if over_notes {
+        "Some of this meeting was hard to hear, and parts of the transcript these notes were \
+         written from may not be exactly what was said. Do not present any wording as an exact \
+         quote, and do not name somebody as responsible for a task unless the notes are clearly \
+         certain about it.\n\n"
+    } else {
+        "Lines in the transcript below that end with [unclear] are lines Echo was not sure it \
+         heard correctly — the words may be wrong. Use them for what happened, but do not quote \
+         them as exact wording, and never name somebody as responsible for a task when their \
+         name appears only on such a line.\n\n"
+    }
+}
+
 fn meeting_header(ctx: &RenderContext) -> String {
     let mut header = format!(
         "Meeting: {}\nStarted: {}\n",
@@ -268,6 +300,11 @@ pub fn render(template: &Template, ctx: &RenderContext) -> String {
         ));
     }
 
+    if ctx.some_lines_unclear {
+        out.push('\n');
+        out.push_str(unclear_clause(false));
+    }
+
     out.push_str("Transcript:\n---\n");
     out.push_str(&ctx.transcript_chunk);
     out.push_str("\n---\n");
@@ -293,6 +330,9 @@ pub fn render_reduce(
          transcript was split into parts.\n\n",
         chunk_summaries.len()
     ));
+    if ctx.some_lines_unclear {
+        out.push_str(unclear_clause(true));
+    }
     for (i, notes) in chunk_summaries.iter().enumerate() {
         out.push_str(&format!("Notes from part {}:\n{}\n\n", i + 1, notes));
     }
@@ -651,5 +691,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t.id, BUILTIN_IDS[0]);
+    }
+
+    #[test]
+    fn the_marker_is_explained_only_when_the_transcript_carries_one() {
+        let template = general_recap();
+        let clear = RenderContext {
+            transcript_chunk: "Marco: morning all\n".to_string(),
+            chunk_count: 1,
+            ..Default::default()
+        };
+        let prompt = render(&template, &clear);
+        assert!(
+            !prompt.contains("[unclear]") && !prompt.to_lowercase().contains("not sure it heard"),
+            "a meeting Echo heard clearly should not be told about a notation that never appears \
+             in it — every unprompted hedge is a sentence the person has to read past"
+        );
+
+        let unclear = RenderContext {
+            some_lines_unclear: true,
+            ..clear.clone()
+        };
+        let prompt = render(&template, &unclear);
+        assert!(prompt.contains("[unclear]"));
+        assert!(prompt.contains("never name somebody as responsible"));
+    }
+
+    #[test]
+    fn the_reduce_step_is_warned_without_being_told_to_look_for_a_marker() {
+        let template = general_recap();
+        let notes = vec!["part one notes".to_string(), "part two notes".to_string()];
+
+        let clear = RenderContext {
+            chunk_count: 2,
+            ..Default::default()
+        };
+        let prompt = render_reduce(&template, &notes, &clear);
+        assert!(!prompt.contains("[unclear]"));
+        assert!(!prompt.contains("hard to hear"));
+
+        let unclear = RenderContext {
+            some_lines_unclear: true,
+            ..clear
+        };
+        let prompt = render_reduce(&template, &notes, &unclear);
+        assert!(prompt.contains("hard to hear"));
+        // Deliberately *not* the marker: the working notes are the model's own
+        // prose and nothing carries `[unclear]` forward into them, so telling
+        // the reduce step to look for markers would point it at something that
+        // is not there. See the comment at the reduce call site.
+        assert!(
+            !prompt.contains("[unclear]"),
+            "the notes carry no markers; the reduce prompt must not claim they do"
+        );
     }
 }

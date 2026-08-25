@@ -167,6 +167,12 @@ export const labels = {
 export const transcriptNote = {
   corrected: (changes: { from: string; to: string }[]) =>
     changes.map((c) => `Echo wrote “${c.from}” and changed it to “${c.to}”.`).join(" "),
+  /**
+   * A line Echo was not sure it heard (`src/pages/Meeting/lib/confidence.ts`).
+   * Said as what happened, not as a score: "0.42" is a number nobody can act on,
+   * and "low confidence" is jargon for the same number.
+   */
+  unsure: "Echo wasn't sure it heard this line. The words may be wrong.",
 } as const;
 
 export const jobLine = {
@@ -304,6 +310,41 @@ export const meeting = {
   tabInfo: "Info",
   noRecapTitle: "No recap yet",
   noRecapDescription: "Write one whenever you're ready.",
+  /**
+   * The same empty tab while Echo is still writing the meeting down.
+   *
+   * A recap is written *from* the transcript, and Echo already queues it behind
+   * that meeting's transcript work — the queue orders by kind, so the recap runs
+   * last whatever order things were asked for in. That was always true and the
+   * screen never said it: for the several minutes after a meeting ends, and for
+   * the whole of one that is still recording, this tab offered "Write one
+   * whenever you're ready" beside a live button, inviting a recap of a
+   * transcript Echo was still writing.
+   *
+   * So the button stays: a promise the queue already keeps is better than a
+   * disabled control that has to explain itself.
+   */
+  noRecapWhileTranscribingTitle: "Still writing the meeting down",
+  noRecapWhileTranscribingDescription:
+    "A recap is written from the transcript, so Echo finishes that first. Ask for one now and it gets written as soon as the transcript is done.",
+  /** The pending card when the recap has been asked for but hasn't started. */
+  recapWaitingTitle: "Your recap is waiting",
+  /** Why it is waiting, when what it is waiting for is the transcript. */
+  recapWaitingForTranscriptDescription:
+    "Echo is still writing the meeting down. Your recap gets written as soon as that's done.",
+  /** Why it is waiting, when it is simply not its turn yet. */
+  recapWaitingDescription: "Echo starts on it as soon as it's free.",
+  /**
+   * The transcript pass stopped before the end.
+   *
+   * Without this a recap would be written from an incomplete transcript with
+   * nothing anywhere saying so. Same shape as the Transcript tab's own notice
+   * for the same stopped pass, which carries the reason underneath in the
+   * core's own words.
+   */
+  recapTranscriptStoppedTitle: "The transcript isn't finished",
+  recapTranscriptStoppedDescription:
+    "Echo stopped before the end of the recording, so a recap written now would miss whatever it didn't reach.",
   writeRecapButton: "Write recap",
   regenerateButton: "Try a different way",
   templateLabel: "Recap style",

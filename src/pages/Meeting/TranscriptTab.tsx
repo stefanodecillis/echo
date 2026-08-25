@@ -40,6 +40,7 @@ import { SpeakerChip } from "./components/SpeakerChip";
 import { SpeakersDialog } from "./components/SpeakersDialog";
 import { formatTimestamp } from "./lib/date";
 import type { MeetingDetailWithPeopleCount } from "./lib/peopleCount";
+import { howSureThisMeetingIs } from "./lib/confidence";
 import { canonicalSpeakers, resolveSpeaker } from "./lib/speakers";
 import { buildTranscriptText } from "./lib/transcriptText";
 
@@ -175,6 +176,12 @@ export function TranscriptTab({
     if (!query) return list;
     return list.filter((s) => s.text.toLowerCase().includes(query));
   }, [segments, filter]);
+
+  // Over the whole meeting, deliberately — not `filtered`. The bar is partly
+  // "how does this line compare with the rest of this meeting", and a search
+  // box is not a meeting: typing a word must not change which lines read as
+  // shaky.
+  const sureness = useMemo(() => howSureThisMeetingIs(segments ?? []), [segments]);
 
   useEffect(() => {
     if (jumpToMs === undefined || !segments || segments.length === 0) return;
@@ -316,6 +323,16 @@ export function TranscriptTab({
           className="flex-1"
           renderItem={(segment) => {
             const speaker = resolveSpeaker(segment.speakerId, detail.speakers);
+            const unsure = sureness.isShaky(segment.avgConfidence);
+            const corrections = segment.corrections ?? [];
+            const corrected = corrections.length > 0;
+            // Both can be true of one line, so both have to be sayable at once.
+            const note = [
+              unsure ? transcriptNote.unsure : undefined,
+              corrected ? transcriptNote.corrected(corrections) : undefined,
+            ]
+              .filter(Boolean)
+              .join(" ");
             return (
               <div className="flex gap-4 border-b border-hairline px-1 py-3">
                 <span className="w-12 shrink-0 pt-0.5 text-xs tabular-nums text-ink-ghost">
@@ -329,20 +346,28 @@ export function TranscriptTab({
                   />
                   <p
                     className={cx(
-                      "line-clamp-3 text-sm leading-relaxed text-ink-soft",
+                      "line-clamp-3 text-sm leading-relaxed",
+                      // A line Echo wasn't sure it heard reads a shade quieter,
+                      // and says why on hover. `text-ink-faint` is already this
+                      // app's word for "less certain" (Live/TranscriptLine uses
+                      // it for a line that is still arriving), so nothing new is
+                      // being taught here.
+                      //
+                      // Deliberately *not* the dotted underline below: that
+                      // already means "a word was put right", and a line can be
+                      // both unsure and corrected. Two meanings on one mark
+                      // leaves the hover unable to say which it is. Colour and
+                      // underline compose; two underlines do not.
+                      unsure ? "text-ink-faint" : "text-ink-soft",
                       // A word Echo put right against the list in Settings. The
                       // whole indication: a dotted underline and a sentence on
                       // hover saying what was written and what it became. The
                       // transcript is not redesigned for this — the repair is
                       // right far more often than not, and a badge on every
                       // third line would be noise.
-                      segment.corrections?.length && "decoration-hairline underline decoration-dotted underline-offset-4",
+                      corrected && "decoration-hairline underline decoration-dotted underline-offset-4",
                     )}
-                    title={
-                      segment.corrections?.length
-                        ? transcriptNote.corrected(segment.corrections)
-                        : undefined
-                    }
+                    title={note || undefined}
                   >
                     {highlightMatches(segment.text, filter)}
                   </p>

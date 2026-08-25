@@ -445,10 +445,99 @@ async fn run_generate(
     last.ok_or(SummarizeError::EmptyReply)
 }
 
+/// What a line of transcript is written as when Echo was not sure it heard it.
+///
+/// A marker, not a redaction. See [`RecapInput`].
+const UNCLEAR_MARKER: &str = "[unclear]";
+
+/// One line of transcript on its way into a prompt, before it is decided how to
+/// write it down.
+#[derive(Debug, Clone)]
+struct RecapLine {
+    speaker: String,
+    text: String,
+    confidence: Option<f32>,
+}
+
+/// The transcript as the recap pass sees it: the prompt text, and the same
+/// words split by whether Echo was sure it heard them.
+///
+/// **Mark, never silently drop.** A line Echo is unsure about is still the only
+/// record of that moment, and a recap written from a transcript with holes in it
+/// is worse than one written from a transcript that says where it is shaky:
+/// dropping is Echo deciding, on the strength of a number, that something
+/// nobody can check did not happen. So every word that was in the transcript is
+/// still in [`Self::text`] — the shaky ones just carry
+/// [`UNCLEAR_MARKER`] after them.
+///
+/// The two extra copies exist for one job only: [`owner_is_founded`], which
+/// needs to know whether a name the model came back with was ever heard
+/// clearly. They are never sent anywhere.
+#[derive(Debug, Clone, Default)]
+pub struct RecapInput {
+    /// Every line, in order, `"{name}: {text}"` — with `[unclear]` appended to
+    /// the lines Echo was not sure of. This is what the prompt gets.
+    pub text: String,
+    /// Is there at least one marker in [`Self::text`]? The prompt only explains
+    /// the marker when there is one to explain: an instruction about a notation
+    /// that never appears is an invitation to hedge a recap that had nothing to
+    /// hedge about.
+    pub any_unclear: bool,
+    /// Speaker names, plus the words of the lines Echo heard clearly.
+    ///
+    /// Names are here for **every** line, including the shaky ones, and that is
+    /// deliberate. A speaker's name comes from the speaker list — diarization
+    /// and whatever the person typed on the meeting screen — not from what the
+    /// engine thought it heard. Somebody who only ever spoke on lines Echo was
+    /// unsure of still really is in this meeting, and clearing them off a task
+    /// for that would be the exact false clear [`owner_is_founded`] is biased
+    /// against.
+    pub confident_text: String,
+    /// The words of the lines Echo was not sure of, and nothing else.
+    pub shaky_text: String,
+}
+
+/// Write the lines out three ways: once for the prompt, twice for the
+/// owner check. Pure, so the marking rules can be tested without a database.
+fn assemble_recap_input(lines: &[RecapLine]) -> RecapInput {
+    let sure = crate::asr::confidence::HowSureThisMeetingIs::from_readings(
+        lines.iter().filter_map(|l| l.confidence),
+    );
+
+    let mut input = RecapInput::default();
+    for line in lines {
+        let shaky = sure.is_shaky(line.confidence);
+        input.text.push_str(&line.speaker);
+        input.text.push_str(": ");
+        input.text.push_str(&line.text);
+        if shaky {
+            input.text.push(' ');
+            input.text.push_str(UNCLEAR_MARKER);
+            input.any_unclear = true;
+        }
+        input.text.push('\n');
+
+        // The name is founded either way (see `RecapInput::confident_text`);
+        // only the words move.
+        input.confident_text.push_str(&line.speaker);
+        input.confident_text.push(':');
+        if shaky {
+            input.shaky_text.push_str(&line.text);
+            input.shaky_text.push('\n');
+        } else {
+            input.confident_text.push(' ');
+            input.confident_text.push_str(&line.text);
+        }
+        input.confident_text.push('\n');
+    }
+    input
+}
+
 /// Every final segment for this meeting, one line per segment, with speakers
 /// resolved through any merge (DESIGN §3: "transcript (final segments w/
-/// speaker names)").
-async fn build_transcript_text(db: &Db, meeting_id: &str) -> Result<String, SummarizeError> {
+/// speaker names)") — and with the lines Echo was not sure it heard marked as
+/// such (see [`RecapInput`] and [`crate::asr::confidence`]).
+async fn build_transcript_text(db: &Db, meeting_id: &str) -> Result<RecapInput, SummarizeError> {
     let segments = repo::get_segments(
         db,
         &TranscriptQuery {
@@ -461,7 +550,7 @@ async fn build_transcript_text(db: &Db, meeting_id: &str) -> Result<String, Summ
     .map_err(db_err)?;
 
     let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut out = String::new();
+    let mut lines: Vec<RecapLine> = Vec::with_capacity(segments.len());
     for seg in &segments {
         if seg.text.trim().is_empty() {
             continue;
@@ -482,12 +571,13 @@ async fn build_transcript_text(db: &Db, meeting_id: &str) -> Result<String, Summ
             }
             None => "Unknown speaker".to_string(),
         };
-        out.push_str(&speaker_name);
-        out.push_str(": ");
-        out.push_str(seg.text.trim());
-        out.push('\n');
+        lines.push(RecapLine {
+            speaker: speaker_name,
+            text: seg.text.trim().to_string(),
+            confidence: seg.avg_confidence,
+        });
     }
-    Ok(out)
+    Ok(assemble_recap_input(&lines))
 }
 
 /// What language this meeting was held in, read off the transcript: the one
@@ -614,8 +704,8 @@ pub async fn summarize_meeting_with_actions(
     let model = connector.model();
     let context_chars = connector.capabilities().context_chars;
 
-    let transcript_text = build_transcript_text(db, &req.meeting_id).await?;
-    if transcript_text.trim().is_empty() {
+    let recap_input = build_transcript_text(db, &req.meeting_id).await?;
+    if recap_input.text.trim().is_empty() {
         return Err(SummarizeError::NoTranscript);
     }
 
@@ -643,6 +733,7 @@ pub async fn summarize_meeting_with_actions(
         transcript_chunk: String::new(),
         chunk_index: 0,
         chunk_count: 1,
+        some_lines_unclear: recap_input.any_unclear,
     };
 
     // Leave headroom for the instructions themselves, not just the transcript
@@ -653,7 +744,7 @@ pub async fn summarize_meeting_with_actions(
     let budget = context_chars
         .saturating_sub(PROMPT_OVERHEAD_CHARS)
         .max(MIN_CHUNK_CHARS);
-    let chunks = chunk_transcript(&transcript_text, budget);
+    let chunks = chunk_transcript(&recap_input.text, budget);
     if chunks.is_empty() {
         return Err(SummarizeError::NoTranscript);
     }
@@ -679,6 +770,15 @@ pub async fn summarize_meeting_with_actions(
         if cancel.is_cancelled() {
             return Err(SummarizeError::Cancelled);
         }
+        // Honest limit, written down rather than papered over: the working
+        // notes come back as the model's own prose, and nothing carries the
+        // `[unclear]` markers forward into them. So the reduce step is told
+        // that parts of this meeting were unclear, but it cannot re-check
+        // *which* parts — it has only the notes, and by then the marking is
+        // gone. A long meeting therefore gets weaker protection in the recap's
+        // prose than a short one. The task list is not affected: the owner rule
+        // below runs in code, over the transcript, on the final owners,
+        // whichever path the prose took.
         let reduce_prompt = templates::render_reduce(&template, &notes, &ctx);
         run_generate(connector.as_ref(), reduce_prompt, &cancel).await?
     };
@@ -714,7 +814,7 @@ pub async fn summarize_meeting_with_actions(
         // The recap's own language, resolved above and now stored on the row —
         // not whatever the global setting says by the time this line runs.
         let language = action_item_language(summary.language.as_deref(), &ctx.output_language);
-        match write_action_items(db, &summary, language, cancel.clone()).await {
+        match write_action_items(db, &summary, language, &recap_input, cancel.clone()).await {
             Ok(items) => items,
             Err(e) => {
                 tracing::warn!("action items not written for summary {}: {e}", summary.id);
@@ -844,7 +944,157 @@ pub async fn extract_action_items(
     let app_settings = settings::load(db).await.map_err(db_err)?;
     let language =
         action_item_language(summary.language.as_deref(), &app_settings.summary_language);
-    write_action_items(db, &summary, language, cancel).await
+    // Read again, because the owner rule ([`owner_is_founded`]) is a check
+    // against the transcript and this entry point starts from a recap that was
+    // written some time ago. One extra read of rows that are already indexed by
+    // meeting, next to a model round-trip.
+    let recap_input = build_transcript_text(db, meeting_id).await?;
+    write_action_items(db, &summary, language, &recap_input, cancel).await
+}
+
+// ---------------------------------------------------------------------------
+// The owner rule
+// ---------------------------------------------------------------------------
+
+/// Take the owner off any task whose owner Echo only ever heard on a line it
+/// was unsure of. The task stays.
+///
+/// Runs over the parsed reply, before anything is stored, so there is no path
+/// from a shaky line to a name on a task list — including the repair retry, a
+/// re-extraction over an old recap, and whatever a future template asks for.
+fn ground_owners(items: Vec<ActionItemRaw>, recap: &RecapInput) -> Vec<ActionItemRaw> {
+    items
+        .into_iter()
+        .map(|mut item| {
+            let Some(owner) = item.owner.as_deref() else {
+                return item;
+            };
+            if owner_is_founded(owner, &recap.confident_text, &recap.shaky_text) {
+                return item;
+            }
+            tracing::debug!(
+                target: "echo::summarize",
+                owner,
+                "took an owner off a task: that name was only ever heard on a line Echo was unsure of"
+            );
+            // The task, not the name. Somebody agreed to do this; what Echo
+            // cannot stand behind is who.
+            item.owner = None;
+            item
+        })
+        .collect()
+}
+
+/// May this name be printed as the person responsible for a task?
+///
+/// The rule the user gave is *never* attribute a task to a name Echo only heard
+/// on a line it was unsure of — and a prompt is a request, not a rule. A model
+/// asked nicely complies most of the time, and "most of the time" is not what
+/// *never* means. So the check runs here, in code, over the transcript, after
+/// the reply has been parsed.
+///
+/// Three answers, and only one of them clears anything:
+///
+/// * **the name appears in text Echo heard clearly → keep.** Even if it also
+///   appears on a shaky line. That is what "only" means: one clear hearing is
+///   enough to found the name, and the rule was never about how often it was
+///   misheard.
+/// * **the name appears on shaky lines and nowhere clear → clear the owner,
+///   keep the task.** The task itself came from the recap and was really
+///   agreed; it is the *who* that rests on words Echo did not catch.
+/// * **the name appears nowhere in the transcript → keep.** This is the common
+///   and completely legitimate case: "the team", "Engineering", "whoever picks
+///   up the on-call", or a paraphrase of a name that was said differently. None
+///   of those are misheard names, and the rule has nothing to say about them.
+///
+/// The bias is deliberate and it runs one way. **A false clear deletes a
+/// correct owner** — the person reads a task with nobody's name on it and has
+/// to remember who said they would do it — whereas a false keep leaves a name
+/// that is at worst the wrong one, next to a task the person can read and
+/// judge. The first is the worse error, so anything ambiguous keeps.
+///
+/// Matching is by folded words ([`crate::asr::glossary`], the same word reader
+/// and the same case/accent flattening the glossary uses to recognise a spoken
+/// name — rather than a fourth hand-rolled word matcher), and **the two sides
+/// are read with different eyes, because a match means opposite things on each
+/// of them.**
+///
+/// On the confident side a match is a reason to *keep*, the safe direction, so
+/// it is read generously: the whole owner string as a run of consecutive words,
+/// or **any single word of the name that could identify the person on its own**.
+/// "Anna Bianchi" is founded by hearing "Bianchi" clearly, and equally by
+/// hearing "Anna" clearly — a first name said plainly is a hearing, and reading
+/// only the longest word here was a false clear waiting to happen: the clear
+/// lines say "Anna will handle the invoices", one shaky line carries the
+/// surname, and the correct owner is deleted. Words shorter than
+/// [`SHORTEST_FOUNDING_WORD`] are the exception — "de", "la", an initial —
+/// because they say nothing about who was meant and turn up everywhere; a name
+/// made only of such words falls back to its longest word so nothing gets
+/// *stricter* than reading one word did.
+///
+/// On the shaky side a match is a reason to *clear*, the dangerous direction, so
+/// it stays narrow: the whole run, or the longest word — the part that actually
+/// carries the identity. Widening it there would clear more owners, which is the
+/// error this rule is biased against.
+fn owner_is_founded(owner: &str, confident: &str, shaky: &str) -> bool {
+    let wanted = folded_words(owner);
+    if wanted.is_empty() {
+        // Punctuation, an emoji, an empty string: not a name, nothing to check.
+        return true;
+    }
+    let longest = wanted
+        .iter()
+        .max_by_key(|w| w.chars().count())
+        .expect("checked non-empty");
+    // Every word of the name that could stand for the person on its own. Empty
+    // for a name made entirely of particles or initials, and then the longest
+    // word carries it alone, exactly as it used to.
+    let mut founding: Vec<&String> = wanted
+        .iter()
+        .filter(|w| w.chars().count() >= SHORTEST_FOUNDING_WORD)
+        .collect();
+    if founding.is_empty() {
+        founding.push(longest);
+    }
+
+    let confident_words = folded_words(confident);
+    if contains_run(&confident_words, &wanted)
+        || confident_words.iter().any(|w| founding.contains(&w))
+    {
+        return true;
+    }
+
+    let shaky_words = folded_words(shaky);
+    if contains_run(&shaky_words, &wanted) || shaky_words.iter().any(|w| w == longest) {
+        return false;
+    }
+    true
+}
+
+/// How many letters a word of a name needs before hearing it clearly can found
+/// the whole name.
+///
+/// Three, which keeps out "de", "la", "van", "d'" and single initials — the
+/// pieces of a name that identify nobody and appear in half of any Italian
+/// transcript — while letting in every first name and surname short enough to
+/// worry about ("Ivo", "Ada", "Li" via the fallback).
+const SHORTEST_FOUNDING_WORD: usize = 3;
+
+/// The words of a piece of text, folded the way the glossary folds them.
+fn folded_words(text: &str) -> Vec<String> {
+    crate::asr::glossary::word_spans(text)
+        .into_iter()
+        .map(|(from, to)| crate::asr::glossary::fold(&text[from..to]))
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Does `needle` appear in `haystack` as a run of consecutive words?
+fn contains_run(haystack: &[String], needle: &[String]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// The one pass that asks for a task list and stores it.
@@ -852,6 +1102,7 @@ async fn write_action_items(
     db: &Db,
     summary: &Summary,
     language: SummaryLanguage,
+    recap_input: &RecapInput,
     cancel: CancelFlag,
 ) -> Result<Vec<ActionItem>, SummarizeError> {
     // The recap's provider, but today's model: `summary.model` says which model
@@ -906,6 +1157,10 @@ async fn write_action_items(
         }
         Err(other) => return Err(other),
     };
+
+    // Between parsing and storing: the owner rule, enforced here rather than
+    // asked for in the prompt. See [`owner_is_founded`].
+    let raw = ground_owners(raw, recap_input);
 
     let items: Vec<ActionItem> = raw
         .into_iter()
@@ -1116,6 +1371,224 @@ pub fn is_loopback_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn said(speaker: &str, text: &str, confidence: Option<f32>) -> RecapLine {
+        RecapLine {
+            speaker: speaker.to_string(),
+            text: text.to_string(),
+            confidence,
+        }
+    }
+
+    /// Enough clearly-read lines that the meeting has a middle to be judged
+    /// against ([`crate::asr::confidence::MEDIAN_NEEDS`]).
+    fn a_meeting_that_reads_well() -> Vec<RecapLine> {
+        (0..10)
+            .map(|i| said("Marco", &format!("line number {i}"), Some(0.92)))
+            .collect()
+    }
+
+    #[test]
+    fn a_shaky_line_is_marked_and_nothing_is_dropped() {
+        let mut lines = a_meeting_that_reads_well();
+        lines.push(said("Giulia", "something Echo half caught", Some(0.30)));
+        let input = assemble_recap_input(&lines);
+
+        // Every word that was in the transcript is still in the prompt text.
+        // This is the whole rule: mark, never silently drop. A recap written
+        // from a transcript with holes punched in it is Echo deciding that
+        // something nobody can check did not happen.
+        for line in &lines {
+            assert!(
+                input.text.contains(&line.text),
+                "{:?} was dropped from the prompt",
+                line.text
+            );
+            assert!(input.text.contains(&line.speaker));
+        }
+        assert_eq!(
+            input.text.lines().count(),
+            lines.len(),
+            "one line in, one line out"
+        );
+
+        // The shaky one carries the marker; the confident ones do not.
+        assert!(input.any_unclear);
+        let marked: Vec<&str> = input
+            .text
+            .lines()
+            .filter(|l| l.contains(UNCLEAR_MARKER))
+            .collect();
+        assert_eq!(marked, vec!["Giulia: something Echo half caught [unclear]"]);
+    }
+
+    #[test]
+    fn a_meeting_echo_heard_clearly_carries_no_markers_at_all() {
+        let input = assemble_recap_input(&a_meeting_that_reads_well());
+        assert!(!input.any_unclear);
+        assert!(!input.text.contains(UNCLEAR_MARKER));
+        assert!(input.shaky_text.trim().is_empty());
+    }
+
+    #[test]
+    fn the_two_side_copies_split_the_words_and_keep_every_name() {
+        let mut lines = a_meeting_that_reads_well();
+        lines.push(said("Giulia", "handle the invoices", Some(0.30)));
+        let input = assemble_recap_input(&lines);
+
+        // Words of the shaky line: on the shaky side only.
+        assert!(input.shaky_text.contains("handle the invoices"));
+        assert!(!input.confident_text.contains("handle the invoices"));
+        // Words of a clear line: on the confident side only.
+        assert!(input.confident_text.contains("line number 3"));
+        assert!(!input.shaky_text.contains("line number 3"));
+        // Both names are founded, because a name comes from the speaker list
+        // rather than from what the engine thought it heard.
+        assert!(input.confident_text.contains("Marco"));
+        assert!(input.confident_text.contains("Giulia"));
+    }
+
+    #[test]
+    fn an_owner_is_only_cleared_when_the_name_was_never_heard_clearly() {
+        let confident = "Marco: I'll take the pricing page\nGiulia:\n";
+        let shaky = "Bianchi is going to redo the invoices with Anna\n";
+
+        // (owner, keep?, why)
+        let table: &[(&str, bool, &str)] = &[
+            // Heard clearly: keep, no question.
+            ("Marco", true, "said clearly"),
+            ("marco", true, "folding flattens case"),
+            // A speaker's name is founded even though every word they said was
+            // shaky — the name is from the speaker list, not from the audio.
+            ("Giulia", true, "on the speaker list"),
+            // Only ever on a line Echo was unsure of: the task is real, the
+            // name is not founded.
+            ("Bianchi", false, "shaky only"),
+            ("Anna", false, "shaky only"),
+            ("Anna Bianchi", false, "shaky only, as a whole run"),
+            // Nowhere in the transcript at all: keep. "the team" is not a
+            // misheard name, and the rule has nothing to say about it.
+            ("the team", true, "not a name from the transcript"),
+            ("Engineering", true, "a role, not a hearing"),
+            ("Unassigned", true, "nowhere in the transcript"),
+            // Not a name at all.
+            ("", true, "nothing to check"),
+            ("—", true, "no words in it"),
+        ];
+        for (owner, keep, why) in table {
+            assert_eq!(
+                owner_is_founded(owner, confident, shaky),
+                *keep,
+                "{owner:?} ({why})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_heard_clearly_once_is_founded_however_often_it_was_misheard() {
+        // "Only" means only. One clear hearing settles it, and the rule was
+        // never about how often a name turned up on a shaky line.
+        let confident = "Marco: fine by me\n";
+        let shaky = "Marco Marco Marco Marco\n";
+        assert!(owner_is_founded("Marco", confident, shaky));
+    }
+
+    #[test]
+    fn a_two_part_name_is_founded_by_its_longest_word() {
+        // The whole run is not in the confident text, but the part that
+        // actually identifies the person is.
+        let confident = "Bianchi said she would send it\n";
+        let shaky = "anna will do it\n";
+        assert!(owner_is_founded("Anna Bianchi", confident, shaky));
+    }
+
+    #[test]
+    fn a_two_part_name_is_founded_by_whichever_part_was_heard_clearly() {
+        // The clear lines say the first name, one shaky line carries the
+        // surname. Reading only the longest word here deleted a correct owner:
+        // "Anna" was heard perfectly well, and one clear hearing founds a name.
+        let confident = "Anna: I'll send it\nAnna said she would send it\n";
+        let shaky = "Bianchi will redo the invoices\n";
+        assert!(owner_is_founded("Anna Bianchi", confident, shaky));
+    }
+
+    #[test]
+    fn a_particle_heard_clearly_founds_nothing() {
+        // "de" is in every other Italian sentence and says nothing about who
+        // was meant, so hearing it clearly is not a hearing of the name.
+        let confident = "Marco: parliamo de visu domani\n";
+        let shaky = "anna de rossi si occupa delle fatture\n";
+        assert!(!owner_is_founded("Anna de Rossi", confident, shaky));
+        // The parts that do identify her still found her.
+        assert!(owner_is_founded(
+            "Anna de Rossi",
+            "Anna: ci penso io\n",
+            shaky
+        ));
+        assert!(owner_is_founded(
+            "Anna de Rossi",
+            "Rossi: ci penso io\n",
+            shaky
+        ));
+    }
+
+    #[test]
+    fn a_name_too_short_to_stand_alone_still_founds_itself() {
+        // Nothing may get stricter than reading the longest word did: a name
+        // with no word of three letters falls back to it.
+        let confident = "Li: I'll take the pricing page\n";
+        let shaky = "li does the invoices\n";
+        assert!(owner_is_founded("Li", confident, shaky));
+        assert!(!owner_is_founded("Li", "Marco: fine by me\n", shaky));
+    }
+
+    #[test]
+    fn clearing_an_owner_keeps_the_task() {
+        let recap = assemble_recap_input(&{
+            let mut lines = a_meeting_that_reads_well();
+            lines.push(said(
+                "Unknown speaker",
+                "Bianchi does the invoices",
+                Some(0.2),
+            ));
+            lines
+        });
+        let items = vec![
+            ActionItemRaw {
+                description: "Redo the invoices".into(),
+                owner: Some("Bianchi".into()),
+                due_hint: Some("Friday".into()),
+            },
+            ActionItemRaw {
+                description: "Ship the pricing page".into(),
+                owner: Some("Marco".into()),
+                due_hint: None,
+            },
+        ];
+        let grounded = ground_owners(items, &recap);
+
+        // The task survives whole — description and due date untouched. Only
+        // the who was unfounded, and only the who is gone.
+        assert_eq!(grounded.len(), 2);
+        assert_eq!(grounded[0].description, "Redo the invoices");
+        assert_eq!(grounded[0].due_hint.as_deref(), Some("Friday"));
+        assert_eq!(grounded[0].owner, None);
+        // ...and a founded owner is left exactly as the model wrote it.
+        assert_eq!(grounded[1].owner.as_deref(), Some("Marco"));
+    }
+
+    #[test]
+    fn a_task_with_no_owner_is_left_alone() {
+        let recap = assemble_recap_input(&a_meeting_that_reads_well());
+        let items = vec![ActionItemRaw {
+            description: "Book the room".into(),
+            owner: None,
+            due_hint: None,
+        }];
+        let grounded = ground_owners(items, &recap);
+        assert_eq!(grounded.len(), 1);
+        assert_eq!(grounded[0].owner, None);
+    }
 
     #[test]
     fn loopback_detection_covers_the_forms_people_type() {

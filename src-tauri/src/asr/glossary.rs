@@ -683,7 +683,7 @@ fn shared_prefix(a: &str, b: &str) -> usize {
 /// has to be recognised, and "lampo.dev" is an entry. Anything hanging off the
 /// end — the full stop, the closing quote — is left in the line, where it stays
 /// untouched when the word is replaced.
-fn word_spans(text: &str) -> Vec<(usize, usize)> {
+pub(crate) fn word_spans(text: &str) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut start: Option<usize> = None;
     for (index, ch) in text.char_indices() {
@@ -736,7 +736,7 @@ fn trim_to_letters(text: &str, from: usize, to: usize) -> Option<(usize, usize)>
 
 /// Lower case, accents flattened, everything that is not a letter or a digit
 /// dropped: "sull'angolo" and "sullangolo" are the same nine letters.
-fn fold(word: &str) -> String {
+pub(crate) fn fold(word: &str) -> String {
     word.chars()
         .flat_map(|c| c.to_lowercase())
         .map(unaccent)
