@@ -6,15 +6,13 @@
 //! own, and this module is not an optimisation — it is what makes the live half
 //! *stick*.
 //!
-//! **Where this sits in the sequence.** [`crate::audio::bleed_guard`] is built
-//! and tested but not yet wired into capture — its own module docs say so, and
-//! the wiring is the change after this one. The live half is therefore written
-//! about below in the present tense of what it *does*, not of what has already
-//! shipped. This pass earns its place either way: today, with nothing
-//! suppressed live at all, catch-up reads the microphone's copy of the far side
-//! back and writes it into the kept transcript of every meeting taken on
-//! loudspeakers — which is the duplication [`crate::audio::bleed`] opens by
-//! describing.
+//! **Where this sits in the sequence.** This landed first and
+//! [`crate::audio::bleed_guard`]'s wiring into the capture path landed after
+//! it, so for one commit this pass was the only half there was — and it earned
+//! its place even then, because catch-up reads the microphone's copy of the far
+//! side back and writes it into the kept transcript of every meeting taken on
+//! loudspeakers. With both halves in place it is what makes the live one
+//! *stick*.
 //!
 //! [`crate::asr::catchup`] plans its work as "the audio on disk, minus the
 //! stretches that have text against them". A stretch the live path suppressed

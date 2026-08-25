@@ -58,6 +58,7 @@
 //! journalled. [`spawn`] wires that up; [`spawn_with_captions`] is the seam the
 //! tests use to drive one task at a time.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -219,8 +220,33 @@ pub type CaptionFeed = mpsc::Receiver<OpenUtterance>;
 /// closes its own line; if the caption task happened to be showing a *different*
 /// line for that channel, this is how the speech task knows to retire it rather
 /// than leave it on screen for the rest of the meeting.
+///
+/// It also remembers the handful of lines that were **closed for good** — a
+/// stretch the capture layer measured as the microphone's copy of what the
+/// computer played. That is the one kind of closing a later caption can undo:
+/// captions decode on a task of their own, so one that was already in flight
+/// when the suppression arrived would land afterwards, on the same id, with
+/// `dropped: false` — putting the far side's words back on screen for the
+/// minute it takes the view to sweep them (`useTranscriptStream.ts`). Nothing
+/// else needs a memory like this, because everything else that closes a line is
+/// followed by text on the same id.
 #[derive(Debug, Default, Clone)]
-struct LiveLines(Arc<Mutex<Vec<Line>>>);
+struct LiveLines(Arc<Mutex<Register>>);
+
+/// How many suppressed lines are remembered.
+///
+/// A caption in flight and one snapshot waiting behind it, per channel, is four
+/// — and only a stretch that is *already* being captioned when it is suppressed
+/// can produce either. Eight is that with room to spare, and it is a ring
+/// rather than a set because the memory is only ever needed for as long as a
+/// decode takes.
+const SUPPRESSED_MEMORY: usize = 8;
+
+#[derive(Debug, Default)]
+struct Register {
+    open: Vec<Line>,
+    suppressed: VecDeque<String>,
+}
 
 /// A live line on screen, and the stretch of the meeting it covers.
 #[derive(Debug, Clone, PartialEq)]
@@ -232,23 +258,80 @@ struct Line {
 }
 
 impl LiveLines {
-    fn showing(&self, line: Line) {
-        let mut lines = self.0.lock().expect("live lines poisoned");
-        match lines.iter_mut().find(|open| open.channel == line.channel) {
-            Some(entry) => *entry = line,
-            None => lines.push(line),
+    /// Put a line on screen and emit it — **unless that stretch has been
+    /// suppressed**, in which case neither happens and this says so.
+    ///
+    /// `emit` runs while the register is locked, and that is the whole point of
+    /// the method existing. Checking a flag and then emitting would leave the
+    /// gap this closes: a suppression landing between the two would find
+    /// nothing on screen to close and the caption would arrive after it,
+    /// reopening a line nothing in the backend will ever close again. Under one
+    /// lock the two orderings are the only two there are — the caption goes out
+    /// first and [`LiveLines::suppress`] closes it, or the suppression is
+    /// recorded first and the caption never goes out.
+    fn show_unless_suppressed(&self, line: Line, emit: impl FnOnce()) -> bool {
+        let mut register = self.0.lock().expect("live lines poisoned");
+        if register.suppressed.iter().any(|id| *id == line.id) {
+            return false;
         }
+        register.show(line);
+        emit();
+        true
+    }
+
+    /// Retire this stretch's line for good and remember it.
+    ///
+    /// `close` is handed whatever *other* line the channel had open — a caption
+    /// that segmented the stretch differently, which nothing else would ever
+    /// close — and runs under the same lock, for the reason
+    /// [`LiveLines::show_unless_suppressed`] gives.
+    fn suppress(&self, id: &str, channel: Channel, close: impl FnOnce(Option<Line>)) {
+        let mut register = self.0.lock().expect("live lines poisoned");
+        register.suppressed.push_back(id.to_string());
+        while register.suppressed.len() > SUPPRESSED_MEMORY {
+            register.suppressed.pop_front();
+        }
+        let stale = register
+            .open
+            .iter()
+            .position(|open| open.channel == channel)
+            .map(|at| register.open.remove(at))
+            .filter(|line| line.id != id);
+        close(stale);
+    }
+
+    /// Has this stretch been closed for good? A cheap look, for the caption task
+    /// deciding whether a decode is worth paying for at all.
+    fn is_suppressed(&self, id: &str) -> bool {
+        let register = self.0.lock().expect("live lines poisoned");
+        register.suppressed.iter().any(|held| held == id)
     }
 
     /// Forget the line for this channel and say what it was.
     fn take(&self, channel: Channel) -> Option<Line> {
-        let mut lines = self.0.lock().expect("live lines poisoned");
-        let at = lines.iter().position(|open| open.channel == channel)?;
-        Some(lines.remove(at))
+        let mut register = self.0.lock().expect("live lines poisoned");
+        let at = register
+            .open
+            .iter()
+            .position(|open| open.channel == channel)?;
+        Some(register.open.remove(at))
     }
 
     fn drain(&self) -> Vec<Line> {
-        std::mem::take(&mut *self.0.lock().expect("live lines poisoned"))
+        std::mem::take(&mut self.0.lock().expect("live lines poisoned").open)
+    }
+}
+
+impl Register {
+    fn show(&mut self, line: Line) {
+        match self
+            .open
+            .iter_mut()
+            .find(|open| open.channel == line.channel)
+        {
+            Some(entry) => *entry = line,
+            None => self.open.push(line),
+        }
     }
 }
 
@@ -324,8 +407,9 @@ pub(crate) fn spawn_with_captions(
     let feed_task = {
         let inner = inner.clone();
         let meeting_id = meeting_id.clone();
+        let lines = lines.clone();
         tokio::spawn(async move {
-            feed_loop(inner, meeting_id, feed, utterances_tx, snapshots).await;
+            feed_loop(inner, meeting_id, feed, utterances_tx, snapshots, lines).await;
             // The queue closing is what tells the speech task to drain; this is
             // what tells it *when* the drain started.
             let _ = over_tx.send(true);
@@ -702,6 +786,7 @@ async fn feed_loop(
     mut feed: CaptureFeed,
     utterances: mpsc::Sender<Utterance>,
     snapshots: Option<CaptionSender>,
+    lines: LiveLines,
 ) {
     let mut last_levels: Option<Instant> = None;
     let mut told_them_we_are_behind = false;
@@ -737,6 +822,62 @@ async fn feed_loop(
                     }
                     tracing::debug!("live text dropped an utterance; the audio is on disk");
                 }
+            }
+            CaptureSignal::UtteranceSuppressed {
+                channel,
+                t_start_ms,
+                t_end_ms,
+            } => {
+                // These words are already going into the transcript from the
+                // computer's own side of the call, so there is nothing to
+                // decode and nothing to write: no engine, no row, no queue.
+                //
+                // `pending` is deliberately not touched. It counts utterances
+                // waiting for text, and a suppressed one never entered the
+                // bounded channel — nothing ever incremented it, so nothing may
+                // decrement it. Subtracting here would take the count below
+                // whatever is genuinely in flight, and it is an unsigned
+                // counter.
+                //
+                // What is owed is the half-written line on screen. Exactly the
+                // below-the-floor path's move: the id is a pure function of two
+                // fields this signal already carries, so no id has to be
+                // plumbed through capture to get here.
+                let id = live_line_id(channel, t_start_ms);
+                // Closed **for good**, which is what `suppress` adds over a
+                // plain `take`: a caption of this stretch may be decoding right
+                // now on the caption task, and it would land after this with
+                // the same id and `dropped: false` — the far side's words back
+                // on screen, on a line no final will ever arrive to replace,
+                // for the minute the view takes to sweep it. The register
+                // remembers the id so that caption is never shown, and the two
+                // closings below happen under the same lock so the caption
+                // cannot slip between them.
+                lines.suppress(&id, channel, |stale| {
+                    close_partial(&inner, &meeting_id, &id, channel, t_start_ms, t_end_ms);
+                    // …and whatever the caption task had open for this channel
+                    // goes with it. Without this, a caption that segmented the
+                    // stretch differently is a line nothing will ever close,
+                    // and it sits in the transcript for the rest of the
+                    // meeting.
+                    if let Some(stale) = stale {
+                        close_partial(
+                            &inner,
+                            &meeting_id,
+                            &stale.id,
+                            stale.channel,
+                            stale.t_start_ms,
+                            stale.t_end_ms,
+                        );
+                    }
+                });
+                tracing::debug!(
+                    ?channel,
+                    t_start_ms,
+                    t_end_ms,
+                    "this stretch is the computer's own audio coming back; the transcript \
+                     already has it from the other side"
+                );
             }
             CaptureSignal::SpeechSoFar(snapshot) => {
                 // A caption nobody has room for is a caption not worth having:
@@ -1830,6 +1971,14 @@ async fn caption_loop(
         if !cadence.advanced(&snapshot) || snapshot.duration_ms() < CAPTION_MIN_MS {
             continue;
         }
+        // A look at a stretch that has since turned out to be the microphone's
+        // copy of what the computer played. [`LiveLines::show_unless_suppressed`]
+        // is what makes this safe; this is only what stops it costing a decode
+        // first. `Cadence` cannot do it: it gates repeat windows of an open
+        // stretch, and this one is closed for good.
+        if lines.is_suppressed(&live_line_id(snapshot.channel, snapshot.t_start_ms)) {
+            continue;
+        }
 
         let channel = snapshot.channel;
         let covers_to_ms = snapshot.window_end_ms();
@@ -1905,26 +2054,44 @@ async fn caption(
             if text.is_empty() {
                 return;
             }
-            lines.showing(Line {
-                channel,
-                id: line.clone(),
-                t_start_ms,
-                t_end_ms,
-            });
-            inner
-                .ports
-                .events
-                .emit(UiEvent::TranscriptPartial(TranscriptPartialPayload {
-                    meeting_id: meeting_id.to_string(),
-                    utterance_id: line,
+            // Registered and emitted as one step, because this stretch may have
+            // been suppressed while the decode was running: these are the far
+            // side's own words coming back out of the microphone, already in
+            // the transcript from the cleaner copy, and putting them on screen
+            // now would undo the closing that took them off it. See
+            // [`LiveLines::show_unless_suppressed`].
+            let shown = lines.show_unless_suppressed(
+                Line {
+                    channel,
+                    id: line.clone(),
                     t_start_ms,
                     t_end_ms,
-                    channel,
-                    speaker_id: None,
-                    text: text.to_string(),
-                    language: transcription.language,
-                    dropped: false,
-                }));
+                },
+                || {
+                    inner
+                        .ports
+                        .events
+                        .emit(UiEvent::TranscriptPartial(TranscriptPartialPayload {
+                            meeting_id: meeting_id.to_string(),
+                            utterance_id: line.clone(),
+                            t_start_ms,
+                            t_end_ms,
+                            channel,
+                            speaker_id: None,
+                            text: text.to_string(),
+                            language: transcription.language.clone(),
+                            dropped: false,
+                        }));
+                },
+            );
+            if !shown {
+                tracing::debug!(
+                    ?channel,
+                    t_start_ms,
+                    "a caption of this stretch came back after it turned out to be the \
+                     computer's own audio; it is already in the transcript from the other side"
+                );
+            }
         }
         // A newer look at the same speech overtook this one, or there was no room
         // for it. Both are the queue working as intended.
@@ -2635,6 +2802,204 @@ mod tests {
         assert!(
             !looks_repetitive("uno due tre uno due tre"),
             "twice is not a loop, at any phrase length"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The microphone's copy of what the computer played
+    // -----------------------------------------------------------------------
+
+    /// The one thing this signal owes the person: **the half-written line goes
+    /// away.**
+    ///
+    /// Without it a mic line that was suppressed sits in the transcript with no
+    /// text and no end for the rest of the meeting — which is a worse transcript
+    /// than the duplicated line suppression exists to remove. And the three
+    /// things it must *not* do: no engine, no row, and no arithmetic on a count
+    /// it never took part in.
+    #[tokio::test]
+    async fn a_suppressed_stretch_closes_its_line_and_writes_nothing() {
+        let h = crate::session::mock::Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+
+        // One ordinary utterance either side, so this is a suppression in the
+        // middle of a meeting rather than a meeting made of one signal.
+        h.capture
+            .send(crate::session::ports::CaptureSignal::UtteranceReady(
+                Utterance {
+                    channel: Channel::Mic,
+                    t_start_ms: 0,
+                    t_end_ms: 2_000,
+                    samples: vec![0.0; 32_000],
+                    truncated: false,
+                    voiced_ms: 1_800,
+                },
+            ));
+        h.capture
+            .send(crate::session::ports::CaptureSignal::UtteranceSuppressed {
+                channel: Channel::Mic,
+                t_start_ms: 4_000,
+                t_end_ms: 12_000,
+            });
+        h.settle().await;
+
+        let closed: Vec<_> = h
+            .events
+            .partials()
+            .into_iter()
+            .filter(|partial| partial.dropped)
+            .collect();
+        assert_eq!(closed.len(), 1, "exactly one line was retired");
+        let closed = &closed[0];
+        assert_eq!(
+            closed.utterance_id,
+            live_line_id(Channel::Mic, 4_000),
+            "the line closed has to be the one the captions were written on, or \
+             the half-written one stays on screen and a different one vanishes"
+        );
+        assert_eq!((closed.t_start_ms, closed.t_end_ms), (4_000, 12_000));
+        assert_eq!(closed.channel, Channel::Mic);
+        assert!(closed.text.is_empty());
+
+        // The engine was never asked, so the second copy cost nothing at all.
+        assert_eq!(
+            h.asr.calls(),
+            1,
+            "only the ordinary utterance reached the engine"
+        );
+        // …and the count of what is waiting for text is the ordinary
+        // utterance's alone. A suppressed one never entered the queue, so a
+        // decrement here would have wrapped an unsigned counter.
+        assert_eq!(h.session.status().await.pending_utterances, 0);
+
+        h.commit_chunk(&id, 0, 13_000).await;
+        // Stopping is what flushes the finals, so this reads the transcript a
+        // person is actually left with.
+        h.session.stop().await.unwrap();
+        let written = repo::get_segments(
+            &h.db,
+            &crate::types::TranscriptQuery {
+                meeting_id: id.clone(),
+                include_partial: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            written.len(),
+            1,
+            "the suppressed stretch must not be in the database in any form"
+        );
+        assert_eq!((written[0].t_start_ms, written[0].t_end_ms), (0, 2_000));
+    }
+
+    /// The other half of retiring that line: **it has to stay retired.**
+    ///
+    /// A caption of the same stretch is decoded on a task of its own, so one
+    /// that was in flight when the suppression arrived lands afterwards — same
+    /// id, `dropped: false`, the far side's words back on screen on a line no
+    /// final will ever come to replace. Both orderings are asserted here,
+    /// because the whole reason the emit happens inside the register's lock is
+    /// that there are exactly two of them.
+    #[test]
+    fn a_caption_of_a_suppressed_stretch_never_puts_the_words_back() {
+        let lines = LiveLines::default();
+        let id = live_line_id(Channel::Mic, 4_000);
+        let caption = || Line {
+            channel: Channel::Mic,
+            id: id.clone(),
+            t_start_ms: 4_000,
+            t_end_ms: 12_000,
+        };
+
+        // Ordering one: the caption came back first. It goes on screen, and the
+        // suppression is what closes it — the line it closes is its own.
+        let mut shown = 0;
+        assert!(lines.show_unless_suppressed(caption(), || shown += 1));
+        assert_eq!(shown, 1);
+        let mut stale_closed = 0;
+        lines.suppress(&id, Channel::Mic, |stale| {
+            assert!(
+                stale.is_none(),
+                "the caption was on this very line; closing it twice would be a \
+                 second dropped event for a line already gone"
+            );
+            stale_closed += 1;
+        });
+        assert_eq!(stale_closed, 1, "the suppression always closes something");
+
+        // Ordering two: the suppression got there first, and the caption lands
+        // after it. Nothing is emitted and nothing is registered — a line the
+        // speech task would otherwise find open and retire all over again, or
+        // never find at all.
+        let mut shown_after = 0;
+        assert!(!lines.show_unless_suppressed(caption(), || shown_after += 1));
+        assert_eq!(
+            shown_after, 0,
+            "the far side's words went back on screen after the line was closed for good"
+        );
+        assert!(
+            lines.take(Channel::Mic).is_none(),
+            "a suppressed stretch was registered as the channel's open line"
+        );
+        // …and the caption task can see it early enough not to pay for the
+        // decode at all — a snapshot of this stretch queued behind the one in
+        // flight is dropped rather than decoded.
+        assert!(lines.is_suppressed(&id));
+
+        // Only that stretch. The next thing the person says is an ordinary line
+        // on an ordinary channel.
+        let next = Line {
+            channel: Channel::Mic,
+            id: live_line_id(Channel::Mic, 13_000),
+            t_start_ms: 13_000,
+            t_end_ms: 15_000,
+        };
+        assert!(!lines.is_suppressed(&next.id));
+        let mut shown_next = 0;
+        assert!(lines.show_unless_suppressed(next.clone(), || shown_next += 1));
+        assert_eq!(shown_next, 1);
+        assert_eq!(lines.take(Channel::Mic), Some(next));
+    }
+
+    /// A caption that segmented the stretch differently is the case the
+    /// suppression has to close *as well as* its own line — and it is handed to
+    /// the closing under the same lock, so nothing can put it back either.
+    #[test]
+    fn a_suppression_retires_a_caption_that_ran_to_a_different_line() {
+        let lines = LiveLines::default();
+        let captioned = Line {
+            channel: Channel::Mic,
+            id: live_line_id(Channel::Mic, 3_600),
+            t_start_ms: 3_600,
+            t_end_ms: 11_000,
+        };
+        assert!(lines.show_unless_suppressed(captioned.clone(), || {}));
+
+        let id = live_line_id(Channel::Mic, 4_000);
+        let mut closed = Vec::new();
+        lines.suppress(&id, Channel::Mic, |stale| closed.push(stale));
+        assert_eq!(
+            closed,
+            vec![Some(captioned)],
+            "a caption on a different line than the suppressed stretch is a line \
+             nothing else will ever close"
+        );
+
+        // The register is empty and the memory is short: a meeting full of
+        // copies must not accumulate ids for its whole length.
+        assert!(lines.take(Channel::Mic).is_none());
+        for later in 0..SUPPRESSED_MEMORY as i64 + 1 {
+            lines.suppress(
+                &live_line_id(Channel::Mic, (20 + later) * 1_000),
+                Channel::Mic,
+                |_| {},
+            );
+        }
+        assert!(
+            !lines.is_suppressed(&id),
+            "the oldest suppressed line is forgotten once nothing can still be decoding it"
         );
     }
 

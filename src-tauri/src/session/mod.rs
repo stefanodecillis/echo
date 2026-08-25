@@ -818,6 +818,9 @@ impl SessionManager {
                 .capture_system_audio
                 .unwrap_or(settings.capture_system_audio),
             input_device_id: opts.input_device_id.clone().or(settings.input_device_id),
+            // Only so capture can look for the one file that switches bleed
+            // suppression off; nothing is written there from the audio threads.
+            log_dir: Some(inner.paths.log_dir.clone()),
         };
         let opened = inner.ports.capture.open(cfg).await;
         let CaptureStart {

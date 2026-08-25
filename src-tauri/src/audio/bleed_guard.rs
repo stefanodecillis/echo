@@ -9,10 +9,11 @@
 //! ([`crate::audio::bleed::LagEstimate`]), what the loudspeaker gate last said
 //! ([`crate::audio::route`]), and the counters a field report is read off.
 //!
-//! Nothing in this file is wired into capture yet. It is built to be
-//! constructible and testable standing on its own — no threads, no devices, no
-//! database — because the wiring is a separate change that should be readable
-//! as wiring.
+//! Nothing in this file knows about threads, devices or a database, which is
+//! what lets every test below stand on its own. The wiring lives in
+//! `audio/mod.rs`'s speech thread — one guard per recording, fed system frames
+//! before either detector runs, asked about every microphone utterance on its
+//! way out — and is deliberately readable as wiring and nothing else.
 //!
 //! ## What suppression is allowed to mean
 //!
@@ -266,6 +267,19 @@ impl SystemEcho {
     /// How much audio is held, in milliseconds — for a log line, not a decision.
     pub fn held_ms(&self) -> i64 {
         self.samples.len() as i64 / SAMPLES_PER_MS
+    }
+
+    /// The moment on the meeting clock the audio held runs up to, or `None`
+    /// while nothing is held.
+    ///
+    /// Rounded **down** to the millisecond, because the one caller
+    /// ([`BleedGuard::system_through_ms`]) uses it to decide whether a whole
+    /// span is on hand and a partial millisecond is not a millisecond it has.
+    pub fn through_ms(&self) -> Option<i64> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        Some(self.end_index().div_euclid(SAMPLES_PER_MS))
     }
 
     pub fn dropped_backwards(&self) -> u64 {
@@ -547,8 +561,48 @@ impl BleedGuard {
         }
     }
 
+    /// Forget what this meeting had measured about the delay.
+    ///
+    /// For the one thing that is neither a route change nor a disarm and yet
+    /// invalidates the measurement just as completely: **a pause**. The audio
+    /// either side of one is not adjacent — the recording writes silence
+    /// through it, so the clock is continuous and nothing else notices — and in
+    /// the meantime the conferencing app's buffers, the two capture paths'
+    /// queues and both drift trackers have all moved on. A warm search around
+    /// the old delay would look 150 ms either side of a number nobody has any
+    /// reason to believe any more, which is worse than looking everywhere: it
+    /// would *miss*, and a miss costs a duplicated line.
+    ///
+    /// The same reasoning the speech detectors are restarted on
+    /// (`audio/mod.rs`, review finding 10), applied to the one piece of state
+    /// this guard carries across the gap.
+    pub fn forget_lag(&mut self) {
+        self.lag.clear();
+    }
+
     pub fn armed(&self) -> bool {
         self.disarmed.is_none()
+    }
+
+    /// How far into the meeting the computer's audio held here reaches, or
+    /// `None` while none is held.
+    ///
+    /// For the one thing a caller cannot work out for itself: **whether it is
+    /// worth asking yet.** [`BleedGuard::judge`] needs the far side from
+    /// [`LAG_MAX_MS`] before a stretch starts to [`LAG_MIN_MS`] after it ends,
+    /// and the second half of that is audio from *after* the utterance —
+    /// 200 ms of it, which at the moment the speech detector closes a stretch
+    /// has not been captured yet. The detector closes 416 ms after the last
+    /// voiced window and dates the stretch back to 288 ms after it, so what is
+    /// on hand at that instant is about 128 ms of tail: every mic utterance
+    /// would be refused for coverage, for ever, on a ring in perfect health.
+    ///
+    /// So the wiring holds each stretch until this reaches
+    /// `t_end_ms - LAG_MIN_MS` — a matter of a few speech-thread ticks — and
+    /// only then asks. Nothing about the judgement moves; what moves is *when*
+    /// it is made.
+    pub fn system_through_ms(&self) -> Option<i64> {
+        self.echo.through_ms()
     }
 
     pub fn route(&self) -> Route {

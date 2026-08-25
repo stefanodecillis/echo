@@ -708,6 +708,22 @@ impl CollectingEvents {
             .collect()
     }
 
+    /// The live lines that went out, in the order they were sent — including
+    /// the empty `dropped` ones, which are how a line that will never get text
+    /// is retired.
+    #[allow(dead_code)]
+    pub(crate) fn partials(&self) -> Vec<crate::events::TranscriptPartialPayload> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::TranscriptPartial(payload) => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The transcript lines that went out, in the order they were sent.
     pub(crate) fn finals(&self) -> Vec<crate::events::TranscriptFinalPayload> {
         self.seen
