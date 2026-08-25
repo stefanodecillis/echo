@@ -29,6 +29,7 @@
 //! dropped — belongs to the session pipeline, which is the thing actually
 //! waiting on the speech engine.
 
+pub mod bleed;
 pub mod clock;
 pub mod mic;
 pub mod resample;
