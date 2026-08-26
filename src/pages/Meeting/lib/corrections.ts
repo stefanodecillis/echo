@@ -24,7 +24,7 @@ const WORD_CHAR = /[\p{L}\p{N}]/u;
  * "A word of its own" is only about letters and digits on either side: a repair
  * is written over a stretch already trimmed to letters, so the line keeps
  * whatever punctuation hung off it — "Langola." and "«Langola»" are both the
- * word, and "Langola" is not.
+ * word, and "Langolas" is not.
  *
  * The mirror of `next_whole_word` in `src-tauri/src/asr/glossary.rs`, and it has
  * to stay one: this decides which words are offered as a click target, and the

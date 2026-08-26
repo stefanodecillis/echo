@@ -40,9 +40,9 @@ describe("correctedSpans", () => {
   });
 
   it("does not point at a word buried inside a longer one", () => {
-    // "Langola" is not the word, so the repair is nowhere in this line: some
+    // "Langolas" is not the word, so the repair is nowhere in this line: some
     // later pass rewrote it, and nothing here can say where the repair was.
-    expect(correctedSpans("Langola everywhere", [{ from: "lana gola", to: "Langola" }])).toBeNull();
+    expect(correctedSpans("Langolas everywhere", [{ from: "lana gola", to: "Langola" }])).toBeNull();
   });
 
   it("refuses a line where the repaired word turns up more often than it was repaired", () => {

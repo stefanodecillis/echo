@@ -3,11 +3,12 @@
 //! The meeting of 2026-08-24 was about a product called **Langola**. The word
 //! is in the transcript eight times and it is spelled six different ways, none
 //! of them right: *Ingola*, *Langura*, *sull'angolo*, *lana gola*, *Nongula*,
-//! *Nongulo*. Obsidara came out three ways, Feedharbour three, Vogliacasa four,
-//! "VMC / Voglia Mutui Casa" became "BMC è voglio lui casa", Yomenia became Omeni,
-//! Ostri became Anastri, lampo.dev became "Lampo.gr". Every one of them is a word
-//! the person could have typed in ten seconds before the call — and some of
-//! them Echo already knows, because the voices were enrolled by name.
+//! *Nongulo*. Obsidara came out three ways, Feedharbour three, Vogliacasa
+//! four, "VMC / Voglia Mutui Casa" became "BMC è voglio lui casa", Yomenia
+//! became Omeni, Ostri became Anastri, lampo.dev became "Lampo.gr". Every one
+//! of them is a word the person could have typed in ten seconds before the
+//! call — and some of them Echo already knows, because the voices were
+//! enrolled by name.
 //!
 //! So this module is two halves of one idea, and they are deliberately
 //! different in temperament.
@@ -55,7 +56,7 @@
 //! times that — *whatever* became a product name, *include* became a person,
 //! *bianco* became somebody's surname. A meeting where "Langola" is still
 //! written *Langura* twice is a meeting somebody skims past; a meeting where the
-//! ordinary Italian word *amabile* has been quietly turned into a product name
+//! ordinary Italian word *lancerà* has been quietly turned into a product name
 //! is a meeting nobody can trust again. The tests carry both.
 
 use crate::types::Correction;
@@ -163,7 +164,7 @@ impl Glossary {
     /// Take a list of words, in the order they should be offered to the decoder.
     ///
     /// Blank entries go, duplicates go (the first spelling wins, so a typed
-    /// "Langola" beats a person named "Langola"), and anything past
+    /// "Langola" beats a person named "langola"), and anything past
     /// [`MAX_ENTRIES`] goes. Order is preserved exactly: the prompt is truncated
     /// from the end, so the caller's order decides what survives a cap, and the
     /// same list always produces the same prompt.
@@ -346,7 +347,7 @@ impl Glossary {
             let parts = &folded[at..at + width];
             // Two decoded words are only ever read as one when both of them are
             // words. A single letter next to a name is "è", "e", "a", "o" — the
-            // Italian sentence around it — and gluing it on turns "È lavabile"
+            // Italian sentence around it — and gluing it on turns "e lancerà"
             // into a candidate that keeps Langola's consonants exactly.
             if width > 1 && parts.iter().any(|p| p.chars().count() < 2) {
                 continue;
@@ -355,7 +356,7 @@ impl Glossary {
             // the decoder put there. A claim is written back over the whole
             // stretch from the first word to the last, so anything else in
             // between — a full stop, a comma, a line break — would be deleted
-            // by the replacement: "Non ho tempo. Casa mia è lontana" must not
+            // by the replacement: "Non ho voglia. Casa mia è lontana" must not
             // come back as "Non ho Vogliacasa mia è lontana". Nothing wider can
             // be contiguous either once this window is not, hence the break.
             if width > 1 && !spaces_between(text, spans, at, width) {
@@ -458,7 +459,7 @@ pub fn revert(text: &str, corrections: &[Correction]) -> Option<String> {
 /// about [`is_word_char`]: a repair is written over a stretch that
 /// [`word_spans`] had already trimmed to letters, so the line keeps whatever
 /// punctuation hung off it — "Langola." and "«Langola»" are both the word, and
-/// "Langola" is not.
+/// "Langolas" is not.
 fn next_whole_word(text: &str, needle: &str, from: usize) -> Option<usize> {
     if needle.is_empty() {
         return None;
@@ -517,7 +518,7 @@ impl Reach {
 /// Everything here is worked out once for the run rather than once per entry,
 /// including the two everyday-word questions, which are the expensive ones.
 struct Candidate<'a> {
-    /// The run, folded and run together: "lana gola" is `lana gola`.
+    /// The run, folded and run together: "lana gola" is `lanagola`.
     folded: String,
     /// The same run exactly as it appears in the line.
     raw: &'a str,
@@ -526,11 +527,11 @@ struct Candidate<'a> {
     /// The run itself is an everyday word. Nothing may touch it.
     everyday: bool,
     /// What follows an elided article is an everyday word: "l'angolo" is *the
-    /// oval*, and folded it is `langolo` — one letter from `Langola`. Only the
-    /// rules that go by sound are stopped by this; the one that needs the entry
-    /// to be present in full is not, which is the whole difference between
-    /// "l'angolo" (left alone) and "sull'angolo" (the 2026-08-24 mangling of
-    /// Langola, which holds `langolo` inside a longer word).
+    /// corner*, and folded it is `langolo` — one letter from `langola`. Only
+    /// the rules that go by sound are stopped by this; the one that needs the
+    /// entry to be present in full is not, which is the whole difference
+    /// between "l'angolo" (left alone) and "sull'angolo" (the 2026-08-24
+    /// mangling of Langola, which holds `langolo` inside a longer word).
     everyday_tail: bool,
     /// The decoder wrote this word the way it writes a name: a capital letter,
     /// in the middle of a sentence rather than at the start of one.
@@ -538,16 +539,16 @@ struct Candidate<'a> {
     /// This is the only thing that separates *Nongula* from *whatever* — the
     /// two are the same shape, and one of them is a name whisper had never
     /// heard and wrote down as a name anyway. Every single-token mangling that
-    /// meeting produced came back capitalised: *Ingola*, *Langura*, *Nongula*,
-    /// *Nongulo*, *Anastri*, *Lampo.gr*, *Omeni*. It is evidence, not proof, so
-    /// only [rule 2](Entry::claims) — the one rule that reads past the spelling
-    /// entirely — is allowed to lean on it, and a decoder that hands Echo a
-    /// line with no capitals in it simply loses that rule rather than
-    /// misreading the line.
+    /// meeting produced came back capitalised: *Ingola*, *Langura*,
+    /// *Nongula*, *Nongulo*, *Anastri*, *Lampo.gr*, *Omeni*. It is evidence,
+    /// not proof, so only [rule 2](Entry::claims) — the one rule that reads
+    /// past the spelling entirely — is allowed to lean on it, and a decoder
+    /// that hands Echo a line with no capitals in it simply loses that rule
+    /// rather than misreading the line.
     named: bool,
-    /// The word wears an elided article or preposition: `sull'angolo`, `l'angolo`,
-    /// `dell'angolo`. That apostrophe is a decoder telling you it heard the
-    /// sentence run into the next word, which is exactly the shape
+    /// The word wears an elided article or preposition: `sull'angolo`,
+    /// `l'angolo`, `dell'angolo`. That apostrophe is a decoder telling you it
+    /// heard the sentence run into the next word, which is exactly the shape
     /// [rule 3](Entry::claims) is looking for.
     elided: bool,
 }
@@ -597,8 +598,8 @@ fn opens_a_sentence(text: &str, from: usize) -> bool {
     }
 }
 
-/// What follows an elided article or preposition — the `ovale` of "sull'angolo"
-/// — folded, when the word has one.
+/// What follows an elided article or preposition — the `angolo` of
+/// "sull'angolo" — folded, when the word has one.
 ///
 /// Only a short prefix counts, because that is what an elision is: `l'`, `un'`,
 /// `dell'`, `sull'`, `quell'`. Anything longer is a word with an apostrophe in
@@ -619,7 +620,7 @@ impl Entry {
         let folded = candidate.folded.as_str();
 
         // Rule 0 — the same word, spelled the same way. Nothing to do unless the
-        // capitals or the punctuation differ ("Obsidara" → "Obsidara",
+        // capitals or the punctuation differ ("obsidara" → "Obsidara",
         // "vmc" → "VMC"), which is the one thing every entry may fix, however
         // short it is. Two letters is where even that stops: "ai" and "di" are
         // Italian, and an entry that short would recapitalise the language.
@@ -644,10 +645,10 @@ impl Entry {
             // ways at once, and the consonant test is only one of them.
             //
             // On its own, "the same consonants in the same order" is not a
-            // bar at all: a spine is two to five characters, so *la favola*
+            // bar at all: a spine is two to five characters, so *lana gialla*
             // keeps Langola's, *non ho* keeps Yomenia's, and *un attimo*
             // keeps Notion's. What actually separates "lana gola" from
-            // "la favola" is the spelling: run together, a real mishearing
+            // "lana gialla" is the spelling: run together, a real mishearing
             // lands within a few letters of the name and starts the same way,
             // and an ordinary phrase does neither.
             if !self.reach.hears_two_words() {
@@ -671,7 +672,7 @@ impl Entry {
 
         // From here on it is one decoded word, and it has to be a word nobody
         // recognises. This guard is what stands between the rules below and the
-        // meeting language: *amabile* is two edits from *Langola*, and it is a
+        // meeting language: *angolo* is two edits from *Langola*, and it is a
         // word somebody said.
         if candidate.everyday {
             return None;
@@ -684,22 +685,22 @@ impl Entry {
         let candidate_sounds = sounds(folded);
 
         // Rule 1 — a near spelling. One insertion, deletion, substitution or
-        // swap: "obsidera", "Vogliacasa".
+        // swap: "obsidera", "vogliacase".
         if sound_alike && distance(folded, &self.folded) <= 1 {
             return Some(1);
         }
 
         // Rule 2 — the first sound misheard, every sound after it kept. This is
-        // Nongula and Nongulo for Langola: *n* for *l*, and then `bbl` exactly,
-        // in order. It is the only rule that reads past the spelling altogether,
-        // so it is fenced in on four sides.
+        // Nongula and Nongulo for Langola: *n* for *l*, and then `ngl`
+        // exactly, in order. It is the only rule that reads past the spelling
+        // altogether, so it is fenced in on four sides.
         //
         // The tail has to be identical, because a *near* spine is not evidence
         // of anything: six sound classes cover the consonants, so a spine is two
         // to five characters long, and one edit inside something that short
-        // reaches most of the language — Langola's `lbbl` is one edit from
-        // *lovely*, *libera*, *lavabo* and *valuable*, and Yomenia's `nn` is one
-        // edit from *Milano*, *mattina*, *Monday* and *nuovo*.
+        // reaches most of the language — Langola's `lngl` is one edit from
+        // *tangle*, *angular*, *language* and *regular*, and Yomenia's `nn`
+        // is one edit from *Milano*, *mattina*, *Monday* and *nuovo*.
         //
         // There has to be enough of that tail ([`LONG_ENOUGH_TO_MISHEAR`] sounds
         // in the name, at least four of them consonants), because *Sentry* and
@@ -709,9 +710,9 @@ impl Entry {
         // And the word has to have been written down like a name
         // ([`Candidate::named`]). That is what is left when the shape stops
         // being enough: *whatever* and *October* stand in exactly the same
-        // relation to *Airtable* that *Nongula* does to *Langola*, and the only
-        // thing that tells them apart is that the decoder wrote one of the three
-        // with a capital in the middle of a sentence.
+        // relation to *Airtable* that *Nongula* does to *Langola*, and the
+        // only thing that tells them apart is that the decoder wrote one of the
+        // three with a capital in the middle of a sentence.
         if sound_alike
             && candidate.named
             && difference(candidate_len, entry_len) <= 2
@@ -730,8 +731,8 @@ impl Entry {
         }
 
         // Rule 3 — the entry with something stuck to the *front* of it.
-        // "sull'angolo" is one token holding "langolo" after `sul`; "Anastri" is
-        // one holding "Ostri" after `an`. This is the one rule a five-letter
+        // "sull'angolo" is one token holding "langolo" after `sul`; "Anastri"
+        // is one holding "ostri" after `an`. This is the one rule a five-letter
         // entry may use, because it asks for the entry to be there in full
         // rather than for something that merely sounds like it.
         //
@@ -751,9 +752,9 @@ impl Entry {
         // And the word has to be one the decoder itself flagged: written like a
         // name it did not know, or wearing the apostrophe of an article it ran
         // into the next word. Without that, "a name with a syllable in front of
-        // it" is a description of ordinary vocabulary — *allowable* is
-        // *Langola* behind `al`, *include* is *Claude* behind `in`, *mention*
-        // and *attention* are both *Notion* behind something.
+        // it" is a description of ordinary vocabulary — *nostri* is *Ostri*
+        // behind `n`, *include* is *Claude* behind `in`, *mention* and
+        // *attention* are both *Notion* behind something.
         if (candidate.named || candidate.elided)
             && candidate_len > entry_len
             && candidate_len <= entry_len + 3
@@ -837,7 +838,7 @@ fn trim_to_letters(text: &str, from: usize, to: usize) -> Option<(usize, usize)>
 // ---------------------------------------------------------------------------
 
 /// Lower case, accents flattened, everything that is not a letter or a digit
-/// dropped: "sull'angolo" and "sullangolo" are the same nine letters.
+/// dropped: "Sull'angolo" and "sullangolo" are the same ten letters.
 pub(crate) fn fold(word: &str) -> String {
     word.chars()
         .flat_map(|c| c.to_lowercase())
@@ -864,8 +865,8 @@ fn unaccent(c: char) -> char {
 /// Letters that a listener confuses are one character here: b/v/p/f/w are all
 /// `b`, d/t are `d`, c/g/k/q/x are `g`, s/z are `s`, m/n are `n`, l/r are `l`.
 /// Every vowel is `a`, because which vowel was heard is the least reliable thing
-/// in a mangled name — *Nongula*, *Nongulo* and *Langola* differ almost entirely
-/// in their vowels. `h` disappears, as it does in Italian.
+/// in a mangled name — *Nongula*, *Nongulo* and *Langola* differ almost
+/// entirely in their vowels. `h` disappears, as it does in Italian.
 ///
 /// This is a deliberately crude stand-in for a phoneme table. It is crude in a
 /// direction that is safe: it throws information away, and everything that reads
@@ -906,7 +907,7 @@ fn skeleton(sounds: &str) -> String {
 /// optimal string alignment).
 ///
 /// The swap matters here: half of what a decoder does to an unfamiliar name is
-/// reorder its letters — "abel" for "able".
+/// reorder its letters — "gnola" for "ngola".
 fn distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -942,7 +943,7 @@ fn distance(a: &str, b: &str) -> usize {
 /// character of the haystack has to be left in front of it.
 ///
 /// The same table as [`distance`], except that skipping the front of the
-/// haystack is free — which is what makes "Langola", read against the tail of
+/// haystack is free — which is what makes "langola", read against the tail of
 /// "sullangolo", one edit away instead of four.
 ///
 /// Both ends matter, and each is one clause of the table. The front is free
@@ -993,9 +994,10 @@ fn is_everyday(folded: &str) -> bool {
 /// words of the three languages Echo meets most, written folded (lower case, no
 /// accents), sorted so it can be searched by halving. Its job is narrow: the
 /// rules above are close enough to reach ordinary language, and this is what
-/// stops them. *lavabile* is two edits from *Langola*; *trenta* keeps *Ostri*'s
-/// consonants; *felpa* keeps *lampo.dev*'s. Every one of those would be rewritten
-/// without this list, and every one of them is a word somebody says.
+/// stops them. *angolo* is two edits from *Langola*; *nostri* keeps
+/// *Ostri*'s consonants; *lampada* keeps *lampo.dev*'s. Every one of those
+/// would be rewritten without this list, and every one of them is a word
+/// somebody says.
 ///
 /// Nothing shorter than [`SHORTEST_TOKEN`] needs to be here — those words are
 /// never candidates in the first place — so the list starts at four letters.
@@ -1029,6 +1031,7 @@ const EVERYDAY_WORDS: &[&str] = &[
     "anche",
     "ancora",
     "andare",
+    "angolo",
     "another",
     "answer",
     "anything",
@@ -1237,6 +1240,8 @@ const EVERYDAY_WORDS: &[&str] = &[
     "keep",
     "kind",
     "know",
+    "lampada",
+    "lancera",
     "large",
     "last",
     "late",
@@ -1270,6 +1275,7 @@ const EVERYDAY_WORDS: &[&str] = &[
     "look",
     "lovely",
     "made",
+    "maestri",
     "mail",
     "make",
     "making",
@@ -1322,6 +1328,7 @@ const EVERYDAY_WORDS: &[&str] = &[
     "nome",
     "nonna",
     "nonno",
+    "nostri",
     "nostro",
     "notable",
     "notably",
@@ -1599,7 +1606,7 @@ const EVERYDAY_WORDS: &[&str] = &[
 mod tests {
     use super::*;
 
-    fn Langola() -> Glossary {
+    fn langola() -> Glossary {
         Glossary::new(["Langola"])
     }
 
@@ -1616,8 +1623,8 @@ mod tests {
     /// The whole reason this file exists: one product name, eight mentions, six
     /// spellings, none of them the name.
     #[test]
-    fn every_way_that_meeting_spelled_Langola_comes_back_as_Langola() {
-        let glossary = Langola();
+    fn every_way_that_meeting_spelled_langola_comes_back_as_langola() {
+        let glossary = langola();
         let table: &[&str] = &["sull'angolo", "lana gola", "Nongula", "Nongulo"];
         for mangled in table {
             let line = format!("Allora, {mangled} è quello che usiamo.");
@@ -1632,8 +1639,8 @@ mod tests {
     /// The two of the six this file cannot have, and why it is better not to.
     ///
     /// *Ingola* keeps three of Langola's sounds and *Langura* keeps its first
-    /// three letters — and every rule loose enough to reach either of them
-    /// reaches ordinary language on the way. "The first three letters and a
+    /// four letters — and every rule loose enough to reach either of them
+    /// reaches ordinary language on the way. "The first letters and a
     /// similar sound" is *bianco* for a person called Bianchi, *classe* for
     /// Claude, *verde* for Vercel, *notte* for Notion and *milanese* for Milano;
     /// letting a sound-alike lose a whole consonant is *troppo* for Stripe,
@@ -1642,7 +1649,7 @@ mod tests {
     /// price.
     #[test]
     fn the_two_spellings_that_are_deliberately_out_of_reach() {
-        let glossary = Langola();
+        let glossary = langola();
         for mangled in ["Ingola", "Langura"] {
             let line = format!("Allora, {mangled} è quello che usiamo.");
             assert_eq!(glossary.correct(&line), None, "{mangled:?}");
@@ -1704,21 +1711,22 @@ mod tests {
     /// to rewrite the language they were speaking.
     #[test]
     fn ordinary_words_near_an_entry_are_left_exactly_where_they_are() {
-        let glossary = Langola();
+        let glossary = langola();
         let table: &[&str] = &[
-            // The one the whole design is aimed at: "amabile" is two edits from
-            // "Langola" and it is an ordinary Italian adjective.
-            "Un vino amabile, direi.",
-            "È lavabile in lavatrice.",
+            // The one the whole design is aimed at: "angolo" is two edits from
+            // "Langola" and it is an ordinary Italian noun.
+            "Un angolo tranquillo, direi.",
             "Mi ha raccontato una favola.",
-            "Questo è un livello notevole.",
-            "Non è probabile che succeda.",
-            "Devo levare il tavolo dalla valle.",
-            "Il lavoro di novembre.",
-            "Ha comprato una tabella globale.",
-            "Guarda l'angolo del campo.",
+            "Non parlo bene la sua lingua.",
+            "Ha comprato una pentola nuova.",
+            "Non è ancora arrivata la risposta.",
+            // Two that keep the entry's consonants exactly, one of them across
+            // a word break, and neither of them a name.
+            "Domani lancerà il nuovo listino.",
+            "Ho comprato della lana gialla.",
+            "Guarda l'angolo della stanza.",
             // Words too short to be looked at, whatever they sound like.
-            "La vale poco.",
+            "La gola fa male.",
         ];
         for line in table {
             assert_eq!(
@@ -1763,16 +1771,16 @@ mod tests {
         ]);
         let table: &[&str] = &[
             // Italian, the language that meeting was in.
-            "Devo levare le tende prima di lavarle.",
+            "Bisogna girare l'angolo prima del semaforo.",
             "Bisogna rifarle tutte entro venerdì prossimo.",
-            "Ci sono troppe variabili in gioco.",
-            "La casa è ancora libera e il lavabo è nuovo.",
-            "Il nostro cliente vuole vedere il preventivo.",
+            "Ci sono troppe lingue in gioco.",
+            "La casa non è ancora libera e la lana è nuova.",
+            "I nostri clienti vogliono vedere il preventivo.",
             "I costi sono alti e siamo arrivati tardi.",
             "Quel palazzo è stato ristrutturato per colpa della banca.",
             "Il mercato a Milano è fermo, ci vediamo domani mattina.",
             "Ho parlato con l'avvocato del portale del comune.",
-            "Il ragazzo è bravo, ha comprato il feltro verde.",
+            "Il ragazzo è bravo, ha comprato la lampada verde.",
             "La stipula del mutuo è troppo pesante.",
             "Manda una mail a tutti quelli di via Roma.",
             "Il locale è carino ma il livello di servizio è basso.",
@@ -1782,11 +1790,11 @@ mod tests {
             "Un attimo, ripeto: la favola della nonna.",
             "Non ho capito bene, è troppo grande per quella stanza.",
             // …and English, which the same meeting drifted into.
-            "That was a really valuable session.",
-            "The lovely part is the price, and the slots are available.",
+            "The triangle in the logo is a regular one.",
+            "We should untangle the language before Monday.",
             "Can you make the button bigger?",
             "I think we should roll it back on Monday.",
-            "The train from Milan was late, whatever.",
+            "The oyster bar in Milan was closed, whatever.",
             "It should be a suitable and movable solution.",
             "Please mention that in the invention section.",
             "We can include or exclude the beautiful part.",
@@ -1806,15 +1814,16 @@ mod tests {
     /// A two-word claim is written back over everything from the first word to
     /// the last, so a match that steps over a full stop deletes it and welds two
     /// sentences together — the transcript then says somebody said something
-    /// they did not. "Non ho tempo. Casa mia è lontana" is the case: both halves
-    /// of "Vogliacasa" are there, in order, with a sentence boundary between them.
+    /// they did not. "Non ho voglia. Casa mia è lontana" is the case: both
+    /// halves of "Vogliacasa" are there, in order, with a sentence boundary
+    /// between them.
     #[test]
     fn a_two_word_match_never_swallows_the_punctuation_between_them() {
         let glossary = Glossary::new(["Vogliacasa"]);
         for line in [
-            "Non ho tempo. Casa mia è lontana.",
-            "che tempo, casa mia",
-            "Non ho tempo\nCasa mia è lontana.",
+            "Non ho voglia. Casa mia è lontana.",
+            "che voglia, casa mia",
+            "Non ho voglia\nCasa mia è lontana.",
         ] {
             assert_eq!(glossary.correct(line), None, "{line:?}");
         }
@@ -1837,8 +1846,8 @@ mod tests {
             ("Milano", "una ditta milanese"),
             ("Verona", "il prosciutto veronese"),
             ("Marco", "il marchio registrato"),
-            ("Langola", "un contratto allowable"),
-            ("Ostri", "hanno Ostri la pratica"),
+            ("Langola", "hanno langolato la pratica"),
+            ("Ostri", "una dozzina di ostriche"),
         ] {
             assert_eq!(Glossary::new([entry]).correct(line), None, "{entry:?}");
         }
@@ -1850,28 +1859,28 @@ mod tests {
 
     /// The narrowest call in the file, and it is a real Italian sentence on one
     /// side and a 2026-08-24 mangling on the other. Both are an elided article
-    /// followed by *ovale*; folded, "l'angolo" is one letter from "Langola".
+    /// followed by *angolo*; folded, "l'angolo" is one letter from "langola".
     ///
     /// What separates them is what each rule asks for. A word wearing an
     /// everyday word behind its apostrophe may not be claimed by anything that
-    /// merely *sounds* like the entry — but "sull'angolo" is long enough to hold
-    /// "langolo" inside it, and the rule that asks for the entry in full is
-    /// allowed to say so.
+    /// merely *sounds* like the entry — but "sull'angolo" is long enough to
+    /// hold "langolo" inside it, and the rule that asks for the entry in full
+    /// is allowed to say so.
     #[test]
-    fn the_oval_of_the_pitch_is_not_a_product_name_and_sullangolo_still_is() {
-        let glossary = Langola();
-        assert_eq!(glossary.correct("Guarda l'angolo del campo."), None);
-        assert_eq!(glossary.correct("Il campo è un ovale."), None);
+    fn the_corner_of_the_room_is_not_a_product_name_and_sullangolo_still_is() {
+        let glossary = langola();
+        assert_eq!(glossary.correct("Guarda l'angolo della barca."), None);
+        assert_eq!(glossary.correct("La stanza ha un solo angolo."), None);
         assert_eq!(
             corrected(&glossary, "Quelli di sull'angolo ci hanno scritto."),
             "Quelli di Langola ci hanno scritto."
         );
     }
 
-    /// A short entry has one power and it is not fuzzy matching. "BMC è più lui
-    /// casa" was the 2026-08-24 mangling of "VMC / Voglia Mutui Casa" — and this
-    /// is deliberately not fixed, because whatever would fix it would also
-    /// rewrite every other three-letter word in the meeting.
+    /// A short entry has one power and it is not fuzzy matching. "BMC è voglio
+    /// lui casa" was the 2026-08-24 mangling of "VMC / Voglia Mutui Casa" — and
+    /// this is deliberately not fixed, because whatever would fix it would
+    /// also rewrite every other three-letter word in the meeting.
     #[test]
     fn a_three_letter_entry_cannot_claim_short_words() {
         let glossary = Glossary::new(["VMC", "PEC", "IVA"]);
@@ -1942,7 +1951,7 @@ mod tests {
     /// word with nothing behind it.
     #[test]
     fn what_was_changed_is_recorded_well_enough_to_put_back() {
-        let glossary = Langola();
+        let glossary = langola();
         let line = "Il team di lana gola ci ha scritto.";
         let fixed = glossary.correct(line).expect("a two-word mishearing");
         assert_eq!(fixed.text, "Il team di Langola ci ha scritto.");
@@ -1955,7 +1964,7 @@ mod tests {
 
     #[test]
     fn a_word_already_spelled_right_is_not_a_correction() {
-        let glossary = Langola();
+        let glossary = langola();
         assert_eq!(glossary.correct("Langola è pronto"), None);
     }
 
@@ -2010,7 +2019,7 @@ mod tests {
     /// meeting recorded twice would be prompted differently each time.
     #[test]
     fn the_same_list_always_produces_the_same_prompt_and_the_same_matches() {
-        let words = ["Langola", "Langola", "  Langola  ", "Obsidara"];
+        let words = ["Langola", "langola", "  Langola  ", "Obsidara"];
         let once = Glossary::new(words);
         let twice = Glossary::new(words);
         assert_eq!(once.prompt(), twice.prompt());
@@ -2034,44 +2043,44 @@ mod tests {
 
     #[test]
     fn a_word_is_read_with_its_apostrophes_and_dots_but_not_its_full_stop() {
-        let spans = word_spans("sull'angolo, poi lampo.dev.");
-        let text = "sull'angolo, poi lampo.dev.";
+        let spans = word_spans("Sull'angolo, poi lampo.dev.");
+        let text = "Sull'angolo, poi lampo.dev.";
         let words: Vec<&str> = spans.iter().map(|(a, b)| &text[*a..*b]).collect();
-        assert_eq!(words, vec!["sull'angolo", "poi", "lampo.dev"]);
+        assert_eq!(words, vec!["Sull'angolo", "poi", "lampo.dev"]);
         assert!(word_spans("... ?!").is_empty());
     }
 
     #[test]
     fn folding_flattens_case_accents_and_punctuation() {
-        assert_eq!(fold("sull'angolo"), "sullangolo");
+        assert_eq!(fold("Sull'angolo"), "sullangolo");
         assert_eq!(fold("Città"), "citta");
         assert_eq!(fold("lampo.dev"), "lampodev");
-        assert_eq!(fold("«Langola»"), "Langola");
+        assert_eq!(fold("«Langola»"), "langola");
     }
 
     #[test]
-    fn the_sound_classes_are_what_make_Nongula_and_Langola_the_same_shape() {
-        assert_eq!(skeleton(&sounds("Langola")), "lbbl");
-        assert_eq!(skeleton(&sounds("Nongula")), "nbbl");
-        assert_eq!(skeleton(&sounds("lana gola")), "lbbl");
-        assert_eq!(skeleton(&sounds("Ingola")), "bbl");
+    fn the_sound_classes_are_what_make_nongula_and_langola_the_same_shape() {
+        assert_eq!(skeleton(&sounds("langola")), "lngl");
+        assert_eq!(skeleton(&sounds("nongula")), "nngl");
+        assert_eq!(skeleton(&sounds("lanagola")), "lngl");
+        assert_eq!(skeleton(&sounds("ingola")), "ngl");
         // …and what keeps an ordinary word from being one: the guard list is
         // what saves these, not the shape.
-        assert_eq!(skeleton(&sounds("lavabile")), "lbbl");
+        assert_eq!(skeleton(&sounds("lancera")), "lngl");
     }
 
     #[test]
     fn a_swap_of_two_letters_is_one_mistake_not_two() {
-        assert_eq!(distance("abel", "able"), 1);
-        assert_eq!(distance("Langola", "Langola"), 0);
+        assert_eq!(distance("gnola", "ngola"), 1);
+        assert_eq!(distance("langola", "langola"), 0);
         assert_eq!(distance("", "abc"), 3);
-        assert_eq!(buried_in_tail("Langola", "sullangolo"), 1);
-        assert_eq!(buried_in_tail("Ostri", "Anastri"), 1);
-        assert!(buried_in_tail("Langola", "amabile") > 1);
+        assert_eq!(buried_in_tail("langola", "sullangolo"), 1);
+        assert_eq!(buried_in_tail("ostri", "anastri"), 1);
+        assert!(buried_in_tail("langola", "pentola") > 1);
         // Both ends are pinned: the entry may not start the word, and it may
         // not stop before the word does.
         assert!(buried_in_tail("milano", "milanese") > 1);
-        assert!(buried_in_tail("Ostri", "tranquillo") > 1);
+        assert!(buried_in_tail("ostri", "ostruito") > 1);
     }
 
     /// The guard list is searched by halving, so it has to be sorted — and it
@@ -2131,7 +2140,7 @@ mod tests {
         let lines = [
             "Allora, Nongula è quello che usiamo.",
             "sull'angolo e obssidara insieme",
-            "«Nongulo», diceva, e poi Voglia Mutui Casa.",
+            "«Nongulo», diceva, e poi voglia mutui casa.",
             "Nongula, Nongulo, sempre Nongula.",
         ];
         for line in lines {
@@ -2186,12 +2195,12 @@ mod tests {
     }
 
     /// A repair is written over a whole word, so putting it back reads whole
-    /// words: "Langola" is not the repair and is left alone — which, there
+    /// words: "Langolas" is not the repair and is left alone — which, there
     /// being no other occurrence, means the whole undo is refused.
     #[test]
     fn a_longer_word_that_merely_contains_the_repair_is_not_the_repair() {
         assert_eq!(
-            revert("i Langola sono due", &[change("Nongula", "Langola")]),
+            revert("i Langolas sono due", &[change("Nongula", "Langola")]),
             None
         );
         // The punctuation the line kept around the word is not part of it.

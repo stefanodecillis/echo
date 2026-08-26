@@ -291,7 +291,7 @@ pub async fn remove_word_to_know(db: &Db, word: &str) -> Result<Vec<VocabularyWo
 }
 
 /// Two spellings of the same word as far as this list is concerned. Case and
-/// surrounding space only — "Langola" and "Langola" are one entry, "Langola"
+/// surrounding space only — "Langola" and "langola" are one entry, "Langola"
 /// and "Lovabile" are two.
 fn same_word(a: &str, b: &str) -> bool {
     a.trim().to_lowercase() == b.trim().to_lowercase()
@@ -542,8 +542,8 @@ mod tests {
 
     /// The half nobody has to type: Echo already knows the names of the people
     /// whose voices it was asked to remember, and those are exactly the words it
-    /// gets wrong — "Gianluca" came back from the 2026-08-24 meeting as "Joe
-    /// Franco".
+    /// gets wrong — "Gianluca" came back from the 2026-08-24 meeting as "Jan
+    /// Luca".
     #[tokio::test]
     async fn the_names_of_remembered_people_are_in_the_list_without_anybody_typing_them() {
         let db = connect_in_memory().await.unwrap();
@@ -611,7 +611,7 @@ mod tests {
         add_word_to_know(&db, "  Obsidara  ").await.unwrap();
         assert_eq!(words_to_know(&db).await.unwrap().len(), 1);
 
-        assert!(remove_word_to_know(&db, "Obsidara")
+        assert!(remove_word_to_know(&db, "obsidara")
             .await
             .unwrap()
             .is_empty());
