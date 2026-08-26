@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/echo-mark.png" alt="Echo" width="112" height="112">
+  <img src="docs/assets/echo-banner.png" alt="Echo" width="720">
 </p>
 
 <h1 align="center">Echo</h1>
