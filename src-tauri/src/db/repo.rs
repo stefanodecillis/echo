@@ -933,9 +933,11 @@ pub struct ClearedTranscript {
     /// pass about to run will work it out again from the recording. False for a
     /// meeting that never settled on one.
     pub language_cleared: bool,
-    /// Stretches that a pass had decided not to transcribe
-    /// ([`SuppressedSpan`]) and that the next pass will therefore judge again.
-    pub spans_unmarked: u64,
+    /// Decisions not to transcribe ([`SuppressedSpan`]) that no longer stand,
+    /// so the next pass judges those seconds again. The rows themselves are
+    /// still there, holding what was measured about that audio — see
+    /// [`measured_lag_ms`].
+    pub spans_withdrawn: u64,
     /// One past the revision the transcript was on, so anything watching can
     /// tell that what it holds is stale.
     ///
@@ -974,14 +976,22 @@ pub struct ClearedTranscript {
 ///   the words are gone and the language they were read in is still standing.
 ///
 /// * the marks that say a stretch was heard and deliberately left without text
-///   ([`SuppressedSpan`]) go too, in the same transaction. They are a decision
-///   about the audio, and "listen again" is a person asking for the audio to be
-///   decided again — the recording is still there to judge, and keeping the
-///   marks would mean one meeting's suppression outlived the transcript it was
-///   part of while a button on screen promised a fresh reading. The cost of
-///   being wrong this way round is a duplicated line, which is what the button
-///   is for; the cost the other way round is a sentence that can never come
-///   back.
+///   ([`SuppressedSpan`]) are **withdrawn**, in the same transaction. They are
+///   a decision about the audio, and "listen again" is a person asking for the
+///   audio to be decided again — the recording is still there to judge, and a
+///   standing mark would mean one meeting's suppression outlived the transcript
+///   it was part of while a button on screen promised a fresh reading. The cost
+///   of being wrong this way round is a duplicated line, which is what the
+///   button is for; the cost the other way round is a sentence that can never
+///   come back.
+///
+///   Withdrawn, not deleted. The decision stops hiding those seconds from the
+///   planner ([`suppressed_spans`] reads only what still stands), but what was
+///   *measured* about them survives: a withdrawn row is still a true
+///   measurement of this recording's audio, and [`measured_lag_ms`] hands the
+///   delay it found to the pass about to read the meeting again. Deleting threw
+///   that away and left the second reading — the one that is worse at this, see
+///   `migrations/0008_withdrawn_suppressions.sql` — starting from nothing.
 ///
 /// Chunks, markers, summaries and action items are left exactly where they are.
 /// So is the person's own count of how many people were there: that is a fact
@@ -1005,11 +1015,18 @@ pub async fn clear_transcript(db: &Db, meeting_id: &str) -> Result<ClearedTransc
         .execute(&mut *tx)
         .await?
         .rows_affected();
-    let spans_unmarked = sqlx::query("DELETE FROM suppressed_spans WHERE meeting_id = ?1")
-        .bind(meeting_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    // Only what still stands: a row an earlier "listen again" withdrew is
+    // already withdrawn, and restamping it would say this clear did something
+    // it did not.
+    let spans_withdrawn = sqlx::query(
+        "UPDATE suppressed_spans SET withdrawn_at = ?2
+         WHERE meeting_id = ?1 AND withdrawn_at IS NULL",
+    )
+    .bind(meeting_id)
+    .bind(now())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     let language_cleared =
         sqlx::query("UPDATE meetings SET language = NULL WHERE id = ?1 AND language IS NOT NULL")
             .bind(meeting_id)
@@ -1023,7 +1040,7 @@ pub async fn clear_transcript(db: &Db, meeting_id: &str) -> Result<ClearedTransc
         segments_deleted: segments,
         speakers_deleted: speakers,
         language_cleared,
-        spans_unmarked,
+        spans_withdrawn,
         revision: previous.saturating_add(1),
     })
 }
@@ -1214,6 +1231,13 @@ pub async fn record_suppressed_span(
 /// against them ([`crate::asr::catchup`]), which is the whole point of the
 /// table: a decision made once against better-aligned audio is not re-litigated
 /// against worse.
+///
+/// **Only decisions that still stand.** One a "listen again" withdrew
+/// ([`clear_transcript`]) hides nothing: those seconds are planned, read and
+/// judged afresh, because the repair button has to be able to reach every
+/// second of the recording — including a sentence Echo wrongly decided was an
+/// echo of the far side. The row stays behind for what it measured
+/// ([`measured_lag_ms`]), not for what it decided.
 pub async fn suppressed_spans(
     db: &Db,
     meeting_id: &str,
@@ -1222,6 +1246,7 @@ pub async fn suppressed_spans(
     let rows: Vec<(i64, i64)> = sqlx::query_as(
         "SELECT t_start_ms, t_end_ms FROM suppressed_spans
          WHERE meeting_id = ?1 AND channel = ?2 AND t_end_ms > t_start_ms
+           AND withdrawn_at IS NULL
          ORDER BY t_start_ms",
     )
     .bind(meeting_id)
@@ -1231,8 +1256,15 @@ pub async fn suppressed_spans(
     Ok(rows)
 }
 
-/// Everything this meeting had marked, newest first — the diagnostic read, for
-/// a person asking why a stretch of their recording has no words in it.
+/// Every decision that still stands for this meeting, in clock order — the
+/// diagnostic read, for a person asking why a stretch of their recording has no
+/// words in it.
+///
+/// Withdrawn rows are left out because they are no longer an answer to that
+/// question: the seconds they cover were judged again by a later pass, and
+/// whatever that pass concluded is what the transcript now shows. What a
+/// withdrawn row still holds is its measurement, and that is read through
+/// [`measured_lag_ms`].
 pub async fn list_suppressed_spans(
     db: &Db,
     meeting_id: &str,
@@ -1240,7 +1272,8 @@ pub async fn list_suppressed_spans(
     let rows = sqlx::query(
         "SELECT channel, t_start_ms, t_end_ms, reason, decided_by,
                 correlation, lag_ms, system_voice_ms
-         FROM suppressed_spans WHERE meeting_id = ?1 ORDER BY t_start_ms",
+         FROM suppressed_spans WHERE meeting_id = ?1 AND withdrawn_at IS NULL
+         ORDER BY t_start_ms",
     )
     .bind(meeting_id)
     .fetch_all(db)
@@ -1270,6 +1303,73 @@ pub async fn list_suppressed_spans(
             })
         })
         .collect()
+}
+
+/// The delay this meeting measured between what the speakers played and what
+/// the microphone heard, in milliseconds — the median `lag_ms` of every
+/// suppression written down for it, **withdrawn or not**.
+///
+/// A decision can be withdrawn; a measurement cannot. Every row here was a full
+/// hit — the correlator only records one when the whole predicate agreed
+/// ([`crate::audio::bleed::is_bleed`]) — so each is an independent statement
+/// about this recording's audio, and pressing "listen again" did not change the
+/// audio. That is why this reads through the withdrawal: what the next pass
+/// inherits is the machine's delay, not the last pass's verdict.
+///
+/// **The median, not the mean**, for [`crate::audio::bleed::LagEstimate`]'s
+/// reason: a drift correction moves the true delay in a single step and the odd
+/// reading is nonsense, so the estimator has to follow a staircase and ignore an
+/// outlier. With an even count this is the midpoint of the two middle
+/// measurements, again matching `LagEstimate`.
+///
+/// One row is enough to answer. Live, [`crate::audio::bleed::LagEstimate`]
+/// wants two before it will speak, because there the number *narrows the
+/// search* and a single wrong reading would aim the search at the wrong delay.
+/// Nothing narrows here — see [`crate::asr::catchup_bleed::OfflineBleed`], which
+/// keeps searching cold whatever this returns — so the number is only ever
+/// evidence that this recording has a real, measurable delay in it, and one full
+/// hit is that.
+///
+/// `None` for a meeting nothing was ever measured on, which is every meeting
+/// recorded before 2026-08-26 and every meeting where no copy was ever found.
+pub async fn measured_lag_ms(db: &Db, meeting_id: &str) -> Result<Option<i64>, DbError> {
+    let lags: Vec<(i64,)> = sqlx::query_as(
+        "SELECT lag_ms FROM suppressed_spans
+         WHERE meeting_id = ?1 AND lag_ms IS NOT NULL
+         ORDER BY lag_ms",
+    )
+    .bind(meeting_id)
+    .fetch_all(db)
+    .await?;
+    if lags.is_empty() {
+        return Ok(None);
+    }
+    let mid = lags.len() / 2;
+    Ok(Some(if lags.len() % 2 == 1 {
+        lags[mid].0
+    } else {
+        (lags[mid - 1].0 + lags[mid].0) / 2
+    }))
+}
+
+/// How many decisions about this meeting have been withdrawn — the count of
+/// stretches a previous reading left without text and this one will judge
+/// again.
+///
+/// Read by the catch-up pass so that it can say so in the log. A duplicated
+/// line in a finished transcript is the thing this whole area gets diagnosed
+/// for, and "which reading produced it" is the first question: a pass that
+/// starts by naming how many decisions it is re-opening, and what delay it
+/// inherited, answers it from the log alone.
+pub async fn withdrawn_suppression_count(db: &Db, meeting_id: &str) -> Result<u64, DbError> {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM suppressed_spans
+         WHERE meeting_id = ?1 AND withdrawn_at IS NOT NULL",
+    )
+    .bind(meeting_id)
+    .fetch_one(db)
+    .await?;
+    Ok(n.max(0) as u64)
 }
 
 // ===========================================================================
@@ -4576,11 +4676,11 @@ mod tests {
     /// twice", which is a different claim from "Echo never heard it".
     ///
     /// It has to survive being read back — the catch-up planner subtracts these
-    /// spans from its work — it has to be per channel, and it has to go when
-    /// the transcript goes, because "listen again" is a person asking for the
-    /// recording to be judged afresh.
+    /// spans from its work — it has to be per channel, and it has to stop
+    /// standing when the transcript goes, because "listen again" is a person
+    /// asking for the recording to be judged afresh.
     #[tokio::test]
-    async fn a_decision_not_to_transcribe_is_kept_with_its_evidence_and_cleared_with_the_words() {
+    async fn a_decision_not_to_transcribe_is_kept_with_its_evidence_and_withdrawn_with_the_words() {
         let db = connect_in_memory().await.unwrap();
         let m = create_meeting(&db, "Bleed", "/audio", None).await.unwrap();
 
@@ -4644,8 +4744,93 @@ mod tests {
         ));
 
         let cleared = clear_transcript(&db, &m.id).await.unwrap();
-        assert_eq!(cleared.spans_unmarked, 3);
-        assert!(list_suppressed_spans(&db, &m.id).await.unwrap().is_empty());
+        assert_eq!(cleared.spans_withdrawn, 3);
+        assert!(
+            list_suppressed_spans(&db, &m.id).await.unwrap().is_empty(),
+            "a withdrawn decision is no longer why a stretch has no words"
+        );
+        assert!(
+            suppressed_spans(&db, &m.id, Channel::Mic)
+                .await
+                .unwrap()
+                .is_empty(),
+            "and it must not hide those seconds from the planner: the sentence \
+             a person pressed the button for might be one of them"
+        );
+
+        // …but the measurement is still there, because the audio did not change
+        // when somebody pressed a button.
+        assert_eq!(withdrawn_suppression_count(&db, &m.id).await.unwrap(), 3);
+        assert_eq!(measured_lag_ms(&db, &m.id).await.unwrap(), Some(210));
+
+        // A second clear withdraws nothing: they are already withdrawn, and
+        // saying otherwise would put a number in the log for work not done.
+        let again = clear_transcript(&db, &m.id).await.unwrap();
+        assert_eq!(again.spans_withdrawn, 0);
+        assert_eq!(withdrawn_suppression_count(&db, &m.id).await.unwrap(), 3);
+    }
+
+    /// A withdrawn decision still measures the audio it was made about.
+    ///
+    /// The delay between what the speakers played and what the microphone heard
+    /// is a property of the machine that recorded the meeting, and every row
+    /// holding one was a full hit. So the median is taken over the meeting's
+    /// rows whether they still stand or not — that is the whole reason "listen
+    /// again" withdraws instead of deleting.
+    #[tokio::test]
+    async fn the_delay_a_meeting_measured_is_read_through_its_withdrawals() {
+        let db = connect_in_memory().await.unwrap();
+        let m = create_meeting(&db, "Delay", "/audio", None).await.unwrap();
+        assert_eq!(
+            measured_lag_ms(&db, &m.id).await.unwrap(),
+            None,
+            "a meeting nothing was measured on inherits nothing"
+        );
+
+        let mark = |from_ms: i64, lag_ms: Option<i64>| SuppressedSpan {
+            channel: Channel::Mic,
+            t_start_ms: from_ms,
+            t_end_ms: from_ms + 4_000,
+            reason: SuppressionReason::Bleed,
+            decided_by: DecidedBy::Live,
+            correlation: Some(0.9),
+            lag_ms,
+            system_voice_ms: Some(3_800),
+        };
+
+        // Two measurements: the midpoint of the middle pair, as `LagEstimate`
+        // takes it.
+        record_suppressed_span(&db, &m.id, &mark(0, Some(180)))
+            .await
+            .unwrap();
+        record_suppressed_span(&db, &m.id, &mark(10_000, Some(220)))
+            .await
+            .unwrap();
+        assert_eq!(measured_lag_ms(&db, &m.id).await.unwrap(), Some(200));
+
+        // A third, wildly out: the median ignores it, which is why it is a
+        // median.
+        record_suppressed_span(&db, &m.id, &mark(20_000, Some(9_999)))
+            .await
+            .unwrap();
+        assert_eq!(measured_lag_ms(&db, &m.id).await.unwrap(), Some(220));
+
+        // A reason with no measurement behind it says nothing about the delay.
+        record_suppressed_span(&db, &m.id, &mark(30_000, None))
+            .await
+            .unwrap();
+        assert_eq!(measured_lag_ms(&db, &m.id).await.unwrap(), Some(220));
+
+        clear_transcript(&db, &m.id).await.unwrap();
+        assert_eq!(
+            measured_lag_ms(&db, &m.id).await.unwrap(),
+            Some(220),
+            "the delay survives the clear that withdrew every decision"
+        );
+        assert!(suppressed_spans(&db, &m.id, Channel::Mic)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

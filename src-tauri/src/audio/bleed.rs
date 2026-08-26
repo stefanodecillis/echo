@@ -801,9 +801,15 @@ pub const OWN_VOICE_MS: i64 = 400;
 ///
 /// Plus two length floors that are not about the audio but about the
 /// measurement: a stretch too short for the correlation to mean anything
-/// ([`MIN_SPAN_COLD_MS`] / [`MIN_SPAN_WARM_MS`], `warm` meaning the delay was
-/// already known so the search was narrow), and a stretch with too little
-/// measured voice in it ([`MIN_MIC_VOICE_MS`]).
+/// ([`MIN_SPAN_COLD_MS`] / [`MIN_SPAN_WARM_MS`], `warm` meaning this
+/// recording's delay is already known), and a stretch with too little measured
+/// voice in it ([`MIN_MIC_VOICE_MS`]).
+///
+/// Live, knowing the delay also narrows the search, and the warm floor was
+/// measured on that pairing. Offline it does not — the search stays cold and
+/// the floor still drops (see [`crate::asr::catchup_bleed::OfflineBleed`]),
+/// which is the weakest of the three arms and is measured on its own in
+/// `chance_never_clears_the_bar_at_the_warm_floor_with_a_cold_search`.
 ///
 /// `mic_voiced_ms` is what the speech detector called voice — pass
 /// [`crate::audio::vad::Utterance::measured_voice_ms`], which answers "nobody

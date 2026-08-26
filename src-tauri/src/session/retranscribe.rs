@@ -13,8 +13,9 @@
 //!    again is already under way for this meeting;
 //! 2. cancel whatever is queued or running for the meeting, so no older pass is
 //!    still writing rows when the wipe lands;
-//! 3. delete the transcript and the speakers ([`repo::clear_transcript`]) and
-//!    tell the screens the revision moved on;
+//! 3. delete the transcript and the speakers, and withdraw the decisions not to
+//!    transcribe ([`repo::clear_transcript`]), and tell the screens the revision
+//!    moved on;
 //! 4. queue catch-up and then the speaker pass, exactly the chain a normal stop
 //!    queues — minus the mixdown, because the audio did not change and the
 //!    playback file is still correct, and minus the recap, because the recap is
@@ -126,9 +127,11 @@ pub(crate) async fn run(
         was_language = meeting.language.as_deref().unwrap_or("none"),
         language_cleared = cleared.language_cleared,
         // Stretches a previous pass had decided were the computer's own audio
-        // coming back. They are judged again from the recording, because that
-        // is what "listen again" means.
-        spans_unmarked = cleared.spans_unmarked,
+        // coming back. The decisions are withdrawn, so those seconds are judged
+        // again from the recording — that is what "listen again" means — while
+        // the delay they measured stays on the rows for the next pass to
+        // inherit (`db::repo::measured_lag_ms`).
+        spans_withdrawn = cleared.spans_withdrawn,
         duration_ms = meeting.duration_ms.max(committed),
         "listening to this meeting again from the recording"
     );

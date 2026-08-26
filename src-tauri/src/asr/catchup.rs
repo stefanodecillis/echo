@@ -380,6 +380,15 @@ pub struct CatchUpReport {
     /// live pass's decisions bought — and, where the two passes would have
     /// disagreed, the encode as well.
     pub left_alone_ms: i64,
+    /// The delay a previous reading of this meeting measured, which this one
+    /// started out knowing ([`crate::db::repo::measured_lag_ms`]).
+    ///
+    /// `None` for a meeting nothing was ever measured on, and for one with no
+    /// computer audio to be a copy of. Reported rather than only logged because
+    /// it is the one thing a second reading inherits from a first, and "which
+    /// reading produced this duplicate" is the question this whole area gets
+    /// diagnosed for.
+    pub inherited_lag_ms: Option<i64>,
     /// Words put right against the vocabulary — "Nongula" back to "Langola"
     /// (see [`crate::asr::glossary`]). Counted for the same reason the phantoms
     /// are: this pass changes words a person will read, so how often it does
@@ -678,9 +687,12 @@ where
         // still here and still runs — a meeting recorded before any of this
         // existed, or one where the live guard was disarmed, has no marks and
         // is judged exactly as it always was — it is simply not asked about
-        // seconds that already have an answer. `clear_transcript` takes the
-        // marks with the transcript, so "listen again" really does judge the
-        // recording afresh.
+        // seconds that already have an answer. `clear_transcript` withdraws the
+        // marks along with the transcript, and `repo::suppressed_spans` reads
+        // only the ones still standing, so "listen again" really does judge
+        // every second of the recording afresh. What the withdrawn ones
+        // measured is not thrown away with them: `repo::measured_lag_ms` reads
+        // it back and hands it to the judge (`inherited_lag_ms`, below).
         //
         // The span recorded is the live stretch's own, not a padded one: a mark
         // is allowed to cover the seconds that were judged and not one more,
@@ -733,7 +745,33 @@ where
     // part of this — see [`crate::asr::catchup_bleed`]. Without it, this pass
     // would read back exactly the seconds the live pass suppressed and write
     // them down at the end of every meeting.
-    let mut bleed = OfflineBleed::over(&far_side);
+    //
+    // It starts knowing whatever this meeting has already measured its delay to
+    // be, including from decisions a "listen again" has since withdrawn: the
+    // button withdrew a verdict, it did not change the audio the verdict was
+    // measured on. That buys the shorter span floor and nothing else — the
+    // search stays cold, see `OfflineBleed::knowing_the_delay`.
+    let measured_lag_ms = repo::measured_lag_ms(db, meeting_id).await?;
+    let mut bleed = OfflineBleed::over(&far_side).map(|b| b.knowing_the_delay(measured_lag_ms));
+    // What the judge actually took, after its plausibility filter — and `None`
+    // on a meeting with no computer audio, which has no judge to hand it to.
+    report.inherited_lag_ms = bleed.as_ref().and_then(OfflineBleed::inherited_lag_ms);
+
+    // A meeting being read for the second time is the situation a duplicated
+    // line comes out of, so this pass says up front that it is re-opening
+    // decisions and what it inherited to re-open them with. Silent for the
+    // ordinary meeting, which has withdrawn nothing.
+    let judging_again = repo::withdrawn_suppression_count(db, meeting_id).await?;
+    if judging_again > 0 {
+        tracing::info!(
+            target: "echo::asr",
+            meeting = %meeting_id,
+            stretches = judging_again,
+            inherited_lag_ms = ?report.inherited_lag_ms,
+            "a previous reading of this meeting decided not to write these stretches down; \
+             they are being read back and judged again, with the delay that reading measured"
+        );
+    }
 
     for (channel, chunks, start, end) in plan {
         report.from_ms = report.from_ms.min(start);
@@ -898,6 +936,7 @@ where
         slivers_dropped = report.slivers_dropped,
         bleed_suppressed = report.bleed_suppressed,
         left_alone_ms = report.left_alone_ms,
+        inherited_lag_ms = ?report.inherited_lag_ms,
         words_corrected = report.words_corrected,
         audio_ms = total_ms,
         "catch-up pass finished"
@@ -2998,6 +3037,11 @@ mod tests {
     /// what could not be undone is a suppression that outlived the transcript it
     /// was part of, on a meeting whose owner is looking at a button that
     /// promises otherwise.
+    ///
+    /// What the withdrawn decision *measured* does not go with it: the delay is
+    /// a fact about this recording's audio, and the second reading — the one
+    /// that missed a copy on 2026-08-26 — starts holding it rather than
+    /// starting from nothing.
     #[tokio::test]
     async fn listening_again_judges_a_decided_stretch_from_the_recording_again() {
         let db = connect_in_memory().await.unwrap();
@@ -3006,11 +3050,26 @@ mod tests {
         already_written(&db, &id, Ch::Mic, 0, 30_000).await;
 
         let cleared = repo::clear_transcript(&db, &id).await.unwrap();
-        assert_eq!(cleared.spans_unmarked, 1, "the mark went with the words");
-        assert!(repo::suppressed_spans(&db, &id, Ch::Mic)
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            cleared.spans_withdrawn, 1,
+            "the decision was withdrawn along with the words"
+        );
+        assert!(
+            repo::suppressed_spans(&db, &id, Ch::Mic)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a withdrawn decision must not hide those seconds from the planner"
+        );
+        assert_eq!(
+            repo::measured_lag_ms(&db, &id).await.unwrap(),
+            Some(210),
+            "the delay this meeting measured survives the withdrawal"
+        );
+        assert_eq!(
+            repo::withdrawn_suppression_count(&db, &id).await.unwrap(),
+            1
+        );
 
         let audio = FakeAudio::with_speech();
         let report = run(
@@ -3036,6 +3095,66 @@ mod tests {
              recording: {:?}",
             audio.reads()
         );
+    }
+
+    /// The delay a withdrawn decision measured reaches the reading that
+    /// replaces it.
+    ///
+    /// This is the half that deleting the rows used to cost. After a "listen
+    /// again" only the offline pass judges, and the offline pass is the one that
+    /// missed a copy on 2026-08-26 — so handing it the delay this recording has
+    /// already been measured to have is the cheapest accuracy on offer. It buys
+    /// the shorter span floor and nothing else; see
+    /// `catchup_bleed::OfflineBleed::knowing_the_delay`.
+    ///
+    /// And a meeting nothing was ever measured on inherits nothing, which is
+    /// every meeting recorded before any of this existed.
+    #[tokio::test]
+    async fn a_second_reading_inherits_the_delay_the_first_one_measured() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 2).await;
+        // A far side for the judge to exist at all: with no computer audio there
+        // is nothing a stretch of the microphone could be a copy of.
+        commit_chunks(&db, &id, Ch::System, 2).await;
+        already_decided(&db, &id, Ch::Mic, 30_000, 60_000).await;
+        repo::clear_transcript(&db, &id).await.unwrap();
+
+        let report = run(
+            &FakeEngine::saying("listening again"),
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &FakeAudio::with_speech(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.inherited_lag_ms,
+            Some(210),
+            "the withdrawn decision's measurement reached the pass that judges \
+             those seconds again"
+        );
+
+        // A meeting that never had a decision on it is exactly as it was.
+        let fresh = meeting_with_audio(&db, 2).await;
+        commit_chunks(&db, &fresh, Ch::System, 2).await;
+        let report = run(
+            &FakeEngine::saying("a first reading"),
+            &db,
+            &fresh,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &FakeAudio::with_speech(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.inherited_lag_ms, None);
+        assert_eq!(report.left_alone_ms, 0);
     }
 
     /// The offline pass records its own decisions, and a pass that decided

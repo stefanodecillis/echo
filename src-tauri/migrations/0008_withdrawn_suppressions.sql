@@ -1,0 +1,52 @@
+-- "Listen again" withdraws a decision not to transcribe. It no longer deletes
+-- the measurement behind it.
+--
+-- This revises the "What clears it" paragraph of `0007_suppressed_spans.sql`.
+-- That file is not edited to say so, because sqlx checksums an applied
+-- migration and rewriting one breaks every database that already ran it — so
+-- 0007 stands as the record of what was true when it landed, and this is the
+-- record of what changed.
+--
+-- ## What was right about deleting
+--
+-- The repair button has to be able to reach every second of the recording. The
+-- very thing a person presses it for might be a sentence Echo wrongly decided
+-- was the computer's own audio coming back: a stretch nobody can ever get
+-- transcribed, behind a button that promises a fresh reading. A returning
+-- duplicate is ugly. An unreachable sentence is data loss, and no duplicate
+-- count is good enough to buy one.
+--
+-- ## What was wrong about it
+--
+-- Deleting the row also threw away what Echo had *measured* about those
+-- seconds — the correlation, and above all `lag_ms`, the delay between what the
+-- speakers played and what the microphone heard on the machine that recorded
+-- this meeting. After a clear, only the offline pass judged, and the offline
+-- pass is the one that missed one copy in six in the verification of
+-- 2026-08-26. So the repair cost accuracy it did not need to cost: the delay is
+-- a fact about this recording's audio, and the audio did not change when
+-- somebody pressed a button.
+--
+-- ## So: withdraw, and keep the measurement
+--
+-- `withdrawn_at` set means the decision no longer stands. The catch-up planner
+-- ignores withdrawn rows entirely — those seconds are read back and judged
+-- afresh, which is what "listen again" means and is the whole of the paragraph
+-- above about unreachable sentences. But the row is still there, and
+-- `db::repo::measured_lag_ms` reads the median `lag_ms` across a meeting's
+-- rows, standing and withdrawn alike, to hand the next reading the delay this
+-- one measured. See `asr::catchup_bleed` for the one thing that number is
+-- allowed to change (the span floor) and the one thing it is not (the width of
+-- the lag search).
+--
+-- ## Safe on a database that already has rows
+--
+-- A plain nullable column with no default: every row already in the table gets
+-- NULL, which reads as "standing", which is exactly what those rows are. No
+-- backfill, no rewrite, and a meeting mid-flight over the upgrade keeps the
+-- decisions its live pass made.
+--
+-- No new index. `idx_suppressed_spans_meeting` still leads with the two
+-- columns both queries select on, and the number of rows one meeting has is in
+-- the tens — the standing filter is cheaper to apply than to index.
+ALTER TABLE suppressed_spans ADD COLUMN withdrawn_at TEXT;

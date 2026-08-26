@@ -315,6 +315,10 @@ impl SystemPager {
 pub struct OfflineBleed {
     pager: SystemPager,
     lag: LagEstimate,
+    /// What a previous reading of this same meeting measured its delay to be
+    /// ([`crate::db::repo::measured_lag_ms`]), when there was one. See
+    /// [`OfflineBleed::knowing_the_delay`] for the single thing it changes.
+    inherited_lag_ms: Option<i64>,
     /// `None` while armed; otherwise the reason, ready to be handed back as an
     /// [`Verdict::Undecided`].
     disarmed: Option<&'static str>,
@@ -342,6 +346,7 @@ impl OfflineBleed {
         Some(Self {
             pager: SystemPager::over(system_chunks)?,
             lag: LagEstimate::default(),
+            inherited_lag_ms: None,
             disarmed: None,
             missed_in_a_row: 0,
             system: Vec::with_capacity(WIDEST_SPAN_MS as usize * SAMPLES_PER_MS as usize),
@@ -350,6 +355,55 @@ impl OfflineBleed {
             examined: 0,
             suppressed: 0,
         })
+    }
+
+    /// Start knowing what a previous reading of this same meeting measured the
+    /// delay to be — [`crate::db::repo::measured_lag_ms`], which reads through a
+    /// withdrawal because a withdrawn decision is still a true measurement of
+    /// this recording's audio.
+    ///
+    /// **It buys the shorter span floor, and nothing else.**
+    ///
+    /// The floor ([`MIN_SPAN_COLD_MS`] versus [`MIN_SPAN_WARM_MS`]) is not about
+    /// the audio, it is about the measurement: three seconds is how much
+    /// stretch a correlation needs before chance stops reaching the bar over a
+    /// hundred and one candidate delays. Knowing that this machine really does
+    /// have a delay of about *this* much, measured on *this* recording by a pass
+    /// that had to satisfy the whole of [`is_bleed`] to record it, is
+    /// independent evidence about the same audio — the same kind the meeting
+    /// earns for itself two hits in, which is already allowed to lower this
+    /// floor mid-pass. Inheriting it only moves that forward to the first
+    /// utterance instead of the third. The combination it produces — the warm
+    /// floor judged with a cold search — is the one
+    /// `chance_never_clears_the_bar_at_the_warm_floor_with_a_cold_search`
+    /// measures directly: a thousand unrelated pairs, none suppressed.
+    ///
+    /// **It does not narrow the search**, and the number itself is never used
+    /// for anything. [`judge`](Self::judge) searches cold whatever is inherited,
+    /// for the reason that doc gives: offline the bottleneck is the FLAC decode
+    /// and the packed encode, not a hundred correlations over an envelope that
+    /// is already computed, so the cold search is free here and strictly more
+    /// robust. A remembered delay could be stale in a way nothing offline can
+    /// see — the route changed, the clock drifted, the recording resumed on
+    /// another device — and a narrowed search would then be looking in the wrong
+    /// place and finding the best of a bad set. A floor cannot lock onto a wrong
+    /// delay; it has no delay in it. That asymmetry is the whole argument, and
+    /// it is why this is deliberately not a seed for
+    /// [`LagEstimate`] — a seeded estimate would narrow the search through
+    /// [`LagEstimate::search`] the moment anything called it.
+    ///
+    /// The one filter applied is plausibility: a `lag_ms` outside the search
+    /// range at all is not a delay this pass could ever have found, so it is
+    /// treated as no measurement rather than as evidence.
+    pub fn knowing_the_delay(mut self, measured_lag_ms: Option<i64>) -> Self {
+        self.inherited_lag_ms =
+            measured_lag_ms.filter(|lag| (LAG_MIN_MS..=LAG_MAX_MS).contains(lag));
+        self
+    }
+
+    /// The delay this reading inherited from a previous one, if any.
+    pub fn inherited_lag_ms(&self) -> Option<i64> {
+        self.inherited_lag_ms
     }
 
     pub fn armed(&self) -> bool {
@@ -421,6 +475,10 @@ impl OfflineBleed {
     /// delay twice can judge shorter stretches ([`MIN_SPAN_WARM_MS`]), and
     /// `chance_never_clears_the_bar_at_the_warm_floor_with_a_cold_search`
     /// measures that this remains true when the search that found it was wide.
+    ///
+    /// A delay inherited from a previous reading of the same meeting counts for
+    /// that floor exactly as a delay measured in this one does, and for nothing
+    /// else — see [`knowing_the_delay`](Self::knowing_the_delay).
     pub async fn judge<A: AudioSource>(&mut self, audio: &A, utterance: &Utterance) -> Verdict {
         // The computer's own channel is the *original*; there is nothing for it
         // to be a copy of.
@@ -433,7 +491,14 @@ impl OfflineBleed {
 
         let now_ms = utterance.t_end_ms;
         let voiced_ms = utterance.measured_voice_ms();
-        let warm = self.lag.is_warm(now_ms);
+        // Warm means "this recording's delay is known", from either of the two
+        // places it can be known from: measured by this pass, or measured by an
+        // earlier reading of the same audio and inherited through the
+        // withdrawal. Note that the inherited one does not expire the way
+        // [`LagEstimate`] does — `LAG_MEMORY_MS` guards a *search* that could be
+        // aimed at a delay the machine has since left behind, and nothing here
+        // is aimed at anything.
+        let warm = self.lag.is_warm(now_ms) || self.inherited_lag_ms.is_some();
 
         let stretch_ms = utterance.samples.len() as i64 / SAMPLES_PER_MS;
         let span_floor = if warm {
@@ -921,6 +986,71 @@ mod tests {
             meeting.reads(),
             0,
             "a stretch nothing can be said about was read"
+        );
+    }
+
+    /// A delay this meeting has already been measured to have lets the pass
+    /// judge a shorter stretch — and changes nothing else.
+    ///
+    /// The inheriting case is "listen again": the decision that measured the
+    /// delay has been withdrawn so those seconds get read afresh, and the
+    /// measurement stays behind for the pass doing the reading
+    /// (`db::repo::measured_lag_ms`). What it buys is the warm span floor, which
+    /// is what lets a two-and-a-half second copy be judged at all.
+    ///
+    /// What it must **not** buy is a narrower search, so the number inherited
+    /// here is deliberately nowhere near this meeting's true 180 ms: a search
+    /// seeded with it would be looking half a second away from the copy and
+    /// would find nothing. The verdict comes back with the true delay on it,
+    /// which is the assertion that the search stayed cold.
+    #[tokio::test]
+    async fn a_delay_this_meeting_already_measured_lowers_the_span_floor_and_nothing_else() {
+        let meeting = Meeting::new(59);
+        // Past MIN_SPAN_WARM_MS, short of MIN_SPAN_COLD_MS.
+        let short_copy = meeting.mic_utterance(20_000, 22_800);
+
+        let mut knows_nothing = OfflineBleed::over(&far_side_chunks(2)).expect("a far side");
+        assert_eq!(
+            knows_nothing.judge(&meeting, &short_copy).await,
+            Verdict::Undecided(TOO_SHORT),
+            "with nothing known about the delay, this stretch is too short to \
+             say anything about"
+        );
+
+        let mut inherited = OfflineBleed::over(&far_side_chunks(2))
+            .expect("a far side")
+            .knowing_the_delay(Some(680));
+        assert_eq!(inherited.inherited_lag_ms(), Some(680));
+        let verdict = inherited.judge(&meeting, &short_copy).await;
+        let Verdict::Bleed(evidence) = verdict else {
+            panic!("the same audio at the warm floor was not judged: {verdict:?}");
+        };
+        assert!(
+            (evidence.lag_ms - 180).abs() <= 40,
+            "the search was seeded rather than left cold: it came back with \
+             {} ms, not this meeting's own 180",
+            evidence.lag_ms
+        );
+
+        // A delay outside the search is not a measurement this pass could ever
+        // have made, so it is treated as no measurement rather than as
+        // evidence.
+        let mut nonsense = OfflineBleed::over(&far_side_chunks(2))
+            .expect("a far side")
+            .knowing_the_delay(Some(LAG_MAX_MS + 1));
+        assert_eq!(nonsense.inherited_lag_ms(), None);
+        assert_eq!(
+            nonsense.judge(&meeting, &short_copy).await,
+            Verdict::Undecided(TOO_SHORT)
+        );
+
+        // …and a meeting nothing was ever measured on is exactly as it was.
+        assert_eq!(
+            OfflineBleed::over(&far_side_chunks(2))
+                .expect("a far side")
+                .knowing_the_delay(None)
+                .inherited_lag_ms(),
+            None
         );
     }
 
