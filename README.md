@@ -1,7 +1,19 @@
-# Echo
+<p align="center">
+  <img src="docs/assets/echo-mark.png" alt="Echo" width="112" height="112">
+</p>
 
-Meeting transcripts, recaps and action items that never leave your computer.
-macOS on Apple Silicon and Linux on x86_64.
+<h1 align="center">Echo</h1>
+
+<p align="center">
+  Meeting transcripts, recaps and action items that never leave your computer.<br>
+  macOS on Apple Silicon and Linux on x86_64.
+</p>
+
+<p align="center">
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT-black" alt="MIT licensed"></a>
+  <img src="https://img.shields.io/badge/local--first-no%20telemetry-black" alt="Local first, no telemetry">
+  <img src="https://img.shields.io/badge/Tauri%202-Rust%20%2B%20React-black" alt="Tauri 2, Rust and React">
+</p>
 
 Echo records your microphone and what your computer plays, writes down what was
 said, works out who said it, and drafts a recap. The audio, the text and the
@@ -202,3 +214,20 @@ machine, either create such a certificate (Keychain Access → Certificate Assis
 Create a Certificate → type "Code Signing", name it "Echo Local Signing") or change
 `bundle.macOS.signingIdentity` to `"-"` and accept re-prompting during development.
 Proper Developer ID signing + notarization replaces this for distribution.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+The models Echo downloads at runtime are not covered by this licence and carry
+their own, recorded next to every entry in `src-tauri/src/asr/catalog.rs`:
+
+| Model | Licence |
+| --- | --- |
+| Whisper weights (OpenAI, GGML conversion by whisper.cpp) | MIT |
+| Silero VAD | MIT |
+| pyannote segmentation 3.0 (CNRS), ONNX export by sherpa-onnx | MIT |
+| WeSpeaker embeddings (wenet-e2e), ONNX export by sherpa-onnx | Apache-2.0 |
+
+Nothing is bundled in this repository. The app fetches what it needs on first run,
+pinned to an exact upstream revision and verified by hash.
