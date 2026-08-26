@@ -125,6 +125,10 @@ pub(crate) async fn run(
         // that the next pass starts without that answer.
         was_language = meeting.language.as_deref().unwrap_or("none"),
         language_cleared = cleared.language_cleared,
+        // Stretches a previous pass had decided were the computer's own audio
+        // coming back. They are judged again from the recording, because that
+        // is what "listen again" means.
+        spans_unmarked = cleared.spans_unmarked,
         duration_ms = meeting.duration_ms.max(committed),
         "listening to this meeting again from the recording"
     );

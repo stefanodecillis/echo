@@ -60,8 +60,8 @@
 use crate::asr::catchup::AudioSource;
 use crate::asr::AsrError;
 use crate::audio::bleed::{
-    covers_every_lag, envelope, examine_envelopes, is_bleed, LagEstimate, LagSearch, LAG_MAX_MS,
-    LAG_MIN_MS, MIN_SPAN_COLD_MS, MIN_SPAN_WARM_MS, MIN_SYSTEM_VOICE_MS,
+    covers_every_lag, envelope, examine_envelopes, is_bleed, BleedEvidence, LagEstimate, LagSearch,
+    LAG_MAX_MS, LAG_MIN_MS, MIN_SPAN_COLD_MS, MIN_SPAN_WARM_MS, MIN_SYSTEM_VOICE_MS,
 };
 use crate::audio::bleed_guard::{Verdict, NOT_ON_HAND, PART_ON_HAND, TOO_SHORT};
 use crate::audio::vad::{Utterance, MAX_UTTERANCE_MS};
@@ -372,7 +372,16 @@ impl OfflineBleed {
     /// [`Verdict::Undecided`] included, which is the whole of the safety
     /// argument: this pass declines far more often than it suppresses, and
     /// every decline costs a duplicated line rather than a lost sentence.
-    pub async fn suppresses<A: AudioSource>(&mut self, audio: &A, utterance: &Utterance) -> bool {
+    ///
+    /// The measurement comes back with the answer rather than being logged and
+    /// dropped, because the caller writes it down: a stretch left without text
+    /// gets a row saying why, so a later pass over the same meeting does not
+    /// judge these seconds a third time (`migrations/0007_suppressed_spans.sql`).
+    pub async fn suppresses<A: AudioSource>(
+        &mut self,
+        audio: &A,
+        utterance: &Utterance,
+    ) -> Option<BleedEvidence> {
         match self.judge(audio, utterance).await {
             Verdict::Bleed(evidence) => {
                 tracing::debug!(
@@ -386,9 +395,9 @@ impl OfflineBleed {
                     "this stretch of the microphone is the computer's own audio coming back; \
                      the transcript already has these words from the computer's own side"
                 );
-                true
+                Some(evidence)
             }
-            Verdict::Undecided(_) | Verdict::Pass => false,
+            Verdict::Undecided(_) | Verdict::Pass => None,
         }
     }
 
@@ -689,7 +698,8 @@ mod tests {
             assert!(
                 bleed
                     .suppresses(&meeting, &meeting.mic_utterance(from, to))
-                    .await,
+                    .await
+                    .is_some(),
                 "the stretch at {from} ms is the far side, late and quiet"
             );
         }
@@ -705,11 +715,10 @@ mod tests {
         // at all: the page the last stretch came out of, and the one before it.
         let before = meeting.reads();
         for (from, to) in [(88_000, 92_000), (62_500, 66_500)] {
-            assert!(
-                bleed
-                    .suppresses(&meeting, &meeting.mic_utterance(from, to))
-                    .await
-            );
+            assert!(bleed
+                .suppresses(&meeting, &meeting.mic_utterance(from, to))
+                .await
+                .is_some());
         }
         assert_eq!(meeting.reads(), before);
     }
@@ -730,6 +739,7 @@ mod tests {
             if bleed
                 .suppresses(&meeting, &meeting.mic_utterance(from, from + 3_200))
                 .await
+                .is_some()
             {
                 suppressed += 1;
             }

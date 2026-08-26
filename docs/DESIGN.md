@@ -87,6 +87,8 @@ meetings(id, title, started_at, ended_at, detected_app, language, status,
 audio_chunks(id, meeting_id, channel, seq, path, t_start_ms, t_end_ms, committed)
 segments(id, meeting_id, t_start_ms, t_end_ms, channel, speaker_id, text,
          language, avg_confidence, revision, is_final, corrections)  -- corrections = words put right against "Words Echo should know", JSON, NULL when untouched
+suppressed_spans(id, meeting_id, channel, t_start_ms, t_end_ms, reason, decided_by,
+                 correlation, lag_ms, system_voice_ms, created_at)  -- seconds heard and deliberately left without text (speaker bleed); the catch-up planner subtracts them, "listen again" clears them
 speakers(id, meeting_id, cluster_key, display_name, alias_of)  -- merge = alias, non-destructive
 markers(id, meeting_id, t_ms, kind, note)                       -- live "flag action item"
 summaries(id, meeting_id, template_id, template_snapshot, provider, model,

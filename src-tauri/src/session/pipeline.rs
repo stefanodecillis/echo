@@ -827,10 +827,17 @@ async fn feed_loop(
                 channel,
                 t_start_ms,
                 t_end_ms,
+                evidence,
             } => {
                 // These words are already going into the transcript from the
                 // computer's own side of the call, so there is nothing to
-                // decode and nothing to write: no engine, no row, no queue.
+                // decode: no engine, no queue.
+                //
+                // What *is* written is the decision itself — see
+                // [`remember_suppressed`]. Not text: a mark saying these
+                // seconds were heard and deliberately left alone, so the
+                // catch-up pass does not read them back and judge them a
+                // second time against audio it can align less well.
                 //
                 // `pending` is deliberately not touched. It counts utterances
                 // waiting for text, and a suppressed one never entered the
@@ -871,6 +878,15 @@ async fn feed_loop(
                         );
                     }
                 });
+                remember_suppressed(
+                    &inner,
+                    &meeting_id,
+                    channel,
+                    t_start_ms,
+                    t_end_ms,
+                    &evidence,
+                )
+                .await;
                 tracing::debug!(
                     ?channel,
                     t_start_ms,
@@ -919,6 +935,53 @@ async fn feed_loop(
     }
     // Closing the channel is what tells the speech task to drain and stop.
     drop(utterances);
+}
+
+/// Write down that these seconds were heard and deliberately left without text.
+///
+/// The row is not a transcript row and it is not a deletion: it is the record
+/// of a decision, with the measurement that produced it, so the catch-up pass
+/// can subtract these seconds from its plan instead of re-deriving the verdict
+/// from audio it aligns less well (`migrations/0007_suppressed_spans.sql`).
+///
+/// **A failure here is not worth interrupting a meeting over.** Losing the row
+/// puts exactly one stretch back to the behaviour of before: catch-up reads it,
+/// judges it again, and usually agrees. So it is logged and the recording goes
+/// on — the same call [`journal`] makes about the meeting length, and the
+/// opposite of the call it makes about a chunk, which is audio and cannot be
+/// re-derived from anything.
+async fn remember_suppressed(
+    inner: &Arc<Inner>,
+    meeting_id: &str,
+    channel: Channel,
+    t_start_ms: i64,
+    t_end_ms: i64,
+    evidence: &crate::audio::bleed::BleedEvidence,
+) {
+    if let Err(error) = repo::record_suppressed_span(
+        &inner.db,
+        meeting_id,
+        &repo::SuppressedSpan {
+            channel,
+            t_start_ms,
+            t_end_ms,
+            reason: repo::SuppressionReason::Bleed,
+            decided_by: repo::DecidedBy::Live,
+            correlation: Some(evidence.correlation),
+            lag_ms: Some(evidence.lag_ms),
+            system_voice_ms: Some(evidence.system_voice_ms),
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            %error,
+            t_start_ms,
+            t_end_ms,
+            "could not write down that this stretch was left alone; it will be read \
+             back and judged again when the meeting ends"
+        );
+    }
 }
 
 /// Journal a chunk as committed. The writer has already flushed and fsynced it,
@@ -2809,16 +2872,21 @@ mod tests {
     // The microphone's copy of what the computer played
     // -----------------------------------------------------------------------
 
-    /// The one thing this signal owes the person: **the half-written line goes
-    /// away.**
+    /// The two things this signal owes: **the half-written line goes away**, and
+    /// **the decision is written down.**
     ///
-    /// Without it a mic line that was suppressed sits in the transcript with no
-    /// text and no end for the rest of the meeting — which is a worse transcript
-    /// than the duplicated line suppression exists to remove. And the three
-    /// things it must *not* do: no engine, no row, and no arithmetic on a count
-    /// it never took part in.
+    /// Without the first, a mic line that was suppressed sits in the transcript
+    /// with no text and no end for the rest of the meeting — a worse transcript
+    /// than the duplicated line suppression exists to remove. Without the
+    /// second, the catch-up pass reads the same seconds back and judges them
+    /// again, which is the defect of 2026-08-26: six stretches decided live,
+    /// five of them decided the same way offline, and one duplicate in the
+    /// finished transcript.
+    ///
+    /// And the three things it must *not* do: no engine, no line of transcript,
+    /// and no arithmetic on a count it never took part in.
     #[tokio::test]
-    async fn a_suppressed_stretch_closes_its_line_and_writes_nothing() {
+    async fn a_suppressed_stretch_closes_its_line_and_writes_down_the_decision() {
         let h = crate::session::mock::Harness::new().await;
         let id = h.session.start(Default::default()).await.unwrap();
 
@@ -2840,6 +2908,13 @@ mod tests {
                 channel: Channel::Mic,
                 t_start_ms: 4_000,
                 t_end_ms: 12_000,
+                evidence: crate::audio::bleed::BleedEvidence {
+                    correlation: 0.86,
+                    lag_ms: 210,
+                    system_voice_ms: 6_400,
+                    unexplained_ms: 0,
+                    span_ms: 8_000,
+                },
             });
         h.settle().await;
 
@@ -2889,9 +2964,34 @@ mod tests {
         assert_eq!(
             written.len(),
             1,
-            "the suppressed stretch must not be in the database in any form"
+            "the suppressed stretch must not be in the transcript in any form"
         );
         assert_eq!((written[0].t_start_ms, written[0].t_end_ms), (0, 2_000));
+
+        // What *is* written is the decision, with the measurement behind it.
+        // This is the promise that changed on 2026-08-26: suppression used to
+        // write nothing at all, and the catch-up pass therefore read the same
+        // seconds back and judged them a second time — five times out of six it
+        // agreed, and the sixth became the duplicate line this row exists to
+        // prevent.
+        let marks = repo::list_suppressed_spans(&h.db, &id).await.unwrap();
+        assert_eq!(marks.len(), 1, "one decision, one row");
+        assert_eq!(
+            (marks[0].channel, marks[0].t_start_ms, marks[0].t_end_ms),
+            (Channel::Mic, 4_000, 12_000),
+            "the row covers exactly the seconds that were left alone"
+        );
+        assert_eq!(marks[0].reason, repo::SuppressionReason::Bleed);
+        assert_eq!(
+            marks[0].decided_by,
+            repo::DecidedBy::Live,
+            "which pass decided is the first thing anybody will ask"
+        );
+        // …and the evidence, so a person reading this database later can see
+        // why those seconds have no words rather than guess.
+        assert_eq!(marks[0].correlation, Some(0.86));
+        assert_eq!(marks[0].lag_ms, Some(210));
+        assert_eq!(marks[0].system_voice_ms, Some(6_400));
     }
 
     /// The other half of retiring that line: **it has to stay retired.**

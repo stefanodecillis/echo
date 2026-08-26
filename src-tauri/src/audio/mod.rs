@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::audio::bleed::LAG_MIN_MS;
+use crate::audio::bleed::{BleedEvidence, LAG_MIN_MS};
 use crate::audio::bleed_guard::{BleedGuard, Verdict};
 use crate::audio::clock::MeetingClock;
 use crate::audio::vad::{OpenSpeech, SpeechDetector, Utterance};
@@ -272,12 +272,23 @@ pub enum CaptureSignal {
     /// already going into the transcript from the computer's own side of the
     /// call ([`crate::audio::bleed`]).
     ///
-    /// It carries no audio, because there is nothing left to do with it: the
-    /// recording on disk is untouched, nothing is written to the database, and
-    /// the only thing the session layer owes it is retiring the half-written
-    /// line the live view has been showing. That is why the three fields are
-    /// exactly the three [`crate::session::pipeline`] needs to name that line
-    /// and close it, and not one more.
+    /// It carries no audio, because there is nothing left to decode: the
+    /// recording on disk is untouched and no text is written for these seconds.
+    /// Two things are owed instead — retiring the half-written line the live
+    /// view has been showing, which the first three fields name, and writing
+    /// down that the decision was made, which is what `evidence` is for.
+    ///
+    /// **The decision is recorded, and that is new.** It used to be that
+    /// suppression wrote nothing at all, on the reasoning that the catch-up
+    /// pass would reach the same verdict over the same audio and so the seconds
+    /// could simply be left blank. The live verification of 2026-08-26 measured
+    /// that: six stretches suppressed live, five of them suppressed again
+    /// offline, and the sixth written to the microphone channel as a duplicate
+    /// nobody said twice. The two passes do not always agree — the live one
+    /// judges against a ring on the meeting clock and a delay this machine has
+    /// already measured, the offline one reads paged audio off disk and always
+    /// searches cold — so the verdict is written down where the offline planner
+    /// can read it (`migrations/0007_suppressed_spans.sql`).
     ///
     /// **Suppression is deduplication, never deletion.** If it ever stops being
     /// that — a recording with no system channel, a system channel that is not
@@ -287,6 +298,10 @@ pub enum CaptureSignal {
         channel: Channel,
         t_start_ms: i64,
         t_end_ms: i64,
+        /// What the guard measured. Kept whole rather than flattened into three
+        /// numbers, so the row and the log line say the same thing the
+        /// correlator said.
+        evidence: BleedEvidence,
     },
     /// A look at speech that is *still going*, so the live view can show words
     /// while someone is still talking instead of only once they stop.
@@ -1282,6 +1297,7 @@ fn send_utterance(
                 channel: utterance.channel,
                 t_start_ms: utterance.t_start_ms,
                 t_end_ms: utterance.t_end_ms,
+                evidence,
             });
         }
         Verdict::Undecided(_) | Verdict::Pass => {
@@ -2060,9 +2076,18 @@ mod tests {
                 channel,
                 t_start_ms,
                 t_end_ms,
+                evidence,
             } => {
                 assert_eq!(*channel, Channel::Mic);
                 assert_eq!((*t_start_ms, *t_end_ms), (6_000, 14_000));
+                // The measurement travels with the verdict, because the session
+                // layer writes it down and a row that cannot say why it exists
+                // is worse than no row.
+                assert!(
+                    evidence.correlation >= crate::audio::bleed::BLEED_CORRELATION,
+                    "the signal carries the correlation that decided it: {evidence:?}"
+                );
+                assert!(evidence.span_ms > 0, "…and the span it was measured over");
             }
             other => panic!("the copy was offered for text: {other:?}"),
         }

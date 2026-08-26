@@ -933,6 +933,9 @@ pub struct ClearedTranscript {
     /// pass about to run will work it out again from the recording. False for a
     /// meeting that never settled on one.
     pub language_cleared: bool,
+    /// Stretches that a pass had decided not to transcribe
+    /// ([`SuppressedSpan`]) and that the next pass will therefore judge again.
+    pub spans_unmarked: u64,
     /// One past the revision the transcript was on, so anything watching can
     /// tell that what it holds is stale.
     ///
@@ -970,6 +973,16 @@ pub struct ClearedTranscript {
 ///   Clearing it in the same transaction means there is never a moment where
 ///   the words are gone and the language they were read in is still standing.
 ///
+/// * the marks that say a stretch was heard and deliberately left without text
+///   ([`SuppressedSpan`]) go too, in the same transaction. They are a decision
+///   about the audio, and "listen again" is a person asking for the audio to be
+///   decided again — the recording is still there to judge, and keeping the
+///   marks would mean one meeting's suppression outlived the transcript it was
+///   part of while a button on screen promised a fresh reading. The cost of
+///   being wrong this way round is a duplicated line, which is what the button
+///   is for; the cost the other way round is a sentence that can never come
+///   back.
+///
 /// Chunks, markers, summaries and action items are left exactly where they are.
 /// So is the person's own count of how many people were there: that is a fact
 /// about the meeting, not something read out of the audio.
@@ -992,6 +1005,11 @@ pub async fn clear_transcript(db: &Db, meeting_id: &str) -> Result<ClearedTransc
         .execute(&mut *tx)
         .await?
         .rows_affected();
+    let spans_unmarked = sqlx::query("DELETE FROM suppressed_spans WHERE meeting_id = ?1")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
     let language_cleared =
         sqlx::query("UPDATE meetings SET language = NULL WHERE id = ?1 AND language IS NOT NULL")
             .bind(meeting_id)
@@ -1005,6 +1023,7 @@ pub async fn clear_transcript(db: &Db, meeting_id: &str) -> Result<ClearedTransc
         segments_deleted: segments,
         speakers_deleted: speakers,
         language_cleared,
+        spans_unmarked,
         revision: previous.saturating_add(1),
     })
 }
@@ -1079,6 +1098,178 @@ pub async fn language_histogram(db: &Db, meeting_id: &str) -> Result<Vec<(String
     .fetch_all(db)
     .await?;
     Ok(rows)
+}
+
+// ===========================================================================
+// suppressed spans — seconds Echo heard and chose not to write down
+// ===========================================================================
+
+/// Why a stretch of a recording was deliberately left without text.
+///
+/// One variant today. It is an enum rather than a string because the column is
+/// read back by machines as well as people, and "which mechanism decided this"
+/// is not a thing to spell twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuppressionReason {
+    /// The microphone's copy of what the computer played, already in the
+    /// transcript from the computer's own side of the call
+    /// ([`crate::audio::bleed`]).
+    Bleed,
+}
+
+impl SuppressionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SuppressionReason::Bleed => "bleed",
+        }
+    }
+}
+
+/// Which pass made the call.
+///
+/// Recorded because the two passes disagreeing is exactly what this table was
+/// built out of (`migrations/0007_suppressed_spans.sql`): the live guard judges
+/// against a ring aligned to the meeting clock and a delay this machine has
+/// already measured, the offline one reads paged audio off disk and always
+/// searches cold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecidedBy {
+    /// The guard on the speech thread, while the meeting was happening.
+    Live,
+    /// The catch-up pass, reading the recording back afterwards.
+    CatchUp,
+}
+
+impl DecidedBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecidedBy::Live => "live",
+            DecidedBy::CatchUp => "catchup",
+        }
+    }
+}
+
+/// One decision not to transcribe a stretch, with the measurement behind it.
+///
+/// The evidence fields are `Option` because a future reason may not have any;
+/// bleed always does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SuppressedSpan {
+    pub channel: Channel,
+    pub t_start_ms: i64,
+    pub t_end_ms: i64,
+    pub reason: SuppressionReason,
+    pub decided_by: DecidedBy,
+    /// How well the two loudness shapes agreed at the best delay, -1.0 to 1.0.
+    pub correlation: Option<f32>,
+    /// That delay: how much the mic copy was late relative to the system copy.
+    pub lag_ms: Option<i64>,
+    /// Milliseconds of the stretch where the far side was audibly playing.
+    pub system_voice_ms: Option<i64>,
+}
+
+/// Write down that these seconds were heard and deliberately left alone.
+///
+/// Backwards or empty spans are refused rather than stored: a mark with no
+/// width covers no audio and would only ever be a puzzle for whoever reads the
+/// table next.
+pub async fn record_suppressed_span(
+    db: &Db,
+    meeting_id: &str,
+    span: &SuppressedSpan,
+) -> Result<Id, DbError> {
+    if span.t_end_ms <= span.t_start_ms {
+        return Err(DbError::Invalid(format!(
+            "suppressed span {}..{} has no width",
+            span.t_start_ms, span.t_end_ms
+        )));
+    }
+    let id = new_id();
+    sqlx::query(
+        "INSERT INTO suppressed_spans
+             (id, meeting_id, channel, t_start_ms, t_end_ms, reason, decided_by,
+              correlation, lag_ms, system_voice_ms, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )
+    .bind(&id)
+    .bind(meeting_id)
+    .bind(span.channel.as_str())
+    .bind(span.t_start_ms)
+    .bind(span.t_end_ms)
+    .bind(span.reason.as_str())
+    .bind(span.decided_by.as_str())
+    .bind(span.correlation)
+    .bind(span.lag_ms)
+    .bind(span.system_voice_ms)
+    .bind(now())
+    .execute(db)
+    .await?;
+    Ok(id)
+}
+
+/// The stretches of this channel a pass already decided not to transcribe, as
+/// merged spans on the meeting clock.
+///
+/// The catch-up planner subtracts these alongside the stretches that have text
+/// against them ([`crate::asr::catchup`]), which is the whole point of the
+/// table: a decision made once against better-aligned audio is not re-litigated
+/// against worse.
+pub async fn suppressed_spans(
+    db: &Db,
+    meeting_id: &str,
+    channel: Channel,
+) -> Result<Vec<(i64, i64)>, DbError> {
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT t_start_ms, t_end_ms FROM suppressed_spans
+         WHERE meeting_id = ?1 AND channel = ?2 AND t_end_ms > t_start_ms
+         ORDER BY t_start_ms",
+    )
+    .bind(meeting_id)
+    .bind(channel.as_str())
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
+}
+
+/// Everything this meeting had marked, newest first — the diagnostic read, for
+/// a person asking why a stretch of their recording has no words in it.
+pub async fn list_suppressed_spans(
+    db: &Db,
+    meeting_id: &str,
+) -> Result<Vec<SuppressedSpan>, DbError> {
+    let rows = sqlx::query(
+        "SELECT channel, t_start_ms, t_end_ms, reason, decided_by,
+                correlation, lag_ms, system_voice_ms
+         FROM suppressed_spans WHERE meeting_id = ?1 ORDER BY t_start_ms",
+    )
+    .bind(meeting_id)
+    .fetch_all(db)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let channel: String = row.try_get("channel")?;
+            let reason: String = row.try_get("reason")?;
+            let decided_by: String = row.try_get("decided_by")?;
+            Ok(SuppressedSpan {
+                channel: Channel::parse(&channel)
+                    .ok_or_else(|| DbError::Invalid(format!("channel {channel}")))?,
+                t_start_ms: row.try_get("t_start_ms")?,
+                t_end_ms: row.try_get("t_end_ms")?,
+                reason: match reason.as_str() {
+                    "bleed" => SuppressionReason::Bleed,
+                    other => return Err(DbError::Invalid(format!("suppression reason {other}"))),
+                },
+                decided_by: match decided_by.as_str() {
+                    "live" => DecidedBy::Live,
+                    "catchup" => DecidedBy::CatchUp,
+                    other => return Err(DbError::Invalid(format!("decided by {other}"))),
+                },
+                correlation: row.try_get("correlation")?,
+                lag_ms: row.try_get("lag_ms")?,
+                system_voice_ms: row.try_get("system_voice_ms")?,
+            })
+        })
+        .collect()
 }
 
 // ===========================================================================
@@ -4311,6 +4502,24 @@ mod tests {
         .await
         .unwrap();
 
+        // A stretch a pass heard and deliberately left without text.
+        record_suppressed_span(
+            &db,
+            &m.id,
+            &SuppressedSpan {
+                channel: Channel::Mic,
+                t_start_ms: 4_000,
+                t_end_ms: 12_000,
+                reason: SuppressionReason::Bleed,
+                decided_by: DecidedBy::Live,
+                correlation: Some(0.91),
+                lag_ms: Some(210),
+                system_voice_ms: Some(7_400),
+            },
+        )
+        .await
+        .unwrap();
+
         let cleared = clear_transcript(&db, &m.id).await.unwrap();
         assert_eq!(cleared.segments_deleted, 1);
         assert_eq!(cleared.speakers_deleted, 2, "the alias row goes too");
@@ -4361,6 +4570,82 @@ mod tests {
             (4, true),
             "how many people were here is the person's answer, not the pass's"
         );
+    }
+
+    /// The record that says "Echo heard this and chose not to write it down
+    /// twice", which is a different claim from "Echo never heard it".
+    ///
+    /// It has to survive being read back — the catch-up planner subtracts these
+    /// spans from its work — it has to be per channel, and it has to go when
+    /// the transcript goes, because "listen again" is a person asking for the
+    /// recording to be judged afresh.
+    #[tokio::test]
+    async fn a_decision_not_to_transcribe_is_kept_with_its_evidence_and_cleared_with_the_words() {
+        let db = connect_in_memory().await.unwrap();
+        let m = create_meeting(&db, "Bleed", "/audio", None).await.unwrap();
+
+        for (channel, from_ms, to_ms) in [
+            (Channel::Mic, 4_000, 12_000),
+            (Channel::Mic, 20_000, 26_000),
+            (Channel::System, 40_000, 44_000),
+        ] {
+            record_suppressed_span(
+                &db,
+                &m.id,
+                &SuppressedSpan {
+                    channel,
+                    t_start_ms: from_ms,
+                    t_end_ms: to_ms,
+                    reason: SuppressionReason::Bleed,
+                    decided_by: DecidedBy::CatchUp,
+                    correlation: Some(0.83),
+                    lag_ms: Some(210),
+                    system_voice_ms: Some(to_ms - from_ms),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            suppressed_spans(&db, &m.id, Channel::Mic).await.unwrap(),
+            vec![(4_000, 12_000), (20_000, 26_000)],
+            "in clock order, and only this channel's"
+        );
+        assert_eq!(
+            suppressed_spans(&db, &m.id, Channel::System).await.unwrap(),
+            vec![(40_000, 44_000)]
+        );
+        let all = list_suppressed_spans(&db, &m.id).await.unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].decided_by, DecidedBy::CatchUp);
+        assert_eq!(all[0].reason, SuppressionReason::Bleed);
+        assert_eq!(all[0].correlation, Some(0.83));
+        assert_eq!(all[0].lag_ms, Some(210));
+
+        // A mark with no width covers no audio and would only ever be a puzzle.
+        assert!(matches!(
+            record_suppressed_span(
+                &db,
+                &m.id,
+                &SuppressedSpan {
+                    channel: Channel::Mic,
+                    t_start_ms: 5_000,
+                    t_end_ms: 5_000,
+                    reason: SuppressionReason::Bleed,
+                    decided_by: DecidedBy::Live,
+                    correlation: None,
+                    lag_ms: None,
+                    system_voice_ms: None,
+                },
+            )
+            .await,
+            Err(DbError::Invalid(_))
+        ));
+
+        let cleared = clear_transcript(&db, &m.id).await.unwrap();
+        assert_eq!(cleared.spans_unmarked, 3);
+        assert!(list_suppressed_spans(&db, &m.id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
