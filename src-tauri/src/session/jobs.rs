@@ -22,7 +22,7 @@ use futures::future::BoxFuture;
 use tokio::sync::Notify;
 
 use crate::db::{repo, Db, DbError};
-use crate::events::{JobProgressPayload, NoticeLevel};
+use crate::events::{JobProgressPayload, NoticeLevel, NoticePayload};
 use crate::paths::AppPaths;
 use crate::session::ports::{AsrPort, EventBus, EventSink, Ports, UiEvent};
 use crate::types::{Channel, Id, Job, JobKind, JobQuery, JobStatus, MeetingStatus, SummaryReq};
@@ -163,6 +163,11 @@ pub fn label_for(kind: JobKind) -> &'static str {
         // would stop being true halfway through.
         JobKind::Download => "Setting up what Echo needs to understand speech…",
         JobKind::Mixdown => "Getting the recording ready to play back…",
+        // Deliberately not "loading" and not "compiling". What is happening is
+        // that a new set of weights is being made ready for this particular
+        // machine, once; what a person needs to know is that Echo is not able
+        // to write anything down until it finishes.
+        JobKind::PrepareEngine => "Getting Echo ready to understand speech…",
     }
 }
 
@@ -178,6 +183,9 @@ pub struct Progress {
     last: std::sync::Mutex<Option<Instant>>,
     /// Where the job already was. Resumed work never appears to go backwards.
     floor: f32,
+    /// The stage written on the row right now, so the first fraction after one
+    /// knows there is something to take back off it.
+    stage: tokio::sync::Mutex<Option<crate::events::JobPhase>>,
 }
 
 impl Progress {
@@ -189,12 +197,19 @@ impl Progress {
             events,
             last: std::sync::Mutex::new(None),
             floor,
+            stage: tokio::sync::Mutex::new(None),
         }
     }
 
     /// 0.0..=1.0. The ends always go through; the middle is capped.
     pub async fn set(&self, value: f32) {
         let value = value.clamp(0.0, 1.0).max(self.floor);
+        // A number to report means the stage is over — the catch-up job waits
+        // for the engine and then gets on with its own work. Taken off the row
+        // before the rate cap can turn this call into a no-op, because a
+        // sentence about a one-time setup left standing over a moving bar is a
+        // lie the same size as the missing one the column was added to fix.
+        self.leave_stage().await;
         let forced = value <= 0.0 || value >= 1.0;
         if !forced && !self.due() {
             return;
@@ -205,28 +220,54 @@ impl Progress {
         let mut job = self.job.clone();
         job.status = JobStatus::Running;
         job.progress = Some(value);
+        job.phase = None;
         self.events.emit(UiEvent::JobProgress(JobProgressPayload {
             label: Some(label_for(job.kind).to_string()),
             job,
-            phase: None,
         }));
     }
 
     /// This job has moved on to a stage of its own, with no fraction to report.
     ///
     /// Progress in the table is left exactly where it was — the stage is a fact
-    /// about now, not a rewind — but the event carries no number, because there
-    /// is no honest one to carry and a bar frozen at 100% for a quarter of an
-    /// hour reads as broken.
-    pub fn phase(&self, phase: crate::events::JobPhase) {
+    /// about now, not a rewind — but nothing carries a number, because there is
+    /// no honest one to carry and a bar frozen at 100% for a quarter of an hour
+    /// reads as broken.
+    ///
+    /// Written to the row as well as announced. The announcement is one moment;
+    /// the stage it describes can last a quarter of an hour, and the screen that
+    /// has to show it may not exist yet when the moment passes (the setup job is
+    /// queued at launch, before the window has finished loading). The row is
+    /// what any screen mounting later reads.
+    pub async fn phase(&self, phase: crate::events::JobPhase) {
+        if let Err(error) = repo::set_job_phase(&self.db, &self.job.id, Some(phase)).await {
+            // Back to what it was before: the announcement below still reaches
+            // whoever is listening now, and only a screen opened later loses the
+            // sentence.
+            tracing::warn!(%error, job = %self.job.id, "could not store what this work is doing");
+        }
+        *self.stage.lock().await = Some(phase);
         let mut job = self.job.clone();
         job.status = JobStatus::Running;
         job.progress = None;
+        job.phase = Some(phase);
         self.events.emit(UiEvent::JobProgress(JobProgressPayload {
             label: Some(phase_label_for(phase).to_string()),
             job,
-            phase: Some(phase),
         }));
+    }
+
+    /// Take the stage back off the row, if it is wearing one.
+    async fn leave_stage(&self) {
+        let mut stage = self.stage.lock().await;
+        if stage.is_none() {
+            return;
+        }
+        if let Err(error) = repo::set_job_phase(&self.db, &self.job.id, None).await {
+            tracing::warn!(%error, job = %self.job.id, "could not clear what this work was doing");
+            return;
+        }
+        *stage = None;
     }
 
     fn due(&self) -> bool {
@@ -287,6 +328,7 @@ impl JobExecutor for DefaultJobExecutor {
                 JobKind::Summarize => summarize(ctx).await,
                 JobKind::Mixdown => mixdown(ctx).await,
                 JobKind::Download => download(ctx).await,
+                JobKind::PrepareEngine => prepare_engine(ctx).await,
                 // Exports run straight from the command that asked for one;
                 // nothing queues them.
                 JobKind::Export => {
@@ -349,7 +391,16 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
     // fraction to report. Named as its own stage, because "Catching up on the
     // transcript" over a still bar is what a person read for eighteen minutes
     // while this was what was happening (field report of 2026-08-21).
-    ctx.progress.phase(crate::events::JobPhase::PreparingEngine);
+    //
+    // Only when it really is not up, though. After an ordinary meeting the
+    // weights are still in memory and this returns in microseconds, and
+    // announcing a stage for that puts a pill on screen that blinks once at the
+    // end of every meeting for no reason anybody could name.
+    if !ctx.asr.is_loaded() {
+        ctx.progress
+            .phase(crate::events::JobPhase::PreparingEngine)
+            .await;
+    }
     if let Err(error) = ctx.asr.prewarm().await {
         return Err(asr_failure(&ctx.cancel, error));
     }
@@ -389,27 +440,139 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
     // dropped mid-meeting is *behind* the end of the transcript, and the two
     // channels reach different lengths, so "carry on from where the text ends"
     // would lose words that are sitting on disk (mantra 3).
-    let written = ctx
+    let pass = ctx
         .asr
         .catch_up(&ctx.db, &meeting_id, None, control)
         .await
         .map_err(|e| asr_failure(&ctx.cancel, e));
     let _ = drain.await;
-    let written = written?;
+    // Nothing below this line may run for a pass that did not finish, and the
+    // `?` is what enforces it. On 2026-08-24 the pass came back `Ok` after a
+    // recording cut it short: the code below cleared the live text for stretches
+    // that were never read back, set progress to 1.0, and the row went down as
+    // done. The meeting was left 69.4% transcribed and nothing said so. A
+    // cancellation is an error now, and a preempted job is parked instead —
+    // `release()` puts it back in the queue and the next pass reads the holes
+    // this one did not get to.
+    let pass = pass?;
 
-    // Live partials are superseded now.
-    if let Err(error) = repo::delete_partial_segments(&ctx.db, &meeting_id).await {
+    // Live partials are superseded now — except over stretches this pass could
+    // not read, where nothing superseded them (see
+    // [`repo::delete_partial_segments_except`]).
+    //
+    // Worth being exact about what this can spare, because a sentence below
+    // used to promise more than it can: a live guess reaches the screen as an
+    // announcement and reaches the database only once its words have settled,
+    // so nothing this app writes today leaves an unfinished row behind. The
+    // sweep is a guard against rows an older build could have left, never a
+    // source of text for a stretch that would not read — those seconds had no
+    // text of any kind, which is exactly why the pass was sent at them.
+    let unread: Vec<(Channel, i64, i64)> = pass.unread_merged();
+    if let Err(error) = repo::delete_partial_segments_except(&ctx.db, &meeting_id, &unread).await {
         tracing::debug!(%error, "could not clear live text");
     }
     if let Ok(hist) = repo::language_histogram(&ctx.db, &meeting_id).await {
-        if let Some((language, _)) = hist.first() {
-            let _ = repo::set_meeting_language(&ctx.db, &meeting_id, language).await;
+        // Most speaking time wins, but a language holding a sliver of the
+        // transcript never does — one sentence misread as Chinese is not what
+        // the meeting was in (see [`crate::asr::language::spoken_in`]).
+        if let Some(language) = crate::asr::language::spoken_in(&hist).dominant {
+            let _ = repo::set_meeting_language(&ctx.db, &meeting_id, &language).await;
         }
     }
 
-    tracing::info!(meeting = %meeting_id, written, "catch-up finished");
+    let unread_ms = pass.unread_ms();
+    tracing::info!(
+        meeting = %meeting_id,
+        written = pass.segments_written,
+        unread = pass.unread.len(),
+        unread_ms,
+        "catch-up finished"
+    );
+    // A pass that finished with holes in it is still a pass that finished: the
+    // job goes down as done at full progress, because it did everything it can
+    // do. What must not happen is that being the whole of the story — the
+    // stretch that would not read is the one the app promised to fill in when
+    // the meeting ended, and a promise that failed is said out loud.
+    if let Some(notice) = unread_stretch_notice(&meeting_id, unread_ms) {
+        tracing::warn!(
+            meeting = %meeting_id,
+            unread = pass.unread.len(),
+            unread_ms,
+            "part of this recording would not read back and has no words against it"
+        );
+        ctx.events.emit(UiEvent::Notice(notice));
+    }
     ctx.progress.set(1.0).await;
     Ok(())
+}
+
+/// Say it out loud when a finished catch-up pass left part of the recording
+/// unread — and say nothing at all otherwise.
+///
+/// The pass is allowed to give up on a window: it asks the engine twice and
+/// carries on rather than abandoning the rest of the meeting. What it is not
+/// allowed to do is give up quietly. Those seconds are exactly the ones the app
+/// promised to come back for — "Echo will fill in the rest when the meeting
+/// ends" — so when it cannot, the person hears it rather than finding a gap
+/// months later.
+///
+/// It used to end "The live text from then is still here", and that was not
+/// true. The pass is sent at the stretches of the recording that have **no**
+/// text against them — that is how its work is planned — so a window it could
+/// not read is a window over seconds nothing had ever written down. Saying the
+/// rough text survived, on top of a transcript that reads there exactly like
+/// one where nobody spoke, is a false explanation for a real hole: the closing
+/// move of the 2026-08-21 incident, in a different place.
+///
+/// Persistent, for the reason the ending of a lost recording is (see
+/// `session::recovery::ending_notice`): nothing else on any screen marks those
+/// seconds. The transcript is silent there, the left-out card on the same tab
+/// is about a different decision entirely, and a pass finishes minutes after
+/// somebody has walked away from the meeting that queued it. A toast that
+/// fades in four seconds is a quieter kind of silence.
+fn unread_stretch_notice(meeting_id: &str, unread_ms: i64) -> Option<NoticePayload> {
+    if unread_ms <= 0 {
+        return None;
+    }
+    Some(NoticePayload {
+        level: NoticeLevel::Warning,
+        message: unread_stretch_message(unread_ms),
+        persistent: true,
+        meeting_id: Some(meeting_id.to_string()),
+        // One meeting, one such message: reading it again replaces the sentence
+        // rather than stacking a second copy of it.
+        tag: Some("someOfItUnread".into()),
+    })
+}
+
+/// What Echo says when it could not read part of a recording back.
+///
+/// Rounded up to the nearest minute, and never below "less than a minute": the
+/// exact figure is a sum of window spans, which is precise about the wrong
+/// thing — a person wants to know whether to go back and listen, and "about 3
+/// minutes" answers that while "2 minutes 47 seconds" pretends to an accuracy
+/// this number does not have. Up rather than down, because rounding a shortfall
+/// down is the direction that flatters Echo.
+///
+/// The second sentence is the one useful thing left to say: the words are gone
+/// but the audio is not, so the meeting can be listened to, or read again from
+/// its own screen. It does not name the button that does the reading — that
+/// name lives with the button, and a copy of it here is a copy that can drift.
+fn unread_stretch_message(unread_ms: i64) -> String {
+    // `div_ceil` on a signed integer is not settled in the compiler this builds
+    // on, and rounding up is one line of arithmetic.
+    let how_much = if unread_ms < 60_000 {
+        "less than a minute".to_string()
+    } else {
+        match (unread_ms + 59_999) / 60_000 {
+            1 => "about a minute".to_string(),
+            minutes => format!("about {minutes} minutes"),
+        }
+    };
+    format!(
+        "Echo couldn't read {how_much} of this recording back, so that part of the \
+         transcript has no words in it. The recording itself is still here."
+    )
 }
 
 async fn diarize(ctx: &JobContext) -> Result<(), JobFailure> {
@@ -457,16 +620,19 @@ async fn diarize(ctx: &JobContext) -> Result<(), JobFailure> {
     let result = outcome.map_err(|error| diarize_failure(&ctx.cancel, error))?;
 
     let _ = repo::recompute_speaking_time(&ctx.db, &meeting_id).await;
-    ctx.events.emit(UiEvent::SpeakersUpdated(
-        crate::events::SpeakersUpdatedPayload {
-            meeting_id: meeting_id.clone(),
-            speakers: result.speakers.clone(),
-            // The pass has just decided this, so it comes from the pass rather
-            // than from a second query that could disagree with it.
-            people_count: result.people_count,
-            people_count_is_override: result.people_count_is_override,
-        },
-    ));
+    ctx.events.emit(UiEvent::SpeakersUpdated(speakers_event(
+        &meeting_id,
+        &result,
+    )));
+    if let Some(notice) = voices_short_notice(&meeting_id, &result) {
+        tracing::info!(
+            meeting = %meeting_id,
+            asked = ?result.voices_asked,
+            found = result.voices_found,
+            "the meeting holds fewer separable voices than the count asks for"
+        );
+        ctx.events.emit(UiEvent::Notice(notice));
+    }
     // The pass is the one thing that changes the remembered voices without
     // anybody clicking: it links a voice (so somebody was "last heard" just
     // now), and it re-embeds a profile the network moved on from (so the quiet
@@ -499,6 +665,67 @@ async fn diarize(ctx: &JobContext) -> Result<(), JobFailure> {
     }
     ctx.progress.set(1.0).await;
     Ok(())
+}
+
+/// The speaker rows the pass just wrote, as the event every open view reads.
+///
+/// Straight off the pass rather than out of a second query, so the chips and
+/// the number beside them cannot disagree.
+fn speakers_event(
+    meeting_id: &str,
+    result: &crate::diarize::DiarizationResult,
+) -> crate::events::SpeakersUpdatedPayload {
+    crate::events::SpeakersUpdatedPayload {
+        meeting_id: meeting_id.to_string(),
+        speakers: result.speakers.clone(),
+        people_count: result.people_count,
+        people_count_is_override: result.people_count_is_override,
+        voices_found: Some(result.voices_found),
+        alternative_count: result
+            .choice
+            .as_ref()
+            .and_then(|choice| choice.runner_up.map(|(count, _)| count as u32)),
+    }
+}
+
+/// Say it out loud when the recording does not hold as many separable voices as
+/// the person asked for — and say nothing at all otherwise.
+///
+/// Echo used to answer a shortfall by making the difference up in empty speaker
+/// rows, which the person then met in the naming dialog as voices with nothing
+/// behind them (2026-08-24). The number they typed is left exactly as it is:
+/// they were in the meeting and Echo was not, so this states what Echo can hear
+/// and asks for nothing.
+fn voices_short_notice(
+    meeting_id: &str,
+    result: &crate::diarize::DiarizationResult,
+) -> Option<NoticePayload> {
+    let asked = result.voices_asked?;
+    if result.voices_found >= asked {
+        return None;
+    }
+    Some(NoticePayload {
+        level: NoticeLevel::Info,
+        message: voices_short_message(result.voices_found),
+        persistent: false,
+        meeting_id: Some(meeting_id.to_string()),
+        // One meeting, one such message: a re-run replaces it rather than
+        // stacking a second copy of the same sentence.
+        tag: Some("voicesShort".into()),
+    })
+}
+
+/// What Echo says when it could not find as many voices as it was asked for.
+///
+/// "Distinct" is doing the work — it says the voices are in there and Echo
+/// cannot tell them apart, which is the true shape of the problem on a
+/// recording of a room. No jargon, no exclamation mark, nothing to press.
+fn voices_short_message(found: u32) -> String {
+    match found {
+        0 => "Echo can't tell any voices apart in this recording.".into(),
+        1 => "Echo can only hear one voice clearly in this recording.".into(),
+        n => format!("Echo can only hear {n} distinct voices in this recording."),
+    }
 }
 
 fn diarize_failure(cancel: &Cancel, error: crate::diarize::DiarizeError) -> JobFailure {
@@ -844,11 +1071,144 @@ async fn download(ctx: &JobContext) -> Result<(), JobFailure> {
     // Announced as its own stage first. Everything above this line has a
     // fraction; nothing below it does, and the eighteen minutes are all below
     // it (field report of 2026-08-21).
-    ctx.progress.phase(crate::events::JobPhase::PreparingEngine);
+    ctx.progress
+        .phase(crate::events::JobPhase::PreparingEngine)
+        .await;
     if let Err(error) = ctx.asr.prewarm().await {
         tracing::warn!(%error, "the new weights did not load on the first attempt");
     }
 
+    ctx.progress.set(1.0).await;
+    Ok(())
+}
+
+/// What a setup row that was interrupted by the process going down is left
+/// saying. Not jargon and not a diagnosis: nobody can be told what killed the
+/// app from inside the app that was killed.
+pub(crate) const SETUP_INTERRUPTED: &str =
+    "Echo closed while it was getting ready to understand speech.";
+
+/// Whether the record of an attempt at the one-time setup should be taken back,
+/// given how the load ended and how long it lasted.
+///
+/// Pure, because this is the rule the whole one-attempt policy turns on and it
+/// is worth being able to read on its own.
+///
+/// * a load that ground away and *then* failed is what the marker exists for.
+///   Something on this machine cannot finish that compile, and starting it again
+///   at every launch would cost a quarter of an hour a time and get no further.
+/// * a load that failed inside the time an ordinary load takes never reached the
+///   compile — there were no weights where they should be, the disk was full for
+///   a moment, the engine would not initialise. Nothing was protected by
+///   remembering it, and remembering it would leave this machine unwarmed for
+///   good on the strength of one bad second.
+/// * a recording taking the machine is not a failure at all: the row is parked
+///   and comes back to finish what it started.
+///
+/// The half-minute is [`crate::asr::engine::LIKELY_COMPILED_AT`], the same line
+/// the engine draws between a compile and a slow disk.
+fn attempt_is_worth_forgetting(outcome: &JobFailure, spent: std::time::Duration) -> bool {
+    matches!(outcome, JobFailure::Failed(_)) && spent < crate::asr::engine::LIKELY_COMPILED_AT
+}
+
+/// The one-time setup a set of weights needs on this machine, paid on purpose
+/// and in the open instead of by the next meeting that happens to start.
+///
+/// Queued by [`crate::session::SessionManager::ensure_speech_current`] when the
+/// weights that are serving have never been through a load here — which is how
+/// a model that arrived without a download job (a restore, a copy between
+/// machines, an out-of-band unpack) got as far as a real meeting on 2026-08-24
+/// and spent its first sixteen minutes compiling.
+async fn prepare_engine(ctx: &JobContext) -> Result<(), JobFailure> {
+    // Which weights this row is for travels with it. A row that has outlived a
+    // catalog change asks the disk again rather than recording an attempt
+    // against a name nothing will ever load.
+    let requested: Option<String> = repo::get_job_payload(&ctx.db, &ctx.job.id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<String>(&raw).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    let file_name = match requested {
+        Some(name) => Some(name),
+        None => crate::asr::models::installed_speech_file_name(&ctx.db)
+            .await
+            .unwrap_or(None),
+    };
+    let Some(file_name) = file_name else {
+        // Nothing installed to get ready. Not a failure: the download job is
+        // what this install is waiting for, and it warms the weights itself.
+        tracing::info!("nothing to get ready yet: there are no speech weights installed");
+        ctx.progress.set(1.0).await;
+        return Ok(());
+    };
+
+    // Recorded *before* the load, never after. The compile inside it is minutes
+    // of heavy work, and anything that takes the process down in the middle of
+    // it would otherwise be repeated at every launch for as long as it keeps
+    // happening — see `models::mark_warm_attempted`. What the attempt turns out
+    // to have cost decides whether it is kept; that is settled below, once the
+    // load has come back one way or the other.
+    if let Err(error) = crate::asr::models::mark_warm_attempted(&ctx.db, &file_name).await {
+        // Costs a repeat of this job at the next launch, nothing more.
+        tracing::debug!(%error, "could not remember that the one-time setup was started");
+    }
+
+    // Everything from here has no fraction to report, so it says what it is
+    // instead of leaving a bar somewhere it will sit for a quarter of an hour.
+    ctx.progress
+        .phase(crate::events::JobPhase::PreparingEngine)
+        .await;
+    tracing::info!(model = %file_name, "getting the speech engine ready for this machine");
+
+    // No cancel check around the load, and none after it, on purpose.
+    //
+    // The only thing that interrupts this job is a recording starting, and a
+    // recording needs exactly the load that is already in flight: the engine
+    // runs one load on one thread, so a meeting that preempted this would queue
+    // behind the very compile it just abandoned the row for, and arrive no
+    // sooner. Parking the row would only mean doing the bookkeeping twice, and
+    // leaving it half-marked. Sixteen minutes is sixteen minutes whoever is
+    // waiting for it (incident of 2026-08-24); the difference this job makes is
+    // that nobody is in a meeting while they pass.
+    let started = std::time::Instant::now();
+    if let Err(error) = ctx.asr.prewarm().await {
+        let failure = asr_failure(&ctx.cancel, error);
+        let spent = started.elapsed();
+        let spent_ms = spent.as_millis() as u64;
+        // What the attempt cost decides whether it stands — see
+        // `attempt_is_worth_forgetting`, which is that rule and nothing else.
+        if attempt_is_worth_forgetting(&failure, spent) {
+            if let Err(error) = crate::asr::models::forget_warm_attempt(&ctx.db, &file_name).await {
+                tracing::debug!(%error, "could not take back the record of the attempt");
+            }
+            tracing::warn!(
+                model = %file_name,
+                spent_ms,
+                "getting the speech engine ready failed before it had started; the next launch \
+                 will try again"
+            );
+        } else if matches!(failure, JobFailure::Failed(_)) {
+            tracing::warn!(
+                model = %file_name,
+                spent_ms,
+                "getting the speech engine ready did not finish; it will not be started again on \
+                 its own"
+            );
+        } else {
+            // Stopped rather than failed: the row is parked or cancelled, and
+            // the attempt it recorded stands for whenever it picks back up.
+            tracing::info!(
+                model = %file_name,
+                spent_ms,
+                "getting the speech engine ready stopped short"
+            );
+        }
+        return Err(failure);
+    }
+
+    tracing::info!(model = %file_name, "the speech engine is ready for this machine");
     ctx.progress.set(1.0).await;
     Ok(())
 }
@@ -950,6 +1310,19 @@ pub struct JobRuntime {
     running: std::sync::Mutex<Option<(Id, Cancel)>>,
     /// A recording owns the machine.
     blocked: AtomicBool,
+    /// Held while who owns the machine changes, and while the row of a job a
+    /// recording stopped is written.
+    ///
+    /// [`JobRuntime::blocked`] is what decides between `paused` and `queued` for
+    /// such a job, and under this lock the read of the flag and the row that
+    /// follows from it cannot be split by a `release()` landing in between. That
+    /// split is the whole of the 2026-08-26 stall: a job already back in the
+    /// queue was written straight back to `paused`, where nothing un-parks it
+    /// (see [`JobRuntime::park_for_a_recording`]).
+    ///
+    /// Nothing slow happens under it — a flag and one statement — and no other
+    /// lock is taken while it is held.
+    parking: tokio::sync::Mutex<()>,
     /// Asked "is a capture live right now?" once the session spine has wired
     /// itself up.
     ///
@@ -958,6 +1331,11 @@ pub struct JobRuntime {
     /// something to hang on a flag (review of 2026-08-20, finding 2). This asks
     /// the capture state machine, which is the fact itself.
     capturing: std::sync::Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    /// Asked "does Echo think a meeting is happening right now?" — the third
+    /// fact the tray rule needs, and the only one that lives outside this
+    /// runtime and the capture state machine. Asked, never remembered, for the
+    /// same reason as [`JobRuntime::capturing`].
+    detecting: std::sync::Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
     stopped: AtomicBool,
     started: AtomicBool,
     wake: Notify,
@@ -971,7 +1349,9 @@ impl JobRuntime {
             ports,
             running: std::sync::Mutex::new(None),
             blocked: AtomicBool::new(false),
+            parking: tokio::sync::Mutex::new(()),
             capturing: std::sync::Mutex::new(None),
+            detecting: std::sync::Mutex::new(None),
             stopped: AtomicBool::new(false),
             started: AtomicBool::new(false),
             wake: Notify::new(),
@@ -1007,8 +1387,12 @@ impl JobRuntime {
         let job = repo::ensure_job_with_payload(&self.db, meeting_id, kind, payload).await?;
         self.announce(&job);
         // Work for a meeting is a reason to keep the speech engine, whether or
-        // not this loop gets to it in the next second.
+        // not this loop gets to it in the next second — and a reason for the
+        // menu bar to say so. This is also the edge that starts the working
+        // icon for every path that finishes a meeting: a normal stop, an
+        // interrupted meeting being picked back up, a transcript being redone.
         self.refresh_engine_residency().await;
+        self.refresh_tray_state().await;
         self.wake.notify_one();
         Ok(job)
     }
@@ -1017,6 +1401,13 @@ impl JobRuntime {
     /// the session spine builds itself.
     pub(crate) fn watch_capture(&self, is_live: Arc<dyn Fn() -> bool + Send + Sync>) {
         *self.capturing.lock().expect("capture hook poisoned") = Some(is_live);
+    }
+
+    /// Point the tray rule at the meeting watcher. Called once, at launch,
+    /// because the watcher lives with the app handle rather than with the
+    /// session spine. Never wired in tests, where nothing is detected.
+    pub(crate) fn watch_detection(&self, is_detected: Arc<dyn Fn() -> bool + Send + Sync>) {
+        *self.detecting.lock().expect("detection hook poisoned") = Some(is_detected);
     }
 
     /// Is a capture running right now?
@@ -1034,6 +1425,20 @@ impl JobRuntime {
         }
     }
 
+    /// Does Echo think a meeting is happening right now?
+    fn meeting_is_detected(&self) -> bool {
+        let hook = self
+            .detecting
+            .lock()
+            .expect("detection hook poisoned")
+            .clone();
+        // No watcher to ask means nothing has been detected — which is the truth
+        // on a machine where detection is turned off, and the safe answer
+        // everywhere else: the worst it costs is a badge the watcher's own poll
+        // puts back within [`crate::detect::POLL_INTERVAL_SECS`].
+        hook.is_some_and(|is_detected| is_detected())
+    }
+
     /// Hold the speech engine while a recording or a meeting's work is
     /// outstanding, and let the grace period start once neither is true.
     ///
@@ -1049,6 +1454,31 @@ impl JobRuntime {
         self.ports
             .asr
             .hold_resident(super::engine_stays_resident(capturing, outstanding));
+    }
+
+    /// Say what the menu bar should be showing, recomputed from scratch.
+    ///
+    /// The tray's half of [`JobRuntime::refresh_engine_residency`], and
+    /// deliberately built the same way: every caller — queue, cancel, retry, a
+    /// job ending however it ended, a recording being released — asks the same
+    /// question of the same three fresh facts. Nothing here accumulates, so
+    /// there is no edge that could be "the one that was missed" and leave the
+    /// menu bar claiming Echo is busy with a meeting it finished an hour ago.
+    ///
+    /// Cancelled and failed work stops counting for free: `active_only` means
+    /// queued, running or parked, so the row that ends any of those three ways
+    /// is the row that lets the icon settle.
+    pub(crate) async fn refresh_tray_state(&self) {
+        let capturing = self.capture_is_live();
+        let detected = self.meeting_is_detected();
+        let outstanding = outstanding_meeting_jobs(&self.db).await;
+        self.ports
+            .events
+            .emit(UiEvent::TrayState(super::tray_state_for(
+                capturing,
+                detected,
+                outstanding,
+            )));
     }
 
     /// Cancel a job. Already finished is success.
@@ -1075,6 +1505,7 @@ impl JobRuntime {
         // nobody reported: the engine stayed held with nothing left to do and no
         // later edge that could ever clear it.
         self.refresh_engine_residency().await;
+        self.refresh_tray_state().await;
         Ok(())
     }
 
@@ -1094,36 +1525,84 @@ impl JobRuntime {
         // And the mirror image: a meeting with work in the queue again needs the
         // engine again, whether or not the loop reaches the row this second.
         self.refresh_engine_residency().await;
+        self.refresh_tray_state().await;
         self.wake.notify_one();
         Ok(())
     }
 
     /// A recording is starting. Park everything, keep it resumable.
     pub async fn preempt(&self) -> Result<(), DbError> {
-        self.blocked.store(true, Ordering::SeqCst);
-        if let Ok(running) = self.running.lock() {
-            if let Some((id, cancel)) = running.as_ref() {
-                tracing::info!(job = %id, "parking background work for a recording");
-                cancel.preempt();
+        let parked = {
+            // Under the lock with the write, so a job on its way out cannot read
+            // this flag on one side of a `release()` and write its row on the
+            // other.
+            let _ordering = self.parking.lock().await;
+            self.blocked.store(true, Ordering::SeqCst);
+            if let Ok(running) = self.running.lock() {
+                if let Some((id, cancel)) = running.as_ref() {
+                    tracing::info!(job = %id, "parking background work for a recording");
+                    cancel.preempt();
+                }
             }
-        }
-        let parked = repo::pause_active_jobs(&self.db).await?;
+            repo::pause_active_jobs(&self.db).await?
+        };
         if parked > 0 {
             tracing::info!(parked, "background work parked");
+            // And say so on the screens, not only in the menu bar. A meeting
+            // whose work is parked used to keep whatever it was last told —
+            // "Working out who said what…" over a bar that had stopped moving —
+            // for as long as the recording lasted, which on a day of
+            // back-to-back meetings is most of the day. The rows have already
+            // changed in the table; this is what carries the change to anything
+            // looking at them.
+            self.announce_all_active().await;
         }
         Ok(())
     }
 
+    /// Re-announce every unfinished job, so screens holding a list of them
+    /// redraw from what the table says now.
+    async fn announce_all_active(&self) {
+        let query = JobQuery {
+            active_only: Some(true),
+            ..Default::default()
+        };
+        match repo::list_jobs(&self.db, &query).await {
+            Ok(jobs) => {
+                for job in jobs {
+                    self.announce(&job);
+                }
+            }
+            Err(error) => tracing::warn!(%error, "could not say which work is waiting"),
+        }
+    }
+
     /// The recording finished. Let the parked work continue.
     pub async fn release(&self) -> Result<(), DbError> {
-        self.blocked.store(false, Ordering::SeqCst);
-        let resumed = repo::resume_paused_jobs(&self.db).await?;
+        let resumed = {
+            // The other half of the pair, and the reason for the lock: this used
+            // to put a job back in the queue only for that job's own last words
+            // to write `paused` over it.
+            let _ordering = self.parking.lock().await;
+            self.blocked.store(false, Ordering::SeqCst);
+            repo::resume_paused_jobs(&self.db).await?
+        };
         if resumed > 0 {
             tracing::info!(resumed, "background work picked back up");
+            // The other edge of the same sentence. Parking says "paused until
+            // the recording ends"; without this, that line stays on screen
+            // after the recording has ended, on every row except the one that
+            // happens to start running next — which is the same stale sentence
+            // this pair of announcements exists to stop.
+            self.announce_all_active().await;
         }
         // Also the launch path, where work left over from a crash is un-parked:
-        // whatever is outstanding now decides whether the engine is held.
+        // whatever is outstanding now decides whether the engine is held, and
+        // what the menu bar says. A launch that finds a meeting's work still in
+        // the table is a launch that should say "still working on it" before
+        // anyone asks.
         self.refresh_engine_residency().await;
+        self.refresh_tray_state().await;
         self.wake.notify_one();
         Ok(())
     }
@@ -1152,13 +1631,65 @@ impl JobRuntime {
         self.wake.notify_one();
     }
 
+    /// Write down that a recording stopped this job: parked while the recording
+    /// still holds the machine, straight back in the queue when it does not.
+    ///
+    /// It used to be `paused`, always — and `release()` is the only thing that
+    /// un-parks a row. A job that reported itself stopped **after** `release()`
+    /// had already put it back in the queue wrote `paused` over that, and then
+    /// sat there: `active_only` counts parked work, so the menu bar stayed on
+    /// Processing, 1.6 GB of speech weights stayed loaded, the meeting never
+    /// left "Processing" in the library, and the screen said "paused until the
+    /// recording ends" while nothing was recording and nothing would ever end.
+    /// The next recording to finish does clear it, so it is a stall rather than
+    /// a stop — but for somebody who does not record again it never ends, and
+    /// that sentence is false for the whole of it.
+    ///
+    /// [`JobRuntime::parking`] is what makes the answer trustworthy: the flag is
+    /// read and the row is written with no `release()` able to fit between them.
+    ///
+    /// Shutting down comes through here too, and comes out `queued`. That is
+    /// what it should be: nothing is recording, and a row waiting for a
+    /// recording to end would be waiting for something that already happened.
+    async fn park_for_a_recording(&self, job_id: &str) -> JobStatus {
+        let _ordering = self.parking.lock().await;
+        let status = if self.blocked.load(Ordering::SeqCst) {
+            JobStatus::Paused
+        } else {
+            JobStatus::Queued
+        };
+        if let Err(error) = repo::set_job_status(&self.db, job_id, status, None).await {
+            tracing::warn!(%error, job = %job_id, "could not record work a recording stopped");
+        }
+        status
+    }
+
+    /// Write down how a job that reached its own end ended.
+    async fn record_end(
+        &self,
+        job_id: &str,
+        status: JobStatus,
+        error: Option<String>,
+    ) -> JobStatus {
+        if let Err(failed) = repo::set_job_status(&self.db, job_id, status, error.as_deref()).await
+        {
+            tracing::warn!(error = %failed, "could not record how the work ended");
+        }
+        status
+    }
+
+    /// Say where a job stands, from the row as it reads now — stage included,
+    /// because the stage is the truer sentence when there is one.
     fn announce(&self, job: &Job) {
+        let label = match job.phase {
+            Some(phase) => phase_label_for(phase).to_string(),
+            None => label_for(job.kind).to_string(),
+        };
         self.ports
             .events
             .emit(UiEvent::JobProgress(JobProgressPayload {
                 job: job.clone(),
-                label: Some(label_for(job.kind).to_string()),
-                phase: None,
+                label: Some(label),
             }));
     }
 
@@ -1274,15 +1805,20 @@ impl JobRuntime {
             if let Ok(mut running) = self.running.lock() {
                 *running = None;
             }
-            if let Err(error) =
-                repo::set_job_status(&self.db, &job.id, JobStatus::Paused, None).await
-            {
-                tracing::warn!(%error, "could not park work for a recording");
-            }
+            let status = self.park_for_a_recording(&job.id).await;
             if let Ok(Some(parked)) = repo::get_job(&self.db, &job.id).await {
                 self.announce(&parked);
             }
-            tracing::info!(job = %job.id, "a recording claimed the machine before this could start");
+            tracing::info!(
+                job = %job.id,
+                status = status.as_str(),
+                "a recording claimed the machine before this could start"
+            );
+            // The recording ended in the moment this took, so the row is queued
+            // rather than parked and the loop has work to come back to.
+            if matches!(status, JobStatus::Queued) {
+                self.wake.notify_one();
+            }
             return;
         }
         if let Err(error) = repo::set_job_status(&self.db, &job.id, JobStatus::Running, None).await
@@ -1292,6 +1828,9 @@ impl JobRuntime {
 
         let mut started = job.clone();
         started.status = JobStatus::Running;
+        // The status write above cleared any stage the row had; this is a job
+        // beginning, and it is not in one yet.
+        started.phase = None;
         self.announce(&started);
 
         let ctx = JobContext {
@@ -1317,19 +1856,28 @@ impl JobRuntime {
             other => other,
         };
 
-        let (status, error) = match outcome {
-            Ok(()) => (JobStatus::Done, None),
-            Err(JobFailure::Preempted) => (JobStatus::Paused, None),
-            Err(JobFailure::Cancelled) => (JobStatus::Cancelled, None),
-            Err(JobFailure::Failed(message)) => (JobStatus::Failed, Some(message)),
+        let status = match outcome {
+            Ok(()) => self.record_end(&job.id, JobStatus::Done, None).await,
+            Err(JobFailure::Cancelled) => {
+                self.record_end(&job.id, JobStatus::Cancelled, None).await
+            }
+            Err(JobFailure::Failed(message)) => {
+                self.record_end(&job.id, JobStatus::Failed, Some(message))
+                    .await
+            }
+            // Not a status this can decide on its own: parking is only right
+            // while a recording still holds the machine
+            // ([`JobRuntime::park_for_a_recording`]).
+            Err(JobFailure::Preempted) => self.park_for_a_recording(&job.id).await,
         };
-
-        if let Err(error) = repo::set_job_status(&self.db, &job.id, status, error.as_deref()).await
-        {
-            tracing::warn!(%error, "could not record how the work ended");
-        }
         if let Ok(mut running) = self.running.lock() {
             *running = None;
+        }
+        // A recording that ended while this job was on its way out leaves it
+        // queued, not parked. Nothing else will notice that on its own when
+        // `execute` was driven from outside the loop.
+        if matches!(status, JobStatus::Queued) {
+            self.wake.notify_one();
         }
 
         if let Ok(Some(finished)) = repo::get_job(&self.db, &job.id).await {
@@ -1337,8 +1885,17 @@ impl JobRuntime {
         }
         // This may have been the meeting's last job. If it was, and nothing is
         // being recorded, this is the moment the engine's grace period starts
-        // (mantra 1's amendment of 2026-08-20).
+        // (mantra 1's amendment of 2026-08-20) and the moment the menu bar stops
+        // saying Echo is working on something.
+        //
+        // Here rather than in `settle_meeting`, deliberately: that one only runs
+        // for work that finished, and a meeting whose last job was cancelled or
+        // failed is just as finished as far as the icon is concerned. The
+        // meeting row stays Processing in that case — which is true, something
+        // did not get done — but nothing is being worked on, and an icon that
+        // spun forever after a cancel would be a lie nobody could clear.
         self.refresh_engine_residency().await;
+        self.refresh_tray_state().await;
         if matches!(status, JobStatus::Done) {
             if let Some(meeting_id) = job.meeting_id.as_deref() {
                 self.settle_meeting(meeting_id).await;
@@ -1406,6 +1963,53 @@ mod tests {
         assert!(!c.is_preempted());
     }
 
+    /// The icon must settle when the meeting's work is *over*, not when it
+    /// happened to succeed. A cancelled or failed row ends the work just as
+    /// truly as a finished one — `active_only` is what makes that free, and a
+    /// regression here would leave the menu bar claiming Echo is still busy
+    /// with a meeting nobody is working on any more.
+    #[tokio::test]
+    async fn work_stops_counting_however_it_ended() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let meeting = repo::create_meeting(&db, "", "/tmp", None).await.unwrap();
+        assert_eq!(outstanding_meeting_jobs(&db).await, 0);
+
+        let catch_up = repo::create_job(&db, Some(&meeting.id), JobKind::TranscribeCatchup)
+            .await
+            .unwrap();
+        let diarize = repo::create_job(&db, Some(&meeting.id), JobKind::Diarize)
+            .await
+            .unwrap();
+        let recap = repo::create_job(&db, Some(&meeting.id), JobKind::Summarize)
+            .await
+            .unwrap();
+        // Work that belongs to no meeting never held the icon in the first
+        // place: a model download is not "still finishing your meeting".
+        repo::create_job(&db, None, JobKind::Download)
+            .await
+            .unwrap();
+        assert_eq!(outstanding_meeting_jobs(&db).await, 3);
+
+        repo::set_job_status(&db, &catch_up.id, JobStatus::Done, None)
+            .await
+            .unwrap();
+        assert_eq!(outstanding_meeting_jobs(&db).await, 2);
+        repo::set_job_status(&db, &diarize.id, JobStatus::Cancelled, None)
+            .await
+            .unwrap();
+        assert_eq!(outstanding_meeting_jobs(&db).await, 1);
+
+        // The last one, and it failed. The meeting is still over.
+        repo::set_job_status(&db, &recap.id, JobStatus::Failed, Some("no"))
+            .await
+            .unwrap();
+        assert_eq!(outstanding_meeting_jobs(&db).await, 0);
+        assert_eq!(
+            super::super::tray_state_for(false, false, 0),
+            crate::types::TrayState::Idle
+        );
+    }
+
     #[test]
     fn the_summarize_flag_follows_the_job() {
         let c = Cancel::new();
@@ -1446,6 +2050,15 @@ mod tests {
         db: &Db,
         job: Job,
     ) -> (JobContext, Arc<super::super::mock::CollectingEvents>) {
+        context_with_asr(db, job, Arc::new(super::super::mock::MockAsr::new())).await
+    }
+
+    /// [`context_for`] for a test that has to set the engine up first.
+    async fn context_with_asr(
+        db: &Db,
+        job: Job,
+        asr: Arc<super::super::mock::MockAsr>,
+    ) -> (JobContext, Arc<super::super::mock::CollectingEvents>) {
         let events = crate::session::ports::EventBus::new();
         let seen = Arc::new(super::super::mock::CollectingEvents::default());
         events.set(seen.clone());
@@ -1458,7 +2071,7 @@ mod tests {
                     std::env::temp_dir().join("echo-jobs"),
                     None,
                 ),
-                asr: Arc::new(super::super::mock::MockAsr::new()),
+                asr,
                 events,
                 cancel: Cancel::new(),
                 progress,
@@ -1516,6 +2129,7 @@ mod tests {
                 is_final: true,
                 model_name: None,
                 model_revision: None,
+                corrections: Vec::new(),
             }],
         )
         .await
@@ -1598,6 +2212,86 @@ mod tests {
         assert!(!blocked.contains("RECITATION"), "{blocked}");
     }
 
+    /// A result shaped like the end of a speaker pass, so the two pure
+    /// functions above can be driven without models or audio.
+    fn pass_result(asked: Option<u32>, found: u32) -> crate::diarize::DiarizationResult {
+        crate::diarize::DiarizationResult {
+            people_count: asked.unwrap_or(found),
+            people_count_is_override: asked.is_some(),
+            voices_asked: asked,
+            voices_found: found,
+            ..Default::default()
+        }
+    }
+
+    /// The 2026-08-24 shape: four people asked for, two voices in the
+    /// recording. Echo says so instead of inventing the other two, and the
+    /// number the person typed is left exactly as they typed it.
+    #[test]
+    fn a_count_the_recording_cannot_deliver_is_said_out_loud() {
+        let notice = voices_short_notice("meeting-1", &pass_result(Some(4), 2))
+            .expect("a shortfall the person can see in the chips has to be said");
+        assert_eq!(
+            notice.message,
+            "Echo can only hear 2 distinct voices in this recording."
+        );
+        assert_eq!(notice.meeting_id.as_deref(), Some("meeting-1"));
+        assert!(!notice.persistent, "one sentence, not a banner to dismiss");
+
+        let payload = speakers_event("meeting-1", &pass_result(Some(4), 2));
+        assert_eq!(payload.people_count, 4, "the person's number is theirs");
+        assert!(payload.people_count_is_override);
+        assert_eq!(
+            payload.voices_found,
+            Some(2),
+            "the dialog needs the true number to annotate the count with"
+        );
+    }
+
+    #[test]
+    fn a_count_that_was_delivered_says_nothing() {
+        assert!(voices_short_notice("m", &pass_result(Some(3), 3)).is_none());
+        assert!(
+            voices_short_notice("m", &pass_result(Some(2), 3)).is_none(),
+            "more voices than asked for is not a shortfall"
+        );
+        assert!(
+            voices_short_notice("m", &pass_result(None, 1)).is_none(),
+            "nobody asked for a number, so there is nothing to fall short of"
+        );
+    }
+
+    #[test]
+    fn the_shortfall_sentence_reads_as_one_and_carries_no_jargon() {
+        let banned = [
+            "cluster",
+            "diariz",
+            "silhouette",
+            "threshold",
+            "override",
+            "embed",
+            "voiceprint",
+        ];
+        for found in [0u32, 1, 2, 7] {
+            let message = voices_short_message(found);
+            assert!(
+                message.ends_with('.'),
+                "{message:?} should read as a sentence"
+            );
+            assert!(
+                !message.contains('!'),
+                "{message:?} is shouting at somebody"
+            );
+            let lower = message.to_lowercase();
+            for word in banned {
+                assert!(!lower.contains(word), "{message:?} leaks {word:?}");
+            }
+        }
+        // A number a person reads has to agree with itself.
+        assert!(voices_short_message(1).contains("one voice"));
+        assert!(voices_short_message(2).contains("2 distinct voices"));
+    }
+
     #[test]
     fn every_label_is_a_plain_sentence() {
         let banned = [
@@ -1618,6 +2312,7 @@ mod tests {
             JobKind::Export,
             JobKind::Download,
             JobKind::Mixdown,
+            JobKind::PrepareEngine,
         ] {
             let label = label_for(kind).to_lowercase();
             for word in banned {
@@ -1631,12 +2326,780 @@ mod tests {
                 assert!(!label.contains(word), "{label:?} leaks {word:?}");
             }
             assert!(phase_label_for(phase).ends_with('…'));
-            assert_ne!(
-                phase_label_for(phase),
-                label_for(JobKind::Download),
-                "a stage worth naming has to read differently from the job"
+            // Against every job, not just the download it started life inside:
+            // a stage is only worth announcing if it reads differently from
+            // whatever sentence is already on screen.
+            for kind in [
+                JobKind::TranscribeCatchup,
+                JobKind::Diarize,
+                JobKind::Summarize,
+                JobKind::Export,
+                JobKind::Download,
+                JobKind::Mixdown,
+                JobKind::PrepareEngine,
+            ] {
+                assert_ne!(
+                    phase_label_for(phase),
+                    label_for(kind),
+                    "a stage worth naming has to read differently from the job"
+                );
+            }
+        }
+    }
+
+    /// The setup job, end to end: it says which stage it is on, it reports no
+    /// fraction while the machine does the one-time work, and the engine comes
+    /// up. This is the sixteen minutes of 2026-08-24, paid before a meeting.
+    #[tokio::test]
+    async fn the_setup_job_names_its_stage_and_reports_no_fraction() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let job = repo::ensure_job_with_payload(
+            &db,
+            None,
+            JobKind::PrepareEngine,
+            Some(&serde_json::to_string("some-weights.bin").unwrap()),
+        )
+        .await
+        .unwrap();
+        let (ctx, seen) = context_for(&db, job).await;
+
+        prepare_engine(&ctx).await.expect("the setup should finish");
+
+        assert!(
+            ctx.asr.is_loaded(),
+            "the point of the job is a loaded engine"
+        );
+        let announced = seen.job_progress();
+        let stage = announced
+            .iter()
+            .find(|p| p.job.phase == Some(crate::events::JobPhase::PreparingEngine))
+            .expect("the stage was announced");
+        assert!(
+            stage.job.progress.is_none(),
+            "there is no honest fraction for a compile, and a still bar reads as broken"
+        );
+        assert_eq!(
+            stage.label.as_deref(),
+            Some(phase_label_for(crate::events::JobPhase::PreparingEngine))
+        );
+        assert_eq!(
+            announced.last().map(|p| p.job.progress),
+            Some(Some(1.0)),
+            "and it finishes"
+        );
+
+        // The one attempt is on the record, against these weights by name.
+        //
+        // Contract change of 2026-08-26: the marker names the build of Echo that
+        // made the attempt as well as the weights, because the compiled encoder
+        // is cached against the binary and a rebuilt app has to pay again. The
+        // weights are still the front of it; what follows the `@` is whichever
+        // build is running the test.
+        assert_eq!(
+            attempt_marker(&db).await.as_deref().map(name_in_marker),
+            Some("some-weights.bin")
+        );
+    }
+
+    /// What the settings table is holding as the one attempt, if anything.
+    async fn attempt_marker(db: &Db) -> Option<String> {
+        repo::get_setting(db, crate::settings::keys::SPEECH_WARM_ATTEMPTED)
+            .await
+            .expect("the settings table")
+    }
+
+    /// The weights half of a marker, which is all these tests are about; the
+    /// build half belongs to `asr::models`, which is where it is tested.
+    fn name_in_marker(marker: &str) -> &str {
+        marker.split('@').next().expect("a marker names weights")
+    }
+
+    /// The order the whole one-attempt policy rests on: the attempt is on the
+    /// record *before* the load begins, not after it comes back.
+    ///
+    /// The window this test looks into is the one a crash falls into. Anything
+    /// that takes the process down inside the compile — an out-of-memory, a
+    /// driver fault, somebody force-quitting an app that looks frozen — leaves
+    /// the marker standing, and that is what stops the next launch from starting
+    /// the same quarter of an hour again.
+    #[tokio::test]
+    async fn the_attempt_is_on_the_record_before_the_load_starts() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let job = a_setup_job_for(&db, "some-weights.bin").await;
+        let (mut ctx, _seen) = context_for(&db, job).await;
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        asr.prewarm_takes(Duration::from_millis(300));
+        ctx.asr = asr;
+
+        let while_it_loads = async {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            attempt_marker(&db).await
+        };
+        let (outcome, midway) = tokio::join!(prepare_engine(&ctx), while_it_loads);
+        outcome.expect("the setup finishes");
+        assert_eq!(
+            midway.as_deref().map(name_in_marker),
+            Some("some-weights.bin"),
+            "the load had not come back yet, and the attempt was already written"
+        );
+    }
+
+    /// A setup row whose weights, name and all, is what the failing job is for.
+    async fn a_setup_job_for(db: &Db, weights: &str) -> Job {
+        repo::ensure_job_with_payload(
+            db,
+            None,
+            JobKind::PrepareEngine,
+            Some(&serde_json::to_string(weights).unwrap()),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A failure that came back before the compile could have started cost
+    /// nothing, so the record of the attempt goes with it: keeping it would
+    /// retire this machine's only automatic setup on the strength of one bad
+    /// second, and hand the sixteen minutes back to the next real meeting.
+    #[tokio::test]
+    async fn a_setup_that_failed_before_it_started_is_not_the_one_attempt() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let job = a_setup_job_for(&db, "some-weights.bin").await;
+        let (mut ctx, _seen) = context_for(&db, job).await;
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        asr.fail_prewarm();
+        ctx.asr = asr;
+
+        let outcome = prepare_engine(&ctx).await;
+        assert!(
+            matches!(outcome, Err(JobFailure::Failed(_))),
+            "a failed setup is a row that failed, not a silent nothing: {outcome:?}"
+        );
+        assert_eq!(
+            attempt_marker(&db).await,
+            None,
+            "nothing expensive happened, so the next launch is free to try again"
+        );
+    }
+
+    /// A recording taking the machine is not a failure and settles nothing: the
+    /// row is parked, and it keeps the attempt it has already recorded.
+    #[tokio::test]
+    async fn a_setup_a_recording_took_the_machine_from_is_not_a_failed_attempt() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let job = a_setup_job_for(&db, "some-weights.bin").await;
+        let (mut ctx, _seen) = context_for(&db, job).await;
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        asr.cancel_prewarm();
+        ctx.asr = asr;
+        ctx.cancel.preempt();
+
+        let outcome = prepare_engine(&ctx).await;
+        assert!(matches!(outcome, Err(JobFailure::Preempted)), "{outcome:?}");
+        assert_eq!(
+            attempt_marker(&db).await.as_deref().map(name_in_marker),
+            Some("some-weights.bin"),
+            "the row comes back for the rest of it; it does not start over"
+        );
+    }
+
+    /// The rule the one-attempt policy turns on, read on its own: only a load
+    /// that lasted long enough to have been the compile is worth remembering,
+    /// and only a real failure settles anything at all.
+    #[test]
+    fn only_a_failure_that_lasted_counts_as_the_one_attempt() {
+        use std::time::Duration;
+        let failed = JobFailure::failed("nope");
+        let long = crate::asr::engine::LIKELY_COMPILED_AT;
+
+        assert!(attempt_is_worth_forgetting(
+            &failed,
+            Duration::from_millis(40)
+        ));
+        assert!(attempt_is_worth_forgetting(
+            &failed,
+            long - Duration::from_millis(1)
+        ));
+        assert!(!attempt_is_worth_forgetting(&failed, long));
+        assert!(!attempt_is_worth_forgetting(
+            &failed,
+            Duration::from_secs(16 * 60)
+        ));
+
+        for kept in [JobFailure::Preempted, JobFailure::Cancelled] {
+            assert!(
+                !attempt_is_worth_forgetting(&kept, Duration::from_millis(40)),
+                "{kept:?}: the load was stopped, not tried and found wanting"
             );
         }
+    }
+
+    /// Every meeting ends with a catch-up pass, and after an ordinary one the
+    /// weights are still in memory. Announcing a stage for a load that returns
+    /// at once puts a pill on screen that blinks for no reason.
+    #[tokio::test]
+    async fn a_catch_up_with_the_engine_already_up_announces_no_stage() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let meeting = repo::create_meeting(&db, "Weekly sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        let chunk = repo::insert_chunk(
+            &db,
+            &meeting.id,
+            crate::types::Channel::Mic,
+            0,
+            "/tmp/echo-test/mic-000000.flac",
+            0,
+            60_000,
+        )
+        .await
+        .unwrap();
+        repo::commit_chunk(&db, &chunk, 60_000).await.unwrap();
+
+        let job = repo::ensure_job(&db, Some(&meeting.id), JobKind::TranscribeCatchup)
+            .await
+            .unwrap();
+        let (ctx, seen) = context_for(&db, job).await;
+        // The engine this meeting was recorded with is still holding its weights.
+        ctx.asr.prewarm().await.unwrap();
+
+        catch_up(&ctx).await.expect("the catch-up should finish");
+
+        assert!(
+            seen.job_progress().iter().all(|p| p.job.phase.is_none()),
+            "nothing to announce: the engine was already up"
+        );
+    }
+
+    /// A meeting with a minute of committed audio and one live guess sitting
+    /// against the second half of it, plus its catch-up job.
+    async fn a_meeting_mid_catch_up(db: &Db) -> (String, Job) {
+        let meeting = repo::create_meeting(db, "Weekly sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        let chunk = repo::insert_chunk(
+            db,
+            &meeting.id,
+            crate::types::Channel::Mic,
+            0,
+            "/tmp/echo-test/mic-000000.flac",
+            0,
+            60_000,
+        )
+        .await
+        .unwrap();
+        repo::commit_chunk(db, &chunk, 60_000).await.unwrap();
+        repo::insert_segment(
+            db,
+            &crate::types::SegmentDraft {
+                meeting_id: meeting.id.clone(),
+                t_start_ms: 30_000,
+                t_end_ms: 40_000,
+                channel: crate::types::Channel::Mic,
+                text: "a live guess nobody has replaced yet".into(),
+                is_final: false,
+                revision: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let job = repo::ensure_job(db, Some(&meeting.id), JobKind::TranscribeCatchup)
+            .await
+            .unwrap();
+        (meeting.id, job)
+    }
+
+    async fn live_guesses(db: &Db, meeting_id: &str) -> usize {
+        repo::get_segments(
+            db,
+            &crate::types::TranscriptQuery {
+                meeting_id: meeting_id.to_string(),
+                include_partial: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .iter()
+        .filter(|s| !s.is_final)
+        .count()
+    }
+
+    /// The 2026-08-24 data loss, at the handler: a recording took the machine
+    /// part-way through the catch-up pass, and the pass came back saying it was
+    /// finished. The job was recorded done at full progress, the live text was
+    /// cleared for stretches that had never been read back, and the meeting was
+    /// left 69.4% transcribed with nothing anywhere saying so.
+    ///
+    /// A pass cut short is a failure the runner understands: parked, not done.
+    /// And nothing after it in the handler may run — least of all the clearing
+    /// of the live guesses, which are the only text those stretches have until
+    /// the pass that finishes actually reads them.
+    ///
+    /// This is the handler's half of that guarantee, and only that half: the
+    /// pass itself keeps the same promise window by window, and
+    /// `asr::catchup::tests::a_pass_cut_short_keeps_the_live_guesses_over_what_it_never_read`
+    /// is where the pass is held to it.
+    #[tokio::test]
+    async fn a_catch_up_a_recording_stopped_is_parked_and_keeps_the_live_text() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let (meeting_id, job) = a_meeting_mid_catch_up(&db).await;
+        let (ctx, _seen) = context_for(&db, job).await;
+        assert_eq!(live_guesses(&db, &meeting_id).await, 1);
+
+        // A recording starting is a preempt, and it reaches the pass through the
+        // same flag a cancel does.
+        ctx.cancel.preempt();
+        let outcome = catch_up(&ctx).await;
+
+        assert!(
+            matches!(outcome, Err(JobFailure::Preempted)),
+            "a pass a recording interrupted is parked, not finished: {outcome:?}"
+        );
+        assert_eq!(
+            live_guesses(&db, &meeting_id).await,
+            1,
+            "the live guess is all those seconds have until the pass reads them back"
+        );
+        assert!(
+            repo::get_job(&db, &ctx.job.id)
+                .await
+                .unwrap()
+                .and_then(|j| j.progress)
+                .is_none_or(|p| p < 1.0),
+            "an interrupted pass does not leave a full bar behind"
+        );
+    }
+
+    /// A pass that finished with a hole in it does not finish quietly.
+    ///
+    /// The live text told the person "Echo will fill in the rest when the
+    /// meeting ends". When a window would not read, that stretch is exactly the
+    /// rest — and the runner used to mark the job done at 100% with nothing
+    /// anywhere saying otherwise.
+    ///
+    /// The sentence is held to what it may claim as much as to being said at
+    /// all. It used to end "The live text from then is still here", which is
+    /// not true of a stretch the pass was sent at *because* nothing had written
+    /// it down: those seconds have no words, and the transcript reads there
+    /// exactly like one where nobody spoke.
+    ///
+    /// The guess the fixture writes is the shape an older build could leave
+    /// behind, and the sweep still spares it: text that exists is never thrown
+    /// away over seconds nothing replaced.
+    #[tokio::test]
+    async fn a_stretch_that_would_not_read_is_said_out_loud_without_a_false_comfort() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let (meeting_id, job) = a_meeting_mid_catch_up(&db).await;
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        // The fixture's guess sits at 30 s–40 s on the microphone, and this is
+        // the window the engine would not read either time it was asked.
+        asr.catch_up_leaves_unread(vec![crate::asr::catchup::UnreadSpan {
+            channel: crate::types::Channel::Mic,
+            from_ms: 30_000,
+            to_ms: 60_000,
+        }]);
+        let (ctx, seen) = context_with_asr(&db, job.clone(), asr).await;
+
+        catch_up(&ctx).await.expect("the pass itself finished");
+
+        assert_eq!(
+            live_guesses(&db, &meeting_id).await,
+            1,
+            "nothing replaced those seconds, so the guess is all the text they have"
+        );
+        let notices = seen.notices();
+        let said = notices
+            .iter()
+            .find(|n| n.tag.as_deref() == Some("someOfItUnread"))
+            .expect("a hole in somebody's transcript is their business, not only the log's");
+        assert_eq!(
+            said.message,
+            "Echo couldn't read less than a minute of this recording back, so that part \
+             of the transcript has no words in it. The recording itself is still here."
+        );
+        assert!(
+            said.persistent,
+            "the only mark those seconds get anywhere faded on its own"
+        );
+        assert_eq!(said.meeting_id.as_deref(), Some(meeting_id.as_str()));
+        assert_eq!(said.level, NoticeLevel::Warning);
+        // The pass did everything it can do, so the row is done — the sentence
+        // is what carries the shortfall, not a job stuck at 90%.
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().progress,
+            Some(1.0)
+        );
+    }
+
+    /// And a pass with nothing to declare declares nothing: every guess goes,
+    /// because the real reading replaced all of them.
+    #[tokio::test]
+    async fn a_pass_that_read_the_whole_meeting_clears_the_live_text_and_says_nothing() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let (meeting_id, job) = a_meeting_mid_catch_up(&db).await;
+        let (ctx, seen) = context_for(&db, job).await;
+
+        catch_up(&ctx).await.unwrap();
+
+        assert_eq!(live_guesses(&db, &meeting_id).await, 0);
+        assert!(
+            !seen.notice_tagged("someOfItUnread"),
+            "nothing was missing, so there is nothing to interrupt anybody about"
+        );
+    }
+
+    /// The sentence a person actually reads, at each of the three sizes it comes
+    /// in, and with none of the words the mechanism thinks in.
+    #[test]
+    fn the_unread_sentence_reads_as_one_and_carries_no_jargon() {
+        assert!(
+            unread_stretch_notice("m", 0).is_none(),
+            "nothing unread is nothing to say"
+        );
+        assert!(unread_stretch_notice("m", -1).is_none());
+
+        assert!(unread_stretch_message(20_000).contains("less than a minute"));
+        assert!(unread_stretch_message(60_000).contains("about a minute"));
+        // Rounded up: rounding a shortfall down is the direction that flatters
+        // Echo, and a person deciding whether to go back and listen is owed the
+        // larger number.
+        assert!(unread_stretch_message(61_000).contains("about 2 minutes"));
+        assert!(unread_stretch_message(167_000).contains("about 3 minutes"));
+
+        let banned = [
+            "window", "decode", "buffer", "stream", "vad", "segment", "span", "whisper", "engine",
+            "asr", "retry",
+        ];
+        for unread_ms in [1_i64, 20_000, 60_000, 61_000, 3_600_000] {
+            let message = unread_stretch_message(unread_ms);
+            assert!(
+                message.ends_with('.'),
+                "{message:?} should read as sentences"
+            );
+            assert!(
+                !message.contains('!'),
+                "{message:?} is shouting at somebody"
+            );
+            let lower = message.to_lowercase();
+            for word in banned {
+                assert!(!lower.contains(word), "{message:?} leaks {word:?}");
+            }
+        }
+    }
+
+    /// A runner with one job in it and an engine a test can hold on to.
+    fn a_runtime_around(db: &Db, asr: Arc<super::super::mock::MockAsr>) -> Arc<JobRuntime> {
+        let events = crate::session::ports::EventBus::new();
+        events.set(Arc::new(super::super::mock::CollectingEvents::default()));
+        JobRuntime::new(
+            db.clone(),
+            crate::paths::AppPaths::rooted_at(std::env::temp_dir().join("echo-jobs"), None),
+            crate::session::ports::Ports {
+                capture: Arc::new(super::super::mock::MockCapture::new()),
+                asr,
+                executor: Arc::new(DefaultJobExecutor),
+                events,
+            },
+        )
+    }
+
+    /// The stall of 2026-08-26: a job that reported itself stopped **after** the
+    /// recording had already ended and put it back in the queue was written
+    /// straight back to `paused`, and nothing un-parks a row outside
+    /// `release()`.
+    ///
+    /// What that cost, for as long as it lasted: the menu bar pinned on
+    /// Processing, 1.6 GB of speech weights held, the meeting stuck on
+    /// "Processing" in the library, and a screen reading "paused until the
+    /// recording ends" with nothing recording and nothing left to end. The next
+    /// recording to finish cleared it — so for anybody who recorded again it was
+    /// a stall, and for anybody who did not it was the end of that meeting.
+    #[tokio::test]
+    async fn a_job_already_back_in_the_queue_is_not_parked_behind_a_recording_that_ended() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let (_meeting_id, job) = a_meeting_mid_catch_up(&db).await;
+
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        // Still reading when the recording starts, and still on its way out
+        // when it ends: the whole of the race, held open.
+        asr.catch_up_waits_to_be_stopped();
+        asr.catch_up_holds_on_its_way_out();
+        let runtime = a_runtime_around(&db, asr.clone());
+
+        let running = {
+            let runtime = runtime.clone();
+            let job = job.clone();
+            tokio::spawn(async move { runtime.execute(job).await })
+        };
+        while !asr.catch_up_started() {
+            tokio::task::yield_now().await;
+        }
+
+        runtime.preempt().await.unwrap();
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
+            JobStatus::Paused,
+            "the recording has the machine, so the work waits for it"
+        );
+        // And now the recording ends, while the pass is still on its way out.
+        runtime.release().await.unwrap();
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
+            JobStatus::Queued
+        );
+
+        asr.let_the_catch_up_report();
+        running.await.unwrap();
+
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
+            JobStatus::Queued,
+            "nothing is recording, so there is nothing for this work to wait behind"
+        );
+        assert_eq!(
+            repo::next_queued_job(&db)
+                .await
+                .unwrap()
+                .map(|queued| queued.id),
+            Some(job.id),
+            "and the loop can reach it, which is what makes it not stuck"
+        );
+    }
+
+    /// The other side of the same ordering, which the fix must not trade away:
+    /// while the recording really does still have the machine, work parks.
+    #[tokio::test]
+    async fn work_a_recording_is_still_holding_parks_and_waits_for_it() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let (_meeting_id, job) = a_meeting_mid_catch_up(&db).await;
+
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        asr.catch_up_waits_to_be_stopped();
+        asr.catch_up_holds_on_its_way_out();
+        let runtime = a_runtime_around(&db, asr.clone());
+
+        let running = {
+            let runtime = runtime.clone();
+            let job = job.clone();
+            tokio::spawn(async move { runtime.execute(job).await })
+        };
+        while !asr.catch_up_started() {
+            tokio::task::yield_now().await;
+        }
+
+        runtime.preempt().await.unwrap();
+        // No release: the meeting is still being recorded when the pass reports.
+        asr.let_the_catch_up_report();
+        running.await.unwrap();
+
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
+            JobStatus::Paused,
+            "a recording has absolute priority, and this work still has to happen"
+        );
+        assert!(
+            repo::next_queued_job(&db).await.unwrap().is_none(),
+            "and nothing may pick it up while the recording is running"
+        );
+
+        // And it comes back the moment the recording is over.
+        runtime.release().await.unwrap();
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
+            JobStatus::Queued
+        );
+    }
+
+    /// The same thing one level up, where the damage was actually recorded: the
+    /// row the runner writes when a recording claims the machine mid-pass. It
+    /// said `done` on 2026-08-24. It has to say paused, so `release()` queues it
+    /// again and the next pass reads the holes this one never reached.
+    #[tokio::test]
+    async fn the_row_a_recording_interrupted_says_paused_and_not_done() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let (meeting_id, job) = a_meeting_mid_catch_up(&db).await;
+
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        // Still reading when the recording starts, which is the whole case.
+        asr.catch_up_waits_to_be_stopped();
+        let events = crate::session::ports::EventBus::new();
+        events.set(Arc::new(super::super::mock::CollectingEvents::default()));
+        let runtime = JobRuntime::new(
+            db.clone(),
+            crate::paths::AppPaths::rooted_at(std::env::temp_dir().join("echo-jobs"), None),
+            crate::session::ports::Ports {
+                capture: Arc::new(super::super::mock::MockCapture::new()),
+                asr: asr.clone(),
+                executor: Arc::new(DefaultJobExecutor),
+                events,
+            },
+        );
+
+        let running = {
+            let runtime = runtime.clone();
+            let job = job.clone();
+            tokio::spawn(async move { runtime.execute(job).await })
+        };
+        while !asr.catch_up_started() {
+            tokio::task::yield_now().await;
+        }
+        runtime.preempt().await.unwrap();
+        running.await.unwrap();
+
+        let row = repo::get_job(&db, &job.id).await.unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            JobStatus::Paused,
+            "the recording has priority, and this work still has to happen"
+        );
+        assert_eq!(
+            live_guesses(&db, &meeting_id).await,
+            1,
+            "nothing after the pass ran, so nothing cleared the live text"
+        );
+
+        // And the runner picks it back up when the recording is over, which is
+        // the half that makes parking it safe.
+        runtime.release().await.unwrap();
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
+            JobStatus::Queued
+        );
+    }
+
+    /// Parking work is not a silent state change.
+    ///
+    /// The rows go to `paused` the moment a recording starts, but until the
+    /// screens are told, a meeting keeps whatever it last said — "Working out
+    /// who said what…" over a bar that has stopped moving — for as long as the
+    /// recording lasts. On a day of back-to-back meetings that is most of the
+    /// day, and it reads as Echo being stuck rather than as Echo waiting.
+    #[tokio::test]
+    async fn work_parked_for_a_recording_is_announced_as_parked() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let meeting = repo::create_meeting(&db, "Weekly sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        let job = repo::create_job(&db, Some(&meeting.id), JobKind::Diarize)
+            .await
+            .unwrap();
+
+        let collecting = Arc::new(super::super::mock::CollectingEvents::default());
+        let events = crate::session::ports::EventBus::new();
+        events.set(collecting.clone());
+        let runtime = JobRuntime::new(
+            db.clone(),
+            crate::paths::AppPaths::rooted_at(std::env::temp_dir().join("echo-jobs"), None),
+            crate::session::ports::Ports {
+                capture: Arc::new(super::super::mock::MockCapture::new()),
+                asr: Arc::new(super::super::mock::MockAsr::new()),
+                executor: Arc::new(DefaultJobExecutor),
+                events,
+            },
+        );
+
+        runtime.preempt().await.unwrap();
+
+        let said = collecting.job_progress();
+        let parked = said
+            .iter()
+            .find(|p| p.job.id == job.id)
+            .expect("the parked job was announced");
+        assert_eq!(parked.job.status, JobStatus::Paused);
+    }
+
+    /// And neither is un-parking it.
+    ///
+    /// Only one row is announced when work actually starts, so every other row
+    /// would go on saying "paused until the recording ends" with nothing
+    /// recording — the same stale sentence, on the other edge. A meeting with
+    /// two pieces of work outstanding is the ordinary case, so this test has
+    /// two.
+    #[tokio::test]
+    async fn work_let_go_when_the_recording_ends_is_announced_as_waiting() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let meeting = repo::create_meeting(&db, "Weekly sync", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        let diarize = repo::create_job(&db, Some(&meeting.id), JobKind::Diarize)
+            .await
+            .unwrap();
+        let summarize = repo::create_job(&db, Some(&meeting.id), JobKind::Summarize)
+            .await
+            .unwrap();
+
+        let collecting = Arc::new(super::super::mock::CollectingEvents::default());
+        let events = crate::session::ports::EventBus::new();
+        events.set(collecting.clone());
+        let runtime = JobRuntime::new(
+            db.clone(),
+            crate::paths::AppPaths::rooted_at(std::env::temp_dir().join("echo-jobs"), None),
+            crate::session::ports::Ports {
+                capture: Arc::new(super::super::mock::MockCapture::new()),
+                asr: Arc::new(super::super::mock::MockAsr::new()),
+                executor: Arc::new(DefaultJobExecutor),
+                events,
+            },
+        );
+
+        runtime.preempt().await.unwrap();
+        runtime.release().await.unwrap();
+
+        // The last thing said about each row is what a screen is left showing.
+        let said = collecting.job_progress();
+        for id in [&diarize.id, &summarize.id] {
+            let last = said
+                .iter()
+                .rfind(|p| &p.job.id == id)
+                .expect("the job was announced");
+            assert_eq!(
+                last.job.status,
+                JobStatus::Queued,
+                "a row left saying it is paused with nothing recording"
+            );
+        }
+    }
+
+    /// The stage goes on the row, not only into an announcement nobody may be
+    /// there to hear — and the first honest fraction takes it back off.
+    ///
+    /// The launch case is the whole reason: the setup job is queued while the
+    /// window is still loading, so the announcement lands before any screen is
+    /// listening, and the row is all the corner pill has to go on when it
+    /// finally mounts. And the catch-up case is why it has to come off again:
+    /// that job waits for the engine, then gets on with its own work, and
+    /// "Finishing one-time setup…" over a moving bar would be the same lie
+    /// pointing the other way.
+    #[tokio::test]
+    async fn a_stage_is_stored_while_it_lasts_and_only_while_it_lasts() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let job = repo::ensure_job(&db, None, JobKind::PrepareEngine)
+            .await
+            .unwrap();
+        let (ctx, _seen) = context_for(&db, job.clone()).await;
+
+        ctx.progress
+            .phase(crate::events::JobPhase::PreparingEngine)
+            .await;
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().phase,
+            Some(crate::events::JobPhase::PreparingEngine),
+            "a screen mounting now has to be able to read what is happening"
+        );
+
+        // Rate-capped or not, a fraction ends the stage: `set` was just called
+        // with 0.05, which the cap would ordinarily swallow.
+        ctx.progress.set(0.05).await;
+        assert!(
+            repo::get_job(&db, &job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase
+                .is_none(),
+            "the stage is over the moment there are numbers again"
+        );
     }
 
     /// A stage with no fraction says so, rather than leaving a bar parked at the
@@ -1653,18 +3116,20 @@ mod tests {
             error: None,
             created_at: String::new(),
             updated_at: String::new(),
+            phase: None,
         };
         let (ctx, seen) = context_for(&db, job).await;
         ctx.progress.set(1.0).await;
         ctx.progress
-            .phase(crate::events::JobPhase::PreparingEngine);
+            .phase(crate::events::JobPhase::PreparingEngine)
+            .await;
 
         let announced = seen.job_progress();
         assert_eq!(announced.len(), 2);
         assert_eq!(announced[0].job.progress, Some(1.0));
-        assert!(announced[0].phase.is_none());
+        assert!(announced[0].job.phase.is_none());
         assert_eq!(
-            announced[1].phase,
+            announced[1].job.phase,
             Some(crate::events::JobPhase::PreparingEngine)
         );
         assert!(

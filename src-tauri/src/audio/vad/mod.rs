@@ -78,6 +78,19 @@ pub const MIN_UTTERANCE_SAMPLES: usize =
 /// How far back a forced cut looks for a real pause to cut at.
 const FORCED_CUT_SEARCH_MS: i64 = 3_000;
 
+/// How far below the voice around it a moment has to sit before a forced cut
+/// will treat it as a gap between words rather than a soft syllable.
+///
+/// A fraction of *this stretch's own* loudness, not a fixed level: a whisper in
+/// a quiet room and a raised voice in a noisy one are then judged the same way.
+/// 0.15 is about 16 dB down. Syllable-to-syllable variation inside ordinary
+/// speech is 6-10 dB, so this cannot fire in the middle of a word; the closure
+/// before a `p` or a `t` does reach 25-30 dB down, but it lasts 30-100 ms, and
+/// averaging over the whole span (the pause tier's own 128 ms) pulls it back
+/// above the bar. Anything that stays this quiet for that long is not a
+/// consonant — it is the speaker drawing breath.
+const QUIET_ENOUGH: f32 = 0.15;
+
 /// Most audio a [`Segmenter::snapshot`] carries: the tail of what is open.
 ///
 /// Deliberately a little more than the live pipeline's caption window, so the
@@ -89,6 +102,33 @@ pub const SNAPSHOT_TAIL_MS: i64 = 12_000;
 // ---------------------------------------------------------------------------
 // Per-channel settings
 // ---------------------------------------------------------------------------
+
+/// Who is waiting for the words.
+///
+/// Not "where did the audio come from" — the same recording is read from disk in
+/// both cases (the live pass detects on the buffers on their way to the FLAC
+/// chunks; the catch-up pass reads those chunks back). What differs is whether
+/// anybody is watching a line appear. Live, every millisecond a detector holds
+/// an utterance open is a millisecond of caption nobody has yet; after the
+/// meeting, nothing is on screen and the only thing that matters is where the
+/// sentence really ended.
+///
+/// So this changes *when a stretch is closed*, and nothing else. It must never
+/// change [`VadSettings::enter`] or [`VadSettings::exit`]: whether a given 32 ms
+/// of audio is speech is a fact about the audio, and if the two passes disagreed
+/// about that they would disagree about *what was said* rather than merely about
+/// where the lines break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Listening {
+    /// Somebody is watching the transcript fill in. A held-open utterance is a
+    /// caption that has not arrived.
+    #[default]
+    Live,
+    /// The recording is being read back with nobody waiting on any one line, so
+    /// a longer tail is free: it costs a delay no one can perceive and buys
+    /// sentences that stay whole across a breath.
+    FromDisk,
+}
 
 /// Everything about *when* speech starts and stops, per channel.
 ///
@@ -171,6 +211,36 @@ impl VadSettings {
         }
     }
 
+    /// The settings for one channel, for whoever is waiting on it.
+    ///
+    /// [`Listening::Live`] is [`Self::for_channel`], unchanged. Reading the
+    /// recording back after the meeting only moves the two numbers that decide
+    /// *when a stretch is closed*:
+    ///
+    /// - `silence_tail_ms` × 1.75 (400 → 700 mic, 320 → 560 system). Live, that
+    ///   wait is dead air in front of a caption, so it is set as short as a
+    ///   sentence can bear; a mid-sentence breath in slow speech is longer than
+    ///   400 ms, which live costs a split line and after the meeting costs
+    ///   nothing. The same multiple on both channels on purpose: the microphone
+    ///   closing later than the computer is a fact about far-field noisy audio
+    ///   versus a clean conferencing feed, and that relationship holds whoever
+    ///   is waiting.
+    /// - `post_pad_ms` 288 → 384, so the trailing consonant of the last word
+    ///   before that longer pause is inside the window handed to the engine.
+    ///
+    /// `enter` and `exit` are deliberately identical — see [`Listening`].
+    pub const fn for_channel_when(channel: Channel, listening: Listening) -> Self {
+        let live = Self::for_channel(channel);
+        match listening {
+            Listening::Live => live,
+            Listening::FromDisk => Self {
+                silence_tail_ms: live.silence_tail_ms * 7 / 4,
+                post_pad_ms: 384,
+                ..live
+            },
+        }
+    }
+
     /// Whole windows of look-behind. Rounded *down*: padding is a courtesy, and
     /// every offset staying an exact number of windows matters more.
     pub const fn pre_pad_samples(&self) -> usize {
@@ -218,6 +288,17 @@ impl Default for VadSettings {
     }
 }
 
+/// How many milliseconds of the first `samples` of an utterance were speech.
+///
+/// `voiced` holds one decision per 32 ms window, alongside the audio; every
+/// length the segmenter works in is a whole number of windows, so this is a
+/// count rather than an interpolation. Windows the emitted piece does not reach
+/// are not its business.
+fn voiced_ms_of(voiced: &[bool], samples: usize) -> i64 {
+    let windows = (samples / WINDOW_SAMPLES).min(voiced.len());
+    voiced[..windows].iter().filter(|v| **v).count() as i64 * WINDOW_MS
+}
+
 /// Milliseconds as samples, rounded down to whole windows.
 const fn whole_windows_down(ms: i64) -> usize {
     if ms <= 0 {
@@ -247,11 +328,46 @@ pub struct Utterance {
     /// A forced cut that found a real pause to land on is not truncated: nothing
     /// was split and no audio is shared.
     pub truncated: bool,
+    /// How much of `samples` the detector actually called speech.
+    ///
+    /// Normally well under the duration: an utterance is padded at both ends
+    /// and carries the pause it closed on. What it is *for* is telling a stretch of
+    /// real speech apart from a window the detector opened on one cough — which
+    /// is what a decoder turns into "Grazie." (see [`crate::asr::phantom`]).
+    ///
+    /// Zero when nothing measured it, which is why nothing should read this
+    /// field directly; [`Utterance::measured_voice_ms`] answers "no measurement"
+    /// with "assume it was all speech", so a missing detector can never cost
+    /// words.
+    pub voiced_ms: i64,
 }
 
 impl Utterance {
     pub fn duration_ms(&self) -> i64 {
         self.t_end_ms - self.t_start_ms
+    }
+
+    /// How many milliseconds of this stretch were speech.
+    ///
+    /// An utterance nobody measured — no detector on disk, a window handed over
+    /// whole — reads as voice from end to end. Every filter downstream deletes
+    /// on *evidence* of silence, never on the absence of evidence.
+    pub fn measured_voice_ms(&self) -> i64 {
+        let duration = self.duration_ms().max(0);
+        if self.voiced_ms <= 0 {
+            return duration;
+        }
+        self.voiced_ms.min(duration)
+    }
+
+    /// The same answer as a density, 0.0 to 1.0, so a stretch clipped to part of
+    /// itself can carry it — see [`crate::asr::phantom::VoicedSpans`].
+    pub fn voiced_ratio(&self) -> f32 {
+        let duration = self.duration_ms();
+        if duration <= 0 {
+            return 1.0;
+        }
+        (self.measured_voice_ms() as f32 / duration as f32).clamp(0.0, 1.0)
     }
 }
 
@@ -323,7 +439,7 @@ struct OpenUtterance {
     samples: Vec<f32>,
     /// One entry per whole window of `samples`: was that window speech?
     ///
-    /// Kept so a forced cut can look for a real pause instead of guessing from
+    /// Kept so a forced cut looks for a real pause *first*, and only then at
     /// loudness — the quietest 32 ms of a vowel is still a vowel.
     voiced: Vec<bool>,
     /// Length up to and including the last window that was speech.
@@ -340,6 +456,34 @@ impl OpenUtterance {
     fn recompute_voiced_len(&mut self) {
         let voiced_windows = self.voiced.len() - self.trailing_silence();
         self.voiced_len = voiced_windows * WINDOW_SAMPLES;
+    }
+}
+
+/// What a forced cut landed on, and therefore how much is known about it.
+///
+/// Three origins kept apart on purpose, because they are not equally good
+/// evidence and only one of them means nothing was split. The quietest moment
+/// is a guess about where a gap probably is: it takes exactly the same contract
+/// as cutting where the cap fell — the piece is flagged truncated and the
+/// continuation re-reads the overlap — and moves only *where* the join lands.
+/// Calling it a pause would tell the rest of Echo that no word was split, and
+/// nothing here knows that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seam {
+    /// A stretch nothing called speech, long enough to be a real gap.
+    APause,
+    /// No such stretch, but a stretch far below the voice around it.
+    TheQuietestMoment,
+    /// Nothing to go on: the sample where the length cap tripped.
+    WhereTheCapFell,
+}
+
+impl Seam {
+    /// Did the join go through speech? Only a real pause is evidence that it
+    /// did not. The other two may land mid-word, so the piece emitted says so
+    /// and the continuation carries audio across the join.
+    const fn splits_speech(self) -> bool {
+        !matches!(self, Self::APause)
     }
 }
 
@@ -617,12 +761,14 @@ impl Segmenter {
             return None;
         }
         let t_start_ms = self.pos_to_ms(open.start_pos);
+        let voiced_ms = voiced_ms_of(&open.voiced, samples.len());
         Some(Utterance {
             channel: self.channel,
             t_start_ms,
             t_end_ms: self.pos_to_ms(open.start_pos + samples.len() as u64),
             samples,
             truncated,
+            voiced_ms,
         })
     }
 
@@ -630,33 +776,48 @@ impl Segmenter {
     /// [`VadSettings::max_utterance_ms`] without a pause the segmenter would
     /// close on, and the engine will not take a longer window.
     ///
-    /// Two ways to cut, and which one happened is what `truncated` says:
+    /// Three places the cut can land, and [`Seam`] is which one it was:
     ///
     /// * **At a real pause.** If the last few seconds contain a stretch of
     ///   silence at least [`VadSettings::min_forced_silence_ms`] long, the cut
     ///   lands in the middle of it: the piece emitted keeps a tail, the
-    ///   continuation keeps a pre-roll, and nothing is split. Looking for the
-    ///   *quietest window* instead — what this used to do — is not the same
-    ///   thing at all: the quietest 32 ms of a monologue may still be a vowel.
-    /// * **Through speech.** Failing that, the cut goes where the cap is, and
-    ///   the continuation starts [`VadSettings::forced_overlap_ms`] earlier — it
-    ///   re-reads the end of what was just emitted. A word that straddles the
-    ///   join is then whole in the second piece, and the engine has real
-    ///   acoustic context to start from instead of a cold start mid-syllable.
+    ///   continuation keeps a pre-roll, and nothing is split.
+    /// * **At the quietest moment.** Failing that, the quietest span of the
+    ///   same width in the same region, if it is [`QUIET_ENOUGH`] below the
+    ///   voice around it. This is *not* the old "cut at the quietest window":
+    ///   the quietest 32 ms of a monologue may still be a vowel, which is why
+    ///   the span is the pause tier's own 128 ms and why it has a bar to clear
+    ///   at all. It promises no less and no more than the tier below it —
+    ///   truncated, with the overlap — it only moves the join somewhere less
+    ///   likely to be mid-word. Honestly: Silero usually calls such a trough
+    ///   silence itself, so on a recording made with the model on disk this
+    ///   rarely fires. It is here for the loudness fallback, which hears a
+    ///   quiet breath as continuing speech — that is, for first-launch
+    ///   recordings made before the download finished.
+    /// * **Where the cap fell.** When even the quietest moment is loud, the cut
+    ///   goes where the cap is, and the continuation starts
+    ///   [`VadSettings::forced_overlap_ms`] earlier — it re-reads the end of
+    ///   what was just emitted. A word that straddles the join is then whole in
+    ///   the second piece, and the engine has real acoustic context to start
+    ///   from instead of a cold start mid-syllable.
     fn force_cut(&mut self) -> Option<Utterance> {
-        let (cut, at_pause) = self.find_forced_cut()?;
+        let (cut, seam) = self.find_forced_cut()?;
+        let splits_speech = seam.splits_speech();
         let overlap = self.settings.overlap_samples();
         let open = self.open.as_mut()?;
 
-        // A pause needs no overlap: nothing was split. A cut through speech
-        // carries audio over, so the join can be read across.
-        let keep_from = if at_pause {
-            cut
-        } else {
+        // A pause needs no overlap: nothing was split. A cut that may have gone
+        // through speech carries audio over, so the join can be read across.
+        let keep_from = if splits_speech {
             cut.saturating_sub(overlap)
+        } else {
+            cut
         };
         let start_pos = open.start_pos;
         let emitted: Vec<f32> = open.samples[..cut].to_vec();
+        // Read before the open utterance is rewritten below: this is the piece
+        // going out, not the piece staying behind.
+        let emitted_voiced_ms = voiced_ms_of(&open.voiced, cut);
         let rest: Vec<f32> = open.samples[keep_from..].to_vec();
         let rest_voiced: Vec<bool> = open.voiced[keep_from / WINDOW_SAMPLES..].to_vec();
 
@@ -689,16 +850,18 @@ impl Segmenter {
             t_start_ms,
             t_end_ms: self.pos_to_ms(start_pos + emitted.len() as u64),
             samples: emitted,
-            truncated: !at_pause,
+            truncated: splits_speech,
+            voiced_ms: emitted_voiced_ms,
         })
     }
 
-    /// Where to cut the open utterance, and whether that spot is a real pause.
+    /// Where to cut the open utterance, and what evidence that spot rests on.
     ///
     /// Prefers the longest qualifying pause in the search region, latest first
     /// on a tie: the longer the silence, the more likely it is the end of a
-    /// sentence rather than a breath between two words.
-    fn find_forced_cut(&self) -> Option<(usize, bool)> {
+    /// sentence rather than a breath between two words. Failing a pause, the
+    /// quietest moment in the same region; failing that, where the cap fell.
+    fn find_forced_cut(&self) -> Option<(usize, Seam)> {
         let open = self.open.as_ref()?;
         let len = open.samples.len();
         let windows = open.voiced.len();
@@ -725,9 +888,57 @@ impl Segmenter {
         match best {
             // Halfway through the pause: both sides of the join keep some of it.
             // Never zero, so a cut always makes progress.
-            Some((run, start)) => Some(((start + run / 2).max(1) * WINDOW_SAMPLES, true)),
-            None => Some((len, false)),
+            Some((run, start)) => Some(((start + run / 2).max(1) * WINDOW_SAMPLES, Seam::APause)),
+            // Halfway through the quiet span, for the same reason.
+            None => match self.find_quietest_span(open, search_from, need) {
+                Some(start) => Some((
+                    (start + need / 2).max(1) * WINDOW_SAMPLES,
+                    Seam::TheQuietestMoment,
+                )),
+                None => Some((len, Seam::WhereTheCapFell)),
+            },
         }
+    }
+
+    /// The first window of the quietest `need`-window span in the search
+    /// region — or `None` when the whole region is loud.
+    ///
+    /// `None` is the ordinary answer, not a failure: most of the time somebody
+    /// really is talking without a break, and then the cut belongs where the cap
+    /// fell, which is the *latest* cut available and so keeps the most words in
+    /// the piece going out. The bar is never lowered until something clears it:
+    /// a tier that always finds something is a tier whose answer means nothing.
+    ///
+    /// Measured in whole windows and stepped one window at a time, so the cut
+    /// this produces is a multiple of [`WINDOW_SAMPLES`] by construction rather
+    /// than by rounding afterwards — every offset the segmenter hands out stays
+    /// an exact number of milliseconds.
+    fn find_quietest_span(
+        &self,
+        open: &OpenUtterance,
+        search_from: usize,
+        need: usize,
+    ) -> Option<usize> {
+        let last_start = open.voiced.len().checked_sub(need)?;
+        // What this speaker's voice measures in this very stretch, so the bar
+        // travels with the room and the microphone instead of being guessed
+        // once. Silence before the first word is not part of the voice.
+        let reference = rms(&open.samples[..open.voiced_len]);
+        let bar = reference * QUIET_ENOUGH;
+
+        let mut quietest: Option<(f32, usize)> = None;
+        for start in search_from..=last_start {
+            let from = start * WINDOW_SAMPLES;
+            let level = rms(&open.samples[from..from + need * WINDOW_SAMPLES]);
+            if quietest.is_none_or(|(best_level, _)| level < best_level) {
+                quietest = Some((level, start));
+            }
+        }
+        // Strictly below, so a stretch with no voice in it at all (reference
+        // zero) declines rather than cutting at an arbitrary spot.
+        quietest
+            .filter(|(level, _)| *level < bar)
+            .map(|(_, start)| start)
     }
 
     /// End of stream: emit whatever is still open.
@@ -944,18 +1155,41 @@ impl SpeechDetector {
     /// absent — first launch, download still running, a person who skipped it —
     /// use [`SpeechDetector::without_model`] and keep recording.
     pub fn load(model_path: &Path, channel: Channel) -> Result<Self, AudioError> {
+        Self::load_when(model_path, channel, Listening::Live)
+    }
+
+    /// [`Self::load`], for a caller who says who is waiting. See [`Listening`].
+    pub fn load_when(
+        model_path: &Path,
+        channel: Channel,
+        listening: Listening,
+    ) -> Result<Self, AudioError> {
         let engine = Engine::Silero(Box::new(Silero::load(model_path)?));
-        Ok(Self::with_engine(engine, channel))
+        Ok(Self::with_settings(
+            engine,
+            channel,
+            VadSettings::for_channel_when(channel, listening),
+        ))
     }
 
     /// Detector for when the asset is not on disk. Recording never waits for a
     /// download.
     pub fn without_model(channel: Channel) -> Self {
-        Self::with_engine(Engine::Loudness(LoudnessGate::default()), channel)
+        Self::without_model_when(channel, Listening::Live)
     }
 
-    fn with_engine(engine: Engine, channel: Channel) -> Self {
-        let settings = VadSettings::for_channel(channel);
+    /// [`Self::without_model`], for a caller who says who is waiting.
+    pub fn without_model_when(channel: Channel, listening: Listening) -> Self {
+        Self::with_settings(
+            Engine::Loudness(LoudnessGate::default()),
+            channel,
+            VadSettings::for_channel_when(channel, listening),
+        )
+    }
+
+    /// The one constructor: an engine, a channel, and the settings to segment
+    /// with. Every other constructor here decides those settings and calls this.
+    fn with_settings(engine: Engine, channel: Channel, settings: VadSettings) -> Self {
         Self {
             engine,
             segmenter: Segmenter::with_settings(channel, settings),
@@ -977,18 +1211,31 @@ impl SpeechDetector {
 
     /// Load the real detector if the asset is there, fall back if it is not.
     pub fn load_or_fallback(model_path: Option<&Path>, channel: Channel) -> Self {
+        Self::load_or_fallback_when(model_path, channel, Listening::Live)
+    }
+
+    /// [`Self::load_or_fallback`], for a caller who says who is waiting.
+    ///
+    /// The fallback gets the same settings as the real thing: the loudness gate
+    /// answers the same question Silero does, and the segmentation around it —
+    /// which is what [`Listening`] moves — is identical either way.
+    pub fn load_or_fallback_when(
+        model_path: Option<&Path>,
+        channel: Channel,
+        listening: Listening,
+    ) -> Self {
         match model_path {
-            Some(path) if path.exists() => match Self::load(path, channel) {
+            Some(path) if path.exists() => match Self::load_when(path, channel, listening) {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(
                         target: "echo::audio",
                         "falling back to loudness-based speech detection: {e}"
                     );
-                    Self::without_model(channel)
+                    Self::without_model_when(channel, listening)
                 }
             },
-            _ => Self::without_model(channel),
+            _ => Self::without_model_when(channel, listening),
         }
     }
 
@@ -1173,12 +1420,25 @@ impl std::fmt::Debug for OfflineDetector {
 impl OfflineDetector {
     /// Start one. `model_path` of `None` — or a path that will not load — falls
     /// back to the loudness gate, exactly as live detection does.
-    pub fn open(model_path: Option<PathBuf>, channel: Channel) -> Result<Self, AudioError> {
+    ///
+    /// `listening` says who is waiting for these words, which is what decides
+    /// how long a stretch is held open — see [`Listening`]. Reading from disk is
+    /// not by itself an answer: the pass that catches up *during* a recording
+    /// reads from disk too, and somebody is watching that one.
+    pub fn open(
+        model_path: Option<PathBuf>,
+        channel: Channel,
+        listening: Listening,
+    ) -> Result<Self, AudioError> {
         let (requests, incoming) = std::sync::mpsc::channel::<DetectRequest>();
         let worker = std::thread::Builder::new()
             .name("echo-speech-offline".into())
             .spawn(move || {
-                let mut detector = SpeechDetector::load_or_fallback(model_path.as_deref(), channel);
+                let mut detector = SpeechDetector::load_or_fallback_when(
+                    model_path.as_deref(),
+                    channel,
+                    listening,
+                );
                 while let Ok(request) = incoming.recv() {
                     match request {
                         DetectRequest::Push {
@@ -1268,8 +1528,9 @@ pub async fn detect_offline(
     samples: &[f32],
     t_offset_ms: i64,
     channel: Channel,
+    listening: Listening,
 ) -> Result<Vec<Utterance>, AudioError> {
-    let mut detector = OfflineDetector::open(Some(model_path.to_path_buf()), channel)?;
+    let mut detector = OfflineDetector::open(Some(model_path.to_path_buf()), channel, listening)?;
     let mut out = Vec::new();
     // Half-second pieces: big enough to be cheap, small enough that a very long
     // recording does not sit in one allocation twice.
@@ -1433,9 +1694,92 @@ mod tests {
         assert_eq!(u.duration_ms(), 3_500);
     }
 
+    /// Every utterance carries how much of itself was speech, because that is
+    /// the only evidence anything downstream has that a line was written over a
+    /// pause (2026-08-24; see [`crate::asr::phantom`]).
+    #[test]
+    fn an_utterance_says_how_much_of_it_was_voice() {
+        let settings = VadSettings::mic();
+        let mut seg = Segmenter::with_settings(Channel::Mic, settings);
+        let quiet = vec![0.0f32; WINDOW_SAMPLES];
+        let mut out = Vec::new();
+
+        // A shortest-possible burst: exactly the debounce, then silence until
+        // the utterance closes.
+        for _ in 0..10 {
+            out.extend(seg.push_window(&quiet, false));
+        }
+        let voiced_windows = settings.min_voiced_windows();
+        for _ in 0..voiced_windows {
+            out.extend(seg.push_window(&quiet, true));
+        }
+        for _ in 0..60 {
+            out.extend(seg.push_window(&quiet, false));
+        }
+        out.extend(seg.finish());
+        assert_eq!(out.len(), 1, "{out:#?}");
+        let blip = &out[0];
+        assert_eq!(blip.voiced_ms, voiced_windows as i64 * WINDOW_MS);
+        assert!(
+            blip.measured_voice_ms() < crate::asr::phantom::TOO_LITTLE_VOICE_MS,
+            "a stretch opened by one blip holds {} ms of voice",
+            blip.measured_voice_ms()
+        );
+
+        // And a stretch somebody actually spoke through does not.
+        let mut seg = Segmenter::with_settings(Channel::Mic, settings);
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            out.extend(seg.push_window(&quiet, false));
+        }
+        for _ in 0..20 {
+            out.extend(seg.push_window(&quiet, true));
+        }
+        for _ in 0..60 {
+            out.extend(seg.push_window(&quiet, false));
+        }
+        out.extend(seg.finish());
+        assert_eq!(out.len(), 1, "{out:#?}");
+        let spoken = &out[0];
+        assert_eq!(spoken.voiced_ms, 20 * WINDOW_MS);
+        assert!(
+            spoken.measured_voice_ms() > crate::asr::phantom::TOO_LITTLE_VOICE_MS,
+            "real speech holds {} ms of voice",
+            spoken.measured_voice_ms()
+        );
+    }
+
+    /// Nothing measured it, so nothing may be deleted because of it.
+    #[test]
+    fn an_unmeasured_utterance_reads_as_all_voice() {
+        let unmeasured = Utterance {
+            t_start_ms: 0,
+            t_end_ms: 4_000,
+            ..Default::default()
+        };
+        assert_eq!(unmeasured.measured_voice_ms(), 4_000);
+        assert_eq!(unmeasured.voiced_ratio(), 1.0);
+        assert_eq!(Utterance::default().measured_voice_ms(), 0);
+        assert_eq!(Utterance::default().voiced_ratio(), 1.0);
+        // And a measurement longer than the stretch cannot exceed it.
+        let odd = Utterance {
+            t_start_ms: 0,
+            t_end_ms: 1_000,
+            voiced_ms: 5_000,
+            ..Default::default()
+        };
+        assert_eq!(odd.measured_voice_ms(), 1_000);
+        assert_eq!(odd.voiced_ratio(), 1.0);
+    }
+
     #[test]
     fn the_utterance_cap_leaves_room_for_padding() {
-        for settings in [VadSettings::mic(), VadSettings::system()] {
+        for settings in [
+            VadSettings::mic(),
+            VadSettings::system(),
+            VadSettings::for_channel_when(Channel::Mic, Listening::FromDisk),
+            VadSettings::for_channel_when(Channel::System, Listening::FromDisk),
+        ] {
             assert!(settings.max_utterance_ms > settings.pre_pad_ms + settings.post_pad_ms);
             assert!(settings.silence_tail_ms > 0);
             // An utterance plus its padding has to fit the speech engine's
@@ -1499,6 +1843,117 @@ mod tests {
         assert_eq!(
             SpeechDetector::without_model(Channel::Mic).settings(),
             &VadSettings::mic()
+        );
+        // …and the settings of whoever is waiting, when it is told.
+        assert_eq!(
+            SpeechDetector::without_model_when(Channel::Mic, Listening::Live).settings(),
+            &VadSettings::mic()
+        );
+        assert_eq!(
+            SpeechDetector::without_model_when(Channel::Mic, Listening::FromDisk).settings(),
+            &VadSettings::for_channel_when(Channel::Mic, Listening::FromDisk)
+        );
+    }
+
+    /// Reading a recording back changes *when a stretch is called finished*, and
+    /// nothing else.
+    ///
+    /// The two halves of that are both load-bearing. The tail grows because live
+    /// it is dead air in front of a caption and after the meeting it is free —
+    /// and `post_pad_ms` grows with it so the last consonant before the longer
+    /// pause is inside the window handed to the engine. Everything that decides
+    /// *whether a given 32 ms is speech* stays put, because if it moved, the
+    /// live pass and the catch-up pass would disagree about what was said rather
+    /// than merely about where the lines break.
+    #[test]
+    fn reading_a_recording_back_only_moves_when_a_stretch_is_closed() {
+        for channel in [Channel::Mic, Channel::System] {
+            let live = VadSettings::for_channel_when(channel, Listening::Live);
+            let from_disk = VadSettings::for_channel_when(channel, Listening::FromDisk);
+
+            // Live is the unchanged, per-channel answer: this is a second set of
+            // settings, not a re-tuning of the first.
+            assert_eq!(live, VadSettings::for_channel(channel));
+
+            assert!(
+                from_disk.silence_tail_ms > live.silence_tail_ms,
+                "{channel:?}: reading back has to wait longer, not less"
+            );
+            assert!(from_disk.post_pad_ms > live.post_pad_ms);
+
+            // The facts about the audio, identical on both sides.
+            assert_eq!(from_disk.enter, live.enter);
+            assert_eq!(from_disk.exit, live.exit);
+            assert_eq!(from_disk.min_voiced_ms, live.min_voiced_ms);
+            assert_eq!(from_disk.max_utterance_ms, live.max_utterance_ms);
+            assert_eq!(from_disk.pre_pad_ms, live.pre_pad_ms);
+            assert_eq!(from_disk.forced_overlap_ms, live.forced_overlap_ms);
+            assert_eq!(from_disk.min_forced_silence_ms, live.min_forced_silence_ms);
+        }
+
+        let mic = VadSettings::for_channel_when(Channel::Mic, Listening::FromDisk);
+        let system = VadSettings::for_channel_when(Channel::System, Listening::FromDisk);
+        // The microphone still closes later than the computer. That ordering is
+        // a fact about far-field noisy audio against a clean conferencing feed,
+        // so it has to survive whoever is waiting…
+        assert!(mic.silence_tail_ms > system.silence_tail_ms);
+        // …and it does because the tail moves by the same multiple on both,
+        // rather than by a number picked twice. Cross-multiplied so the equality
+        // is exact whatever the multiple becomes.
+        assert_eq!(
+            mic.silence_tail_ms * VadSettings::system().silence_tail_ms,
+            system.silence_tail_ms * VadSettings::mic().silence_tail_ms,
+        );
+        assert_eq!(mic.post_pad_ms, system.post_pad_ms);
+    }
+
+    /// The same recording, read back after the meeting, keeps a sentence whole
+    /// where the live pass broke it in two.
+    ///
+    /// This is the whole of [`Listening::FromDisk`] in one test: a breath in the
+    /// middle of unhurried speech outlasts the tail a live caption can afford to
+    /// wait for, so live it ends a line and afterwards it does not. Modelled on
+    /// `the_computer_channel_closes_sooner_than_the_microphone`: identical audio
+    /// into two detectors, the settings being the only difference between them.
+    #[test]
+    fn a_recording_read_back_keeps_a_sentence_the_live_pass_would_have_split() {
+        // Per channel: a pause longer than the live tail and shorter than the
+        // from-disk one, in whole 32 ms windows (mic 416 → 704, system 320 →
+        // 576).
+        for (channel, pause_ms) in [(Channel::Mic, 560), (Channel::System, 448)] {
+            let mut audio = room_noise(300);
+            audio.extend(tone(1_400, 300.0, 0.3));
+            audio.extend(room_noise(pause_ms));
+            audio.extend(tone(1_400, 300.0, 0.3));
+            audio.extend(room_noise(1_500));
+
+            let mut live = SpeechDetector::without_model_when(channel, Listening::Live);
+            let mut as_it_happened = feed(&mut live, &audio, 0);
+            as_it_happened.extend(live.finish());
+            assert_eq!(
+                as_it_happened.len(),
+                2,
+                "{channel:?}: the live pass was supposed to close at the breath: {as_it_happened:#?}"
+            );
+
+            let mut afterwards = SpeechDetector::without_model_when(channel, Listening::FromDisk);
+            let mut read_back = feed(&mut afterwards, &audio, 0);
+            read_back.extend(afterwards.finish());
+            assert_eq!(
+                read_back.len(),
+                1,
+                "{channel:?}: reading it back still split a sentence at a breath: {read_back:#?}"
+            );
+        }
+    }
+
+    /// Nobody gets the longer tail by accident: a caller has to ask.
+    #[test]
+    fn a_detector_listens_live_unless_it_is_told_otherwise() {
+        assert_eq!(Listening::default(), Listening::Live);
+        assert_eq!(
+            SpeechDetector::without_model(Channel::Mic).settings(),
+            SpeechDetector::without_model_when(Channel::Mic, Listening::default()).settings()
         );
     }
 
@@ -1893,8 +2348,9 @@ mod tests {
         let settings = VadSettings::mic();
         let mut d = SpeechDetector::without_model(Channel::Mic);
         let mut audio = room_noise(200);
-        // Not one breath in seventy seconds: there is nowhere good to cut, so
-        // every cut has to go through speech.
+        // Not one breath in seventy seconds, and never a moment quieter than the
+        // rest: there is nowhere good to cut, so every cut has to go through
+        // speech where the cap fell.
         audio.extend(tone(70_000, 300.0, 0.3));
         audio.extend(room_noise(1_000));
 
@@ -1916,6 +2372,24 @@ mod tests {
         let (last, forced) = out.split_last().unwrap();
         assert!(forced.iter().all(|u| u.truncated), "{out:#?}");
         assert!(!last.truncated);
+
+        // Uniformly loud audio gives the quietest-moment tier nothing to find,
+        // and it says so rather than settling for the least loud vowel: every
+        // forced piece runs the full length of the cap, which is the latest cut
+        // available and so the one that keeps the most words together.
+        let cap_ms = samples_to_ms(settings.max_samples());
+        for u in forced {
+            assert_eq!(
+                u.duration_ms(),
+                cap_ms,
+                "a piece was cut early, so something claimed to find a quiet moment"
+            );
+        }
+        // And every cut sits on a window boundary, so the pieces tile the
+        // timeline with no rounding gap between them.
+        for u in &out {
+            assert_eq!(u.samples.len() % WINDOW_SAMPLES, 0, "{u:#?}");
+        }
 
         let overlap_ms = samples_to_ms(settings.overlap_samples());
         assert!(
@@ -1970,6 +2444,152 @@ mod tests {
             quiet_tail < 0.05,
             "the first piece ends mid-word: {quiet_tail}"
         );
+        assert_eq!(out[0].samples.len() % WINDOW_SAMPLES, 0, "{:#?}", out[0]);
+    }
+
+    /// The tier the loudness fallback is for.
+    ///
+    /// Before the speech model has been downloaded, a breath taken without
+    /// going properly silent reads as continuing speech, so there is no pause to
+    /// cut at — but there is still an obvious place to put the join, and it is
+    /// not wherever the cap happened to fall.
+    #[test]
+    fn a_monologue_with_a_quiet_moment_but_no_pause_is_cut_at_the_quiet_moment() {
+        let settings = VadSettings::mic();
+        let mut d = SpeechDetector::without_model(Channel::Mic);
+        let mut audio = room_noise(200);
+        audio.extend(tone(21_300, 300.0, 0.3));
+        // Far below the voice around it, and far too loud to be silence: the
+        // loudness gate calls all of this speech.
+        audio.extend(tone(200, 300.0, 0.02));
+        audio.extend(tone(3_000, 300.0, 0.3));
+        audio.extend(room_noise(1_000));
+
+        let mut out = feed(&mut d, &audio, 0);
+        out.extend(d.finish());
+        assert!(out.len() >= 2, "{out:#?}");
+
+        // Nothing in there was ever called silence, so the pause tier had
+        // nothing to offer.
+        let breath_ms = 21_500;
+        let cap_ms = samples_to_ms(settings.max_samples());
+        let first = &out[0];
+        assert!(
+            (breath_ms - 200..breath_ms + 200).contains(&first.duration_ms()),
+            "the cut missed the quiet moment at {breath_ms} ms: {first:#?}"
+        );
+        assert!(
+            first.duration_ms() < cap_ms,
+            "the cut fell at the cap ({cap_ms} ms) instead of the quiet moment"
+        );
+        // It really is quiet where the join landed.
+        let tail = rms(&first.samples[first.samples.len() - WINDOW_SAMPLES..]);
+        assert!(
+            tail < 0.15 * rms(&first.samples),
+            "the join is mid-word: {tail}"
+        );
+
+        // And it promises no more than a cut at the cap would: nobody measured
+        // whether a word was split, so the piece says it was and the
+        // continuation re-reads the join.
+        assert!(
+            first.truncated,
+            "a cut at the quietest moment claimed to be a pause"
+        );
+        let overlap_ms = samples_to_ms(settings.overlap_samples());
+        assert_eq!(
+            out[1].t_start_ms,
+            first.t_end_ms - overlap_ms,
+            "the join carried no audio: {:#?} then {:#?}",
+            first,
+            out[1]
+        );
+        let carried = ms_to_samples(overlap_ms);
+        assert_eq!(
+            &out[1].samples[..carried],
+            &first.samples[first.samples.len() - carried..],
+            "the overlap is not the same audio"
+        );
+        assert_eq!(first.samples.len() % WINDOW_SAMPLES, 0, "{first:#?}");
+    }
+
+    /// One window at a time, with the speech decision spelled out.
+    ///
+    /// Lets a test build audio no gate would ever produce — a stretch nothing
+    /// called speech that is *louder* than a stretch something did — which is
+    /// the only way to ask which of the two a forced cut prefers.
+    fn push_flat(seg: &mut Segmenter, ms: usize, amp: f32, is_speech: bool) -> Vec<Utterance> {
+        let window = vec![amp; WINDOW_SAMPLES];
+        let mut out = Vec::new();
+        for _ in 0..(RATE * ms / 1_000 / WINDOW_SAMPLES) {
+            out.extend(seg.push_window(&window, is_speech));
+        }
+        out
+    }
+
+    /// A pause is better evidence than quiet, however quiet the quiet is.
+    ///
+    /// Being told "nobody is speaking here" is knowledge about the words; being
+    /// told "this is the softest part" is knowledge about the loudness. A cut at
+    /// the first splits nothing and can say so, so it wins even when the second
+    /// looks more inviting.
+    #[test]
+    fn a_pause_beats_a_quieter_moment_that_is_nobody_pausing() {
+        let settings = VadSettings::mic();
+        let mut seg = Segmenter::with_settings(Channel::Mic, settings);
+        let mut out = push_flat(&mut seg, 200, 0.0, false);
+        out.extend(push_flat(&mut seg, 21_300, 0.3, true));
+        // A breath: not loud, and nothing called it speech.
+        out.extend(push_flat(&mut seg, 200, 0.02, false));
+        out.extend(push_flat(&mut seg, 1_000, 0.3, true));
+        // Quieter still — but this is somebody speaking softly.
+        out.extend(push_flat(&mut seg, 200, 0.001, true));
+        out.extend(push_flat(&mut seg, 2_000, 0.3, true));
+
+        assert_eq!(out.len(), 1, "{out:#?}");
+        let first = &out[0];
+        assert!(
+            !first.truncated,
+            "the cut passed over a real pause for a quieter non-pause"
+        );
+        assert!(
+            (21_300..21_700).contains(&first.duration_ms()),
+            "the cut landed at {} ms, not in the pause at 21.5 s",
+            first.duration_ms()
+        );
+    }
+
+    /// Whichever tier answers, the answer is a whole number of windows.
+    ///
+    /// Every offset the segmenter hands out is derived from this, so a cut that
+    /// landed on a fraction of a window would put a rounding gap between two
+    /// pieces of one sentence.
+    #[test]
+    fn every_forced_cut_lands_on_a_window_boundary() {
+        let settings = VadSettings::mic();
+        for (what, breath_amp, breath_is_speech) in [
+            ("a real pause", 0.0, false),
+            ("a quiet moment", 0.02, true),
+            ("nothing at all", 0.3, true),
+        ] {
+            let mut seg = Segmenter::with_settings(Channel::Mic, settings);
+            let mut out = push_flat(&mut seg, 200, 0.0, false);
+            out.extend(push_flat(&mut seg, 21_300, 0.3, true));
+            out.extend(push_flat(&mut seg, 200, breath_amp, breath_is_speech));
+            out.extend(push_flat(&mut seg, 4_000, 0.3, true));
+            out.extend(seg.finish());
+
+            assert!(out.len() >= 2, "{what}: {out:#?}");
+            for u in &out {
+                assert_eq!(u.samples.len() % WINDOW_SAMPLES, 0, "{what}: {u:#?}");
+                assert_eq!(
+                    u.t_end_ms - u.t_start_ms,
+                    samples_to_ms(u.samples.len()),
+                    "{what}: the window claimed does not match the audio"
+                );
+                assert_eq!((u.t_end_ms - u.t_start_ms) % WINDOW_MS, 0, "{what}: {u:#?}");
+            }
+        }
     }
 
     #[test]
@@ -2189,6 +2809,7 @@ mod tests {
                 &audio,
                 10_000,
                 Channel::Mic,
+                Listening::FromDisk,
             ))
             .unwrap();
         assert_eq!(found.len(), 1, "{found:#?}");
@@ -2213,7 +2834,8 @@ mod tests {
             .build()
             .unwrap();
         let found = rt.block_on(async {
-            let mut detector = OfflineDetector::open(None, Channel::Mic).unwrap();
+            let mut detector =
+                OfflineDetector::open(None, Channel::Mic, Listening::FromDisk).unwrap();
             let mut out = Vec::new();
             // Two reads, with the boundary in the middle of the sentence.
             let split = RATE * 2;

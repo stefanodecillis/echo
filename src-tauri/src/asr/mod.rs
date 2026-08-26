@@ -11,6 +11,13 @@
 //! * [`engine`] runs it: one loaded engine, one job at a time.
 //! * [`language`] decides when the meeting's language is settled.
 //! * [`catchup`] transcribes from disk whatever the live pass missed.
+//! * [`confidence`] decides which lines Echo should admit it is unsure about,
+//!   and is the one bar both the transcript screen and the recap ask.
+//! * [`phantom`] recognises the lines silence talked the decoder into, after
+//!   the fact, and drops them.
+//! * [`left_out`] works out which of the stretches Echo decided not to write
+//!   down left the transcript with no words at all, so the meeting screen can
+//!   say so.
 //!
 //! Lifecycle (mantra 1, as amended 2026-08-20): the engine loads the moment a
 //! meeting is detected or started and stays resident for the whole conversation
@@ -22,9 +29,14 @@
 
 pub mod catalog;
 pub mod catchup;
+pub mod catchup_bleed;
+pub mod confidence;
 pub mod engine;
+pub mod glossary;
 pub mod language;
+pub mod left_out;
 pub mod models;
+pub mod phantom;
 pub mod reconcile;
 
 use crate::types::{Channel, Id};
@@ -107,9 +119,22 @@ pub struct Transcription {
     pub t_start_ms: i64,
     pub t_end_ms: i64,
     pub text: String,
-    /// Detected language for this stretch, with its own confidence.
+    /// The language this stretch was read in, with the confidence of the
+    /// detection when there was one.
     pub language: Option<String>,
     pub language_confidence: Option<f32>,
+    /// Whether [`Transcription::language`] is the meeting's standing answer
+    /// handed down to this stretch rather than something heard in it.
+    ///
+    /// Handed down is the common case once a meeting has settled — seven
+    /// stretches in eight are decoded on the hint without a detection of their
+    /// own — and it is what the stretch was read in, so it stays here for the
+    /// things that care about that. It must not reach the segment row, though:
+    /// a language histogram built from copies of the pin can only ever
+    /// re-confirm the pin, which is how a meeting a third of which was in
+    /// English gets written up as if it had not been. See
+    /// [`Transcription::observed_language`].
+    pub language_inherited: bool,
     /// Mean token probability, used to flag shaky passages.
     pub avg_confidence: Option<f32>,
     /// Name and revision of what produced this, stored on the segment.
@@ -144,6 +169,7 @@ impl Transcription {
                 text: line.text.clone(),
                 language: self.language.clone(),
                 language_confidence: self.language_confidence,
+                language_inherited: self.language_inherited,
                 avg_confidence: line.avg_confidence.or(self.avg_confidence),
                 model_name: self.model_name.clone(),
                 model_revision: self.model_revision.clone(),
@@ -163,6 +189,22 @@ impl Transcription {
         meaningful == 0
     }
 
+    /// The language this stretch was *heard* to be in, which is what a segment
+    /// row records.
+    ///
+    /// `None` when the stretch only inherited the meeting's answer. A row
+    /// carrying a copy of the pin is not evidence about the meeting — it is the
+    /// pin again — and everything downstream of these rows
+    /// ([`crate::asr::language::spoken_in`], the recap's bilingual directive,
+    /// the write-back that decides the meeting's language after catch-up) is
+    /// asking what was *heard*.
+    pub fn observed_language(&self) -> Option<String> {
+        if self.language_inherited {
+            return None;
+        }
+        self.language.clone()
+    }
+
     /// The row this becomes. Speakers are attached later: live attribution is
     /// channel-based and the offline pass owns the final answer.
     pub fn to_draft(&self, meeting_id: &str) -> crate::types::SegmentDraft {
@@ -173,12 +215,13 @@ impl Transcription {
             channel: self.channel,
             speaker_id: None,
             text: self.text.clone(),
-            language: self.language.clone(),
+            language: self.observed_language(),
             avg_confidence: self.avg_confidence,
             revision: 1,
             is_final: true,
             model_name: self.model_name.clone(),
             model_revision: self.model_revision.clone(),
+            corrections: Vec::new(),
         }
     }
 }
@@ -196,6 +239,26 @@ pub struct TranscribeJob {
     pub samples: Vec<f32>,
     /// Language hint from earlier in this meeting. `None` asks for detection.
     pub language_hint: Option<String>,
+    /// Work the language out from this audio alone, whatever the meeting has
+    /// settled on.
+    ///
+    /// `language_hint: None` on its own does *not* mean that: the engine keeps
+    /// its own answer for the meeting and fills an empty hint in from it, which
+    /// is the right default for every ordinary utterance. It is wrong for
+    /// exactly one caller — catch-up reading a stretch a second time *because*
+    /// the meeting's answer does not fit it (`catchup::transcribe_with_prior`).
+    /// Without this the second
+    /// reading is handed the very answer it is trying to get away from, and the
+    /// escape hatch is a decode that can never reach a different result.
+    pub detect_afresh: bool,
+    /// How much of this window the speech detector actually called voice.
+    ///
+    /// `None` means nobody measured, and the whole window stands in for it.
+    /// It matters for one thing: how much a language vote from this window is
+    /// worth. A live utterance is padded at both ends and a catch-up window is
+    /// mostly the pauses between the things that were said, so weighting a vote
+    /// by the window is weighting it by silence.
+    pub voiced_ms: Option<i64>,
     /// Emit partial results while decoding. Off for catch-up work.
     pub want_partials: bool,
     /// Live utterances are dropped when the queue is full; catch-up work waits
@@ -210,6 +273,16 @@ impl TranscribeJob {
 
     pub fn t_end_ms(&self) -> i64 {
         self.t_start_ms + self.duration_ms()
+    }
+
+    /// The speech in this window, as far as anything measured it — never more
+    /// than the window itself, and the whole window when nothing did.
+    pub fn voice_ms(&self) -> i64 {
+        let duration = self.duration_ms().max(0);
+        match self.voiced_ms {
+            Some(measured) if measured > 0 => measured.min(duration),
+            _ => duration,
+        }
     }
 }
 
@@ -305,6 +378,34 @@ mod tests {
         assert_eq!(job.t_end_ms(), 6_000);
     }
 
+    /// What a segment row records is what these seconds were *heard* to be in.
+    ///
+    /// Seven settled stretches in eight are decoded on the meeting's own answer
+    /// without a detection of their own, and a row carrying that answer is not
+    /// evidence about the meeting — it is the pin written out again. Rows like
+    /// that are what the meeting's language is later recomputed from, so keeping
+    /// them makes that a closed loop, and drowns a language a real part of the
+    /// meeting was in under copies of the one that was pinned.
+    #[test]
+    fn a_language_a_stretch_only_inherited_never_reaches_the_row() {
+        let mut t = Transcription {
+            channel: Channel::Mic,
+            t_start_ms: 0,
+            t_end_ms: 2_000,
+            text: "hello".into(),
+            language: Some("it".into()),
+            language_inherited: true,
+            ..Default::default()
+        };
+        assert_eq!(t.observed_language(), None);
+        assert_eq!(t.to_draft("m1").language, None);
+
+        // Heard in these seconds, so it is worth writing down.
+        t.language_inherited = false;
+        assert_eq!(t.observed_language().as_deref(), Some("it"));
+        assert_eq!(t.to_draft("m1").language.as_deref(), Some("it"));
+    }
+
     #[test]
     fn a_transcription_becomes_a_final_segment_with_its_provenance() {
         let t = Transcription {
@@ -314,6 +415,7 @@ mod tests {
             text: "hello".into(),
             language: Some("en".into()),
             language_confidence: Some(0.98),
+            language_inherited: false,
             avg_confidence: Some(0.87),
             // Deliberately the weights Echo has retired: a segment written
             // while an older model was still serving has to keep saying so

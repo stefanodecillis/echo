@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -345,6 +345,261 @@ pub async fn readiness(db: &Db, paths: &AppPaths) -> Result<SpeechReadiness, Asr
         level_id: Some(plan.level_id.to_string()),
         loaded: false,
     })
+}
+
+// ---------------------------------------------------------------------------
+// The one-time setup a set of weights needs on this machine
+//
+// On Apple silicon the first load of a speech model compiles its encoder for
+// this particular machine and the OS caches the result: sixteen minutes on
+// 2026-08-24, against three seconds every load after it. The compile happens
+// inside the load, wherever that load is asked for — and on 2026-08-24 it was
+// asked for by a meeting that had already started, so the first sixteen minutes
+// of a real conversation had no live text and nothing on screen explaining why.
+//
+// The cache is keyed on the app as well as the weights. On 2026-08-26 a rebuilt
+// Echo, with a model it had not touched, spent 15.8 minutes compiling again —
+// in a meeting again — because this file believed a marker naming the model
+// file alone. So the marker names the running build too ([`build_identity`]).
+//
+// These functions are the whole memory of it: which weights are installed,
+// whether they have been through a load here, by this build, and whether one
+// has been tried and what it cost.
+// What acts on the answer is `JobKind::PrepareEngine`, queued from
+// `SessionManager::ensure_speech_current` while nothing is being recorded.
+// ---------------------------------------------------------------------------
+
+/// File name of the speech weights a load would actually use right now.
+///
+/// The *serving* file, exactly as [`installed_path`] resolves it — while an
+/// upgrade is still downloading that is yesterday's model, and yesterday's model
+/// is the one whose setup has already been paid. The name rather than the path,
+/// because it is what identifies the weights across a change of storage folder.
+pub async fn installed_speech_file_name(db: &Db) -> Result<Option<String>, AsrError> {
+    Ok(installed_path(db, AssetKind::Speech)
+        .await?
+        .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned())))
+}
+
+/// What "this app" is, as far as the one-time setup is concerned.
+///
+/// The compile the marker remembers is not really a property of the weights.
+/// macOS caches the compiled encoder under a key that includes the *binary*
+/// that asked for it, so replacing the app throws that cache away even though
+/// every byte of the model is untouched. On 2026-08-26 that is exactly what
+/// happened: a rebuilt Echo, the same weights, and 15.8 minutes of compiling
+/// paid inside a meeting, because the marker named the model file and nothing
+/// else.
+///
+/// So the marker has to name the running binary too, and this is that name: the
+/// app's version and the modification time of [`std::env::current_exe`]. The
+/// timestamp was chosen over a build-time constant, and the version is folded
+/// in beside it rather than instead of it:
+///
+/// * `CARGO_PKG_VERSION` on its own is not enough, and is precisely what failed
+///   here — the rebuild that lost the cache carried the same version number as
+///   the build before it.
+/// * A constant stamped in by a build script is a property of the source tree
+///   that compiled *this crate*, not of the artifact the OS keys its cache on.
+///   A relink, a re-sign, a change in the bundled speech library, a repackage:
+///   each of those is a new binary that a stale constant would call old.
+/// * The file's timestamp is a property of that artifact. Anything that writes
+///   a new app — an update, a reinstall, a rebuild — writes a new timestamp.
+///   Its one weak spot is a copy that deliberately preserves timestamps, and
+///   the version sitting next to it covers the case where such a copy is also a
+///   new release.
+///
+/// This means a developer rebuilding Echo is asked for a warm-up too. That is
+/// correct rather than a wart to suppress: their cache really was thrown away,
+/// and the alternative is that the person most likely to be about to join a
+/// meeting with a brand-new build is the one person Echo never gets ready for.
+///
+/// `None` means the identity could not be read at all — no executable path, no
+/// timestamp on it. What is done with that is [`UNIDENTIFIED_BUILD`], and it is
+/// never "assume warm".
+///
+/// Read once and kept, because the file on disk can change while this process is
+/// still running it. A rebuild, or an updater staging the new app, replaces the
+/// executable underneath a running Echo — and the run that is in the middle of
+/// paying a quarter of an hour of compiling would then finish and write a marker
+/// naming the *replacement*, for a cache the OS keyed on the binary that
+/// actually did the work. The next launch would read its own identity, find the
+/// marker already naming it, skip the warm-up it genuinely needs, and hand the
+/// compile back to a meeting. Pinning it at first use closes that window: at
+/// first use the file on disk and the running process are still the same thing,
+/// so every marker this run writes names the build that paid for it.
+fn build_identity() -> Option<&'static str> {
+    static IDENTITY: OnceLock<Option<String>> = OnceLock::new();
+    pin_identity(&IDENTITY, read_build_identity)
+}
+
+/// The pinning itself, separated only so a test can watch it happen with a
+/// reader whose answer changes underneath it — which is the whole point.
+fn pin_identity(
+    cell: &OnceLock<Option<String>>,
+    read: impl FnOnce() -> Option<String>,
+) -> Option<&str> {
+    cell.get_or_init(read).as_deref()
+}
+
+/// The one read behind [`build_identity`]: the running app's version, and the
+/// modification time of the file it was launched from.
+fn read_build_identity() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let modified = std::fs::metadata(exe).ok()?.modified().ok()?;
+    let stamp = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(format!("{}+{stamp}", env!("CARGO_PKG_VERSION")))
+}
+
+/// Stands in for a build whose identity could not be read.
+///
+/// Written and compared like any other identity rather than treated as a
+/// wildcard, which is what keeps an unreadable identity on the safe side: a
+/// marker left by a build Echo *could* identify never matches this, so the
+/// answer is "these weights still owe this machine a setup" — warm me up, not
+/// assume warm.
+///
+/// What it deliberately does not do is ask forever. A marker written under this
+/// stand-in matches this stand-in, so one attempt is still one attempt and a
+/// compile that takes the process down with it cannot be restarted at every
+/// launch for good. Two runs that both fail to read the identity are the single
+/// case Echo cannot tell apart, and there it has nothing whatever to go on; the
+/// second half of the defence covers it anyway, because a load that turns out
+/// to have compiled records the marker itself
+/// ([`crate::session::ports::EngineAsr`]).
+const UNIDENTIFIED_BUILD: &str = "unidentified-build";
+
+/// The stored form of "these weights have been set up, by this app, here".
+fn warm_marker(file_name: &str, identity: Option<&str>) -> String {
+    format!("{file_name}@{}", identity.unwrap_or(UNIDENTIFIED_BUILD))
+}
+
+/// Which weights still owe this machine their one-time setup, if any.
+///
+/// `Some(file_name)` when all three of these hold: those weights are what is
+/// installed and serving, no load of them by *this build* of Echo has ever
+/// finished here, and no attempt has ever been made by it. Anything else is
+/// `None`, including the ordinary case of weights that came up fine weeks ago
+/// under an app nobody has replaced since.
+///
+/// The build is half the question because the OS cache is keyed on it: see
+/// [`build_identity`]. An app update — or a developer's rebuild — means the
+/// compile has to be paid again, and paying it here, before a meeting, is the
+/// whole point of this file.
+pub async fn warm_up_needed(db: &Db) -> Result<Option<String>, AsrError> {
+    warm_up_needed_for(db, build_identity()).await
+}
+
+/// [`warm_up_needed`] against an identity handed in, so the tests can be a
+/// different build, or a build that cannot be identified at all.
+async fn warm_up_needed_for(db: &Db, identity: Option<&str>) -> Result<Option<String>, AsrError> {
+    let Some(installed) = installed_speech_file_name(db).await? else {
+        // Nothing to serve is not something a warm-up can fix; the download job
+        // is what that install is waiting for.
+        return Ok(None);
+    };
+    let warmed = repo::get_setting(db, settings::keys::SPEECH_WARMED_MODEL).await?;
+    let attempted = repo::get_setting(db, settings::keys::SPEECH_WARM_ATTEMPTED).await?;
+    let wanted = warm_marker(&installed, identity);
+    let matches = |stored: Option<String>| stored.as_deref() == Some(wanted.as_str());
+    if matches(warmed) || matches(attempted) {
+        return Ok(None);
+    }
+    Ok(Some(installed))
+}
+
+/// Remember that these weights have been all the way through a load here, under
+/// this build.
+///
+/// Recorded by [`crate::session::ports::EngineAsr`], which every load anything
+/// asks for by name goes through, so weights warmed by a download, by a meeting
+/// or by the setup job all count the same — and so does a load nobody asked to
+/// warm anything, which turned out to compile.
+pub async fn mark_warmed(db: &Db, file_name: &str) -> Result<(), AsrError> {
+    mark_warmed_for(db, file_name, build_identity()).await
+}
+
+/// [`mark_warmed`] against an identity handed in.
+async fn mark_warmed_for(db: &Db, file_name: &str, identity: Option<&str>) -> Result<(), AsrError> {
+    let marker = warm_marker(file_name, identity);
+    repo::set_setting(db, settings::keys::SPEECH_WARMED_MODEL, &marker).await?;
+    Ok(())
+}
+
+/// Remember that the one-time setup for these weights was *started*.
+///
+/// Written before the load begins, never after. The compile it is about is
+/// minutes of heavy work, and anything that kills the process in the middle of
+/// it — an out-of-memory, a driver fault, someone force-quitting an app that
+/// looks frozen — would otherwise be repeated at the next launch, and the one
+/// after that, each time costing a quarter of an hour and getting no further.
+/// The marker is what makes the interrupted attempt count as the attempt, and
+/// the row it belongs to is settled as failed at the next launch rather than
+/// requeued ([`crate::db::repo::fail_interrupted_setup_jobs`]) so that nothing
+/// picks the compile back up on its own.
+///
+/// One attempt per marker, and the marker names the build as well as the
+/// weights ([`build_identity`]): the next version of Echo gets one attempt of
+/// its own, because its cache really is empty, but it gets exactly one.
+///
+/// The cost of being wrong the other way is bounded and already handled: the
+/// meeting that eventually needs these weights pays the compile itself, its
+/// audio is on disk throughout (mantra 3) and the transcript arrives from the
+/// catch-up pass.
+///
+/// It is not, however, "one attempt ever" for a load that cost nothing. An
+/// attempt that came back before the compile could even have begun — no weights
+/// where they should be, a moment of disk pressure, an engine that would not
+/// initialise — has protected nobody by being remembered, and remembering it
+/// would retire this machine's only automatic setup on the strength of one bad
+/// second. Those are forgotten again by [`forget_warm_attempt`], and the failed
+/// row gets one more go at the next launch.
+pub async fn mark_warm_attempted(db: &Db, file_name: &str) -> Result<(), AsrError> {
+    mark_warm_attempted_for(db, file_name, build_identity()).await
+}
+
+/// [`mark_warm_attempted`] against an identity handed in.
+async fn mark_warm_attempted_for(
+    db: &Db,
+    file_name: &str,
+    identity: Option<&str>,
+) -> Result<(), AsrError> {
+    let marker = warm_marker(file_name, identity);
+    repo::set_setting(db, settings::keys::SPEECH_WARM_ATTEMPTED, &marker).await?;
+    Ok(())
+}
+
+/// Take back an attempt that turned out to have cost nothing.
+///
+/// The other half of [`mark_warm_attempted`]: called only when the load came
+/// back quickly *and* with an error, which means the expensive part never
+/// started and there is nothing for the marker to protect the next launch from.
+/// Forgetting it is what lets that launch try again — without it, a single
+/// transient failure would leave this machine unwarmed for good and hand the
+/// compile back to the next real meeting, which is the whole incident of
+/// 2026-08-24 restored.
+///
+/// Only clears a marker that names these exact weights *and* this build, so a
+/// marker written for the model somebody has since moved on to — or by a
+/// version of Echo that is no longer running — is left where it is.
+pub async fn forget_warm_attempt(db: &Db, file_name: &str) -> Result<(), AsrError> {
+    forget_warm_attempt_for(db, file_name, build_identity()).await
+}
+
+/// [`forget_warm_attempt`] against an identity handed in.
+async fn forget_warm_attempt_for(
+    db: &Db,
+    file_name: &str,
+    identity: Option<&str>,
+) -> Result<(), AsrError> {
+    let attempted = repo::get_setting(db, settings::keys::SPEECH_WARM_ATTEMPTED).await?;
+    if attempted.as_deref() == Some(warm_marker(file_name, identity).as_str()) {
+        repo::delete_setting(db, settings::keys::SPEECH_WARM_ATTEMPTED).await?;
+    }
+    Ok(())
 }
 
 /// Download every asset a preset needs, in order, resuming what is partial.
@@ -2298,6 +2553,245 @@ mod tests {
         assert!(
             expected_total > 0,
             "the mock served something (sanity check)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The one-time setup marker
+    // -----------------------------------------------------------------
+
+    /// The whole life of the marker, in the order a person lives it: nothing
+    /// installed, then installed and never warmed, then attempted, then warmed —
+    /// and a new model that starts the story over.
+    ///
+    /// Contract change of 2026-08-26: the marker names the running build as well
+    /// as the weights, so "once and once only" now means once per pair of the
+    /// two. Everything asserted here is one build's story and reads the same,
+    /// because every call in it is made by the same running test binary; the new
+    /// half is `an_app_whose_binary_changed_owes_the_setup_again`.
+    #[tokio::test]
+    async fn weights_owe_this_machine_their_setup_once_and_once_only() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap(),
+            None,
+            "there is nothing to get ready before anything is installed"
+        );
+        assert_eq!(installed_speech_file_name(&db).await.unwrap(), None);
+
+        // What a finished download leaves behind.
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            install(&fx.paths, &db, id).await;
+        }
+        refresh_installed(&db, &fx.paths).await.unwrap();
+        let speech = catalog::entry(catalog::ids::SPEECH).unwrap().file_name;
+        assert_eq!(
+            installed_speech_file_name(&db).await.unwrap().as_deref(),
+            Some(speech)
+        );
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap().as_deref(),
+            Some(speech),
+            "weights nothing has ever loaded here still owe this machine their setup"
+        );
+
+        // The attempt alone settles it: one try per set of weights per build,
+        // ever, so a compile that kills the process cannot become a launch that
+        // never ends.
+        mark_warm_attempted(&db, speech).await.unwrap();
+        assert_eq!(warm_up_needed(&db).await.unwrap(), None);
+
+        // And so does a load that actually finished.
+        mark_warmed(&db, speech).await.unwrap();
+        assert_eq!(warm_up_needed(&db).await.unwrap(), None);
+
+        // Different weights, different bill. Markers naming the model somebody
+        // used to have say nothing about the one they have now.
+        mark_warmed(&db, "some-other-weights.bin").await.unwrap();
+        mark_warm_attempted(&db, "some-other-weights.bin")
+            .await
+            .unwrap();
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap().as_deref(),
+            Some(speech),
+            "a marker for another model must not pass for this one"
+        );
+    }
+
+    /// An attempt that cost nothing is taken back, so the next launch is free to
+    /// try again — one transient failure must not retire this machine's setup
+    /// for good and hand the compile back to a real meeting.
+    #[tokio::test]
+    async fn an_attempt_that_cost_nothing_is_taken_back() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            install(&fx.paths, &db, id).await;
+        }
+        refresh_installed(&db, &fx.paths).await.unwrap();
+        let speech = catalog::entry(catalog::ids::SPEECH).unwrap().file_name;
+
+        mark_warm_attempted(&db, speech).await.unwrap();
+        assert_eq!(warm_up_needed(&db).await.unwrap(), None);
+
+        // A marker naming some other weights is not this attempt, and is left
+        // exactly where it is.
+        forget_warm_attempt(&db, "some-other-weights.bin")
+            .await
+            .unwrap();
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap(),
+            None,
+            "the marker for these weights is still standing"
+        );
+
+        forget_warm_attempt(&db, speech).await.unwrap();
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap().as_deref(),
+            Some(speech),
+            "these weights still owe this machine a setup, and may be asked again"
+        );
+
+        // Forgetting what was never recorded is not an error, and does not
+        // disturb the record of a load that actually finished.
+        forget_warm_attempt(&db, speech).await.unwrap();
+        mark_warmed(&db, speech).await.unwrap();
+        forget_warm_attempt(&db, speech).await.unwrap();
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap(),
+            None,
+            "weights that have been through a load here owe nothing, ever again"
+        );
+    }
+
+    /// A set of weights installed and warmed, for whichever build asks.
+    async fn installed_and_warmed_by(fx: &Fixture, db: &Db, identity: Option<&str>) -> String {
+        sync_catalog(db).await.unwrap();
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            install(&fx.paths, db, id).await;
+        }
+        refresh_installed(db, &fx.paths).await.unwrap();
+        let speech = catalog::entry(catalog::ids::SPEECH).unwrap().file_name;
+        mark_warmed_for(db, speech, identity).await.unwrap();
+        speech.to_string()
+    }
+
+    /// The incident of 2026-08-26: a rebuilt app, weights nobody touched, and
+    /// 15.8 minutes of compiling paid inside a meeting. The compiled encoder is
+    /// cached against the binary, so a new binary owes the setup again — and the
+    /// same binary, asked twice, owes nothing.
+    #[tokio::test]
+    async fn an_app_whose_binary_changed_owes_the_setup_again() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        let speech = installed_and_warmed_by(&fx, &db, Some("1.0.0+100")).await;
+
+        assert_eq!(
+            warm_up_needed_for(&db, Some("1.0.0+100")).await.unwrap(),
+            None,
+            "the app that paid the compile does not pay it twice"
+        );
+        assert_eq!(
+            warm_up_needed_for(&db, Some("1.0.0+200")).await.unwrap(),
+            Some(speech.clone()),
+            "a rebuild at the same version is still a new binary and an empty cache"
+        );
+        assert_eq!(
+            warm_up_needed_for(&db, Some("1.1.0+100")).await.unwrap(),
+            Some(speech),
+            "so is a new version"
+        );
+    }
+
+    /// A build that cannot say what it is asks to be warmed up. The safe
+    /// direction: an unreadable identity must never read as "already warm".
+    ///
+    /// It asks *once*, though. The one-attempt rule is what stops a compile that
+    /// takes the process down from being started again at every launch, and it
+    /// has to survive a machine where the identity never reads.
+    #[tokio::test]
+    async fn a_build_that_cannot_identify_itself_asks_for_a_warm_up() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        let speech = installed_and_warmed_by(&fx, &db, Some("1.0.0+100")).await;
+
+        assert_eq!(
+            warm_up_needed_for(&db, None).await.unwrap(),
+            Some(speech.clone()),
+            "a marker left by a build Echo can name says nothing about one it cannot"
+        );
+
+        mark_warm_attempted_for(&db, &speech, None).await.unwrap();
+        assert_eq!(
+            warm_up_needed_for(&db, None).await.unwrap(),
+            None,
+            "one attempt is still one attempt when nothing can be identified"
+        );
+    }
+
+    /// The running binary can be identified, and says the same thing twice —
+    /// otherwise every launch would ask for a warm-up it does not need.
+    #[test]
+    fn the_running_build_identifies_itself_the_same_way_every_time() {
+        let identity = build_identity().expect("this test binary is on disk");
+        assert_eq!(Some(identity), build_identity());
+    }
+
+    /// A rebuild, or an update staged while Echo is running, rewrites the file
+    /// this process was launched from — and can do it in the middle of the
+    /// quarter of an hour of compiling that the marker is about. Asking the disk
+    /// again at that moment would credit the compile to the *new* build, which
+    /// would then skip the setup it has genuinely never had and pay for it in
+    /// somebody's meeting. So the answer is taken once and kept for the run.
+    #[test]
+    fn the_identity_is_taken_once_and_survives_the_file_being_replaced() {
+        static PINNED: OnceLock<Option<String>> = OnceLock::new();
+
+        let first = pin_identity(&PINNED, || Some("1.0.0+100".to_string()));
+        assert_eq!(first, Some("1.0.0+100"));
+
+        // The executable on disk is now somebody else's build.
+        let after_replacement = pin_identity(&PINNED, || Some("1.0.0+200".to_string()));
+        assert_eq!(
+            after_replacement,
+            Some("1.0.0+100"),
+            "the marker this run writes has to name the binary that did the work"
+        );
+    }
+
+    /// The case the incident of 2026-08-24 was: weights that appeared on disk
+    /// with no download job to warm them. Nothing else in the table changes, and
+    /// the answer is still "these owe this machine a setup".
+    #[tokio::test]
+    async fn weights_that_arrived_without_a_download_still_owe_the_setup() {
+        let fx = fixture();
+        let db = connect_in_memory().await.unwrap();
+        sync_catalog(&db).await.unwrap();
+
+        // Copied in from another machine, or restored from a backup: the file is
+        // simply there, and `refresh_installed` believes the disk.
+        for id in catalog::preset_asset_ids(catalog::DEFAULT_PRESET_ID) {
+            let entry = catalog::entry(id).unwrap();
+            let path = install_path(&fx.paths, entry);
+            if entry.is_bundle() {
+                tokio::fs::create_dir_all(&path).await.unwrap();
+                tokio::fs::write(path.join("coremldata.bin"), b"x")
+                    .await
+                    .unwrap();
+            } else {
+                tokio::fs::write(&path, b"weights").await.unwrap();
+            }
+        }
+        // Nobody marked anything installed; only the disk knows.
+        plan_reconcile(&db, &fx.paths).await.unwrap();
+
+        assert_eq!(
+            warm_up_needed(&db).await.unwrap().as_deref(),
+            Some(catalog::entry(catalog::ids::SPEECH).unwrap().file_name)
         );
     }
 

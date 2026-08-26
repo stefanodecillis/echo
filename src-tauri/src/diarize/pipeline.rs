@@ -20,7 +20,9 @@
 //! 1. **It never touches the audio.** Everything is read-only on disk; the pass
 //!    can be run again, or abandoned, without losing anything (mantra 3).
 //! 2. **It yields.** A recording starting outranks it absolutely, and it drops
-//!    both models when it does (mantra 1).
+//!    both models when it does (mantra 1). What it worked out first is written
+//!    down ([`super::scan_cache`]), so stepping aside costs the meeting a delay
+//!    and not the work.
 //! 3. **It never invents a name.** A voice Echo separated out but cannot identify
 //!    is "Speaker N", never a guess at who it was.
 //!
@@ -77,6 +79,7 @@ use super::cluster::{self, ClusterItem};
 use super::embedding::{self, Embedder};
 use super::pcm::ChunkPcm;
 use super::people;
+use super::scan_cache;
 use super::segmentation::{self, Segmenter};
 use super::split;
 use super::timeline::{self, Span};
@@ -163,6 +166,16 @@ impl DiarizeControl {
     }
 }
 
+/// Why a step that had to be interruptible stopped.
+///
+/// Asked of the control after the fact, because the clustering only reports
+/// *that* it was told to stop. If the reason has already gone away — a yield
+/// closure that has since changed its mind — this still parks rather than
+/// carrying on, because the work that was in flight has already been dropped.
+fn stopped(control: &DiarizeControl) -> DiarizeError {
+    control.checkpoint().err().unwrap_or(DiarizeError::Yielded)
+}
+
 /// How many cores to give the models.
 ///
 /// Half of them, capped at four. This is background work: leaving headroom means
@@ -205,19 +218,32 @@ enum Source {
     MicOnly,
 }
 
+impl Source {
+    /// For the log only. Never shown to anybody (mantra 2).
+    fn as_str(self) -> &'static str {
+        match self {
+            Source::System => "system",
+            Source::MicOnly => "microphone-only",
+        }
+    }
+}
+
 /// What one sliding window produced. Local speaker indices are meaningless
 /// outside the window they came from.
-#[derive(Debug, Clone, Default)]
-struct WindowResult {
-    start_ms: i64,
+///
+/// Serialisable, and visible to [`super::scan_cache`], because a park keeps
+/// these rather than throwing the models' work away.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WindowResult {
+    pub(crate) start_ms: i64,
     /// Per local speaker, the stretches it was talking, on the meeting clock.
-    tracks: Vec<Vec<Span>>,
+    pub(crate) tracks: Vec<Vec<Span>>,
     /// Per local speaker, mean activation while it was talking.
-    confidence: Vec<f32>,
+    pub(crate) confidence: Vec<f32>,
     /// Per local speaker, its fingerprint's index, when it spoke enough alone.
-    fingerprint: Vec<Option<usize>>,
+    pub(crate) fingerprint: Vec<Option<usize>>,
     /// Per local speaker, the previous window's local speaker it continues.
-    continues: Vec<Option<usize>>,
+    pub(crate) continues: Vec<Option<usize>>,
 }
 
 /// Everything the models had to say about one meeting, before any decision about
@@ -252,6 +278,13 @@ pub struct ScanCut {
     /// that arrived at it. `None` for a count the person gave us and for a cut
     /// at a distance a sweep chose.
     pub choice: Option<cluster::CountChoice>,
+    /// What a count the person gave us actually came back with — and whether it
+    /// came back short. `None` for the automatic count and for a cut at a
+    /// distance a sweep chose.
+    ///
+    /// The counterpart of [`Self::choice`]: one of the two is always `None`,
+    /// because a cut is either Echo's decision or the person's.
+    pub forced: Option<cluster::ForcedOutcome>,
     /// Per person, the voice print of everything they said in this meeting.
     ///
     /// Stored on the speaker row by [`persist`], which is what makes "this
@@ -270,6 +303,13 @@ impl Scan {
     /// no threshold can possibly find them all.
     pub fn fingerprints(&self) -> usize {
         self.items.len()
+    }
+
+    /// Speech behind all the fingerprints together. The mass the clustering has
+    /// to divide up, which is what makes a per-cluster figure in the log mean
+    /// something.
+    pub fn fingerprinted_ms(&self) -> i64 {
+        self.items.iter().map(|i| i.weight_ms.max(0)).sum()
     }
 
     /// Length of the fingerprints, or `None` when nothing was fingerprintable.
@@ -366,8 +406,16 @@ impl Scan {
     pub fn cut(&self, threshold: f32, target: Option<usize>) -> ScanCut {
         let nobody = Guided::default();
         match target {
-            Some(k) => self.tracks_of(cluster::cluster_fixed(&self.items, k), None, &nobody),
-            None => self.tracks_of(cluster::cluster(&self.items, threshold), None, &nobody),
+            Some(k) => {
+                let (clustering, forced) = cluster::cluster_fixed(&self.items, k);
+                self.tracks_of(clustering, None, Some(forced), &nobody)
+            }
+            None => self.tracks_of(
+                cluster::cluster(&self.items, threshold),
+                None,
+                None,
+                &nobody,
+            ),
         }
     }
 
@@ -392,6 +440,24 @@ impl Scan {
     /// real speech unattributed to make an arithmetic come out right is worse
     /// than one voice too many.
     pub fn cut_guided(&self, guided: &Guided, target: Option<usize>) -> ScanCut {
+        self.cut_guided_until(guided, target, &DiarizeControl::new())
+            .expect("a cut nothing can stop always finishes")
+    }
+
+    /// [`Self::cut_guided`], which a recording can interrupt.
+    ///
+    /// The clustering is the one stretch of the pass that reads nothing off
+    /// disk, so without a checkpoint inside it a park would be honoured only
+    /// once the whole merge tree had been built — minutes, on a long meeting,
+    /// with a recording already running. Stopping gives back
+    /// [`DiarizeError::Yielded`] or [`DiarizeError::Cancelled`] and no cut at
+    /// all: half a merge tree is not a smaller answer, it is a wrong one.
+    pub fn cut_guided_until(
+        &self,
+        guided: &Guided,
+        target: Option<usize>,
+        control: &DiarizeControl,
+    ) -> Result<ScanCut, DiarizeError> {
         let known = guided.groups.len();
         let leftovers: Vec<usize> = (0..self.items.len())
             .filter(|i| guided.assignment.get(*i).copied().flatten().is_none())
@@ -407,13 +473,19 @@ impl Scan {
             }
         });
 
-        let (clustering, choice) = match (items.is_empty(), strangers) {
-            (true, _) => (cluster::Clustering::default(), None),
-            (false, Some(0)) => (cluster::Clustering::default(), None),
-            (false, Some(k)) => (cluster::cluster_fixed(&items, k), None),
+        let stop = || control.checkpoint().is_err();
+        let (clustering, choice, forced) = match (items.is_empty(), strangers) {
+            (true, _) => (cluster::Clustering::default(), None, None),
+            (false, Some(0)) => (cluster::Clustering::default(), None, None),
+            (false, Some(k)) => {
+                let (clustering, forced) = cluster::cluster_fixed_until(&items, k, &stop)
+                    .ok_or_else(|| stopped(control))?;
+                (clustering, None, Some(forced))
+            }
             (false, None) => {
-                let (clustering, choice) = cluster::cluster_auto(&items);
-                (clustering, Some(choice))
+                let (clustering, choice) =
+                    cluster::cluster_auto_until(&items, &stop).ok_or_else(|| stopped(control))?;
+                (clustering, Some(choice), None)
             }
         };
 
@@ -464,7 +536,7 @@ impl Scan {
             cluster_count: known + clustering.cluster_count,
             threshold: clustering.threshold,
         };
-        self.tracks_of(combined, choice, guided)
+        Ok(self.tracks_of(combined, choice, forced, guided))
     }
 
     /// Turn one clustering of the fingerprints into per-person timelines.
@@ -472,6 +544,7 @@ impl Scan {
         &self,
         clustering: cluster::Clustering,
         choice: Option<cluster::CountChoice>,
+        forced: Option<cluster::ForcedOutcome>,
         guided: &Guided,
     ) -> ScanCut {
         let labelled = label_windows(&self.windows, &clustering.labels);
@@ -529,6 +602,7 @@ impl Scan {
             confidence,
             threshold: clustering.threshold,
             choice,
+            forced,
             centroids,
             matches,
         }
@@ -593,6 +667,77 @@ async fn voice_channel(
     Ok(Some((Source::MicOnly, mic)))
 }
 
+/// What the models do to one window.
+///
+/// A trait with exactly one real implementation, so the resumable walk below can
+/// be exercised without two ONNX sessions — which is the only way a test can
+/// state the thing that matters here: after a park and a resume, no window is
+/// analysed twice.
+trait WindowModels: Send {
+    fn analyse(
+        &mut self,
+        samples: &[f32],
+        start_ms: i64,
+        window_ms: i64,
+        previous: Option<&WindowResult>,
+        items: &mut Vec<ClusterItem>,
+    ) -> Result<WindowResult, DiarizeError>;
+}
+
+/// The real one: the segmentation network and the fingerprint network.
+struct OnnxModels {
+    segmenter: Segmenter,
+    embedder: Embedder,
+}
+
+impl WindowModels for OnnxModels {
+    fn analyse(
+        &mut self,
+        samples: &[f32],
+        start_ms: i64,
+        window_ms: i64,
+        previous: Option<&WindowResult>,
+        items: &mut Vec<ClusterItem>,
+    ) -> Result<WindowResult, DiarizeError> {
+        analyse_window(
+            &mut self.segmenter,
+            &mut self.embedder,
+            samples,
+            start_ms,
+            window_ms,
+            previous,
+            items,
+        )
+    }
+}
+
+/// How much work may be lost to something that is not a park — a crash, a
+/// force-quit, the power going.
+///
+/// A park writes the scan down on its way out, so this interval is only about
+/// the ways of stopping that get no warning. A minute of ONNX arithmetic is a
+/// tolerable loss; writing after every window would not be, because the file
+/// holds every fingerprint found so far and grows all pass.
+const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Where the window walk got to, and everything it found on the way.
+#[derive(Debug)]
+struct Walk {
+    items: Vec<ClusterItem>,
+    windows: Vec<WindowResult>,
+    next_start_ms: i64,
+}
+
+impl Walk {
+    fn fresh() -> Self {
+        Self {
+            items: Vec::new(),
+            windows: Vec::new(),
+            next_start_ms: 0,
+        }
+    }
+}
+
 /// Segment and fingerprint one meeting's audio. Writes nothing.
 ///
 /// The expensive half of [`refine`], and the half a calibration run wants on its
@@ -605,15 +750,38 @@ pub async fn scan(
     embedder_path: &std::path::Path,
     control: &DiarizeControl,
 ) -> Result<Option<Scan>, DiarizeError> {
+    scan_resumable(db, meeting_id, segmenter_path, embedder_path, None, control).await
+}
+
+/// [`scan`], with somewhere to keep the work.
+///
+/// `audio_dir` is the meeting's own directory. Given one, the walk picks up
+/// where a parked run stopped and writes down where this one gets to; given
+/// `None` — the calibration tools — it behaves exactly as it always did.
+/// [`super::scan_cache`] carries the argument for why resuming is safe, and what
+/// makes a kept scan get thrown away instead.
+pub(crate) async fn scan_resumable(
+    db: &Db,
+    meeting_id: &str,
+    segmenter_path: &std::path::Path,
+    embedder_path: &std::path::Path,
+    audio_dir: Option<&std::path::Path>,
+    control: &DiarizeControl,
+) -> Result<Option<Scan>, DiarizeError> {
     control.checkpoint()?;
 
-    let Some((_source, mut pcm)) = voice_channel(db, meeting_id).await? else {
+    let Some((source, mut pcm)) = voice_channel(db, meeting_id).await? else {
         return Ok(None);
     };
 
-    let threads = inference_threads();
-    let mut segmenter = Segmenter::load(segmenter_path, threads)?;
-    let mut embedder = Embedder::load(embedder_path, threads)?;
+    // The key first: it decides whether there is anything to resume, and a
+    // model file that cannot even be stat'ed switches the whole cache off
+    // rather than being guessed at.
+    let key = match audio_dir {
+        Some(_) => scan_key(db, &pcm, source, segmenter_path, embedder_path).await,
+        None => None,
+    };
+    let slot = audio_dir.zip(key);
 
     let covered = pcm.covered();
     let total_ms = pcm.total_ms();
@@ -621,53 +789,215 @@ pub async fn scan(
     let window_ms = segmentation::WINDOW_MS;
     let planned = ((total_ms + step - 1) / step).max(1);
 
-    let mut items: Vec<ClusterItem> = Vec::new();
-    let mut windows: Vec<WindowResult> = Vec::new();
+    let mut walk = Walk::fresh();
+    if let Some((dir, key)) = &slot {
+        if let Some(kept) = scan_cache::load(dir, key).await {
+            tracing::info!(
+                meeting = %meeting_id,
+                from_ms = kept.next_start_ms,
+                fingerprints = kept.items.len(),
+                "picking this meeting's separation up where it stopped"
+            );
+            walk = Walk {
+                items: kept.items,
+                windows: kept.windows,
+                next_start_ms: kept.next_start_ms,
+            };
+        }
+    }
 
-    let mut start_ms = 0i64;
-    let mut index = 0i64;
-    while start_ms < total_ms {
-        control.checkpoint()?;
+    if walk.next_start_ms < total_ms {
+        let threads = inference_threads();
+        let mut models = OnnxModels {
+            // Loaded only when there are windows left to analyse: a scan that
+            // was finished before the park goes straight to clustering without
+            // opening an ONNX session at all (mantra 1).
+            segmenter: Segmenter::load(segmenter_path, threads)?,
+            embedder: Embedder::load(embedder_path, threads)?,
+        };
+        walk = walk_windows(
+            &mut pcm,
+            &mut models,
+            walk,
+            &covered,
+            total_ms,
+            window_ms,
+            step,
+            planned,
+            slot.as_ref().map(|(dir, key)| (*dir, key)),
+            control,
+        )
+        .await?;
+    }
 
+    // Both models are done. Drop the decoded audio before clustering, so the
+    // heaviest part of this pass is not also the part holding two ONNX sessions
+    // open (mantra 1).
+    pcm.release();
+    control.checkpoint()?;
+    control.report(0.85);
+
+    Ok(Some(Scan {
+        items: walk.items,
+        windows: walk.windows,
+        covered,
+    }))
+}
+
+/// The window walk itself: forward, one step at a time, from wherever it starts.
+///
+/// Parked at a checkpoint like everything else in this pass — but on the way out
+/// it writes down what it has, which is the difference between a meeting that
+/// eventually gets its speakers and one that restarts from zero every time
+/// somebody takes a call.
+#[allow(clippy::too_many_arguments)]
+async fn walk_windows(
+    pcm: &mut ChunkPcm,
+    models: &mut (dyn WindowModels + Send),
+    mut walk: Walk,
+    covered: &[Span],
+    total_ms: i64,
+    window_ms: i64,
+    step: i64,
+    planned: i64,
+    slot: Option<(&std::path::Path, &scan_cache::Key)>,
+    control: &DiarizeControl,
+) -> Result<Walk, DiarizeError> {
+    let mut last_saved = std::time::Instant::now();
+    while walk.next_start_ms < total_ms {
+        if let Err(stopped) = control.checkpoint() {
+            // A park is Echo stepping aside and coming back, so what it worked
+            // out is written down. A cancel is not: the commonest reason for
+            // one is the person deleting this meeting, whose folder is being
+            // removed at that very moment — and a write landing in the middle of
+            // that recreates the file the delete just took away, leaving this
+            // meeting's voice fingerprints behind after somebody asked Echo to
+            // forget the recording.
+            keep(slot, &walk, covered, control).await;
+            return Err(stopped);
+        }
+
+        let start_ms = walk.next_start_ms;
         let window: Span = (start_ms, start_ms + window_ms);
         // Skip stretches of clock with no audio behind them at all.
         let has_audio = covered.iter().any(|&c| timeline::overlap_ms(window, c) > 0);
         if has_audio {
             let samples = pcm.window(start_ms, window_ms).await?;
             if segmentation::has_signal(&samples) {
-                let result = analyse_window(
-                    &mut segmenter,
-                    &mut embedder,
+                let result = models.analyse(
                     &samples,
                     start_ms,
                     window_ms,
-                    windows.last(),
-                    &mut items,
+                    walk.windows.last(),
+                    &mut walk.items,
                 )?;
-                windows.push(result);
+                walk.windows.push(result);
             }
         }
 
-        index += 1;
+        walk.next_start_ms = start_ms + step;
         // Reserve the last fifth of the bar for clustering and the database.
-        control.report(0.8 * (index as f32 / planned as f32));
-        start_ms += step;
+        let done = (walk.next_start_ms + step - 1) / step;
+        control.report(0.8 * (done as f32 / planned as f32));
+
+        if last_saved.elapsed() >= SAVE_EVERY {
+            keep(slot, &walk, covered, control).await;
+            last_saved = std::time::Instant::now();
+        }
     }
+    // Finished: the file now says so, and a park during the clustering that
+    // follows resumes without touching a model again.
+    keep(slot, &walk, covered, control).await;
+    Ok(walk)
+}
 
-    // Both models are done. Drop them and the decoded audio before clustering,
-    // so the heaviest part of this pass is not also the part holding two ONNX
-    // sessions open (mantra 1).
-    drop(segmenter);
-    drop(embedder);
-    pcm.release();
-    control.checkpoint()?;
-    control.report(0.85);
+/// Write the walk down, when there is somewhere to write it and the meeting is
+/// still there to write it for.
+///
+/// Cancelled means stop, and the reason is usually that this meeting is being
+/// deleted — its folder emptied by `commands::delete_meeting` while this runs.
+/// Checked here as well as at the checkpoint above, because a save that came due
+/// on a timer has no checkpoint in front of it.
+async fn keep(
+    slot: Option<(&std::path::Path, &scan_cache::Key)>,
+    walk: &Walk,
+    covered: &[Span],
+    control: &DiarizeControl,
+) {
+    let Some((dir, key)) = slot else {
+        return;
+    };
+    if control.is_cancelled() {
+        return;
+    }
+    scan_cache::store(
+        dir,
+        &scan_cache::Cached {
+            key: key.clone(),
+            next_start_ms: walk.next_start_ms,
+            items: walk.items.clone(),
+            windows: walk.windows.clone(),
+            covered: covered.to_vec(),
+        },
+    )
+    .await;
+}
 
-    Ok(Some(Scan {
-        items,
-        windows,
-        covered,
-    }))
+/// Everything that has to be the same for a kept scan to still be true of this
+/// meeting, or `None` when one of the model files cannot be identified — in
+/// which case nothing is kept and nothing is resumed.
+async fn scan_key(
+    db: &Db,
+    pcm: &ChunkPcm,
+    source: Source,
+    segmenter_path: &std::path::Path,
+    embedder_path: &std::path::Path,
+) -> Option<scan_cache::Key> {
+    Some(scan_cache::Key {
+        format: scan_cache::FORMAT,
+        source: source.as_str().to_string(),
+        audio: pcm.stamp(),
+        total_ms: pcm.total_ms(),
+        window_ms: segmentation::WINDOW_MS,
+        step_ms: segmentation::STEP_MS,
+        segmenter: scan_cache::model_stamp(segmenter_path)?,
+        embedder: scan_cache::model_stamp(embedder_path)?,
+        embedder_tag: people::embedder_tag(db, embedder_path).await,
+    })
+}
+
+/// Where a meeting's own directory is, for the things that live beside its
+/// audio. `None` when the meeting has gone — the pass then keeps nothing and
+/// still works.
+async fn audio_dir_of(db: &Db, meeting_id: &str) -> Option<std::path::PathBuf> {
+    let recorded = match repo::get_meeting(db, meeting_id).await {
+        Ok(Some(meeting)) => std::path::PathBuf::from(meeting.audio_dir),
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::debug!(%error, "could not read where this meeting's audio lives");
+            return None;
+        }
+    };
+    // Only a folder that names this meeting. The row is written before the
+    // per-meeting folder is recorded on it and the second write is allowed to
+    // fail (`session::start`), so a row can name the storage root instead — and
+    // deleting the meeting only ever removes the folder named after it
+    // (`commands::meeting_audio_dir`, which guards the same way for the same
+    // reason). Keeping voice fingerprints anywhere else would leave them behind
+    // when somebody asks Echo to forget a recording, and would have every such
+    // meeting overwriting the same file. Nothing kept is the correct answer
+    // here: the pass costs time and loses nothing.
+    let names_this_meeting = recorded
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(meeting_id));
+    if !names_this_meeting {
+        tracing::debug!(
+            meeting = %meeting_id,
+            "this meeting has no folder of its own; its separation will not be kept"
+        );
+        return None;
+    }
+    Some(recorded)
 }
 
 /// The canonical offline pass. See the module docs for the shape of it.
@@ -694,6 +1024,14 @@ pub async fn refine(
             speakers,
             people_count,
             people_count_is_override,
+            voices_asked: None,
+            // The same question as below, asked of the rows channel attribution
+            // just pinned: how many voices are audible in what was recorded. A
+            // row with nothing on it — "You" on a meeting the person only
+            // listened to — is not one of them.
+            voices_found: repo::count_audible_people(db, meeting_id)
+                .await
+                .map_err(db_failed)?,
         });
     };
 
@@ -707,8 +1045,10 @@ pub async fn refine(
     };
 
     // Who Echo has been told to remember, before anything is counted (DESIGN §1).
-    // A profile computed by an older network is re-embedded from its kept clips
-    // first, quietly, so a change of network costs nobody their people.
+    // A voice that is not being matched right now but could be — its numbers
+    // came from an older network, or two names were made one and the centroid
+    // was dropped rather than averaged — is re-embedded from its kept clips
+    // first, quietly, so neither costs anybody their people.
     let embedder_tag = people::embedder_tag(db, embedder_path).await;
     let mut enrolment = people::enrolled(db, &embedder_tag).await?;
     if enrolment.stale > 0 {
@@ -725,7 +1065,19 @@ pub async fn refine(
         }
     }
 
-    let Some(scanned) = scan(db, meeting_id, segmenter_path, embedder_path, control).await? else {
+    // The meeting's own directory is where a parked scan is kept, so twelve
+    // minutes of ONNX work survives somebody taking the next call.
+    let audio_dir = audio_dir_of(db, meeting_id).await;
+    let Some(scanned) = scan_resumable(
+        db,
+        meeting_id,
+        segmenter_path,
+        embedder_path,
+        audio_dir.as_deref(),
+        control,
+    )
+    .await?
+    else {
         return Err(DiarizeError::Failed(
             "the meeting's audio disappeared while the pass was starting".into(),
         ));
@@ -740,16 +1092,58 @@ pub async fn refine(
             guided.recognised()
         );
     }
-    let mut cut = scanned.cut_guided(&guided, target);
+    // What the clustering is about to be asked, and what it has to work with.
+    // At info, because the forced path used to log nothing at all and a run that
+    // under-delivers is exactly the run somebody reads the log for.
+    tracing::info!(
+        source = source.as_str(),
+        target = ?target,
+        recognised = guided.recognised(),
+        fingerprints = scanned.fingerprints(),
+        dim = ?scanned.fingerprint_dim(),
+        speech_ms = scanned.fingerprinted_ms(),
+        "separating this meeting's voices"
+    );
+    // Solid arithmetic with no I/O in it, and minutes of it on a long meeting:
+    // off the async worker, and interruptible, or a recording starting would
+    // wait for the whole merge tree.
+    let mut cut = run_blocking(|| scanned.cut_guided_until(&guided, target, control))?;
     people::match_remaining(&mut cut, &enrolment);
     if let Some(choice) = &cut.choice {
-        tracing::debug!(
+        for candidate in &choice.candidates {
+            tracing::info!(
+                count = candidate.count,
+                silhouette = candidate.silhouette,
+                verdict = ?candidate.refusal,
+                split_gap = candidate.split_gap,
+                cut_clusters = candidate.cut_clusters,
+                folded = candidate.folded,
+                mass_ms = ?candidate.mass_ms,
+                "a possible answer: {} people",
+                candidate.count
+            );
+        }
+        tracing::info!(
             count = choice.count,
             cut_at = choice.cut_at,
             silhouette = choice.silhouette,
             runner_up = ?choice.runner_up,
+            fragment_bar_ms = choice.fragment_bar_ms,
             "the automatic count read {} people out of the merge tree",
             choice.count
+        );
+    }
+    if let Some(forced) = &cut.forced {
+        tracing::info!(
+            asked = forced.asked,
+            got = forced.got,
+            cut_at = forced.cut_at,
+            silhouette = forced.silhouette,
+            mass_ms = ?forced.mass_ms,
+            floor_ms = cluster::FORCED_FLOOR_MS,
+            "the count this meeting was given came back with {} of {} voice(s)",
+            forced.got,
+            forced.asked
         );
     }
     let turns = turns_from_tracks(&cut.tracks, &cut.confidence);
@@ -759,6 +1153,16 @@ pub async fn refine(
 
     let speakers = persist(db, meeting_id, &cut, source).await?;
     let (people_count, people_count_is_override) = people_count(db, meeting_id).await?;
+    // Counted from the rows the pass just wrote, and only the ones a line of
+    // transcript landed on. `people_count` cannot answer this: with an override
+    // it reads back the person's own number, which is the question, not the
+    // answer. Nor can a plain row count — "You" exists on a two-channel meeting
+    // whether or not the microphone caught a word, and on a meeting somebody
+    // only listened to, counting it would claim one more audible voice than the
+    // recording holds.
+    let voices_found = repo::count_audible_people(db, meeting_id)
+        .await
+        .map_err(db_failed)?;
     control.report(1.0);
 
     Ok(DiarizationResult {
@@ -769,6 +1173,11 @@ pub async fn refine(
         speakers,
         people_count,
         people_count_is_override,
+        // In people, counting whoever was at this computer — the same units the
+        // person typed their correction in, so the two are comparable without
+        // anybody redoing [`remote_target`]'s arithmetic backwards.
+        voices_asked: people_count_is_override.then_some(people_count),
+        voices_found,
     })
 }
 
@@ -1078,6 +1487,26 @@ fn turns_from_tracks(tracks: &[Vec<Span>], confidence: &[f32]) -> Vec<SpeakerTur
 /// run no longer produced. Without that a meeting re-cut from four voices to two
 /// would keep two ghost chips with nothing behind them, and Echo's own count of
 /// how many people were in the meeting would still say four.
+///
+/// **The invariant: no voice row without a line of transcript on it.** Who said
+/// what is worked out *first*, in track numbers, and only the tracks that ended
+/// up owning at least one final segment get a row. This is a safety net and it
+/// is deliberately independent of the clustering: whatever a cut hands over —
+/// a count the person gave us, the automatic count, a sweep — a voice that wins
+/// no line is not a person anybody can do anything with. On 2026-08-24 a forced
+/// count of four produced two rows with 630 and 313 lines and two rows with
+/// none, and the person met those two in the enrolment dialog, which could only
+/// tell them there was no clear moment of a voice that had never spoken.
+///
+/// The one row this does not apply to is "You", which is not a cluster: it is
+/// the microphone channel itself, and it exists on a two-channel meeting
+/// whether or not the person happened to say anything.
+///
+/// Surviving voices are *labelled* from one in the order they first speak, so a
+/// meeting whose first cluster won no line still shows a "Speaker 1" — but they
+/// are *keyed* by the voice, not by that position, so a re-run in which one
+/// voice falls silent cannot slide the row underneath somebody's rename. See
+/// [`cluster_key`].
 async fn persist(
     db: &Db,
     meeting_id: &str,
@@ -1090,6 +1519,75 @@ async fn persist(
         .map_err(db_failed)?
         + 1;
 
+    let segments = repo::get_segments(
+        db,
+        &TranscriptQuery {
+            meeting_id: meeting_id.to_string(),
+            limit: Some(50_000),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(db_failed)?;
+
+    // Which channel's lines the clustering is entitled to speak for. The other
+    // one is either "You" (a microphone line, when the far end had its own
+    // channel) or nothing at all.
+    let separated = match source {
+        Source::System => Channel::System,
+        Source::MicOnly => Channel::Mic,
+    };
+
+    // ---- Who said what, in track numbers. Nothing is written yet. ----------
+    let mut plan: Vec<(crate::types::Segment, Attribution)> = Vec::new();
+    let mut mine: Vec<Id> = Vec::new();
+    let mut owned_ms: Vec<i64> = vec![0; tracks.len()];
+    let mut owned_lines: Vec<usize> = vec![0; tracks.len()];
+    let mut unattributed = 0usize;
+    for segment in segments {
+        let span: Span = (segment.t_start_ms, segment.t_end_ms);
+        if segment.channel == separated {
+            // A line that holds two voices is cut in two before anything is
+            // attributed. Attributing it whole is what put a whole exchange of
+            // fast dialogue on one speaker and silently lost the other one's
+            // words; see [`split`].
+            let pieces = split::split_line(
+                split::LineFacts {
+                    span,
+                    text_confidence: segment.avg_confidence,
+                },
+                &segment.text,
+                tracks,
+                &cut.confidence,
+            );
+            let attribution = match pieces {
+                Some(pieces) => Some(Attribution::Split(pieces)),
+                None => timeline::assign_by_overlap(span, tracks)
+                    .or_else(|| timeline::nearest_track(span, tracks, NEAREST_TOLERANCE_MS))
+                    .map(Attribution::Whole),
+            };
+            match attribution {
+                Some(a) => {
+                    for (track, ms) in a.claims(span) {
+                        if let (Some(slot), Some(lines)) =
+                            (owned_ms.get_mut(track), owned_lines.get_mut(track))
+                        {
+                            *slot += ms;
+                            *lines += 1;
+                        }
+                    }
+                    plan.push((segment, a));
+                }
+                // Nothing covers it, and guessing is worse than saying nothing:
+                // an unattributed line stays honestly unattributed.
+                None => unattributed += 1,
+            }
+        } else if segment.channel == Channel::Mic && source == Source::System {
+            mine.push(segment.id);
+        }
+    }
+
+    // ---- The rows, for the tracks that own speech and no others. -----------
     let me = match source {
         Source::System => Some(
             repo::upsert_speaker(db, meeting_id, SELF_CLUSTER_KEY, SELF_DISPLAY_NAME, true)
@@ -1099,22 +1597,42 @@ async fn persist(
         Source::MicOnly => None,
     };
 
-    let mut remote_ids: Vec<Id> = Vec::with_capacity(tracks.len());
-    for i in 0..tracks.len() {
-        let speaker =
-            repo::upsert_speaker(db, meeting_id, &cluster_key(i), &display_name(i), false)
+    let surviving: Vec<usize> = (0..tracks.len()).filter(|i| owned_lines[*i] > 0).collect();
+
+    let mut remote_ids: Vec<Option<Id>> = vec![None; tracks.len()];
+    for (slot, &track) in surviving.iter().enumerate() {
+        // Keyed by the voice, named by where it comes in the list. The key is
+        // the row's identity across runs and is never renumbered (see below);
+        // the label is what the person reads, and reads best counting from one.
+        let speaker = repo::upsert_speaker(
+            db,
+            meeting_id,
+            &cluster_key(track),
+            &display_name(slot),
+            false,
+        )
+        .await
+        .map_err(db_failed)?;
+
+        // A row that was already here keeps whatever it is called, unless what
+        // it is called is a label Echo made up — those are renumbered so the
+        // list still reads 1, 2, 3 after a voice drops out of it. A name
+        // somebody typed is never touched.
+        if speaker.display_name != display_name(slot) && is_numbered_name(&speaker.display_name) {
+            repo::rename_speaker(db, &speaker.id, &display_name(slot))
                 .await
                 .map_err(db_failed)?;
+        }
 
         // This meeting's voice print for this voice, whether or not anybody
         // knows whose it is. Stored either way: it is what a person enrolled
         // next month will be matched against (DESIGN §1).
-        let centroid = cut.centroids.get(i).filter(|c| !c.is_empty());
+        let centroid = cut.centroids.get(track).filter(|c| !c.is_empty());
         repo::set_speaker_centroid(db, &speaker.id, centroid.map(|c| c.as_slice()))
             .await
             .map_err(db_failed)?;
 
-        match cut.matches.get(i).and_then(|m| m.as_ref()) {
+        match cut.matches.get(track).and_then(|m| m.as_ref()) {
             Some(people::Match::Linked {
                 person_id, name, ..
             }) => {
@@ -1149,20 +1667,17 @@ async fn persist(
                 }
             }
         }
-        remote_ids.push(speaker.id);
+        tracing::info!(
+            speaker = %cluster_key(slot),
+            lines = owned_lines[track],
+            speaking_ms = owned_ms[track],
+            "this voice ended up with {} line(s) of the transcript",
+            owned_lines[track]
+        );
+        remote_ids[track] = Some(speaker.id);
     }
 
-    let segments = repo::get_segments(
-        db,
-        &TranscriptQuery {
-            meeting_id: meeting_id.to_string(),
-            limit: Some(50_000),
-            ..Default::default()
-        },
-    )
-    .await
-    .map_err(db_failed)?;
-
+    // ---- The writes, now that every piece has a row to point at. -----------
     fn push(into: &mut Vec<(Id, Vec<Id>)>, speaker_id: &Id, segment_id: Id) {
         match into.iter_mut().find(|(s, _)| s == speaker_id) {
             Some((_, ids)) => ids.push(segment_id),
@@ -1170,40 +1685,29 @@ async fn persist(
         }
     }
 
-    // Which channel's lines the clustering is entitled to speak for. The other
-    // one is either "You" (a microphone line, when the far end had its own
-    // channel) or nothing at all.
-    let separated = match source {
-        Source::System => Channel::System,
-        Source::MicOnly => Channel::Mic,
-    };
-
     let mut by_speaker: Vec<(Id, Vec<Id>)> = Vec::new();
+    if let Some(me) = &me {
+        for id in mine {
+            push(&mut by_speaker, &me.id, id);
+        }
+    }
     let mut lines_split = 0usize;
-    for segment in segments {
+    for (segment, attribution) in plan {
         let span: Span = (segment.t_start_ms, segment.t_end_ms);
-        if segment.channel == separated {
-            // A line that holds two voices is cut in two before anything is
-            // attributed. Attributing it whole is what put a whole exchange of
-            // fast dialogue on one speaker and silently lost the other one's
-            // words; see [`split`].
-            if let Some(pieces) = split::split_line(
-                split::LineFacts {
-                    span,
-                    text_confidence: segment.avg_confidence,
-                },
-                &segment.text,
-                tracks,
-                &cut.confidence,
-            ) {
+        match attribution {
+            Attribution::Split(pieces) => {
+                // A note about a word Echo put right belongs to the half of the
+                // line that still holds that word, and to exactly one half.
+                let mut notes = corrections_by_piece(&segment.corrections, &pieces);
                 let drafts: Vec<crate::types::SegmentDraft> = pieces
                     .iter()
-                    .map(|piece| crate::types::SegmentDraft {
+                    .zip(notes.drain(..))
+                    .map(|(piece, corrections)| crate::types::SegmentDraft {
                         meeting_id: segment.meeting_id.clone(),
                         t_start_ms: piece.span.0,
                         t_end_ms: piece.span.1,
                         channel: segment.channel,
-                        speaker_id: remote_ids.get(piece.speaker).cloned(),
+                        speaker_id: remote_ids.get(piece.speaker).and_then(|id| id.clone()),
                         text: piece.text.clone(),
                         // The words were not re-transcribed, so their language,
                         // the engine's confidence in them and their provenance
@@ -1214,6 +1718,7 @@ async fn persist(
                         is_final: true,
                         model_name: segment.model_name.clone(),
                         model_revision: segment.model_revision.clone(),
+                        corrections,
                     })
                     .collect();
                 if drafts.iter().all(|d| d.speaker_id.is_some())
@@ -1225,16 +1730,22 @@ async fn persist(
                     lines_split += 1;
                     continue;
                 }
+                // The cut did not happen after all. The line is still one of
+                // these voices' — whoever holds most of it — rather than
+                // nobody's.
+                let hit = timeline::assign_by_overlap(span, tracks)
+                    .or_else(|| timeline::nearest_track(span, tracks, NEAREST_TOLERANCE_MS));
+                if let Some(speaker_id) = hit
+                    .and_then(|i| remote_ids.get(i))
+                    .and_then(|id| id.clone())
+                {
+                    push(&mut by_speaker, &speaker_id, segment.id);
+                }
             }
-
-            let hit = timeline::assign_by_overlap(span, tracks)
-                .or_else(|| timeline::nearest_track(span, tracks, NEAREST_TOLERANCE_MS));
-            if let Some(speaker_id) = hit.and_then(|i| remote_ids.get(i)).cloned() {
-                push(&mut by_speaker, &speaker_id, segment.id);
-            }
-        } else if segment.channel == Channel::Mic {
-            if let Some(me) = &me {
-                push(&mut by_speaker, &me.id, segment.id);
+            Attribution::Whole(track) => {
+                if let Some(speaker_id) = remote_ids.get(track).and_then(|id| id.clone()) {
+                    push(&mut by_speaker, &speaker_id, segment.id);
+                }
             }
         }
     }
@@ -1244,31 +1755,74 @@ async fn persist(
             .await
             .map_err(db_failed)?;
     }
-    if lines_split > 0 {
-        tracing::debug!(
-            lines_split,
-            "cut {lines_split} line(s) that held more than one voice"
-        );
-    }
 
     // Whoever this run did not produce is no longer one of the people in this
     // meeting. Their rows go, which releases any line still pointing at them
     // back to unattributed rather than leaving it labelled with a voice the pass
     // no longer believes in.
-    let mut keep: Vec<String> = Vec::with_capacity(tracks.len() + 1);
+    let mut keep: Vec<String> = Vec::with_capacity(surviving.len() + 1);
     if let Some(me) = &me {
         keep.push(me.cluster_key.clone());
     }
-    keep.extend((0..tracks.len()).map(cluster_key));
-    repo::prune_speakers_except(db, meeting_id, &keep)
-        .await
-        .map_err(db_failed)?;
+    keep.extend(surviving.iter().map(|&track| cluster_key(track)));
+    let pruned = if keep.is_empty() {
+        // Nothing on the microphone belongs to any voice this pass found — a
+        // meeting with no transcript yet, or one whose lines all sit outside
+        // the speech it detected. There is nobody to keep, and saying so is
+        // `prune_speakers_except`'s one refusal, so it is said here instead.
+        repo::forget_speakers(db, meeting_id)
+            .await
+            .map_err(db_failed)?
+    } else {
+        repo::prune_speakers_except(db, meeting_id, &keep)
+            .await
+            .map_err(db_failed)?
+    };
+
+    tracing::info!(
+        voices = tracks.len(),
+        rows = surviving.len(),
+        silent_voices = tracks.len() - surviving.len(),
+        rows_pruned = pruned,
+        lines_split,
+        unattributed,
+        "wrote {} voice row(s); {} voice(s) won no line and got none",
+        surviving.len(),
+        tracks.len() - surviving.len()
+    );
 
     repo::recompute_speaking_time(db, meeting_id)
         .await
         .map_err(db_failed)?;
 
     repo::list_speakers(db, meeting_id).await.map_err(db_failed)
+}
+
+/// Which voice one final segment turned out to belong to, before any row
+/// exists to point it at.
+///
+/// [`persist`] works this out for every line first and creates rows afterwards,
+/// so that a voice nobody's words landed on never becomes a speaker row.
+enum Attribution {
+    /// The whole line is one voice's.
+    Whole(usize),
+    /// The line holds more than one voice and is cut at the turn boundary
+    /// first; each piece names the track it belongs to.
+    Split(Vec<split::Piece>),
+}
+
+impl Attribution {
+    /// Per track, how much of the line it claims. One entry for a whole line,
+    /// one per piece for a split one.
+    fn claims(&self, line: Span) -> Vec<(usize, i64)> {
+        match self {
+            Attribution::Whole(track) => vec![(*track, timeline::span_ms(line))],
+            Attribution::Split(pieces) => pieces
+                .iter()
+                .map(|p| (p.speaker, timeline::span_ms(p.span)))
+                .collect(),
+        }
+    }
 }
 
 /// Channel attribution on its own: "You" for the microphone, and one provisional
@@ -1341,6 +1895,15 @@ pub async fn pin_channel_speakers(db: &Db, meeting_id: &str) -> Result<Vec<Speak
 
 /// Stable per-meeting cluster key. Stable matters: re-running the pass must
 /// reuse the same rows so a rename survives it.
+///
+/// **Keyed by the voice the cut produced, never by where that voice comes in the
+/// list.** [`persist`] shows only the voices that won a line of transcript, so
+/// the list has gaps in it — voice 3 of 4 can be the second row on the screen.
+/// Numbering the *rows* instead would mean a re-run in which one voice fell
+/// silent handed voice 3's fingerprints, and its lines, to the row voice 2 is
+/// on: the person's rename, and the person they linked it to, would end up on
+/// somebody else's speech, and the last row would be pruned away with a name on
+/// it. So the key follows the voice and [`display_name`] does the counting.
 pub fn cluster_key(index: usize) -> String {
     format!("speaker-{:02}", index + 1)
 }
@@ -1348,6 +1911,60 @@ pub fn cluster_key(index: usize) -> String {
 /// Zero jargon: the person sees "Speaker 1", never a cluster id (mantra 2).
 pub fn display_name(index: usize) -> String {
     format!("Speaker {}", index + 1)
+}
+
+/// Is this still one of the labels Echo made up, rather than a name somebody
+/// typed? Only those are renumbered when the list of voices changes.
+///
+/// Narrower than [`people::is_default_name`], which also counts "You": a remote
+/// row somebody has named "You" is a name they chose, and this must not take it
+/// off them.
+/// Hand each of a line's corrections to the one piece of the split that still
+/// holds the word it wrote.
+///
+/// Asking each piece whether it *contains* the corrected word is not enough,
+/// and the case it gets wrong is not exotic: one ASR line can hold two separate
+/// manglings of the same name — the 2026-08-24 meeting spelled Langola six ways
+/// and used two of them within a sentence of each other — and both notes then
+/// say "Langola", so both pieces claim both of them. The reader is told the
+/// half in front of them was repaired twice when it was repaired once.
+///
+/// The pieces tile the line left to right with no gap and no overlap
+/// ([`split::Piece`]), and the corrections were recorded left to right as the
+/// line was read, so the two orders agree: this walks them together and gives
+/// each note the next occurrence of its word that no earlier note has taken.
+/// A note whose word is nowhere in the pieces is dropped rather than guessed at.
+fn corrections_by_piece(
+    corrections: &[crate::types::Correction],
+    pieces: &[split::Piece],
+) -> Vec<Vec<crate::types::Correction>> {
+    let mut out = vec![Vec::new(); pieces.len()];
+    // How far the sweep has read: which piece, and how far into it.
+    let (mut piece, mut at) = (0usize, 0usize);
+    for correction in corrections {
+        if correction.to.is_empty() {
+            continue;
+        }
+        while piece < pieces.len() {
+            let text = &pieces[piece].text;
+            match text.get(at..).and_then(|rest| rest.find(&correction.to)) {
+                Some(hit) => {
+                    out[piece].push(correction.clone());
+                    at += hit + correction.to.len();
+                    break;
+                }
+                None => {
+                    piece += 1;
+                    at = 0;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn is_numbered_name(display_name: &str) -> bool {
+    (0..cluster::MAX_SPEAKERS).any(|i| display_name == self::display_name(i))
 }
 
 fn db_failed(err: crate::db::DbError) -> DiarizeError {
@@ -1367,6 +1984,74 @@ mod tests {
             fingerprint: vec![None; n],
             continues: vec![None; n],
         }
+    }
+
+    fn piece(text: &str) -> split::Piece {
+        split::Piece {
+            span: (0, 0),
+            text: text.to_string(),
+            speaker: 0,
+        }
+    }
+
+    fn note(from: &str, to: &str) -> crate::types::Correction {
+        crate::types::Correction {
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    /// Two manglings of the same name in one line, and a cut between them.
+    ///
+    /// Both notes read "Langola", so asking each half whether it contains
+    /// "Langola" hands both notes to both halves — and the reader is told a
+    /// sentence was repaired twice when one word in it was repaired once. Each
+    /// note belongs to the occurrence it actually made.
+    #[test]
+    fn a_repaired_word_follows_the_half_of_the_line_it_is_actually_in() {
+        let pieces = [piece("Langola è ok."), piece("Poi Langola è tornato.")];
+        let notes = corrections_by_piece(
+            &[note("Nongula", "Langola"), note("lana gola", "Langola")],
+            &pieces,
+        );
+        assert_eq!(
+            notes,
+            vec![
+                vec![note("Nongula", "Langola")],
+                vec![note("lana gola", "Langola")]
+            ]
+        );
+    }
+
+    /// The ordinary shapes: one note, and a note whose word the cut left in the
+    /// other half entirely.
+    #[test]
+    fn a_repaired_word_is_never_claimed_by_a_half_that_does_not_hold_it() {
+        let pieces = [
+            piece("Non lo so."),
+            piece("Quelli di Langola hanno scritto."),
+        ];
+        assert_eq!(
+            corrections_by_piece(&[note("Nongula", "Langola")], &pieces),
+            vec![vec![], vec![note("Nongula", "Langola")]]
+        );
+        // Two different names, one in each half, in the order they were read.
+        let pieces = [piece("Usiamo Langola."), piece("E poi Obsidara.")];
+        assert_eq!(
+            corrections_by_piece(
+                &[note("Nongula", "Langola"), note("obsidera", "Obsidara")],
+                &pieces
+            ),
+            vec![
+                vec![note("Nongula", "Langola")],
+                vec![note("obsidera", "Obsidara")]
+            ]
+        );
+        // And a note for a word no piece kept is dropped, not guessed at.
+        assert_eq!(
+            corrections_by_piece(&[note("Nongula", "Langola")], &[piece("Non lo so.")]),
+            vec![Vec::new()]
+        );
     }
 
     #[test]
@@ -1586,6 +2271,7 @@ mod tests {
             tracks: tracks.to_vec(),
             threshold: 0.5,
             choice: None,
+            forced: None,
         }
     }
 
@@ -1677,7 +2363,11 @@ mod tests {
 
         let guided = scanned.guide(&known);
         assert_eq!(guided.recognised(), 1);
-        assert_eq!(guided.fingerprints(), 3, "all three of Marco's, and nobody else's");
+        assert_eq!(
+            guided.fingerprints(),
+            3,
+            "all three of Marco's, and nobody else's"
+        );
 
         let cut = scanned.cut_guided(&guided, None);
         // The automatic count only ever saw the strangers. That is the claim, and
@@ -1689,7 +2379,11 @@ mod tests {
         // Marco is the first voice heard, so he is the first row, and he arrives
         // with a name rather than a number.
         match cut.matches[0].as_ref().expect("Marco was recognised") {
-            people::Match::Linked { name, person_id, score } => {
+            people::Match::Linked {
+                name,
+                person_id,
+                score,
+            } => {
                 assert_eq!(name, "Marco");
                 assert_eq!(person_id, "person-marco");
                 assert!(*score > people::TAU_LINK, "{score}");
@@ -1813,7 +2507,10 @@ mod tests {
 
         let three = scanned.cut_guided(&guided, Some(3));
         assert_eq!(three.tracks.len(), 3, "Marco plus two strangers");
-        assert!(three.choice.is_none(), "a count the person gave is not a guess");
+        assert!(
+            three.choice.is_none(),
+            "a count the person gave is not a guess"
+        );
 
         // "There were two of us": Marco plus one stranger.
         let two = scanned.cut_guided(&guided, Some(2));
@@ -1870,6 +2567,7 @@ mod tests {
             matches: vec![None, None],
             threshold: 0.5,
             choice: None,
+            forced: None,
         };
         let enrolment = people::Enrolment {
             people: vec![enrolled_as(0, "Marco", "person-marco")],
@@ -1877,7 +2575,10 @@ mod tests {
         };
         people::match_remaining(&mut cut, &enrolment);
 
-        match cut.matches[0].as_ref().expect("the better one is asked about") {
+        match cut.matches[0]
+            .as_ref()
+            .expect("the better one is asked about")
+        {
             people::Match::Suggested { person_id, .. } => assert_eq!(person_id, "person-marco"),
             other => panic!("{other:?}"),
         }
@@ -1897,6 +2598,7 @@ mod tests {
             })],
             threshold: 0.5,
             choice: None,
+            forced: None,
         };
         let enrolment = people::Enrolment {
             people: vec![enrolled_as(0, "Renamed since", "person-marco")],
@@ -1915,8 +2617,14 @@ mod tests {
 
     /// A cut of one voice, with a known person attached and a voice print to
     /// remember it by.
+    ///
+    /// Each voice gets four seconds of its own, five seconds apart, so a caller
+    /// can give every one of them a line — a voice with no line of transcript on
+    /// it no longer gets a row at all ([`persist`]).
     fn cut_with(matches: Vec<Option<people::Match>>) -> ScanCut {
-        let tracks = vec![vec![(0i64, 4_000i64)]; matches.len().max(1)];
+        let tracks: Vec<Vec<Span>> = (0..matches.len().max(1))
+            .map(|i| vec![(i as i64 * 5_000, i as i64 * 5_000 + 4_000)])
+            .collect();
         ScanCut {
             confidence: vec![0.9; tracks.len()],
             centroids: (0..tracks.len()).map(|i| print_of(i, 0.99, i)).collect(),
@@ -1924,6 +2632,7 @@ mod tests {
             tracks,
             threshold: 0.5,
             choice: None,
+            forced: None,
         }
     }
 
@@ -1953,13 +2662,18 @@ mod tests {
             .find(|s| s.cluster_key == cluster_key(0))
             .unwrap();
         assert_eq!(voice.person_id.as_deref(), Some(marco.id.as_str()));
-        assert_eq!(voice.display_name, "Marco", "the label Echo made up is replaced");
+        assert_eq!(
+            voice.display_name, "Marco",
+            "the label Echo made up is replaced"
+        );
         assert!(voice.suggested_person_id.is_none());
 
         // The person renames the chip in this meeting. That is meeting-local: the
         // link stays, the person keeps their own name, and a re-run does not
         // overwrite what was typed.
-        repo::rename_speaker(&db, &voice.id, "Marco B.").await.unwrap();
+        repo::rename_speaker(&db, &voice.id, "Marco B.")
+            .await
+            .unwrap();
         let again = persist(&db, &meeting.id, &cut_with(linked()), Source::System)
             .await
             .unwrap();
@@ -1970,7 +2684,11 @@ mod tests {
         assert_eq!(voice.display_name, "Marco B.");
         assert_eq!(voice.person_id.as_deref(), Some(marco.id.as_str()));
         assert_eq!(
-            repo::get_person(&db, &marco.id).await.unwrap().unwrap().name,
+            repo::get_person(&db, &marco.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
             "Marco",
             "renaming a speaker must never rename the person"
         );
@@ -2002,9 +2720,15 @@ mod tests {
             .iter()
             .find(|s| s.cluster_key == cluster_key(0))
             .unwrap();
-        assert_eq!(voice.suggested_person_id.as_deref(), Some(marco.id.as_str()));
+        assert_eq!(
+            voice.suggested_person_id.as_deref(),
+            Some(marco.id.as_str())
+        );
         assert!((voice.suggestion_score.unwrap() - 0.58).abs() < 1e-6);
-        assert!(voice.person_id.is_none(), "a suggestion is never an assignment");
+        assert!(
+            voice.person_id.is_none(),
+            "a suggestion is never an assignment"
+        );
         assert_eq!(voice.display_name, "Speaker 1", "and never a name");
 
         // A later run that no longer believes it takes the question away rather
@@ -2029,13 +2753,24 @@ mod tests {
         let meeting = repo::create_meeting(&db, "Workshop", "/tmp/echo-test", None)
             .await
             .unwrap();
-        repo::insert_segments(&db, &[remote_line(&meeting.id, 0, 4_000)])
-            .await
-            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                remote_line(&meeting.id, 0, 4_000),
+                remote_line(&meeting.id, 5_000, 9_000),
+            ],
+        )
+        .await
+        .unwrap();
 
-        persist(&db, &meeting.id, &cut_with(vec![None, None]), Source::System)
-            .await
-            .unwrap();
+        persist(
+            &db,
+            &meeting.id,
+            &cut_with(vec![None, None]),
+            Source::System,
+        )
+        .await
+        .unwrap();
 
         let prints = repo::list_unnamed_voice_prints(&db).await.unwrap();
         assert_eq!(prints.len(), 2, "{prints:?}");
@@ -2136,9 +2871,14 @@ mod tests {
             .await
             .unwrap();
 
-        let first = persist(&db, &meeting.id, &cut_of(&[vec![(0i64, 4_000i64)]]), Source::System)
-            .await
-            .unwrap();
+        let first = persist(
+            &db,
+            &meeting.id,
+            &cut_of(&[vec![(0i64, 4_000i64)]]),
+            Source::System,
+        )
+        .await
+        .unwrap();
         let voice = first
             .iter()
             .find(|s| s.cluster_key == cluster_key(0))
@@ -2148,9 +2888,14 @@ mod tests {
         let me = first.iter().find(|s| s.is_self).unwrap();
         repo::rename_speaker(&db, &me.id, "Stefano").await.unwrap();
 
-        let second = persist(&db, &meeting.id, &cut_of(&[vec![(0i64, 4_000i64)]]), Source::System)
-            .await
-            .unwrap();
+        let second = persist(
+            &db,
+            &meeting.id,
+            &cut_of(&[vec![(0i64, 4_000i64)]]),
+            Source::System,
+        )
+        .await
+        .unwrap();
         assert_eq!(second.len(), 2);
         let names: Vec<&str> = second.iter().map(|s| s.display_name.as_str()).collect();
         assert!(names.contains(&"Ada"), "{names:?}");
@@ -2176,6 +2921,194 @@ mod tests {
         assert_eq!(speakers.len(), 1);
         assert_eq!(speakers[0].cluster_key, SELF_CLUSTER_KEY);
         assert!(speakers[0].is_self);
+    }
+
+    /// The safety net, and the shape of the meeting of 2026-08-24: a cut that
+    /// hands over a voice which then wins no line of the transcript. Whatever
+    /// decided that cut — a count the person gave us, the automatic count — a
+    /// voice with nothing behind it must not become a row. Two of them did on
+    /// that meeting, and the person met them in the naming dialog.
+    #[tokio::test]
+    async fn a_voice_that_wins_no_line_gets_no_row() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Standup", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                remote_line(&meeting.id, 0, 4_000),
+                remote_line(&meeting.id, 5_000, 9_000),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Two voices with the conversation between them, and two slivers off in
+        // the silence where nobody said anything.
+        let cut = cut_of(&[
+            vec![(0i64, 4_000i64)],
+            vec![(5_000, 9_000)],
+            vec![(30_000, 30_300)],
+            vec![(31_000, 31_300)],
+        ]);
+        let speakers = persist(&db, &meeting.id, &cut, Source::System)
+            .await
+            .unwrap();
+
+        assert_eq!(speakers.len(), 3, "You and the two voices that spoke");
+        let keys: Vec<&str> = speakers.iter().map(|s| s.cluster_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                SELF_CLUSTER_KEY,
+                cluster_key(0).as_str(),
+                cluster_key(1).as_str()
+            ],
+            "the two silent voices left rows behind"
+        );
+        // The invariant, stated as the person would meet it: every row has at
+        // least one line of the transcript on it.
+        let segments = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for speaker in speakers.iter().filter(|s| !s.is_self) {
+            assert!(
+                segments
+                    .iter()
+                    .any(|s| s.speaker_id.as_deref() == Some(speaker.id.as_str())),
+                "{} has no lines and should not exist",
+                speaker.display_name
+            );
+        }
+        assert_eq!(repo::count_people(&db, &meeting.id).await.unwrap(), 3);
+    }
+
+    /// The rows are *labelled* by the voices that survive, so a meeting whose
+    /// first cluster is a stray still has a "Speaker 1". Without this the person
+    /// is shown "Speaker 2" and "Speaker 3" and left wondering where the first
+    /// one went. The key underneath still names the voice, not the position —
+    /// [`a_rename_stays_on_the_voice_it_was_given_to`] is what that is for.
+    #[tokio::test]
+    async fn the_voices_that_survive_are_numbered_from_one() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Retro", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(&db, &[remote_line(&meeting.id, 10_000, 14_000)])
+            .await
+            .unwrap();
+
+        // The sliver speaks first on the clock, so it is track 0.
+        let cut = cut_of(&[vec![(0i64, 300i64)], vec![(10_000, 14_000)]]);
+        let speakers = persist(&db, &meeting.id, &cut, Source::System)
+            .await
+            .unwrap();
+
+        let voices: Vec<&Speaker> = speakers.iter().filter(|s| !s.is_self).collect();
+        assert_eq!(voices.len(), 1);
+        assert_eq!(voices[0].display_name, display_name(0), "counted from one");
+        assert_eq!(
+            voices[0].cluster_key,
+            cluster_key(1),
+            "the key names the voice it came from, not where it sits in the list"
+        );
+    }
+
+    /// **The thing the key exists for.** A person renames a voice and links it
+    /// to somebody they know; a re-run then finds one of the *earlier* voices
+    /// silent. The row must still be the row for that voice — same name, same
+    /// person, same lines — however the list around it shifts. Numbering the
+    /// rows instead of the voices slides the name onto somebody else's speech
+    /// and deletes the last row with a name still on it.
+    #[tokio::test]
+    async fn a_rename_stays_on_the_voice_it_was_given_to() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Weekly", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                remote_line(&meeting.id, 0, 4_000),
+                remote_line(&meeting.id, 5_000, 9_000),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Two voices, both talking: two rows.
+        let both = cut_of(&[vec![(0i64, 4_000i64)], vec![(5_000, 9_000)]]);
+        persist(&db, &meeting.id, &both, Source::System)
+            .await
+            .unwrap();
+        let second = repo::list_speakers(&db, &meeting.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.cluster_key == cluster_key(1))
+            .expect("the second voice has a row");
+        let person = repo::create_person(&db, "Ada").await.unwrap();
+        repo::rename_speaker(&db, &second.id, "Ada").await.unwrap();
+        repo::set_speaker_person(&db, &second.id, Some(&person.id))
+            .await
+            .unwrap();
+
+        // A re-run in which the first voice wins nothing at all.
+        let only_second = cut_of(&[vec![(30_000i64, 30_300i64)], vec![(5_000, 9_000)]]);
+        let speakers = persist(&db, &meeting.id, &only_second, Source::System)
+            .await
+            .unwrap();
+
+        let voices: Vec<&Speaker> = speakers.iter().filter(|s| !s.is_self).collect();
+        assert_eq!(voices.len(), 1, "one voice spoke, so one row");
+        assert_eq!(voices[0].cluster_key, cluster_key(1));
+        assert_eq!(voices[0].display_name, "Ada", "the name moved or was lost");
+        assert_eq!(voices[0].person_id.as_deref(), Some(person.id.as_str()));
+        // And Ada still has the lines she said, not the silent voice's.
+        let segments = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let hers: Vec<i64> = segments
+            .iter()
+            .filter(|s| s.speaker_id.as_deref() == Some(voices[0].id.as_str()))
+            .map(|s| s.t_start_ms)
+            .collect();
+        assert_eq!(hers, vec![5_000]);
+    }
+
+    /// With nothing on disk to separate there is no pass to report on: the
+    /// result carries the rows that exist and no claim about how many voices
+    /// were heard.
+    #[tokio::test]
+    async fn a_meeting_with_no_audio_reports_the_rows_it_has() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Notes only", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(&db, &[mic_line(&meeting.id, 0, 4_000)])
+            .await
+            .unwrap();
+
+        let missing = std::path::Path::new("/nowhere/at/all");
+        let result = refine(&db, &meeting.id, missing, missing, &DiarizeControl::new())
+            .await
+            .expect("no audio is an answer, not a failure");
+        assert_eq!(result.voices_asked, None);
+        assert_eq!(result.voices_found, 1, "the microphone row");
+        assert_eq!(result.speaker_count, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -2258,10 +3191,24 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(segments.len(), 2, "the line was not cut: {segments:?}");
-        assert_eq!(segments[0].speaker_id.as_deref(), Some(speakers[0].id.as_str()));
-        assert_eq!(segments[1].speaker_id.as_deref(), Some(speakers[1].id.as_str()));
-        assert!(segments[0].text.ends_with("Italia."), "{:?}", segments[0].text);
-        assert!(segments[1].text.starts_with("Ah ok"), "{:?}", segments[1].text);
+        assert_eq!(
+            segments[0].speaker_id.as_deref(),
+            Some(speakers[0].id.as_str())
+        );
+        assert_eq!(
+            segments[1].speaker_id.as_deref(),
+            Some(speakers[1].id.as_str())
+        );
+        assert!(
+            segments[0].text.ends_with("Italia."),
+            "{:?}",
+            segments[0].text
+        );
+        assert!(
+            segments[1].text.starts_with("Ah ok"),
+            "{:?}",
+            segments[1].text
+        );
         // The pieces tile the line, carry the new revision, and keep the
         // provenance of words that were never re-transcribed.
         assert_eq!((segments[0].t_start_ms, segments[1].t_end_ms), (0, 9_000));
@@ -2364,9 +3311,14 @@ mod tests {
         .unwrap();
         pin_channel_speakers(&db, &meeting.id).await.unwrap();
 
-        persist(&db, &meeting.id, &cut_of(&[vec![(0i64, 4_000i64)]]), Source::MicOnly)
-            .await
-            .unwrap();
+        persist(
+            &db,
+            &meeting.id,
+            &cut_of(&[vec![(0i64, 4_000i64)]]),
+            Source::MicOnly,
+        )
+        .await
+        .unwrap();
 
         let segments = repo::get_segments(
             &db,
@@ -2469,5 +3421,641 @@ mod tests {
         assert_eq!(segments[0].speaker_id.as_deref(), Some(me.id.as_str()));
         assert_ne!(segments[1].speaker_id.as_deref(), Some(me.id.as_str()));
         assert!(segments[1].speaker_id.is_some());
+    }
+
+    /// A meeting the person only listened to: "You" gets a row because they were
+    /// there, and it has nothing on it because they said nothing. The count Echo
+    /// reports back — the one behind "Echo can only hear N distinct voices" —
+    /// must not include it, or a two-voice recording claims three.
+    #[tokio::test]
+    async fn the_silent_you_row_is_not_one_of_the_voices_echo_can_hear() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Webinar", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[
+                remote_line(&meeting.id, 0, 4_000),
+                remote_line(&meeting.id, 5_000, 9_000),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let cut = cut_of(&[vec![(0i64, 4_000i64)], vec![(5_000, 9_000)]]);
+        let speakers = persist(&db, &meeting.id, &cut, Source::System)
+            .await
+            .unwrap();
+        assert_eq!(speakers.len(), 3, "You, silent, plus the two who spoke");
+        assert_eq!(
+            repo::count_people(&db, &meeting.id).await.unwrap(),
+            3,
+            "there were three people in the meeting"
+        );
+        assert_eq!(
+            repo::count_audible_people(&db, &meeting.id).await.unwrap(),
+            2,
+            "and two of them can be heard"
+        );
+    }
+
+    /// The other end of the same rule: nothing on the microphone belongs to any
+    /// voice the pass found, so there is nobody to keep and every row goes.
+    /// Microphone-only, so there is no "You" row holding the list open — the
+    /// branch that deletes them all outright.
+    #[tokio::test]
+    async fn a_pass_that_finds_nobody_leaves_nobody_behind() {
+        let db = db().await;
+        let meeting = repo::create_meeting(&db, "Voice memo", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::insert_segments(&db, &[mic_line(&meeting.id, 0, 4_000)])
+            .await
+            .unwrap();
+        // The rows a previous run left behind, one of them with a name on it.
+        let stale = repo::upsert_speaker(&db, &meeting.id, &cluster_key(0), "Speaker 1", false)
+            .await
+            .unwrap();
+        repo::rename_speaker(&db, &stale.id, "Giulia")
+            .await
+            .unwrap();
+        let existing = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ids: Vec<Id> = existing.iter().map(|s| s.id.clone()).collect();
+        repo::assign_speaker(&db, &ids, &stale.id, 1).await.unwrap();
+
+        // Another meeting's rows, which this must not touch.
+        let other = repo::create_meeting(&db, "Standup", "/tmp/echo-test", None)
+            .await
+            .unwrap();
+        repo::upsert_speaker(&db, &other.id, &cluster_key(0), "Speaker 1", false)
+            .await
+            .unwrap();
+
+        let speakers = persist(&db, &meeting.id, &cut_of(&[]), Source::MicOnly)
+            .await
+            .unwrap();
+        assert!(speakers.is_empty(), "{speakers:?}");
+        assert_eq!(repo::count_people(&db, &meeting.id).await.unwrap(), 0);
+        assert_eq!(
+            repo::count_people(&db, &other.id).await.unwrap(),
+            1,
+            "the other meeting's speakers were deleted too"
+        );
+        // The line that pointed at a deleted row reads as unattributed rather
+        // than as a voice nobody can look up.
+        let segments = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(segments.iter().all(|s| s.speaker_id.is_none()));
+    }
+}
+
+// ===========================================================================
+// Keeping the expensive half across a park
+// ===========================================================================
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use crate::types::Channel;
+
+    async fn db() -> Db {
+        let db = crate::db::connect_in_memory().await.expect("in-memory db");
+        crate::db::migrate(&db).await.expect("migrations");
+        db
+    }
+
+    /// Stands in for the two ONNX networks and counts what it was asked to do.
+    ///
+    /// Every window it sees costs real seconds in the app; the whole point of
+    /// the cache is that a parked meeting does not pay for the same window
+    /// twice, and a counter is the only way to state that as a test.
+    #[derive(Default)]
+    struct CountingModels {
+        seen: Vec<i64>,
+    }
+
+    impl WindowModels for CountingModels {
+        fn analyse(
+            &mut self,
+            _samples: &[f32],
+            start_ms: i64,
+            _window_ms: i64,
+            previous: Option<&WindowResult>,
+            items: &mut Vec<ClusterItem>,
+        ) -> Result<WindowResult, DiarizeError> {
+            self.seen.push(start_ms);
+            let continues = previous.map(|_| Some(0usize)).unwrap_or(None);
+            let index = items.len();
+            items.push(ClusterItem {
+                embedding: vec![1.0, start_ms as f32 / 100_000.0],
+                weight_ms: 4_000,
+            });
+            Ok(WindowResult {
+                start_ms,
+                tracks: vec![vec![(start_ms, start_ms + 4_000)]],
+                confidence: vec![0.9],
+                fingerprint: vec![Some(index)],
+                continues: vec![continues],
+            })
+        }
+    }
+
+    /// A meeting whose audio is one chunk of noise, long enough for several
+    /// windows.
+    async fn meeting_with_audio(db: &Db, dir: &std::path::Path, ms: i64) -> String {
+        let meeting = repo::create_meeting(db, "Standup", &dir.to_string_lossy(), None)
+            .await
+            .unwrap();
+        let path = dir.join("mic-0.wav");
+        // Something every window can find a signal in; the fake models never
+        // look at it, but `has_signal` does.
+        let samples: Vec<f32> = (0..(ms * 16))
+            .map(|i| if i % 2 == 0 { 0.4 } else { -0.4 })
+            .collect();
+        crate::audio::writer::write_wav_16k_mono(&path, &samples).unwrap();
+        let id = repo::insert_chunk(
+            db,
+            &meeting.id,
+            Channel::Mic,
+            0,
+            &path.to_string_lossy(),
+            0,
+            ms,
+        )
+        .await
+        .unwrap();
+        repo::commit_chunk(db, &id, ms).await.unwrap();
+        meeting.id
+    }
+
+    /// Two files that exist, so the cache key can identify "the models" without
+    /// this test loading a hundred megabytes of ONNX.
+    fn model_files(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let segmenter = dir.join("segmenter.onnx");
+        let embedder = dir.join("embedder.onnx");
+        std::fs::write(&segmenter, b"segmenter").unwrap();
+        std::fs::write(&embedder, b"embedder").unwrap();
+        (segmenter, embedder)
+    }
+
+    async fn key_for(
+        db: &Db,
+        meeting_id: &str,
+        segmenter: &std::path::Path,
+        embedder: &std::path::Path,
+    ) -> scan_cache::Key {
+        let (source, pcm) = voice_channel(db, meeting_id).await.unwrap().unwrap();
+        scan_key(db, &pcm, source, segmenter, embedder)
+            .await
+            .expect("both model files are there")
+    }
+
+    /// Run the walk over a whole meeting, resuming from whatever was kept, and
+    /// with a recording either in the way or not.
+    async fn walk(
+        db: &Db,
+        meeting_id: &str,
+        dir: &std::path::Path,
+        key: &scan_cache::Key,
+        models: &mut CountingModels,
+        recording: bool,
+    ) -> Result<Walk, DiarizeError> {
+        let (_, mut pcm) = voice_channel(db, meeting_id).await.unwrap().unwrap();
+        let covered = pcm.covered();
+        let total_ms = pcm.total_ms();
+        let step = segmentation::STEP_MS;
+        let planned = ((total_ms + step - 1) / step).max(1);
+
+        // A recording holding the machine, expressed the way the session layer
+        // expresses it: a flag the pass reads at its next checkpoint.
+        let control = if recording {
+            DiarizeControl::new().yield_when(Arc::new(|| true))
+        } else {
+            DiarizeControl::new()
+        };
+
+        let mut walk = Walk::fresh();
+        if let Some(kept) = scan_cache::load(dir, key).await {
+            walk = Walk {
+                items: kept.items,
+                windows: kept.windows,
+                next_start_ms: kept.next_start_ms,
+            };
+        }
+
+        walk_windows(
+            &mut pcm,
+            models,
+            walk,
+            &covered,
+            total_ms,
+            segmentation::WINDOW_MS,
+            step,
+            planned,
+            Some((dir, key)),
+            &control,
+        )
+        .await
+    }
+
+    /// The claim of the whole workstream: a park does not throw away the
+    /// minutes of model work that were already paid for.
+    #[tokio::test]
+    async fn a_parked_scan_picks_up_where_it_stopped_instead_of_starting_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+        let meeting = meeting_with_audio(&db, dir.path(), 60_000).await;
+        let (segmenter, embedder) = model_files(dir.path());
+        let key = key_for(&db, &meeting, &segmenter, &embedder).await;
+
+        // First run: park it before it has done anything.
+        let mut first = CountingModels::default();
+        let parked = walk(&db, &meeting, dir.path(), &key, &mut first, true).await;
+        assert!(
+            matches!(parked, Err(DiarizeError::Yielded)),
+            "a recording has to park the walk"
+        );
+
+        // Prove the file is there and says where to pick up.
+        let kept = scan_cache::load(dir.path(), &key)
+            .await
+            .expect("the parked scan was kept");
+        assert_eq!(kept.next_start_ms, 0);
+
+        // Second run: no recording in the way, so it finishes.
+        let mut second = CountingModels::default();
+        let done = walk(&db, &meeting, dir.path(), &key, &mut second, false)
+            .await
+            .expect("the resumed scan finished");
+        assert_eq!(done.next_start_ms, 60_000);
+
+        // Third run over the finished cache: every window is already done, so
+        // the models are asked for nothing at all.
+        let mut third = CountingModels::default();
+        let again = walk(&db, &meeting, dir.path(), &key, &mut third, false)
+            .await
+            .expect("nothing left to do");
+        assert!(
+            third.seen.is_empty(),
+            "a finished scan was walked again: {:?}",
+            third.seen
+        );
+        assert_eq!(again.windows.len(), done.windows.len());
+        assert_eq!(again.items.len(), done.items.len());
+    }
+
+    /// Halfway is the case that matters on a real machine: some windows paid
+    /// for, the rest still owed. Neither window is analysed twice, and the
+    /// fingerprints of both halves end up in one scan.
+    #[tokio::test]
+    async fn the_windows_already_paid_for_are_not_paid_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+        let meeting = meeting_with_audio(&db, dir.path(), 60_000).await;
+        let (segmenter, embedder) = model_files(dir.path());
+        let key = key_for(&db, &meeting, &segmenter, &embedder).await;
+
+        // Do the first half by hand, then keep it exactly as a park would.
+        let mut first = CountingModels::default();
+        let (_, mut pcm) = voice_channel(&db, &meeting).await.unwrap().unwrap();
+        let covered = pcm.covered();
+        let control = DiarizeControl::new();
+        let half = walk_windows(
+            &mut pcm,
+            &mut first,
+            Walk::fresh(),
+            &covered,
+            30_000,
+            segmentation::WINDOW_MS,
+            segmentation::STEP_MS,
+            12,
+            Some((dir.path(), &key)),
+            &control,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.seen, vec![0, 5_000, 10_000, 15_000, 20_000, 25_000]);
+        assert_eq!(half.next_start_ms, 30_000);
+
+        let mut second = CountingModels::default();
+        let whole = walk(&db, &meeting, dir.path(), &key, &mut second, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.seen,
+            vec![30_000, 35_000, 40_000, 45_000, 50_000, 55_000],
+            "the second run redid work the first one had already done"
+        );
+        assert_eq!(
+            whole.windows.len(),
+            12,
+            "both halves are in the finished scan"
+        );
+        assert_eq!(whole.items.len(), 12);
+    }
+
+    /// A cancel is not a park. The commonest reason for one is somebody
+    /// deleting the meeting, and `commands::delete_meeting` cancels the work and
+    /// then removes the folder without waiting — so a scan that wrote itself
+    /// down on its way out could recreate the very file the delete had just
+    /// taken away, leaving this meeting's voice fingerprints on disk after
+    /// somebody asked Echo to forget the recording.
+    #[tokio::test]
+    async fn a_cancelled_scan_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+        let meeting = meeting_with_audio(&db, dir.path(), 30_000).await;
+        let (segmenter, embedder) = model_files(dir.path());
+        let key = key_for(&db, &meeting, &segmenter, &embedder).await;
+
+        let (_, mut pcm) = voice_channel(&db, &meeting).await.unwrap().unwrap();
+        let covered = pcm.covered();
+        let control = DiarizeControl::new();
+        control.cancel();
+        let mut models = CountingModels::default();
+        let stopped = walk_windows(
+            &mut pcm,
+            &mut models,
+            Walk::fresh(),
+            &covered,
+            30_000,
+            segmentation::WINDOW_MS,
+            segmentation::STEP_MS,
+            6,
+            Some((dir.path(), &key)),
+            &control,
+        )
+        .await;
+
+        assert!(
+            matches!(stopped, Err(DiarizeError::Cancelled)),
+            "{stopped:?}"
+        );
+        assert!(
+            !scan_cache::path_in(dir.path()).exists(),
+            "a cancelled pass wrote itself into a folder that may be being deleted"
+        );
+    }
+
+    /// Where the fingerprints are allowed to live: a folder named after this
+    /// meeting and nothing else.
+    ///
+    /// A meeting row is created against the storage root and only afterwards
+    /// told about its own folder, and that second write is allowed to fail
+    /// (`session::start`). A row still naming the root would put this meeting's
+    /// voice fingerprints where deleting the meeting never looks — and where
+    /// every other such meeting writes the same file.
+    #[tokio::test]
+    async fn a_meeting_with_no_folder_of_its_own_keeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+
+        let stray = repo::create_meeting(&db, "Standup", &dir.path().to_string_lossy(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            audio_dir_of(&db, &stray.id).await,
+            None,
+            "a row naming the storage root must not be written into"
+        );
+
+        let own = dir.path().join("meeting-of-its-own");
+        std::fs::create_dir_all(&own).unwrap();
+        let proper = repo::create_meeting(&db, "Standup", &own.to_string_lossy(), None)
+            .await
+            .unwrap();
+        // The folder has to be named after the meeting; rename it to the id the
+        // row was actually given.
+        let named = dir.path().join(&proper.id);
+        std::fs::rename(&own, &named).unwrap();
+        repo::set_meeting_audio_dir(&db, &proper.id, &named.to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(audio_dir_of(&db, &proper.id).await, Some(named));
+    }
+
+    /// The safety property. A cache that no longer describes this meeting's
+    /// audio is worth less than nothing — it would put one person's voice on
+    /// another person's lines — so it is thrown away and the work is done
+    /// again.
+    #[tokio::test]
+    async fn audio_that_arrived_late_throws_the_kept_scan_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+        let meeting = meeting_with_audio(&db, dir.path(), 30_000).await;
+        let (segmenter, embedder) = model_files(dir.path());
+        let key = key_for(&db, &meeting, &segmenter, &embedder).await;
+
+        let mut first = CountingModels::default();
+        walk(&db, &meeting, dir.path(), &key, &mut first, false)
+            .await
+            .unwrap();
+        assert_eq!(first.seen.len(), 6);
+
+        // A second chunk lands — a recovery after a crash, a late commit — and
+        // the meeting is no longer the one that was scanned.
+        let path = dir.path().join("mic-1.wav");
+        let samples: Vec<f32> = (0..(30_000 * 16))
+            .map(|i| if i % 2 == 0 { 0.4 } else { -0.4 })
+            .collect();
+        crate::audio::writer::write_wav_16k_mono(&path, &samples).unwrap();
+        let id = repo::insert_chunk(
+            &db,
+            &meeting,
+            Channel::Mic,
+            1,
+            &path.to_string_lossy(),
+            30_000,
+            60_000,
+        )
+        .await
+        .unwrap();
+        repo::commit_chunk(&db, &id, 60_000).await.unwrap();
+
+        let fresh_key = key_for(&db, &meeting, &segmenter, &embedder).await;
+        assert_ne!(fresh_key, key, "the key has to notice the new audio");
+        assert!(
+            scan_cache::load(dir.path(), &fresh_key).await.is_none(),
+            "the old scan must not be resumed over audio it never saw"
+        );
+
+        let mut second = CountingModels::default();
+        walk(&db, &meeting, dir.path(), &fresh_key, &mut second, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.seen.first().copied(),
+            Some(0),
+            "a stale cache has to mean a full rescan, from the first window"
+        );
+        assert_eq!(second.seen.len(), 12);
+    }
+
+    /// A finished scan is the one case where the pass can answer without a
+    /// model at all — which is also how this test can prove it: the model paths
+    /// are files no ONNX runtime could ever load, so reaching for them fails
+    /// loudly.
+    #[tokio::test]
+    async fn a_finished_scan_is_read_back_without_loading_a_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+        let meeting = meeting_with_audio(&db, dir.path(), 30_000).await;
+        let (segmenter, embedder) = model_files(dir.path());
+        let key = key_for(&db, &meeting, &segmenter, &embedder).await;
+
+        let mut models = CountingModels::default();
+        walk(&db, &meeting, dir.path(), &key, &mut models, false)
+            .await
+            .unwrap();
+
+        let scanned = scan_resumable(
+            &db,
+            &meeting,
+            &segmenter,
+            &embedder,
+            Some(dir.path()),
+            &DiarizeControl::new(),
+        )
+        .await
+        .expect("the kept scan answered")
+        .expect("there is audio");
+        assert_eq!(scanned.fingerprints(), 6);
+
+        // And without the cache, the same call has to load the models and
+        // fails on these files — which is what makes the assertion above mean
+        // "it did not load them".
+        std::fs::remove_file(scan_cache::path_in(dir.path())).unwrap();
+        let without_the_cache = scan_resumable(
+            &db,
+            &meeting,
+            &segmenter,
+            &embedder,
+            Some(dir.path()),
+            &DiarizeControl::new(),
+        )
+        .await;
+        match without_the_cache {
+            Err(DiarizeError::Load(_)) => {}
+            Err(other) => panic!("{other:?}"),
+            Ok(_) => panic!("these files are not models; loading them cannot succeed"),
+        }
+    }
+
+    /// A model file that cannot be identified switches the cache off entirely
+    /// rather than being guessed at.
+    #[tokio::test]
+    async fn without_a_model_to_name_nothing_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db().await;
+        let meeting = meeting_with_audio(&db, dir.path(), 10_000).await;
+        let (_, pcm) = voice_channel(&db, &meeting).await.unwrap().unwrap();
+        assert!(scan_key(
+            &db,
+            &pcm,
+            Source::MicOnly,
+            std::path::Path::new("/nonexistent/segmenter.onnx"),
+            std::path::Path::new("/nonexistent/embedder.onnx"),
+        )
+        .await
+        .is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // A park during the clustering
+    // -----------------------------------------------------------------------
+
+    /// Enough fingerprints that building the merge tree is real work.
+    fn many_prints(n: usize) -> Scan {
+        let mut items = Vec::new();
+        let mut windows = Vec::new();
+        for i in 0..n {
+            let start = i as i64 * 1_000;
+            let mut embedding = vec![0.0f32; 64];
+            embedding[i % 64] = 1.0;
+            embedding[(i * 7) % 64] += 0.5;
+            cluster::l2_normalize(&mut embedding);
+            windows.push(WindowResult {
+                start_ms: start,
+                tracks: vec![vec![(start, start + 900)]],
+                confidence: vec![0.9],
+                fingerprint: vec![Some(items.len())],
+                continues: vec![None],
+            });
+            items.push(ClusterItem {
+                embedding,
+                weight_ms: 900,
+            });
+        }
+        Scan {
+            items,
+            windows,
+            covered: vec![(0, n as i64 * 1_000)],
+        }
+    }
+
+    /// The clustering reads nothing off disk, so before this it was minutes
+    /// during which a starting recording simply had to wait. Now it stops at the
+    /// first thing it does, and stops with no answer rather than half of one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recording_starting_during_the_clustering_is_honoured_at_once() {
+        let scanned = many_prints(400);
+        let guided = Guided::default();
+
+        let undisturbed = std::time::Instant::now();
+        let full = scanned.cut_guided(&guided, None);
+        let full_took = undisturbed.elapsed();
+        assert!(!full.tracks.is_empty());
+
+        let parked = std::time::Instant::now();
+        let control = DiarizeControl::new().yield_when(Arc::new(|| true));
+        let err = scanned
+            .cut_guided_until(&guided, None, &control)
+            .expect_err("the recording wins");
+        let parked_took = parked.elapsed();
+        assert!(matches!(err, DiarizeError::Yielded), "{err:?}");
+        assert!(
+            parked_took * 4 < full_took,
+            "the clustering ran on regardless: {parked_took:?} against {full_took:?}"
+        );
+    }
+
+    /// The same, for the path a count correction takes.
+    #[test]
+    fn a_forced_count_stops_for_a_recording_too() {
+        let scanned = many_prints(200);
+        let control = DiarizeControl::new().yield_when(Arc::new(|| true));
+        let err = scanned
+            .cut_guided_until(&Guided::default(), Some(3), &control)
+            .expect_err("the recording wins");
+        assert!(matches!(err, DiarizeError::Yielded), "{err:?}");
+    }
+
+    /// Cancelling is not parking, and the two must not be confused: one is the
+    /// person saying stop, the other is Echo standing aside.
+    #[test]
+    fn cancelling_during_the_clustering_says_cancelled() {
+        let scanned = many_prints(50);
+        let control = DiarizeControl::new();
+        control.cancel();
+        let err = scanned
+            .cut_guided_until(&Guided::default(), None, &control)
+            .expect_err("the person stopped it");
+        assert!(matches!(err, DiarizeError::Cancelled), "{err:?}");
     }
 }

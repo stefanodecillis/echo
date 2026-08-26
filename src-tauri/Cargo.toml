@@ -51,7 +51,7 @@ thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
-tracing-subscriber = "0.3.23"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.20.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
@@ -66,6 +66,10 @@ coreaudio-sys = "0.2.18"
 dispatch2 = { version = "0.3.1", default-features = false, features = ["std", "objc2"] }
 objc2 = "0.6.4"
 objc2-core-audio-types = "0.3.2"
+# CFRetained lives here: it is what keeps the block buffer CoreMedia hands back
+# alive exactly as long as the samples read from it, and releases it on every
+# return path.
+objc2-core-foundation = "0.3.2"
 objc2-core-media = "0.3.2"
 objc2-foundation = "0.3.2"
 objc2-screen-capture-kit = "0.3.2"

@@ -52,7 +52,10 @@
 //! The pass answers this itself — the number of clusters it ends up with, plus
 //! the person at the keyboard — and the answer is shown as "detected". The
 //! person can correct it, and a correction is better evidence than any threshold
-//! (DESIGN §1), so it re-runs the pass cut to exactly that many voices.
+//! (DESIGN §1), so it re-runs the pass cut to that many voices — and says so
+//! when the recording does not hold that many that can be told apart, rather
+//! than making the difference up in speaker rows with nothing behind them
+//! ([`cluster::ForcedOutcome`]).
 //!
 //! **How the pass decides, and why it changed.** It used to merge fingerprints
 //! until the closest pair was further apart than one calibrated distance. That
@@ -107,6 +110,7 @@ pub mod pcm;
 pub mod people;
 pub mod pipeline;
 pub mod sample;
+pub(crate) mod scan_cache;
 pub mod segmentation;
 pub mod split;
 pub mod timeline;
@@ -156,8 +160,10 @@ pub enum DiarizeError {
     #[error("cancelled")]
     Cancelled,
     /// A recording started. Not a failure: the pass reads only finished audio
-    /// off disk, so it can be redone from scratch whenever the machine is free
-    /// again (mantra 1, and DESIGN §3 "recording preempts all").
+    /// off disk, so it can be picked up again whenever the machine is free
+    /// (mantra 1, and DESIGN §3 "recording preempts all") — and it picks up
+    /// where it stopped rather than at the beginning, because the windows it
+    /// had already paid for are kept ([`scan_cache`]).
     #[error("paused because a recording started")]
     Yielded,
     #[error("speaker analysis failed: {0}")]
@@ -170,6 +176,17 @@ pub enum DiarizeError {
     /// cut a recognisable clip out of. See [`sample`].
     #[error("there is no clear moment of that voice on its own")]
     NoVoiceSample,
+    /// A different problem from [`Self::NoVoiceSample`], and one the person can
+    /// act on: not one line of this meeting's transcript belongs to that voice,
+    /// so there is nothing to look through for a clear moment in the first
+    /// place. Telling somebody there is no clear moment of a voice that never
+    /// said anything sends them looking for a recording fault that is not there.
+    ///
+    /// Since 2026-08-24 the pass no longer leaves rows like this behind (see
+    /// [`pipeline::persist`]), but a merge, a rename or an older meeting can
+    /// still produce one, and a person clicking on it deserves the true answer.
+    #[error("no line of this meeting belongs to that voice")]
+    NoLines,
     /// The words are still there and the audio is not — the recording was
     /// deleted, or the meeting was kept as a transcript only.
     #[error("that meeting's audio is no longer on this computer")]
@@ -235,6 +252,18 @@ pub struct DiarizationResult {
     /// True when [`Self::people_count`] is the person's own correction rather
     /// than Echo's count.
     pub people_count_is_override: bool,
+    /// How many people the pass was told to look for, counting whoever was at
+    /// this computer. `None` when nobody corrected the count.
+    pub voices_asked: Option<u32>,
+    /// How many people the pass could actually tell apart, in the same units:
+    /// the speaker rows it left behind, every one of them holding at least one
+    /// line of the transcript.
+    ///
+    /// Below [`Self::voices_asked`] when the recording does not hold that many
+    /// separable voices. That is a shortfall Echo says out loud rather than
+    /// filling with rows nobody can hear (see
+    /// [`cluster::ForcedOutcome`](crate::diarize::cluster::ForcedOutcome)).
+    pub voices_found: u32,
 }
 
 /// Where live clustering would plug in, if the M0-S4 gate ever passes.

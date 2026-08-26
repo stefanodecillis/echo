@@ -58,12 +58,60 @@ export const labels = {
     recovering: "Picking up where it left off",
   },
   degradedReason: {
+    /** The one true copy for "nothing this computer plays ever reached Echo, so
+     * the whole meeting is in the microphone recording". It used to be
+     * hand-copied into four places (`live.micOnlyBanner`,
+     * `notices.systemAudioLost`, `anchors.micOnlyBanner`, and this one) and
+     * drifted — the incident of 2026-08-24 shipped a banner that claimed Echo
+     * couldn't hear the other people at all, while it was transcribing them
+     * anyway, mislabelled "You". The others now reference these two instead of
+     * repeating them. A Rust test (`SYSTEM_AUDIO_SILENT_MESSAGE` in
+     * `src-tauri/src/audio/mod.rs`) pins the backend's copy of the same
+     * sentence to this exact string.
+     *
+     * The last sentence is a promise, and this is the only state that can keep
+     * it: the offline pass re-cuts the microphone recording into separate
+     * voices for a meeting that has no system audio at all, and pins every
+     * microphone line to "You" for one that has any. Hence the separate
+     * `systemAudioLost` below rather than one sentence for both. */
     systemAudioUnavailable:
-      "Echo can hear you, but not the other people. It will keep recording.",
+      "Echo is recording through the microphone only, so it can't tell who is speaking — every line says You for now. It will work out who said what once the meeting ends.",
+    /** The computer's audio was arriving and stopped. Says what changed and
+     * claims nothing else: the lines written while it was working carry real
+     * names and stay that way, and the microphone tail is not separated by
+     * anything, so neither half of the sentence above would be true here.
+     * Pinned to `SYSTEM_AUDIO_LOST_MESSAGE` in `src-tauri/src/audio/mod.rs`. */
+    systemAudioLost:
+      "Echo stopped hearing what this computer plays. It's still recording through the microphone.",
     microphoneUnavailable:
       "Echo can hear the meeting, but not your own microphone.",
+    /** Nothing is arriving at all: this recording has no microphone in it and
+     * what the computer plays is not coming through either. Its own sentence
+     * because both of the two above end in a promise about the microphone
+     * recording — one that the offline pass will sort the voices out of it, one
+     * that Echo is still recording through it — and a person who denied the
+     * microphone has no microphone recording for either promise to be about.
+     * Pinned to `NOTHING_IS_BEING_HEARD_MESSAGE` in
+     * `src-tauri/src/audio/mod.rs`. */
+    nothingIsBeingHeard:
+      "Echo can't hear anything — there's no microphone in this recording, and nothing is coming from this computer. Nothing is being saved, so it's worth stopping and starting again.",
     transcriptBehind: "Catching up on the last few minutes.",
     storageLow: "Running low on space. Recording keeps going — free up room soon.",
+  },
+  /**
+   * Whether Echo can understand speech right now, said while a meeting is
+   * running. Only the two states worth interrupting somebody for are here:
+   * "ready" needs no words, and "idle" means nothing is asking for it.
+   *
+   * `unavailable` is the same sentence the core sends as a notice when the
+   * engine fails to come up, word for word, so the banner on the screen and the
+   * message that slid past agree instead of sounding like two problems.
+   */
+  speechState: {
+    preparing:
+      "Echo is finishing a one-time setup. It's recording everything, and the words will fill in as soon as that's done.",
+    unavailable:
+      "Echo is recording, but it can't write the words down yet. It will catch up as soon as it can.",
   },
   provider: {
     onThisComputer: "Ollama",
@@ -76,6 +124,9 @@ export const labels = {
     export: "Preparing the file",
     download: "Downloading",
     mixdown: "Preparing playback",
+    /** The one-time setup a set of speech weights needs on this computer, paid
+     * before a meeting has to pay it (incident of 2026-08-24). */
+    prepareEngine: "Getting Echo ready",
   },
   /**
    * A stage inside a job, named because a person would read it as a different
@@ -113,9 +164,106 @@ export const labels = {
  * started says so, in words, instead of borrowing the sentence — and the bar —
  * of the one that is running.
  */
+/**
+ * The note on a line Echo repaired against "Words Echo should know".
+ *
+ * Deliberately a whole sentence and deliberately quiet — a title, nothing more.
+ * The transcript is what a person reads as the record of the meeting, so a word
+ * Echo changed on its own has to be able to say so; but the change is right far
+ * more often than not, and a badge on every third line would be noise. Says what
+ * was written and what it became, in that order, so the sentence reads the way
+ * it happened.
+ */
+export const transcriptNote = {
+  corrected: (changes: { from: string; to: string }[]) =>
+    changes.map((c) => `Echo wrote “${c.from}” and changed it to “${c.to}”.`).join(" "),
+  /**
+   * A line Echo was not sure it heard (`src/pages/Meeting/lib/confidence.ts`).
+   * Said as what happened, not as a score: "0.42" is a number nobody can act on,
+   * and "low confidence" is jargon for the same number.
+   */
+  unsure: "Echo wasn't sure it heard this line. The words may be wrong.",
+  /**
+   * The last sentence of the same tooltip, on a line whose repaired words can
+   * still be found in it — which is to say, on a line Echo can put back.
+   *
+   * Says *line*, not *word*, because that is what happens: the note kept
+   * against a line records what was replaced and never where, so one repair
+   * among several cannot be undone on its own. Nothing new is drawn for this;
+   * the underline that already means "a word was put right" is the thing you
+   * click, so a line that is also shaky keeps its dimmed text saying only that.
+   */
+  undoHint: "Click it to put this line back the way Echo first heard it.",
+  /** The same offer for anyone not looking at a tooltip. */
+  undoLabel: "Put this line back the way Echo first heard it",
+  /** Said once, quietly, after the words go back. */
+  undone: "Put back the way Echo heard it.",
+} as const;
+
+/**
+ * The moments Echo heard and chose not to write down, said on the meeting's
+ * own screen (`src-tauri/src/asr/left_out.rs` decides which ones these are).
+ *
+ * Echo takes the microphone's copy of what this computer played out of the
+ * transcript so the other people are written down once instead of twice. That
+ * is right almost every time and nothing is missing — but it is measurably
+ * wrong sometimes, and when it is, the transcript reads exactly like one where
+ * nobody spoke. Only the moments that left no words at all reach this: a
+ * decision the transcript covers is not a person's problem, and saying "84
+ * stretches" about a perfectly good transcript would be noise nobody could act
+ * on.
+ *
+ * Zero-jargon, and specifically: not a word here names the machinery. What a
+ * person needs is what happened ("Echo took it for this computer's own sound"),
+ * when it happened, and what to do about it.
+ */
+export const leftOut = {
+  title: (count: number) =>
+    count === 1 ? "One moment has no words" : `${count} moments have no words`,
+  /** Says what Echo did and that nothing else covered those seconds — the two
+   * halves of why the transcript is silent there. */
+  explanation: (count: number) =>
+    count === 1
+      ? "Echo heard something through the microphone here and took it for this computer's own sound coming back, so it didn't write it down. Nothing else was written down at that moment either."
+      : "Echo heard something through the microphone at these times and took it for this computer's own sound coming back, so it didn't write them down. Nothing else was written down then either.",
+  /**
+   * The repair, naming the button that performs it so the two can never drift
+   * apart. Only shown while the recording still exists: without it there is
+   * nothing to read again, and offering a repair that can't run is worse than
+   * offering none.
+   */
+  repair: (buttonLabel: string) =>
+    `If somebody was speaking, “${buttonLabel}” reads the whole recording again and decides afresh.`,
+  jumpLabel: (time: string) => `Go to ${time} in the transcript`,
+  /** The list is a way in, not the record: the count above is the truth, and
+   * fifty times in a row is a wall rather than a list. */
+  andMore: (count: number) => `and ${count} more`,
+} as const;
+
 export const jobLine = {
   running: (label: string) => `${label}…`,
   waiting: (label: string) => `${label} — waiting its turn`,
+  /**
+   * A pass that stopped without finishing, said on the screen that was waiting
+   * for it. The banner during a mic-only recording promises that Echo will work
+   * out who said what once the meeting ends; when the pass can't — the speaker
+   * files are allowed to arrive after the first recording, so a meeting can
+   * happen before they land — this is what keeps that from being a promise
+   * quietly broken behind a transcript where every line still says You. The
+   * reason underneath it comes from the core, already in plain words.
+   */
+  stopped: (label: string) => `${label} — didn't finish`,
+  /**
+   * Work that is set aside because a recording is going on.
+   *
+   * Recording always gets the machine first, so on a day of back-to-back
+   * meetings the previous meeting's work sits still for as long as the next one
+   * lasts. Until now the screen kept whatever it last said — a job name over a
+   * bar that had stopped moving — which reads as Echo being stuck. This says
+   * what is actually true and that it will carry on by itself, so nobody has to
+   * decide whether to press anything.
+   */
+  deferred: (label: string) => `${label} — paused until the recording ends`,
 } as const;
 
 /** Words used across more than one screen: dialogs, toasts, generic buttons. */
@@ -205,8 +353,7 @@ export const live = {
   stopConfirmTitle: "Stop recording?",
   stopConfirmDescription:
     "Echo will finish listening and start writing the recap.",
-  micOnlyBanner:
-    "Echo can hear you, but not the other people. It will keep recording.",
+  micOnlyBanner: labels.degradedReason.systemAudioUnavailable,
   systemOnlyBanner: "Echo can hear the meeting, but not your own microphone.",
   unknownSpeaker: "Speaker",
   nothingRecordingTitle: "Nothing is being recorded",
@@ -228,6 +375,41 @@ export const meeting = {
   tabInfo: "Info",
   noRecapTitle: "No recap yet",
   noRecapDescription: "Write one whenever you're ready.",
+  /**
+   * The same empty tab while Echo is still writing the meeting down.
+   *
+   * A recap is written *from* the transcript, and Echo already queues it behind
+   * that meeting's transcript work — the queue orders by kind, so the recap runs
+   * last whatever order things were asked for in. That was always true and the
+   * screen never said it: for the several minutes after a meeting ends, and for
+   * the whole of one that is still recording, this tab offered "Write one
+   * whenever you're ready" beside a live button, inviting a recap of a
+   * transcript Echo was still writing.
+   *
+   * So the button stays: a promise the queue already keeps is better than a
+   * disabled control that has to explain itself.
+   */
+  noRecapWhileTranscribingTitle: "Still writing the meeting down",
+  noRecapWhileTranscribingDescription:
+    "A recap is written from the transcript, so Echo finishes that first. Ask for one now and it gets written as soon as the transcript is done.",
+  /** The pending card when the recap has been asked for but hasn't started. */
+  recapWaitingTitle: "Your recap is waiting",
+  /** Why it is waiting, when what it is waiting for is the transcript. */
+  recapWaitingForTranscriptDescription:
+    "Echo is still writing the meeting down. Your recap gets written as soon as that's done.",
+  /** Why it is waiting, when it is simply not its turn yet. */
+  recapWaitingDescription: "Echo starts on it as soon as it's free.",
+  /**
+   * The transcript pass stopped before the end.
+   *
+   * Without this a recap would be written from an incomplete transcript with
+   * nothing anywhere saying so. Same shape as the Transcript tab's own notice
+   * for the same stopped pass, which carries the reason underneath in the
+   * core's own words.
+   */
+  recapTranscriptStoppedTitle: "The transcript isn't finished",
+  recapTranscriptStoppedDescription:
+    "Echo stopped before the end of the recording, so a recap written now would miss whatever it didn't reach.",
   writeRecapButton: "Write recap",
   regenerateButton: "Try a different way",
   templateLabel: "Recap style",
@@ -481,6 +663,25 @@ export const settings = {
   peopleForgetButton: "Forget",
   peopleDeleteConfirmTitle: "Forget this voice?",
   peopleDeleteConfirmDescription: "The saved samples are deleted too.",
+  /**
+   * Combining two saved voices — the same shape as "Combine two speakers" in a
+   * meeting, and deliberately the same words, because it is the same idea said
+   * about the list that outlives the meeting.
+   *
+   * The one difference is that this one cannot be taken back, so it gets a
+   * second step that says so before anything happens. What it says there is
+   * what the core actually does: both sets of saved sound are kept as one, the
+   * overlapping bits are dropped, meetings already read do not change.
+   */
+  peopleMergeButton: "Combine two voices",
+  peopleMergeTitle: "Which two are the same person?",
+  peopleMergeDescription:
+    "Pick two names below, and the one whose name to keep. Everything Echo has saved for the other moves across.",
+  peopleMergeKeepLabel: "Keep this name",
+  peopleMergeNeedTwo: "Pick exactly two names to combine.",
+  peopleMergeConfirmTitle: "Combine these two voices?",
+  peopleMergeConfirmButton: "Combine",
+  peopleMergeBackButton: "Back",
   /** `needsRefresh` on a saved person: never actionable, just said once and
    * quietly — Echo runs the refresh itself. */
   peopleRefreshingNote: "Echo is refreshing how it recognizes voices.",
@@ -495,6 +696,25 @@ export const settings = {
    * next to a Save button said what the button does twice instead. */
   peopleSaveAsPlaceholder: "Their name",
   peopleSaveAsButton: "Save",
+
+  // Words Echo should know
+  sectionWords: "Words",
+  /** Mantra 2 all the way through: no "vocabulary", no "glossary", no
+   * "prompt" — just the names, and what typing one does. The second sentence is
+   * the honest limit: this makes those words far more likely to come out right,
+   * and promising more than that would be a promise a listener cannot keep. */
+  wordsIntro:
+    "Names Echo tends to get wrong: a product, a company, a street, someone you work with. Add them here and Echo will watch for them while it writes your meetings down.",
+  wordsAddPlaceholder: "A name or a word",
+  wordsAddButton: "Add",
+  wordsEmptyTitle: "Nothing here yet",
+  wordsEmptyDescription:
+    "Add the names that come up in your meetings, and Echo will spell them the way you do.",
+  /** On a row Echo added itself, from an enrolled voice. Says where it came
+   * from, not how it got there — and it can be removed like any other. */
+  wordsFromPersonNote: "From a voice you saved",
+  wordsRemoveButton: "Remove",
+  wordsTooLongError: "That's longer than a name. Add one word or two.",
 } as Record<string, string>;
 
 /**
@@ -589,8 +809,7 @@ export const onboarding = {
 export const notices = {
   somethingWentWrong: "Something went wrong. Nothing was lost.",
   setupDone: "Echo is ready — recording and meeting alerts are on.",
-  systemAudioLost:
-    "Echo can hear you, but not the other people. It will keep recording.",
+  systemAudioLost: labels.degradedReason.systemAudioLost,
   storageLow:
     "Running low on space. Recording keeps going — free up room when you can.",
   storageFull:
@@ -627,8 +846,7 @@ export const anchors = {
   systemAudioMeaning: "everything your computer plays",
   catchingUp: "Catching up on the last few minutes",
   workingOutSpeakers: "Working out who said what",
-  micOnlyBanner:
-    "Echo can still hear you, but not the other people. It will keep recording.",
+  micOnlyBanner: labels.degradedReason.systemAudioUnavailable,
 } as const;
 
 /**
@@ -662,6 +880,30 @@ export const peopleCount = {
     n === null
       ? "Redo who said what automatically?"
       : `Redo who said what for ${n} ${n === 1 ? meeting.peopleCountSingular : meeting.peopleCountPlural}?`,
+  /**
+   * Beside the participants stepper when someone asked for more people than
+   * the recording holds separable voices. Says what Echo can hear and asks for
+   * nothing: the number they typed is about the room they were in, and it
+   * stays. Same sentence the backend puts in the message when the pass
+   * finishes, so the two never disagree.
+   */
+  voicesFound: (n: number) =>
+    n === 0
+      ? "Echo can't tell any voices apart in this recording."
+      : n === 1
+        ? "Echo can only hear one voice clearly in this recording."
+        : `Echo can only hear ${n} distinct voices in this recording.`,
+  /**
+   * Beside the participants stepper when the count is Echo's own automatic
+   * reading. Shows the best count it decided against, because a wrong count is
+   * the one speaker mistake nothing here can fix later — merges exist, splits
+   * don't — and a decision nobody can see is a decision nobody can argue with.
+   * An invitation to correct the number, not a confession of error.
+   */
+  alternativeCount: (n: number) =>
+    n === 1
+      ? "One voice was Echo's next best reading. If that's right, lower the number."
+      : `${n} was Echo's next best reading. If that's right, set the number to ${n}.`,
 } as const;
 
 /**
@@ -677,6 +919,18 @@ export const knownPeople = {
   /** A recurring unnamed voice: how many meetings it has turned up in. Without
    * this, two rows of "Unnamed voice" give nobody anything to decide with. */
   heardIn: (n: number) => `Heard in ${n} ${n === 1 ? "meeting" : "meetings"}`,
+  /**
+   * The second step of combining two saved voices, which names them because
+   * the whole risk of the thing is combining the wrong two.
+   *
+   * Every clause is something the core really does: both sets of saved sound
+   * end up behind one name, the overlapping bits are dropped (that dropping is
+   * what makes the result one voice rather than two), and meetings somebody has
+   * already read are left exactly as they read. It ends on the sentence that
+   * decides whether anybody should click.
+   */
+  combineConfirm: (keep: string, merge: string) =>
+    `Echo keeps “${keep}” and puts everything it has saved for “${merge}” behind that one name. Some of it is dropped along the way, where the two voices overlap. Meetings you've already read stay exactly as they read. This can't be undone.`,
 } as const;
 
 /** Words for the two microphone-versus-computer channels. */

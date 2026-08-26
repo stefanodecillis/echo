@@ -71,6 +71,28 @@ impl ChunkPcm {
         self.chunks.is_empty()
     }
 
+    /// A short, stable digest of exactly which audio this reader would read.
+    ///
+    /// Every committed chunk's identity, order, file and stretch of the meeting
+    /// clock. It is what lets a kept scan be trusted: if any of that has moved —
+    /// a chunk recovered after a crash, a late commit, a re-recorded meeting —
+    /// the digest changes and the work is done again rather than replayed over
+    /// audio it was not computed from (see [`super::scan_cache`]).
+    pub fn stamp(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for c in &self.chunks {
+            hasher.update(c.id.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(c.path.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(c.seq.to_le_bytes());
+            hasher.update(c.t_start_ms.to_le_bytes());
+            hasher.update(c.t_end_ms.to_le_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
     /// Stretches of the clock that actually have audio behind them, merged.
     ///
     /// A recording that lost a device mid-meeting has holes; running the model

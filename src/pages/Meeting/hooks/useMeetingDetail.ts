@@ -10,6 +10,18 @@ export interface UseMeetingDetailResult {
   detail: MeetingDetail | undefined;
   loading: boolean;
   error: UiError | undefined;
+  /**
+   * How many voices the last speaker pass could actually tell apart. Only a
+   * finished pass knows this, so it lives here rather than on `detail`: it
+   * arrives with the event and is gone again on a page reload, which is right —
+   * it describes a run, not the meeting.
+   */
+  voicesFound: number | undefined;
+  /**
+   * The best count the last automatic pass decided against, if there was one.
+   * Same lifetime as `voicesFound`: it describes a run, not the meeting.
+   */
+  alternativeCount: number | undefined;
   /** Re-fetch everything. Used after a destructive action (delete audio) or
    * when an event says something changed that a patch can't express. */
   reload: () => void;
@@ -28,6 +40,8 @@ export function useMeetingDetail(meetingId: Id | undefined): UseMeetingDetailRes
   const [detail, setDetailState] = useState<MeetingDetail>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<UiError>();
+  const [voicesFound, setVoicesFound] = useState<number>();
+  const [alternativeCount, setAlternativeCount] = useState<number>();
   const meetingIdRef = useRef(meetingId);
   meetingIdRef.current = meetingId;
 
@@ -43,6 +57,7 @@ export function useMeetingDetail(meetingId: Id | undefined): UseMeetingDetailRes
 
   useEffect(() => {
     setDetailState(undefined);
+    setVoicesFound(undefined);
     reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meetingId]);
@@ -71,6 +86,13 @@ export function useMeetingDetail(meetingId: Id | undefined): UseMeetingDetailRes
     // also change the detected count or clear an override; pick that up here
     // too, if the payload carries it, alongside the refreshed speaker list.
     const withPeopleCount = payload as SpeakersUpdatedPayloadWithPeopleCount;
+    // Only a pass that has just run sends this. The emitters that are only
+    // announcing rows leave it out, and the last pass's answer stands rather
+    // than being wiped by, say, a rename.
+    if (typeof payload.voicesFound === "number") setVoicesFound(payload.voicesFound);
+    // A fresh decision retires the previous runner-up; an emitter that only
+    // announces rows leaves the last answer standing, exactly like the count.
+    if (payload.alternativeCount != null) setAlternativeCount(payload.alternativeCount);
     setDetail((prev) => {
       const prevWithPeopleCount = prev as MeetingDetailWithPeopleCount;
       return {
@@ -99,11 +121,12 @@ export function useMeetingDetail(meetingId: Id | undefined): UseMeetingDetailRes
 
   useEvent(EVENTS.jobProgress, (payload) => {
     if (payload.job.meetingId !== meetingIdRef.current) return;
-    // The stage travels beside the job rather than in it, and it is the truer
-    // description of what is happening — a catch-up job waiting for the engine
-    // to be got ready is not yet catching up on anything. Folded in here so
-    // every screen reading `detail.jobs` gets it (see `lib/jobs.ts`).
-    const job = { ...payload.job, phase: payload.phase };
+    // The job carries its own stage, so this row replaces the fetched one
+    // whole. It used to arrive beside the job and be folded in here, which
+    // meant a screen opened after the announcement drew the job's own name over
+    // a bar at 0% — a catch-up job waiting for the engine to be got ready is
+    // not catching up on anything yet, and said so to nobody.
+    const job = payload.job;
     setDetail((prev) => {
       const jobs = prev.jobs.some((j) => j.id === job.id)
         ? prev.jobs.map((j) => (j.id === job.id ? job : j))
@@ -112,5 +135,5 @@ export function useMeetingDetail(meetingId: Id | undefined): UseMeetingDetailRes
     });
   });
 
-  return { detail, loading, error, reload, setDetail };
+  return { detail, loading, error, reload, setDetail, voicesFound, alternativeCount };
 }

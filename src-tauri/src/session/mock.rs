@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
+use crate::asr::catchup::{CatchUpReport, UnreadSpan};
 use crate::asr::engine::PartialFn;
 use crate::asr::{AsrError, TranscribeJob, Transcription};
 use crate::audio::{AudioError, CaptureConfig, CaptureStarted};
@@ -198,7 +199,20 @@ pub(crate) struct MockAsr {
     resident: AtomicBool,
     calls: AtomicU32,
     catch_up_segments: AtomicU32,
+    /// Hold inside the catch-up pass until something cancels it: how a real
+    /// pass behaves when the next meeting starts while it is still reading.
+    catch_up_waits_to_be_stopped: AtomicBool,
+    /// Hold inside the pass after it has been cancelled, until a test lets it
+    /// go: a pass on its way out, with the machine free to change hands again
+    /// behind it. The window the 2026-08-26 stall lived in.
+    catch_up_holds_on_its_way_out: AtomicBool,
+    /// Set the moment the catch-up pass begins, so a test can wait for the job
+    /// to really be in flight before it takes the machine away.
+    catch_up_started: AtomicBool,
     fail_prewarm: AtomicBool,
+    /// The load gives up because something else wanted the machine — what a
+    /// recording starting mid-load looks like from here.
+    cancel_prewarm: AtomicBool,
     /// How long loading takes, the way a first-ever launch takes minutes.
     prewarm_takes: std::sync::Mutex<Option<Duration>>,
     /// How long one live decode takes, so a test can still have one in flight
@@ -209,6 +223,22 @@ pub(crate) struct MockAsr {
     backlog_writes: std::sync::Mutex<Vec<(i64, i64, String)>>,
     /// The `to_ms` each live backlog pass was asked for.
     backlog_calls: std::sync::Mutex<Vec<i64>>,
+    /// What was put in front of the audio on each live decode, and what kind of
+    /// decode it was — so a test can check which lanes are told the words Echo
+    /// should know (see [`crate::asr::glossary`]).
+    live_plans: std::sync::Mutex<Vec<(crate::asr::engine::JobKind, Option<String>)>>,
+    /// Meetings the session layer asked the engine to forget, in order. The
+    /// real engine holds a meeting's settled language in memory as well as on
+    /// the row, so "was this one forgotten" is the only way to tell that a
+    /// wrong language is really gone.
+    forgotten: std::sync::Mutex<Vec<String>>,
+    /// Stretches the next catch-up pass reports it could not read back at all.
+    /// Empty unless a test says otherwise, because that is the ordinary case.
+    catch_up_unread: std::sync::Mutex<Vec<UnreadSpan>>,
+    /// What the engine has settled on for each meeting. Empty until a test says
+    /// otherwise: the real engine settles on evidence, not on the first line it
+    /// managed to write (see [`crate::asr::language`]).
+    settled: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl MockAsr {
@@ -218,13 +248,43 @@ impl MockAsr {
             resident: AtomicBool::new(false),
             calls: AtomicU32::new(0),
             catch_up_segments: AtomicU32::new(0),
+            catch_up_waits_to_be_stopped: AtomicBool::new(false),
+            catch_up_holds_on_its_way_out: AtomicBool::new(false),
+            catch_up_started: AtomicBool::new(false),
             fail_prewarm: AtomicBool::new(false),
+            cancel_prewarm: AtomicBool::new(false),
             prewarm_takes: std::sync::Mutex::new(None),
             transcribe_takes: std::sync::Mutex::new(None),
             text: std::sync::Mutex::new("hello there".to_string()),
             backlog_writes: std::sync::Mutex::new(Vec::new()),
             backlog_calls: std::sync::Mutex::new(Vec::new()),
+            live_plans: std::sync::Mutex::new(Vec::new()),
+            catch_up_unread: std::sync::Mutex::new(Vec::new()),
+            forgotten: std::sync::Mutex::new(Vec::new()),
+            settled: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The engine has worked out what language this meeting is in — what a real
+    /// one does once it has heard enough speech agreeing.
+    #[allow(dead_code)]
+    pub(crate) fn settles_on(&self, meeting_id: &str, language: &str) {
+        self.settled
+            .lock()
+            .unwrap()
+            .insert(meeting_id.to_string(), language.to_string());
+    }
+
+    /// Which meetings the engine was told to forget, oldest first.
+    #[allow(dead_code)]
+    pub(crate) fn forgotten(&self) -> Vec<String> {
+        self.forgotten.lock().unwrap().clone()
+    }
+
+    /// The prompts handed to the live lanes so far, newest last.
+    #[allow(dead_code)]
+    pub(crate) fn live_plans(&self) -> Vec<(crate::asr::engine::JobKind, Option<String>)> {
+        self.live_plans.lock().unwrap().clone()
     }
 
     #[allow(dead_code)]
@@ -232,9 +292,49 @@ impl MockAsr {
         self.calls.load(Ordering::SeqCst)
     }
 
+    /// Make the catch-up pass sit there until it is told to stop, the way a real
+    /// one does while it still has audio to read.
+    #[allow(dead_code)]
+    pub(crate) fn catch_up_waits_to_be_stopped(&self) {
+        self.catch_up_waits_to_be_stopped
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Hold the pass inside itself once it has been cancelled, so a test can
+    /// decide what the machine is doing by the time it reports back.
+    pub(crate) fn catch_up_holds_on_its_way_out(&self) {
+        self.catch_up_holds_on_its_way_out
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Let a pass held by [`MockAsr::catch_up_holds_on_its_way_out`] report.
+    pub(crate) fn let_the_catch_up_report(&self) {
+        self.catch_up_holds_on_its_way_out
+            .store(false, Ordering::SeqCst);
+    }
+
+    /// The next catch-up pass finishes, but with these stretches unread — an
+    /// engine that refused the same window twice.
+    pub(crate) fn catch_up_leaves_unread(&self, spans: Vec<UnreadSpan>) {
+        *self.catch_up_unread.lock().unwrap() = spans;
+    }
+
+    /// Has a catch-up pass begun?
+    #[allow(dead_code)]
+    pub(crate) fn catch_up_started(&self) -> bool {
+        self.catch_up_started.load(Ordering::SeqCst)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn fail_prewarm(&self) {
         self.fail_prewarm.store(true, Ordering::SeqCst);
+    }
+
+    /// The load stops short because something else claimed the machine, rather
+    /// than because anything went wrong with it.
+    #[allow(dead_code)]
+    pub(crate) fn cancel_prewarm(&self) {
+        self.cancel_prewarm.store(true, Ordering::SeqCst);
     }
 
     /// Is a meeting holding the engine right now?
@@ -258,6 +358,12 @@ impl MockAsr {
         *self.transcribe_takes.lock().unwrap() = Some(how_long);
     }
 
+    /// What every decode from now on comes back with. Lets a test be the
+    /// meeting where the engine answered a pause with "Grazie." (2026-08-24).
+    pub(crate) fn says(&self, text: &str) {
+        *self.text.lock().unwrap() = text.to_string();
+    }
+
     /// What the next live backlog pass finds on disk and writes down.
     pub(crate) fn backlog_writes(&self, rows: &[(i64, i64, &str)]) {
         *self.backlog_writes.lock().unwrap() = rows
@@ -279,6 +385,9 @@ impl AsrPort for MockAsr {
             if let Some(takes) = takes {
                 tokio::time::sleep(takes).await;
             }
+            if self.cancel_prewarm.load(Ordering::SeqCst) {
+                return Err(AsrError::Cancelled);
+            }
             if self.fail_prewarm.load(Ordering::SeqCst) {
                 return Err(AsrError::NotInstalled);
             }
@@ -289,6 +398,23 @@ impl AsrPort for MockAsr {
 
     fn hold_resident(&self, resident: bool) {
         self.resident.store(resident, Ordering::SeqCst);
+    }
+
+    fn settled_language(&self, meeting_id: &str) -> Option<String> {
+        self.settled.lock().unwrap().get(meeting_id).cloned()
+    }
+
+    fn transcribe_live<'a>(
+        &'a self,
+        job: TranscribeJob,
+        plan: crate::asr::engine::DecodePlan,
+        on_partial: Option<PartialFn>,
+    ) -> BoxFuture<'a, Result<Transcription, AsrError>> {
+        self.live_plans
+            .lock()
+            .unwrap()
+            .push((plan.kind, plan.prompt.clone()));
+        self.transcribe(job, on_partial)
     }
 
     fn transcribe<'a>(
@@ -314,6 +440,7 @@ impl AsrPort for MockAsr {
                 text,
                 language: Some("en".into()),
                 language_confidence: Some(0.99),
+                language_inherited: false,
                 avg_confidence: Some(0.9),
                 model_name: Some("test".into()),
                 model_revision: Some("1".into()),
@@ -322,21 +449,43 @@ impl AsrPort for MockAsr {
         })
     }
 
+    fn forget_meeting(&self, meeting_id: &str) {
+        self.forgotten.lock().unwrap().push(meeting_id.to_string());
+    }
+
     fn catch_up<'a>(
         &'a self,
         _db: &'a Db,
         _meeting_id: &'a str,
         _not_before_ms: Option<i64>,
         control: crate::session::ports::CatchUpControl,
-    ) -> BoxFuture<'a, Result<u32, AsrError>> {
+    ) -> BoxFuture<'a, Result<CatchUpReport, AsrError>> {
         Box::pin(async move {
+            self.catch_up_started.store(true, Ordering::SeqCst);
+            while self.catch_up_waits_to_be_stopped.load(Ordering::SeqCst)
+                && !control.cancel.as_ref().is_some_and(|c| c())
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            // On its way out, and not out yet. A real pass has a window here
+            // too — the drain to finish, the last row to write — and the machine
+            // can change hands twice inside it.
+            while self.catch_up_holds_on_its_way_out.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            // A pass that was stopped part-way has one thing it may say about
+            // itself, and a count of what it managed is not it.
             if control.cancel.as_ref().is_some_and(|c| c()) {
                 return Err(AsrError::Cancelled);
             }
             if let Some(report) = &control.on_progress {
                 report(1.0);
             }
-            Ok(self.catch_up_segments.load(Ordering::SeqCst))
+            Ok(CatchUpReport {
+                segments_written: self.catch_up_segments.load(Ordering::SeqCst),
+                unread: self.catch_up_unread.lock().unwrap().clone(),
+                ..CatchUpReport::default()
+            })
         })
     }
 
@@ -391,6 +540,7 @@ impl AsrPort for MockAsr {
                     is_final: true,
                     model_name: Some("test".into()),
                     model_revision: Some("1".into()),
+                    corrections: Vec::new(),
                 };
                 if crate::db::repo::insert_segment(db, &draft).await.is_ok() {
                     written += 1;
@@ -515,22 +665,44 @@ pub(crate) struct CollectingEvents {
 
 impl CollectingEvents {
     pub(crate) fn names(&self) -> Vec<&'static str> {
-        self.seen.lock().unwrap().iter().map(|e| e.name()).collect()
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|e| e.name())
+            .collect()
     }
 
     /// Did a banner with this machine tag go out?
     pub(crate) fn notice_tagged(&self, tag: &str) -> bool {
-        self.seen.lock().unwrap().iter().any(|event| match event {
-            UiEvent::Notice(payload) => payload.tag.as_deref() == Some(tag),
-            _ => false,
-        })
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|event| match event {
+                UiEvent::Notice(payload) => payload.tag.as_deref() == Some(tag),
+                _ => false,
+            })
+    }
+
+    /// Every banner that went out, in order — the words, not just the tag.
+    pub(crate) fn notices(&self) -> Vec<crate::events::NoticePayload> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::Notice(payload) => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Every job announcement, in order.
     pub(crate) fn job_progress(&self) -> Vec<crate::events::JobProgressPayload> {
         self.seen
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter_map(|event| match event {
                 UiEvent::JobProgress(payload) => Some(payload.clone()),
@@ -549,7 +721,7 @@ impl CollectingEvents {
     pub(crate) fn transcript_revisions(&self) -> Vec<crate::events::TranscriptRevisedPayload> {
         self.seen
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter_map(|event| match event {
                 UiEvent::TranscriptRevised(payload) => Some(payload.clone()),
@@ -564,10 +736,41 @@ impl CollectingEvents {
     pub(crate) fn speaker_updates(&self) -> Vec<crate::events::SpeakersUpdatedPayload> {
         self.seen
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter_map(|event| match event {
                 UiEvent::SpeakersUpdated(payload) => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every capture status that went out, in order — the whole story of one
+    /// meeting as the screen saw it.
+    #[allow(dead_code)]
+    pub(crate) fn capture_states(&self) -> Vec<crate::types::CaptureStatus> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::CaptureState(payload) => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The live lines that went out, in the order they were sent — including
+    /// the empty `dropped` ones, which are how a line that will never get text
+    /// is retired.
+    #[allow(dead_code)]
+    pub(crate) fn partials(&self) -> Vec<crate::events::TranscriptPartialPayload> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::TranscriptPartial(payload) => Some(payload.clone()),
                 _ => None,
             })
             .collect()
@@ -577,7 +780,7 @@ impl CollectingEvents {
     pub(crate) fn finals(&self) -> Vec<crate::events::TranscriptFinalPayload> {
         self.seen
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter_map(|event| match event {
                 UiEvent::TranscriptFinal(payload) => Some(payload.clone()),
@@ -589,7 +792,10 @@ impl CollectingEvents {
 
 impl EventSink for CollectingEvents {
     fn emit(&self, event: UiEvent) {
-        self.seen.lock().unwrap().push(event);
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(event);
     }
 }
 

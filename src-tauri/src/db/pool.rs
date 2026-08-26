@@ -142,6 +142,84 @@ mod tests {
         migrate(&db).await.unwrap();
     }
 
+    /// Everybody upgrading to `0008_withdrawn_suppressions` has a database with
+    /// rows in it, and some of those rows are decisions their last meeting's
+    /// live pass made. The column has to land on a populated table and leave
+    /// every one of them **standing** — a decision silently withdrawn by an
+    /// upgrade would have the catch-up pass read those seconds back and write
+    /// the duplicate the row exists to prevent.
+    #[tokio::test]
+    async fn the_withdrawal_column_lands_on_a_database_that_already_holds_decisions() {
+        use crate::db::repo;
+        use crate::types::Channel;
+        use std::borrow::Cow;
+
+        // The database as it was before this migration existed.
+        let db = connect_without_migrations().await;
+        let before_0008 = sqlx::migrate::Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|m| m.version < 8)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+            ..sqlx::migrate::Migrator::DEFAULT
+        };
+        before_0008.run(&db).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO meetings (id, started_at, audio_dir)
+             VALUES ('m', '2026-08-25T09:00:00Z', '/tmp/m')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO suppressed_spans
+                 (id, meeting_id, channel, t_start_ms, t_end_ms, reason, decided_by,
+                  correlation, lag_ms, system_voice_ms, created_at)
+             VALUES ('s', 'm', 'mic', 4000, 12000, 'bleed', 'live',
+                     0.91, 210, 7400, '2026-08-25T09:04:00Z')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // The upgrade.
+        migrate(&db).await.unwrap();
+
+        assert_eq!(
+            repo::suppressed_spans(&db, "m", Channel::Mic)
+                .await
+                .unwrap(),
+            vec![(4_000, 12_000)],
+            "a decision made before the column existed still stands after it"
+        );
+        assert_eq!(
+            repo::withdrawn_suppression_count(&db, "m").await.unwrap(),
+            0
+        );
+        assert_eq!(repo::measured_lag_ms(&db, "m").await.unwrap(), Some(210));
+    }
+
+    /// A pool with no migrations run at all, so a test can choose which ones to
+    /// apply. Mirrors [`connect_in_memory`] in everything else.
+    async fn connect_without_migrations() -> Db {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5));
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(options)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn six_builtin_templates_are_seeded() {
         let db = connect_in_memory().await.unwrap();

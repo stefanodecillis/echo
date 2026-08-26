@@ -30,6 +30,7 @@ import type {
   Job,
   JobProgressPayload,
   JobQuery,
+  LeftOutMoment,
   Marker,
   MarkerKind,
   Meeting,
@@ -44,10 +45,10 @@ import type {
   PanelState,
   PanelStatePayload,
   PeopleUpdatedPayload,
-  PersonInfo,
   PermissionState,
   PermissionStatus,
   PermissionTarget,
+  PersonInfo,
   Provider,
   ProviderConfig,
   ProviderInfo,
@@ -78,6 +79,7 @@ import type {
   TrayActionPayload,
   TrayStatePayload,
   UiError,
+  VocabularyWord,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -174,6 +176,18 @@ export const getTranscript = (query: TranscriptQuery) =>
   call<Segment[]>("get_transcript", { query });
 
 /**
+ * The moments of this meeting that have no words in them because Echo decided
+ * not to write them down.
+ *
+ * Empty for almost every meeting: the decision is nearly always the other
+ * people written down once instead of twice, and the core only returns the ones
+ * where nothing covered those seconds. Worth re-asking once a transcript pass
+ * finishes, since a pass changes what covers what.
+ */
+export const leftOutMoments = (meetingId: Id) =>
+  call<LeftOutMoment[]>("left_out_moments", { meetingId });
+
+/**
  * "Listen again": write this meeting's transcript again from its recording.
  *
  * For a meeting recorded while transcription wasn't working — the sound is on
@@ -187,6 +201,27 @@ export const getTranscript = (query: TranscriptQuery) =>
  */
 export const retranscribeMeeting = (meetingId: Id) =>
   call<void>("retranscribe_meeting", { meetingId });
+
+/**
+ * "No, it heard that right": put one line back the way the engine wrote it.
+ *
+ * The other half of a repair. Every word Echo changes against "Words Echo
+ * should know" is written down beside the line, so every one of them can be
+ * taken back — until now only the writing-down half existed.
+ *
+ * **Per line, not per word**, however the person got here. The note kept
+ * against a line records *what* was replaced and never *where*, so one repair
+ * among several is not addressable, and a line with one word put back and the
+ * rest left is neither what was said nor what Echo wrote.
+ *
+ * Resolves to the line as it now stands — safe to call twice, since a line with
+ * nothing recorded against it comes straight back unchanged. Rejects, in a
+ * sentence worth showing as an explanation rather than a failure, when the line
+ * has been written down again since the repair. Every open view of the meeting
+ * refreshes off `transcriptRevised`.
+ */
+export const undoCorrections = (segmentId: Id) =>
+  call<Segment>("undo_corrections", { segmentId });
 
 export const searchTranscripts = (query: SearchQuery) =>
   call<SearchHit[]>("search_transcripts", { query });
@@ -293,6 +328,28 @@ export const deletePerson = (personId: Id) =>
  */
 export const renamePerson = (personId: Id, name: string) =>
   call<void>("rename_person", { personId, name });
+
+/**
+ * "These two are the same person": join two remembered voices into one.
+ *
+ * The same voice gets enrolled twice — once heard down a call, once heard in
+ * the room — and until now the only tidy-up was Forget, which destroys one of
+ * the two voices' samples for good. This keeps both: everything saved for
+ * `mergeId` moves to `keepId`, every meeting that was linked to the first is
+ * linked to the second, and the voice Echo matches against is rebuilt from the
+ * two sets together.
+ *
+ * **This cannot be undone** — making one voice out of two throws away the
+ * samples that turn out to be near-duplicates — so ask before calling it.
+ * Meetings already read do not rewrite themselves: the names on their speaker
+ * rows were copied there when the link was made and stay as plain text, the
+ * same rule `renamePerson` and `deletePerson` follow.
+ *
+ * Resolves to the whole list as it now stands, so the screen that shows it does
+ * not have to ask again. Safe to call twice and either way round.
+ */
+export const mergePeople = (keepId: Id, mergeId: Id) =>
+  call<PersonInfo[]>("merge_people", { keepId, mergeId });
 
 /**
  * A few seconds of this remembered voice — **base64 WAV**, no prefix, same as
@@ -495,6 +552,22 @@ export const validateStorageLocation = (path: string) =>
   call<number>("validate_storage_location", { path });
 
 export const listInputDevices = () => call<AudioDevice[]>("list_input_devices");
+
+// ---------------------------------------------------------------------------
+// Words Echo should know
+//
+// The list is what somebody typed plus the names of the voices Echo was asked
+// to remember. Every one of these hands the whole list back, so the screen that
+// shows it never has to ask twice.
+// ---------------------------------------------------------------------------
+
+export const listVocabulary = () => call<VocabularyWord[]>("list_vocabulary");
+
+export const addVocabularyWord = (word: string) =>
+  call<VocabularyWord[]>("add_vocabulary_word", { word });
+
+export const removeVocabularyWord = (word: string) =>
+  call<VocabularyWord[]>("remove_vocabulary_word", { word });
 
 // ---------------------------------------------------------------------------
 // Permissions and onboarding

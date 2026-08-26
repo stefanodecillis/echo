@@ -16,6 +16,11 @@ use crate::types::{
     TrayAction, TrayState,
 };
 
+/// The stage a job is in. Defined with the job in [`crate::types`] because it
+/// is stored on the row; re-exported here so the event contract still reads as
+/// one file.
+pub use crate::types::JobPhase;
+
 // ---------------------------------------------------------------------------
 // Event names
 // ---------------------------------------------------------------------------
@@ -151,26 +156,12 @@ pub struct AudioLevelsPayload {
     pub t_ms: i64,
 }
 
-/// A stage inside one job that a person would read as a different activity.
-///
-/// Almost no job needs one: "Writing your recap…" is the whole of what the
-/// recap job does. The download is the exception. Its second half is not a
-/// download at all — the bytes have arrived and are being made ready to use on
-/// this particular machine, which on Apple silicon is a one-off that can take
-/// many minutes — and a progress bar that has been sitting at 100% since the
-/// bytes landed is not an honest account of it (field report of 2026-08-21: a
-/// person watched a bar for eighteen minutes with no idea what was happening,
-/// under a sentence about a job that had not started).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum JobPhase {
-    /// The bytes are in; this machine is being got ready to use them. There is
-    /// no fraction to report and none can be invented, so the UI shows this as
-    /// work in progress without a number.
-    PreparingEngine,
-}
-
 /// `JOB_PROGRESS`
+///
+/// The stage travels *in* the job (`job.phase`), not beside it. It used to be a
+/// field of its own here, which made the event the only place it existed and
+/// left every screen that mounted afterwards drawing the job's own name over a
+/// bar that was not moving — see `migrations/0009_job_stage.sql`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobProgressPayload {
@@ -179,11 +170,6 @@ pub struct JobProgressPayload {
     /// few minutes…". Zero jargon.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Which stage of the job this is, when the job has stages a person would
-    /// read differently. `job.progress` is `None` for a stage with no honest
-    /// fraction to report.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub phase: Option<JobPhase>,
 }
 
 /// `DOWNLOAD_PROGRESS`
@@ -225,6 +211,27 @@ pub struct SpeakersUpdatedPayload {
     pub people_count: u32,
     /// True when the count is the person's correction, not Echo's.
     pub people_count_is_override: bool,
+    /// How many people the pass could actually tell apart, when this payload
+    /// comes from a pass that has just run. `None` from every other emitter —
+    /// they are announcing rows, not a fresh separation, and a stale number
+    /// here would annotate the count with an answer from a previous run.
+    ///
+    /// Below [`Self::people_count`] when a count the person gave us was more
+    /// than the recording holds. The dialog says so beside the number rather
+    /// than showing rows nobody can hear (2026-08-24).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voices_found: Option<u32>,
+    /// The best count Echo decided against, when the count is Echo's own
+    /// automatic reading. `None` when the person set the count, and from every
+    /// other emitter.
+    ///
+    /// A wrong count is the one speaker mistake nothing in the UI can fix after
+    /// the fact (merges exist; splits do not), so the dialog shows what the
+    /// runner-up said rather than leaving the decision unarguable. It is an
+    /// invitation to correct the number, not a confession of error: plenty of
+    /// meetings have a plausible second reading.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternative_count: Option<u32>,
 }
 
 /// `PEOPLE_UPDATED`

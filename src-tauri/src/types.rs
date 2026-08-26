@@ -186,14 +186,67 @@ impl Channel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DegradedReason {
-    /// No permission / device gone: we keep the microphone only.
+    /// What this computer plays never reached Echo at all — no permission, no
+    /// device, or a stream that opened and delivered nothing. The whole meeting
+    /// is in the microphone recording, so the offline pass will separate the
+    /// voices in it and the banner is allowed to say so.
     SystemAudioUnavailable,
+    /// What this computer plays *was* reaching Echo and stopped. The two halves
+    /// of the meeting are not alike: the first has its own channel and the
+    /// second does not, which is why this is a reason of its own rather than a
+    /// second use of [`Self::SystemAudioUnavailable`]. A banner drawn from that
+    /// one would promise a separation of the microphone tail that the offline
+    /// pass does not do for a meeting that has any system audio at all
+    /// (`diarize::pipeline::voice_channel`), and would claim every line so far
+    /// says "You" when the ones from this computer say a real name.
+    SystemAudioLost,
     /// Microphone gone, we keep what the computer plays.
     MicrophoneUnavailable,
+    /// Nothing is reaching Echo at all: this recording has no microphone in it,
+    /// and what the computer plays is not arriving either.
+    ///
+    /// The state the other two system-audio reasons cannot describe without
+    /// lying, because both of their sentences end in a promise about the
+    /// microphone recording — one says the offline pass will sort the voices
+    /// out of it, the other says Echo is still recording through it. Somebody
+    /// who denied the microphone and is capturing this computer alone has no
+    /// microphone recording, so a banner drawn from either reason reads as
+    /// "carry on, Echo has you" while nothing whatever is being saved.
+    NothingIsBeingHeard,
     /// Live text is behind; audio on disk is complete and will catch up.
     TranscriptBehind,
     /// Disk is nearly full.
     StorageLow,
+}
+
+/// Whether Echo can write down what is being said right now, in plain states a
+/// screen can show without knowing anything about weights or engines.
+///
+/// Worked out fresh from what the engine is holding every time
+/// [`CaptureStatus`] is built, and never remembered anywhere. That is what makes
+/// it survive the failure of 2026-08-24, when the window stopped receiving
+/// events and every remembered flag on the screen froze with the last one that
+/// got through: nothing here can be stale, because there is nothing to go stale.
+///
+/// Being derived only helps if something re-reads it, so the screen does: while
+/// this says `Preparing` or `Unavailable` — the two states a banner is drawn
+/// from — the window asks for the status outright every few seconds
+/// (`useCaptureState`), and a lost event costs a banner a few seconds, not a
+/// meeting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SpeechState {
+    /// Nothing needs it and nothing is loaded. There is nothing to say.
+    #[default]
+    Idle,
+    /// A meeting needs it and it is not up yet: the weights are being read, or
+    /// the one-time setup they need on this machine is being paid.
+    Preparing,
+    /// Loaded. Words appear as they are said.
+    Ready,
+    /// It was needed and it did not come up. The recording carries on and the
+    /// transcript arrives when the meeting ends (mantra 3).
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -213,6 +266,10 @@ pub struct CaptureStatus {
     pub pending_utterances: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<Timestamp>,
+    /// Whether Echo can understand speech right now. Derived on every read from
+    /// what the engine is actually holding, never remembered, so no missed event
+    /// can leave it stale (see [`SpeechState`]).
+    pub speech: SpeechState,
 }
 
 /// Options for `start_recording`. All fields optional so the UI can call it
@@ -393,8 +450,51 @@ pub struct AudioChunk {
 }
 
 // ---------------------------------------------------------------------------
+// Words Echo should know
+// ---------------------------------------------------------------------------
+
+/// One word in the vocabulary, and where it came from.
+///
+/// The two sources behave differently when somebody deletes one, which is the
+/// whole reason this is not a plain list of strings: a typed word is deleted by
+/// forgetting it, while a name that comes from an enrolled person has to be
+/// remembered *as deleted* or the next launch would derive it all over again.
+/// See [`crate::settings::words_to_know`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VocabularyWord {
+    pub word: String,
+    pub source: VocabularySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VocabularySource {
+    /// Somebody typed it.
+    Typed,
+    /// The name of a person whose voice Echo was asked to remember.
+    Person,
+}
+
+// ---------------------------------------------------------------------------
 // Segments
 // ---------------------------------------------------------------------------
+
+/// One word Echo put right after the engine wrote it down, and what it had
+/// written.
+///
+/// Kept with the line rather than thrown away, for two reasons that are really
+/// the same reason: a person reading a transcript is entitled to know that a
+/// word in it is not the word the engine produced, and anything Echo changed on
+/// its own has to be reversible. `from` is exactly the run of text that was
+/// replaced, `to` exactly what replaced it — put `from` back and the line is the
+/// line the engine wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Correction {
+    pub from: String,
+    pub to: String,
+}
 
 /// Row of `segments`. `revision` increases when a later, better pass replaces
 /// the text or the speaker (live partial → final → diarization-refined).
@@ -420,6 +520,24 @@ pub struct Segment {
     pub model_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_revision: Option<String>,
+    /// Words put right against the list in Settings, empty on the vast majority
+    /// of lines. See [`Correction`] and [`crate::asr::glossary`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub corrections: Vec<Correction>,
+}
+
+/// A stretch of a meeting that has no words in it because Echo heard it and
+/// decided not to write it down.
+///
+/// Not every such decision is one of these — nearly all of them are the far
+/// side written down once instead of twice, and those seconds have words.
+/// [`crate::asr::left_out`] is where that difference is argued, and this is
+/// only what survives it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeftOutMoment {
+    pub t_start_ms: i64,
+    pub t_end_ms: i64,
 }
 
 /// A segment as it is being written, before it lands in the database.
@@ -438,6 +556,9 @@ pub struct SegmentDraft {
     pub is_final: bool,
     pub model_name: Option<String>,
     pub model_revision: Option<String>,
+    /// See [`Segment::corrections`].
+    #[serde(default)]
+    pub corrections: Vec<Correction>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -820,6 +941,9 @@ pub enum JobKind {
     Download,
     /// Build the mixed file used for playback.
     Mixdown,
+    /// Pay the one-time setup a set of speech weights needs on this machine,
+    /// before a meeting has to pay it (incident of 2026-08-24).
+    PrepareEngine,
 }
 
 impl JobKind {
@@ -831,6 +955,7 @@ impl JobKind {
             JobKind::Export => "export",
             JobKind::Download => "download",
             JobKind::Mixdown => "mixdown",
+            JobKind::PrepareEngine => "prepare_engine",
         }
     }
 
@@ -842,6 +967,7 @@ impl JobKind {
             "export" => Some(JobKind::Export),
             "download" => Some(JobKind::Download),
             "mixdown" => Some(JobKind::Mixdown),
+            "prepare_engine" => Some(JobKind::PrepareEngine),
             _ => None,
         }
     }
@@ -892,6 +1018,44 @@ impl JobStatus {
     }
 }
 
+/// A stage inside one job that a person would read as a different activity.
+///
+/// Almost no job needs one: "Writing your recap…" is the whole of what the
+/// recap job does. The download is the exception. Its second half is not a
+/// download at all — the bytes have arrived and are being made ready to use on
+/// this particular machine, which on Apple silicon is a one-off that can take
+/// many minutes — and a progress bar that has been sitting at 100% since the
+/// bytes landed is not an honest account of it (field report of 2026-08-21: a
+/// person watched a bar for eighteen minutes with no idea what was happening,
+/// under a sentence about a job that had not started).
+///
+/// Stored on the job row rather than only announced, because the stage that
+/// matters most begins before any screen exists to hear about it — see
+/// `migrations/0009_job_stage.sql`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JobPhase {
+    /// The bytes are in; this machine is being got ready to use them. There is
+    /// no fraction to report and none can be invented, so the UI shows this as
+    /// work in progress without a number.
+    PreparingEngine,
+}
+
+impl JobPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobPhase::PreparingEngine => "preparing_engine",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "preparing_engine" => Some(JobPhase::PreparingEngine),
+            _ => None,
+        }
+    }
+}
+
 /// Row of `jobs`. Persisted so work survives a restart.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -908,6 +1072,13 @@ pub struct Job {
     pub error: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    /// The stage this job is in right now, when it is in one worth naming.
+    ///
+    /// Only ever set on a row that is running, and cleared by every write that
+    /// changes the status or reports a fraction, so a screen can read it
+    /// straight off the row without asking when it was last true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<JobPhase>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1333,7 +1504,11 @@ pub struct OnboardingState {
 // Tray
 // ---------------------------------------------------------------------------
 
-/// Tray icon appearance, driven by capture + detection.
+/// Tray icon appearance, driven by capture, detection and the work queue.
+///
+/// Which one is showing is never remembered anywhere: it is recomputed from
+/// those three facts by [`crate::session::tray_state_for`] every time one of
+/// them moves.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TrayState {
@@ -1341,6 +1516,11 @@ pub enum TrayState {
     Idle,
     Detected,
     Recording,
+    /// The meeting is over and Echo is still finishing it: the rest of the
+    /// transcript, who spoke, the playback file, the recap. Worth its own icon
+    /// because the work outlives the recording by minutes and, until this
+    /// existed, the menu bar said "nothing is happening" throughout.
+    Processing,
 }
 
 /// What the person picked in the tray menu, forwarded to the UI.
@@ -1380,6 +1560,7 @@ mod tests {
             JobKind::Export,
             JobKind::Download,
             JobKind::Mixdown,
+            JobKind::PrepareEngine,
         ] {
             assert_eq!(JobKind::parse(k.as_str()), Some(k));
         }
@@ -1393,6 +1574,8 @@ mod tests {
         ] {
             assert_eq!(JobStatus::parse(s.as_str()), Some(s));
         }
+        let stage = JobPhase::PreparingEngine;
+        assert_eq!(JobPhase::parse(stage.as_str()), Some(stage));
         for k in [
             MarkerKind::ActionItem,
             MarkerKind::Highlight,

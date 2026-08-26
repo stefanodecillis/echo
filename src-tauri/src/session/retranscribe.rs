@@ -13,8 +13,9 @@
 //!    again is already under way for this meeting;
 //! 2. cancel whatever is queued or running for the meeting, so no older pass is
 //!    still writing rows when the wipe lands;
-//! 3. delete the transcript and the speakers ([`repo::clear_transcript`]) and
-//!    tell the screens the revision moved on;
+//! 3. delete the transcript and the speakers, and withdraw the decisions not to
+//!    transcribe ([`repo::clear_transcript`]), and tell the screens the revision
+//!    moved on;
 //! 4. queue catch-up and then the speaker pass, exactly the chain a normal stop
 //!    queues — minus the mixdown, because the audio did not change and the
 //!    playback file is still correct, and minus the recap, because the recap is
@@ -110,10 +111,27 @@ pub(crate) async fn run(
     inner.cancel_jobs_for(meeting_id).await;
 
     let cleared = repo::clear_transcript(&inner.db, meeting_id).await?;
+    // The row is only half of where the meeting's language lives: the engine
+    // keeps its own answer in memory for the length of a run, and catch-up asks
+    // it whenever the row has nothing (`asr::catchup`'s `prior`). Clearing one
+    // and not the other would hand the next pass the same wrong language it was
+    // asked to get rid of, out of a place nobody can see.
+    inner.ports.asr.forget_meeting(meeting_id);
     tracing::info!(
         meeting = %meeting_id,
         segments = cleared.segments_deleted,
         speakers = cleared.speakers_deleted,
+        // Named, because "the transcript came back in the wrong language" is
+        // the reason this button gets pressed, and this line is the evidence
+        // that the next pass starts without that answer.
+        was_language = meeting.language.as_deref().unwrap_or("none"),
+        language_cleared = cleared.language_cleared,
+        // Stretches a previous pass had decided were the computer's own audio
+        // coming back. The decisions are withdrawn, so those seconds are judged
+        // again from the recording — that is what "listen again" means — while
+        // the delay they measured stays on the rows for the next pass to
+        // inherit (`db::repo::measured_lag_ms`).
+        spans_withdrawn = cleared.spans_withdrawn,
         duration_ms = meeting.duration_ms.max(committed),
         "listening to this meeting again from the recording"
     );
@@ -148,6 +166,10 @@ pub(crate) async fn run(
             speakers: Vec::new(),
             people_count,
             people_count_is_override,
+            // The rows are gone and the pass has not run yet, so there is
+            // nothing true to say about how many voices are in there.
+            voices_found: None,
+            alternative_count: None,
         }));
 
     // Back to Processing while the work runs. This is also what lets the meeting
@@ -245,6 +267,7 @@ mod tests {
                 is_final: true,
                 model_name: None,
                 model_revision: None,
+                corrections: Vec::new(),
             }],
         )
         .await
@@ -287,6 +310,37 @@ mod tests {
             2
         );
         assert!(h.queued_kinds(&meeting_id).await.is_empty());
+    }
+
+    /// The 2026-08-24 meeting: 75 minutes of Italian written down as Danish
+    /// because one short utterance was read that way and the answer stuck.
+    /// "Listen again" is the whole repair path, and it only works if the wrong
+    /// language goes with the words — in both places it is kept, the row and
+    /// the engine's own memory of the meeting. Otherwise the next pass reads
+    /// "da" as its prior and spends an hour writing the same transcript again.
+    #[tokio::test]
+    async fn a_wrong_language_does_not_survive_listening_again() {
+        let h = Harness::new().await;
+        let meeting_id = a_recorded_meeting(&h).await;
+        repo::set_meeting_language(&h.db, &meeting_id, "da")
+            .await
+            .unwrap();
+
+        h.session.retranscribe(&meeting_id).await.unwrap();
+
+        let meeting = repo::get_meeting(&h.db, &meeting_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            meeting.language, None,
+            "the next pass has to be free to reach a different answer"
+        );
+        assert_eq!(
+            h.asr.forgotten(),
+            vec![meeting_id.clone()],
+            "the engine's own copy of the language goes too"
+        );
     }
 
     /// The whole sequence: the transcript and the speakers go, the search index

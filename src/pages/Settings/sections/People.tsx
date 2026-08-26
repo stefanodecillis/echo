@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { Card, EmptyState } from "@/components";
+import { Button, Card, EmptyState } from "@/components";
 import { useEvent } from "@/hooks/useEvent";
 import { EVENTS, speakerSample, toUiError } from "@/lib/ipc";
 import { common, settings as copy } from "@/lib/copy";
 import { useEchoStore } from "@/lib/store";
 import type { Id } from "@/lib/types";
 
+import { MergePeopleModal } from "../components/MergePeopleModal";
 import { PersonRow } from "../components/PersonRow";
 import { SuggestedPersonRow } from "../components/SuggestedPersonRow";
 import { base64ToBlobUrl } from "../lib/audio";
@@ -42,6 +43,7 @@ export function People() {
   const [playingKey, setPlayingKey] = useState<PlayKey>();
   const [loadingKey, setLoadingKey] = useState<PlayKey>();
   const [rowError, setRowError] = useState<{ key: PlayKey; message: string }>();
+  const [mergeOpen, setMergeOpen] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const sampleCache = useRef<Map<PlayKey, string>>(new Map());
@@ -145,7 +147,19 @@ export function People() {
 
   return (
     <div className="flex flex-col gap-6">
-      <p className="text-sm text-ink-faint">{copy.peopleIntro}</p>
+      <div className="flex items-start justify-between gap-4">
+        <p className="text-sm text-ink-faint">{copy.peopleIntro}</p>
+        {people && people.length > 1 && (
+          <Button
+            variant="secondary"
+            size="sm"
+            className="shrink-0"
+            onClick={() => setMergeOpen(true)}
+          >
+            {copy.peopleMergeButton}
+          </Button>
+        )}
+      </div>
 
       <Card padding="sm">
         {people === null && !peopleError && (
@@ -214,6 +228,13 @@ export function People() {
           )}
         </Card>
       </div>
+
+      <MergePeopleModal
+        open={mergeOpen}
+        onClose={() => setMergeOpen(false)}
+        people={people ?? []}
+        onMerged={setPeople}
+      />
 
       <audio ref={audioRef} className="hidden" onEnded={() => setPlayingKey(undefined)} />
     </div>

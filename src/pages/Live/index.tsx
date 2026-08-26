@@ -34,6 +34,10 @@ const BOTTOM_SLACK_PX = ROW_HEIGHT * 1.5;
  * position on, without VirtualList needing to expose one of its own. */
 const SCROLL_EL_CLASS = "js-live-transcript-scroll";
 
+/** How long the one-time engine setup has to last before the screen mentions
+ * it. Long enough that an ordinary load comes and goes unremarked. */
+const PREPARING_BANNER_DELAY_MS = 4000;
+
 const ACTIVE_STATES = new Set(["starting", "recording", "paused", "degraded", "stopping"]);
 
 /** States where Echo is actually taking in speech right now — the ones the
@@ -50,8 +54,12 @@ const LISTENING_ROW_STATES = new Set(["recording", "degraded"]);
 export default function Live() {
   const navigate = useNavigate();
   const capture = useCaptureState();
-  const speakerLabelFor = useSpeakerNames(capture.meetingId);
-  const lines = useTranscriptStream(capture.meetingId);
+  // Worked out before the hooks below because they take it: a meeting that is
+  // still running is one they keep re-reading from the core, a finished one is
+  // not (see `useTranscriptStream`).
+  const active = capture.meetingId != null && ACTIVE_STATES.has(capture.state);
+  const speakerLabelFor = useSpeakerNames(capture.meetingId, active);
+  const lines = useTranscriptStream(capture.meetingId, active);
   const addToast = useEchoStore((s) => s.addToast);
 
   const pauseCmd = useCommand(pauseRecording);
@@ -74,8 +82,13 @@ export default function Live() {
   // new to jump to.
   const [awaitingJump, setAwaitingJump] = useState(false);
 
+  // Whether the one-time engine setup has been going on long enough to be
+  // worth a banner. A three-second load is not news; sixteen minutes is the
+  // whole story of the meeting somebody spent watching an empty transcript
+  // (incident of 2026-08-24), so the banner waits, then stays.
+  const [preparingIsNews, setPreparingIsNews] = useState(false);
+
   const paused = capture.state === "paused";
-  const active = capture.meetingId != null && ACTIVE_STATES.has(capture.state);
   const showListeningRow = LISTENING_ROW_STATES.has(capture.state);
   const hasLines = lines.length > 0;
 
@@ -107,6 +120,18 @@ export default function Live() {
       setAwaitingJump(true);
     }
   }, [lines.length, atBottom]);
+
+  // Wait out `PREPARING_BANNER_DELAY_MS` of unbroken "preparing" before saying
+  // anything, and drop the wait the moment the engine is up (or gives up) so
+  // the banner never outlives the thing it describes.
+  useEffect(() => {
+    if (capture.speech !== "preparing") {
+      setPreparingIsNews(false);
+      return;
+    }
+    const timer = setTimeout(() => setPreparingIsNews(true), PREPARING_BANNER_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [capture.speech]);
 
   const handleJumpToNow = () => {
     listRef.current?.scrollToBottom();
@@ -167,6 +192,21 @@ export default function Live() {
           {formatElapsed(capture.elapsedMs)}
         </span>
       </header>
+
+      {/* Speech and audio are separate promises, and both can be broken at
+          once: this one is about the words, the one below it about what Echo
+          can hear. Neither hides the other. */}
+      {capture.speech === "unavailable" && (
+        <div className="rounded-xl border border-hairline bg-surface-sunken px-4 py-2.5 text-sm text-ink-soft">
+          {labels.speechState.unavailable}
+        </div>
+      )}
+
+      {capture.speech === "preparing" && preparingIsNews && (
+        <div className="rounded-xl border border-hairline bg-surface-sunken px-4 py-2.5 text-sm text-ink-soft">
+          {labels.speechState.preparing}
+        </div>
+      )}
 
       {capture.state === "degraded" && capture.degradedReason && (
         <div className="rounded-xl border border-hairline bg-surface-sunken px-4 py-2.5 text-sm text-ink-soft">

@@ -19,6 +19,7 @@ export {
   acceptSuggestedPerson,
   deletePerson,
   listPeople,
+  mergePeople,
   personSampleAudio,
   renamePerson,
   suggestedPeople,

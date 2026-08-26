@@ -35,18 +35,20 @@
 //! anyone else.
 //!
 //! The bindings used are `objc2-screen-capture-kit`, not `cidre`: the objc2
-//! family is already in the tree for the rest of the macOS integration. Where an
-//! `objc2-core-media` helper is behind a feature we do not enable, the C
-//! function is declared directly — that is the whole reason this file talks to
-//! CoreMedia by hand.
+//! family is already in the tree for the rest of the macOS integration. All
+//! CoreMedia and CoreAudio types come from the crate bindings too — this file
+//! used to declare them by hand, and a mistake in those hand declarations is
+//! exactly the kind of thing that made every buffer of a real meeting
+//! unreadable (2026-08-24). The only functions still declared directly are the
+//! two CoreGraphics permission preflights, which no crate in the tree binds.
 
 #![cfg(target_os = "macos")]
 // The protocol methods below have to keep their Objective-C selector spelling so
 // the runtime can find them.
 #![allow(non_snake_case)]
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,7 +57,24 @@ use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
-use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags};
+use objc2_core_audio_types::{
+    kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, AudioBuffer, AudioBufferList,
+};
+use objc2_core_foundation::CFRetained;
+use objc2_core_media::{
+    kCMSampleBufferError_AllocationFailed, kCMSampleBufferError_AlreadyHasDataBuffer,
+    kCMSampleBufferError_ArrayTooSmall, kCMSampleBufferError_BufferHasNoSampleSizes,
+    kCMSampleBufferError_BufferHasNoSampleTimingInfo, kCMSampleBufferError_BufferNotReady,
+    kCMSampleBufferError_CannotSubdivide, kCMSampleBufferError_DataCanceled,
+    kCMSampleBufferError_DataFailed, kCMSampleBufferError_InvalidEntryCount,
+    kCMSampleBufferError_InvalidMediaFormat, kCMSampleBufferError_InvalidMediaTypeForOperation,
+    kCMSampleBufferError_InvalidSampleData, kCMSampleBufferError_Invalidated,
+    kCMSampleBufferError_RequiredParameterMissing, kCMSampleBufferError_SampleIndexOutOfRange,
+    kCMSampleBufferError_SampleTimingInfoInvalid,
+    kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+    CMAudioFormatDescriptionGetStreamBasicDescription, CMBlockBuffer, CMSampleBuffer, CMTime,
+    CMTimeFlags,
+};
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSProcessInfo, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCRunningApplication, SCShareableContent, SCStream, SCStreamConfiguration,
@@ -92,77 +111,86 @@ const VIDEO_FRAME_INTERVAL: CMTime = CMTime {
 };
 
 // ---------------------------------------------------------------------------
-// The parts of CoreMedia / CoreGraphics / CoreFoundation we need by hand
+// The one part of CoreGraphics we still declare by hand (no crate binds it)
 // ---------------------------------------------------------------------------
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct AudioBufferRaw {
-    number_channels: u32,
-    data_byte_size: u32,
-    data: *mut c_void,
-}
-
-/// `AudioBufferList` is a variable-length struct. ScreenCaptureKit never gives
-/// us more than a handful of channels, so a fixed maximum is honest and avoids
-/// allocating inside the sample handler.
+/// `AudioBufferList` is a variable-length C struct: a count followed by as many
+/// `AudioBuffer`s as the stream has channels. The crate binding only declares
+/// the first element, so [`AudioBufferListStorage`] reserves the rest.
+/// ScreenCaptureKit never gives us more than a handful of channels, so a fixed
+/// maximum is honest and avoids allocating inside the sample handler.
 const MAX_BUFFERS: usize = 8;
 
+/// Room for an `AudioBufferList` carrying up to [`MAX_BUFFERS`] buffers.
+///
+/// The crate's [`AudioBufferList`] declares `mBuffers: [AudioBuffer; 1]`
+/// faithfully to the C header, where the array is really variable-length and
+/// the caller is expected to allocate enough room behind it. `_extra` is that
+/// room. `#[repr(C)]` keeps `_extra` contiguous with `list.mBuffers`, which
+/// the layout tests pin down — this is exactly the kind of ABI assumption that
+/// silently broke a real meeting (2026-08-24), so it stays under test.
 #[repr(C)]
-struct AudioBufferListRaw {
-    number_buffers: u32,
-    buffers: [AudioBufferRaw; MAX_BUFFERS],
+struct AudioBufferListStorage {
+    list: AudioBufferList,
+    _extra: [AudioBuffer; MAX_BUFFERS - 1],
 }
 
-impl AudioBufferListRaw {
+impl AudioBufferListStorage {
     fn zeroed() -> Self {
+        const EMPTY: AudioBuffer = AudioBuffer {
+            mNumberChannels: 0,
+            mDataByteSize: 0,
+            mData: std::ptr::null_mut(),
+        };
         Self {
-            number_buffers: 0,
-            buffers: [AudioBufferRaw {
-                number_channels: 0,
-                data_byte_size: 0,
-                data: std::ptr::null_mut(),
-            }; MAX_BUFFERS],
+            list: AudioBufferList {
+                mNumberBuffers: 0,
+                mBuffers: [EMPTY; 1],
+            },
+            _extra: [EMPTY; MAX_BUFFERS - 1],
         }
     }
-}
 
-#[repr(C)]
-struct StreamBasicDescription {
-    sample_rate: f64,
-    format_id: u32,
-    format_flags: u32,
-    bytes_per_packet: u32,
-    frames_per_packet: u32,
-    bytes_per_frame: u32,
-    channels_per_frame: u32,
-    bits_per_channel: u32,
-    reserved: u32,
-}
+    /// The pointer CoreMedia calls want. Derived from the whole struct, not
+    /// just the `list` field, so writes into the extra buffers behind the
+    /// header stay inside the pointer's provenance.
+    fn list_ptr(&mut self) -> NonNull<AudioBufferList> {
+        // SAFETY: `list` is the first field of a #[repr(C)] struct, so a
+        // pointer to the struct is a valid pointer to it; `&mut self` is
+        // never null.
+        unsafe { NonNull::new_unchecked(std::ptr::addr_of_mut!(*self).cast::<AudioBufferList>()) }
+    }
 
-const FORMAT_FLAG_IS_FLOAT: u32 = 1 << 0;
+    /// The first `n` buffers as one slice. Always go through this rather than
+    /// indexing `list.mBuffers` — the crate type declares one element, and
+    /// anything past it lives in `_extra`.
+    fn buffers(&self, n: usize) -> &[AudioBuffer] {
+        let n = n.min(MAX_BUFFERS);
+        let base = std::ptr::addr_of!(*self).cast::<u8>();
+        // SAFETY: the layout tests pin `list.mBuffers` and `_extra` as one
+        // contiguous [AudioBuffer; MAX_BUFFERS] region starting at this
+        // offset, and `n` never exceeds MAX_BUFFERS.
+        unsafe {
+            let first = base.add(Self::BUFFERS_OFFSET).cast::<AudioBuffer>();
+            std::slice::from_raw_parts(first, n)
+        }
+    }
 
-#[link(name = "CoreMedia", kind = "framework")]
-unsafe extern "C" {
-    fn CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-        sbuf: *const CMSampleBuffer,
-        buffer_list_size_needed_out: *mut usize,
-        buffer_list_out: *mut c_void,
-        buffer_list_size: usize,
-        structure_allocator: *const c_void,
-        block_allocator: *const c_void,
-        flags: u32,
-        block_buffer_out: *mut *mut c_void,
-    ) -> i32;
-    fn CMSampleBufferGetFormatDescription(sbuf: *const CMSampleBuffer) -> *const c_void;
-    fn CMAudioFormatDescriptionGetStreamBasicDescription(
-        desc: *const c_void,
-    ) -> *const StreamBasicDescription;
-}
+    /// Mutable twin of [`Self::buffers`].
+    fn buffers_mut(&mut self, n: usize) -> &mut [AudioBuffer] {
+        let n = n.min(MAX_BUFFERS);
+        let base = std::ptr::addr_of_mut!(*self).cast::<u8>();
+        // SAFETY: same layout argument as `buffers`; `&mut self` guarantees
+        // exclusive access to the whole region.
+        unsafe {
+            let first = base.add(Self::BUFFERS_OFFSET).cast::<AudioBuffer>();
+            std::slice::from_raw_parts_mut(first, n)
+        }
+    }
 
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFRelease(cf: *const c_void);
+    /// Where the buffer array starts, inside this struct.
+    const BUFFERS_OFFSET: usize =
+        std::mem::offset_of!(Self, list) + std::mem::offset_of!(AudioBufferList, mBuffers);
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -173,6 +201,37 @@ unsafe extern "C" {
     /// Prompts once per process. Returns the state *before* the person answers,
     /// which is why granting needs a relaunch.
     fn CGRequestScreenCaptureAccess() -> bool;
+}
+
+/// Names an `OSStatus` CoreMedia handed back from a failed buffer-list call.
+/// The number alone means nothing to whoever reads the log next; the constant
+/// name is the thing a search engine (or a memory of this file) can work with.
+/// Zero-jargon doesn't apply here — this is a tracing line, not something a
+/// person in a meeting ever sees.
+// The kCMSampleBufferError_* constants keep Apple's own spelling so a search
+// for the name in Apple's headers or docs finds it here too.
+#[allow(non_upper_case_globals)]
+fn sample_buffer_status_name(status: i32) -> &'static str {
+    match status {
+        kCMSampleBufferError_AllocationFailed => "AllocationFailed",
+        kCMSampleBufferError_RequiredParameterMissing => "RequiredParameterMissing",
+        kCMSampleBufferError_AlreadyHasDataBuffer => "AlreadyHasDataBuffer",
+        kCMSampleBufferError_BufferNotReady => "BufferNotReady",
+        kCMSampleBufferError_SampleIndexOutOfRange => "SampleIndexOutOfRange",
+        kCMSampleBufferError_BufferHasNoSampleSizes => "BufferHasNoSampleSizes",
+        kCMSampleBufferError_BufferHasNoSampleTimingInfo => "BufferHasNoSampleTimingInfo",
+        kCMSampleBufferError_ArrayTooSmall => "ArrayTooSmall",
+        kCMSampleBufferError_InvalidEntryCount => "InvalidEntryCount",
+        kCMSampleBufferError_CannotSubdivide => "CannotSubdivide",
+        kCMSampleBufferError_SampleTimingInfoInvalid => "SampleTimingInfoInvalid",
+        kCMSampleBufferError_InvalidMediaTypeForOperation => "InvalidMediaTypeForOperation",
+        kCMSampleBufferError_InvalidSampleData => "InvalidSampleData",
+        kCMSampleBufferError_InvalidMediaFormat => "InvalidMediaFormat",
+        kCMSampleBufferError_Invalidated => "Invalidated",
+        kCMSampleBufferError_DataFailed => "DataFailed",
+        kCMSampleBufferError_DataCanceled => "DataCanceled",
+        _ => "unknown",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +245,10 @@ struct SystemShared {
     counters: Arc<CaptureCounters>,
     /// Reused between callbacks so the handler does not allocate per buffer.
     scratch: Mutex<Vec<f32>>,
+    /// Landing area for the PCM CoreMedia copies out of each sample buffer,
+    /// before the mixdown into `scratch`. Grow-only, so after the first buffer
+    /// the handler never allocates.
+    pcm: Mutex<Vec<f32>>,
     /// Presentation timestamp of the first buffer, in microseconds.
     /// `i64::MIN` until the first one arrives.
     first_pts_us: AtomicI64,
@@ -204,6 +267,28 @@ struct SystemShared {
     counts: BufferCounts,
     /// Set once the first audio buffer's format has been written to the log.
     format_logged: AtomicBool,
+    /// Set once the first buffer-list refusal for this stream has been
+    /// written to the log. Every subsequent refusal still counts toward
+    /// `unreadable`; it just doesn't get its own log line, or a failing
+    /// stream would drown the log in a repeat of the same OSStatus.
+    read_failure_logged: AtomicBool,
+    /// Set once this stream has logged that the fallback read rescued a
+    /// buffer the primary read refused. Separate from
+    /// `read_failure_logged`, which is reserved for the double refusal: a
+    /// stream that is rescued for an hour and then loses a buffer outright
+    /// deserves both lines.
+    fallback_logged: AtomicBool,
+    /// The OSStatus CoreMedia gave back for the most recent refusal of the
+    /// primary (copy) read — recorded on *every* copy refusal, whether or
+    /// not the fallback then rescued the buffer, so a meeting served
+    /// entirely by the fallback still names its reason in the diagnostics.
+    /// Zero means never failed. This is deliberately not reset by
+    /// `reopen()` — see the comment there.
+    last_read_status: AtomicI32,
+    /// Same, for the fallback (retained-block-buffer) read. Set only when
+    /// the fallback is *also* refused, so it is only ever non-zero together
+    /// with `last_read_status`.
+    last_list_status: AtomicI32,
 }
 
 /// How many sample buffers arrived and what became of them.
@@ -212,10 +297,20 @@ struct BufferCounts {
     audio: AtomicU64,
     /// Video frames, which we drop on purpose.
     other: AtomicU64,
-    /// Not packed float, so we did not guess at it.
+    /// Not 32-bit float, so we did not guess at it.
     not_float: AtomicU64,
-    /// CoreMedia would not give us an audio buffer list.
+    /// CoreMedia would not let us read it: no usable format description, an
+    /// impossible channel or frame count, or both read paths refused.
     unreadable: AtomicU64,
+    /// The primary (copy) read was refused but the fallback read rescued the
+    /// buffer. No audio was lost — but a stream living off this counter is
+    /// degraded, and 2026-08-24 is the proof that a degraded read path must
+    /// never be indistinguishable from a healthy one.
+    fallback: AtomicU64,
+    /// Arrived before its data did. CoreMedia says which; we count it apart
+    /// from `unreadable` because "the data never became ready" points at the
+    /// producer, not at this file's reading of it.
+    not_ready: AtomicU64,
     /// Carried no samples.
     empty: AtomicU64,
 }
@@ -228,6 +323,44 @@ impl SystemShared {
             .unwrap_or_else(|e| e.into_inner()) = Some(reason);
         self.stopped.store(true, Ordering::Relaxed);
         self.counters.mark_stopped();
+    }
+
+    /// One line of counters for the diagnostics log. Lives here, not on
+    /// [`SystemCapture`], so a test can build a `SystemShared` directly and
+    /// check the line without opening a stream.
+    fn diagnostics_summary(&self) -> String {
+        diagnostics_line(
+            self.counts.audio.load(Ordering::Relaxed),
+            self.counts.other.load(Ordering::Relaxed),
+            self.counts.not_float.load(Ordering::Relaxed),
+            self.counts.unreadable.load(Ordering::Relaxed),
+            self.counts.fallback.load(Ordering::Relaxed),
+            self.counts.not_ready.load(Ordering::Relaxed),
+            self.counts.empty.load(Ordering::Relaxed),
+            self.counters.pushed_samples(),
+            self.counters.dropped_samples(),
+            self.rate.load(Ordering::Relaxed),
+            self.last_read_status.load(Ordering::Relaxed),
+            self.last_list_status.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Give a fresh stream its own once-per-stream log lines. Called by
+    /// [`SystemCapture::reopen`]; lives here so a test can exercise it
+    /// without opening a stream.
+    ///
+    /// A new stream gets to describe its own first buffer: the format can
+    /// change under us when the output device does. And it gets to earn its
+    /// own read-failure warning rather than staying silent because the last
+    /// stream already used its one line. The buffer counts and the last
+    /// refusal statuses are deliberately left alone: they are the record of
+    /// the whole meeting, not of one particular stream, and the diagnostics
+    /// line at the end should still be able to say what went wrong even if
+    /// the last reopen happened to succeed.
+    fn reset_per_stream_logs(&self) {
+        self.format_logged.store(false, Ordering::Relaxed);
+        self.read_failure_logged.store(false, Ordering::Relaxed);
+        self.fallback_logged.store(false, Ordering::Relaxed);
     }
 }
 
@@ -290,31 +423,21 @@ impl AudioTap {
 /// Convert one sample buffer to mono `f32` and hand it over. Allocation-free
 /// after the first buffer.
 fn handle_audio(shared: &Arc<SystemShared>, sbuf: &CMSampleBuffer) {
-    let raw: *const CMSampleBuffer = sbuf;
+    // Format first: if this is not 32-bit float we do not guess.
+    // SAFETY: `sbuf` is a valid sample buffer for the whole callback; the
+    // description comes back retained, and the ASBD pointer it hands out is
+    // valid as long as the description is — the struct is copied out before
+    // the retain is dropped.
+    let described = unsafe { sbuf.format_description() }.and_then(|desc| {
+        let asbd = unsafe { CMAudioFormatDescriptionGetStreamBasicDescription(&desc) };
+        (!asbd.is_null()).then(|| unsafe { *asbd })
+    });
 
-    // Format first: if this is not packed float we do not guess.
-    let mut rate = REQUESTED_RATE;
-    let mut is_float = true;
-    let mut described: Option<(u32, u32, u32, u32)> = None;
-    unsafe {
-        let desc = CMSampleBufferGetFormatDescription(raw);
-        if !desc.is_null() {
-            let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc);
-            if !asbd.is_null() {
-                let asbd = &*asbd;
-                if asbd.sample_rate > 0.0 {
-                    rate = asbd.sample_rate as u32;
-                }
-                is_float = asbd.format_flags & FORMAT_FLAG_IS_FLOAT != 0;
-                described = Some((
-                    rate,
-                    asbd.channels_per_frame,
-                    asbd.bits_per_channel,
-                    asbd.format_flags,
-                ));
-            }
-        }
-    }
+    let rate = match described {
+        Some(asbd) if asbd.mSampleRate > 0.0 => asbd.mSampleRate as u32,
+        _ => REQUESTED_RATE,
+    };
+    let is_float = described.is_some_and(|asbd| asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0);
 
     // Exactly once per stream, and never audio content: what macOS actually
     // negotiated, so the next real meeting's log either proves this path works
@@ -322,12 +445,12 @@ fn handle_audio(shared: &Arc<SystemShared>, sbuf: &CMSampleBuffer) {
     // already taking two mutexes below costs nothing.
     if !shared.format_logged.swap(true, Ordering::Relaxed) {
         match described {
-            Some((rate, channels, bits, flags)) => tracing::info!(
+            Some(asbd) => tracing::info!(
                 target: "echo::audio",
                 rate,
-                channels,
-                bits,
-                format_flags = flags,
+                channels = asbd.mChannelsPerFrame,
+                bits = asbd.mBitsPerChannel,
+                format_flags = asbd.mFormatFlags,
                 is_float,
                 "first system-audio buffer arrived"
             ),
@@ -338,81 +461,348 @@ fn handle_audio(shared: &Arc<SystemShared>, sbuf: &CMSampleBuffer) {
         }
     }
 
-    if !is_float {
+    // A buffer that does not say what format it is in cannot be read. The old
+    // code silently assumed float and carried on; now it counts and says so.
+    let Some(asbd) = described else {
+        shared.counts.unreadable.fetch_add(1, Ordering::Relaxed);
+        if !shared.read_failure_logged.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "echo::audio",
+                "an audio buffer arrived without a format description, so it cannot be read"
+            );
+        }
+        return;
+    };
+
+    if !is_float || asbd.mBitsPerChannel != 32 {
         shared.counts.not_float.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let non_interleaved = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0;
+    let channels = asbd.mChannelsPerFrame as usize;
+    if channels == 0 || channels > MAX_BUFFERS {
+        shared.counts.unreadable.fetch_add(1, Ordering::Relaxed);
+        if !shared.read_failure_logged.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "echo::audio",
+                channels,
+                max_channels = MAX_BUFFERS,
+                "the stream announced a channel count the buffer list cannot hold"
+            );
+        }
         return;
     }
     shared.rate.store(rate, Ordering::Relaxed);
 
-    let mut list = AudioBufferListRaw::zeroed();
-    let mut block_buffer: *mut c_void = std::ptr::null_mut();
-    let status = unsafe {
-        CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            raw,
+    // SAFETY: plain accessor on a valid sample buffer.
+    if !unsafe { sbuf.data_is_ready() } {
+        shared.counts.not_ready.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // SAFETY: plain accessor on a valid sample buffer.
+    let num_samples = unsafe { sbuf.num_samples() };
+    if num_samples <= 0 {
+        shared.counts.empty.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // The copy call takes the frame count as an i32. A count that does not
+    // fit is not audio we can represent anyway; refuse it rather than let the
+    // cast wrap into a nonsense request.
+    let Ok(frames) = i32::try_from(num_samples) else {
+        shared.counts.unreadable.fetch_add(1, Ordering::Relaxed);
+        if !shared.read_failure_logged.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "echo::audio",
+                num_samples,
+                "the buffer claims a frame count too large to read"
+            );
+        }
+        return;
+    };
+    let frames = frames as usize;
+
+    let mut scratch = shared.scratch.lock().unwrap_or_else(|e| e.into_inner());
+    let copy_status = {
+        let mut pcm = shared.pcm.lock().unwrap_or_else(|e| e.into_inner());
+        read_by_copying(
+            sbuf,
+            non_interleaved,
+            channels,
+            frames,
+            &mut pcm,
+            &mut scratch,
+        )
+    };
+    if copy_status != 0 {
+        // Record the refusal before anything else: even if the fallback
+        // rescues every single buffer, the diagnostics line must still be
+        // able to say the primary read never worked and why. A degraded
+        // stream that looks healthy is this file's original sin (2026-08-24).
+        shared
+            .last_read_status
+            .store(copy_status, Ordering::Relaxed);
+        // The primary read was refused; ask for the buffer list that
+        // references the sample buffer's own storage instead. The 2026-08-24
+        // meeting failed on (an unsound hand-rolled version of) this second
+        // call on every one of 500 buffers, which is why the copy is primary
+        // now and why a double refusal names both statuses below.
+        match read_via_block_buffer(sbuf, frames, &mut scratch) {
+            Ok(()) => {
+                shared.counts.fallback.fetch_add(1, Ordering::Relaxed);
+                // Once per stream: the audio survived, but the stream is
+                // running on its second-choice read and the log has to say
+                // so while the meeting is still happening, not only in the
+                // end-of-meeting counters.
+                if !shared.fallback_logged.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "echo::audio",
+                        copy_status,
+                        copy_status_name = sample_buffer_status_name(copy_status),
+                        "macOS refused the primary read of an audio buffer; the fallback read is carrying the audio"
+                    );
+                }
+            }
+            Err((list_status, needed)) => {
+                shared.counts.unreadable.fetch_add(1, Ordering::Relaxed);
+                shared
+                    .last_list_status
+                    .store(list_status, Ordering::Relaxed);
+                // Once per stream, and named rather than numbered. Every later
+                // refusal still counts toward `unreadable`; it just doesn't get
+                // its own line, or a stream that fails on every buffer would
+                // drown the log in the same status a thousand times over.
+                if !shared.read_failure_logged.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "echo::audio",
+                        copy_status,
+                        copy_status_name = sample_buffer_status_name(copy_status),
+                        list_status,
+                        list_status_name = sample_buffer_status_name(list_status),
+                        needed_size = needed,
+                        storage_size = std::mem::size_of::<AudioBufferListStorage>(),
+                        "macOS refused both ways of reading an audio buffer"
+                    );
+                }
+                return;
+            }
+        }
+    }
+    if scratch.is_empty() {
+        shared.counts.empty.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    let mut producer = shared.producer.lock().unwrap_or_else(|e| e.into_inner());
+    if shared.first_pts_us.load(Ordering::Relaxed) == i64::MIN {
+        let pts_us = presentation_us(sbuf);
+        shared.first_pts_us.store(pts_us, Ordering::Relaxed);
+        shared
+            .first_clock_ms
+            .store(producer.counters().last_clock_ms(), Ordering::Relaxed);
+    }
+    producer.push(&scratch);
+}
+
+/// Primary read: have CoreMedia copy the buffer's PCM into `pcm`, then mix it
+/// down to mono in `mono`. Returns the OSStatus of the copy call; `mono` is
+/// only meaningful when that is 0. `pcm` grows to fit and never shrinks, so
+/// after the first buffer this path allocates nothing.
+fn read_by_copying(
+    sbuf: &CMSampleBuffer,
+    non_interleaved: bool,
+    channels: usize,
+    frames: usize,
+    pcm: &mut Vec<f32>,
+    mono: &mut Vec<f32>,
+) -> i32 {
+    let total = frames * channels;
+    if pcm.len() < total {
+        pcm.resize(total, 0.0);
+    }
+    let data = &mut pcm[..total];
+
+    // Describe `data` to CoreMedia the way the format says the samples are
+    // laid out: one buffer per channel when non-interleaved, one buffer of
+    // frame-sized groups when interleaved.
+    let mut storage = AudioBufferListStorage::zeroed();
+    if non_interleaved {
+        storage.list.mNumberBuffers = channels as u32;
+        let byte_size = (frames * std::mem::size_of::<f32>()) as u32;
+        for (chunk, buffer) in data
+            .chunks_exact_mut(frames)
+            .zip(storage.buffers_mut(channels).iter_mut())
+        {
+            *buffer = AudioBuffer {
+                mNumberChannels: 1,
+                mDataByteSize: byte_size,
+                mData: chunk.as_mut_ptr().cast(),
+            };
+        }
+    } else {
+        storage.list.mNumberBuffers = 1;
+        storage.buffers_mut(1)[0] = AudioBuffer {
+            mNumberChannels: channels as u32,
+            mDataByteSize: (total * std::mem::size_of::<f32>()) as u32,
+            mData: data.as_mut_ptr().cast(),
+        };
+    }
+
+    // SAFETY: every buffer in the list points into `data`, which lives for
+    // the whole call and is exactly as large as the sizes written above;
+    // `frames` was bounds-checked against i32 by the caller.
+    let status =
+        unsafe { sbuf.copy_pcm_data_into_audio_buffer_list(0, frames as i32, storage.list_ptr()) };
+    if status != 0 {
+        return status;
+    }
+
+    if non_interleaved {
+        let mut planes: [&[f32]; MAX_BUFFERS] = [&[]; MAX_BUFFERS];
+        for (plane, chunk) in planes.iter_mut().zip(data.chunks_exact(frames)) {
+            *plane = chunk;
+        }
+        mix_planar_into(mono, &planes[..channels], frames);
+    } else {
+        mix_interleaved_into(mono, data, channels);
+    }
+    0
+}
+
+/// Fallback read: ask CoreMedia for an `AudioBufferList` whose buffers point
+/// into the sample buffer's own storage, kept alive by a retained block
+/// buffer, and mix that down to mono. On failure returns the OSStatus and the
+/// buffer-list size CoreMedia said it actually needed.
+///
+/// This is the call the 2026-08-24 meeting lost 500 of 500 buffers to, back
+/// when a hand-declared version of it was the whole read path. It stays as
+/// the fallback — and is exercised directly by tests — so a refusal of the
+/// copy call still has a second chance instead of a silent gap.
+fn read_via_block_buffer(
+    sbuf: &CMSampleBuffer,
+    frames: usize,
+    mono: &mut Vec<f32>,
+) -> Result<(), (i32, usize)> {
+    // Ask for the size first. CoreMedia does NOT treat `buffer_list_size` as
+    // a capacity: handing it storage larger than the list actually needs
+    // fails with ArrayTooSmall, of all things — measured right here on a
+    // synthetic stereo buffer (needed=40, provided=136, status=-12737). The
+    // exact reported size is accepted. This is the same shape of refusal the
+    // 2026-08-24 meeting hit 500 times out of 500: the old hand-rolled call
+    // always handed over its full fixed-size storage and lost every buffer.
+    let mut needed: usize = 0;
+    // SAFETY: a null buffer list with size 0 is the documented way to ask
+    // only for the needed size; the out-pointer is valid for the write.
+    let probe = unsafe {
+        sbuf.audio_buffer_list_with_retained_block_buffer(
+            &mut needed,
             std::ptr::null_mut(),
-            (&mut list as *mut AudioBufferListRaw).cast(),
-            std::mem::size_of::<AudioBufferListRaw>(),
-            std::ptr::null(),
-            std::ptr::null(),
             0,
+            None,
+            None,
+            kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            std::ptr::null_mut(),
+        )
+    };
+    if needed == 0 || needed > std::mem::size_of::<AudioBufferListStorage>() {
+        // Either the probe told us nothing, or the list genuinely does not
+        // fit (more than MAX_BUFFERS channels). Hand back the probe's status
+        // so the log can name it.
+        return Err((probe, needed));
+    }
+
+    let mut storage = AudioBufferListStorage::zeroed();
+    let mut block_buffer: *mut CMBlockBuffer = std::ptr::null_mut();
+    // SAFETY: `needed` was checked against the real size of `storage` just
+    // above, so CoreMedia writes only into memory we own; the out-pointers
+    // are valid for writes.
+    let status = unsafe {
+        sbuf.audio_buffer_list_with_retained_block_buffer(
+            std::ptr::null_mut(),
+            storage.list_ptr().as_ptr(),
+            needed,
+            None,
+            None,
+            kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
             &mut block_buffer,
         )
     };
+    // Wrap the block buffer immediately so every return path below releases
+    // it. The old hand-rolled CFRelease could be skipped by an early return.
+    // SAFETY: when non-null, this is a +1 reference the call handed over.
+    let _block_buffer = NonNull::new(block_buffer).map(|b| unsafe { CFRetained::from_raw(b) });
     if status != 0 {
-        shared.counts.unreadable.fetch_add(1, Ordering::Relaxed);
-        if !block_buffer.is_null() {
-            unsafe { CFRelease(block_buffer) };
-        }
-        return;
+        return Err((status, needed));
     }
 
-    let channel_count = (list.number_buffers as usize).min(MAX_BUFFERS);
-    if channel_count == 0 {
-        shared.counts.empty.fetch_add(1, Ordering::Relaxed);
-        unsafe { CFRelease(block_buffer) };
-        return;
-    }
-
-    // ScreenCaptureKit delivers de-interleaved float: one buffer per channel.
-    let frames = (list.buffers[0].data_byte_size as usize) / std::mem::size_of::<f32>();
-    if frames == 0 {
-        shared.counts.empty.fetch_add(1, Ordering::Relaxed);
-    }
-    if frames > 0 {
-        let mut scratch = shared.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        scratch.clear();
-        scratch.resize(frames, 0.0);
+    let count = (storage.list.mNumberBuffers as usize).min(MAX_BUFFERS);
+    let buffers = storage.buffers(count);
+    if count > 1 {
+        // One buffer per channel.
+        let mut planes: [&[f32]; MAX_BUFFERS] = [&[]; MAX_BUFFERS];
         let mut used = 0usize;
-        for buffer in list.buffers.iter().take(channel_count) {
-            if buffer.data.is_null() {
+        for buffer in buffers {
+            if buffer.mData.is_null() {
                 continue;
             }
-            let n = (buffer.data_byte_size as usize / std::mem::size_of::<f32>()).min(frames);
-            let samples = unsafe { std::slice::from_raw_parts(buffer.data as *const f32, n) };
-            for (dst, src) in scratch.iter_mut().zip(samples.iter()) {
-                *dst += *src;
-            }
+            let n = (buffer.mDataByteSize as usize / std::mem::size_of::<f32>()).min(frames);
+            // SAFETY: the block buffer guard keeps the pointed-to samples
+            // alive past the mixdown, and `n` never exceeds what
+            // mDataByteSize says is there.
+            planes[used] = unsafe { std::slice::from_raw_parts(buffer.mData as *const f32, n) };
             used += 1;
         }
-        if used > 1 {
-            let scale = 1.0 / used as f32;
-            for s in scratch.iter_mut() {
-                *s *= scale;
-            }
-        }
-
-        let mut producer = shared.producer.lock().unwrap_or_else(|e| e.into_inner());
-        if shared.first_pts_us.load(Ordering::Relaxed) == i64::MIN {
-            let pts_us = presentation_us(sbuf);
-            shared.first_pts_us.store(pts_us, Ordering::Relaxed);
-            shared
-                .first_clock_ms
-                .store(producer.counters().last_clock_ms(), Ordering::Relaxed);
-        }
-        producer.push(&scratch);
+        mix_planar_into(mono, &planes[..used], frames);
+    } else if count == 1 && !buffers[0].mData.is_null() {
+        // One buffer of interleaved frames (or plain mono).
+        let buffer = &buffers[0];
+        let channels = (buffer.mNumberChannels as usize).max(1);
+        let n = (buffer.mDataByteSize as usize / std::mem::size_of::<f32>()).min(frames * channels);
+        // SAFETY: same lifetime and bounds argument as above.
+        let samples = unsafe { std::slice::from_raw_parts(buffer.mData as *const f32, n) };
+        mix_interleaved_into(mono, samples, channels);
+    } else {
+        mono.clear();
     }
+    Ok(())
+}
 
-    unsafe { CFRelease(block_buffer) };
+/// Mix one buffer per channel down to mono: sum the channels and, when more
+/// than one contributed, scale by 1/channels. A single channel passes through
+/// untouched. Channels shorter than `frames` contribute what they have.
+fn mix_planar_into(mono: &mut Vec<f32>, planes: &[&[f32]], frames: usize) {
+    mono.clear();
+    mono.resize(frames, 0.0);
+    for plane in planes {
+        for (dst, src) in mono.iter_mut().zip(plane.iter()) {
+            *dst += *src;
+        }
+    }
+    if planes.len() > 1 {
+        let scale = 1.0 / planes.len() as f32;
+        for s in mono.iter_mut() {
+            *s *= scale;
+        }
+    }
+}
+
+/// Mix interleaved frames down to mono: average each frame's channels. Mono
+/// input passes through untouched. A trailing partial frame is dropped —
+/// it was never a whole frame to begin with.
+fn mix_interleaved_into(mono: &mut Vec<f32>, samples: &[f32], channels: usize) {
+    mono.clear();
+    if channels == 0 {
+        return;
+    }
+    if channels == 1 {
+        mono.extend_from_slice(samples);
+        return;
+    }
+    let scale = 1.0 / channels as f32;
+    mono.extend(
+        samples
+            .chunks_exact(channels)
+            .map(|frame| frame.iter().sum::<f32>() * scale),
+    );
 }
 
 fn presentation_us(sbuf: &CMSampleBuffer) -> i64 {
@@ -421,6 +811,46 @@ fn presentation_us(sbuf: &CMSampleBuffer) -> i64 {
         return 0;
     }
     time.value.saturating_mul(1_000_000) / i64::from(time.timescale)
+}
+
+/// Builds the one-line diagnostics summary, pulled out of [`SystemCapture::diagnostics`]
+/// so the format can be tested without a stream, a display, or anyone's
+/// permission. `read_status` (the copy read) and `list_status` (the fallback
+/// read) are 0 when that call has never failed on this stream.
+#[allow(clippy::too_many_arguments)]
+fn diagnostics_line(
+    audio_buffers: u64,
+    video_buffers: u64,
+    not_float: u64,
+    unreadable: u64,
+    fallback: u64,
+    not_ready: u64,
+    empty: u64,
+    pushed_samples: u64,
+    dropped_samples: u64,
+    rate: u32,
+    read_status: i32,
+    list_status: i32,
+) -> String {
+    let mut line = format!(
+        "audio_buffers={audio_buffers} video_buffers={video_buffers} not_float={not_float} unreadable={unreadable} fallback={fallback} not_ready={not_ready} empty={empty} pushed_samples={pushed_samples} dropped_samples={dropped_samples} rate={rate}"
+    );
+    use std::fmt::Write as _;
+    if read_status != 0 {
+        let _ = write!(
+            line,
+            " read_status={read_status}({})",
+            sample_buffer_status_name(read_status)
+        );
+    }
+    if list_status != 0 {
+        let _ = write!(
+            line,
+            " list_status={list_status}({})",
+            sample_buffer_status_name(list_status)
+        );
+    }
+    line
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +918,11 @@ impl SystemCapture {
             producer: Mutex::new(producer),
             counters: Arc::clone(&counters),
             scratch: Mutex::new(Vec::with_capacity(REQUESTED_RATE as usize)),
+            // Pre-sized to a full second of stereo — far more than one
+            // callback's worth — so the handler never allocates once running.
+            pcm: Mutex::new(Vec::with_capacity(
+                REQUESTED_RATE as usize * usize::from(REQUESTED_CHANNELS),
+            )),
             first_pts_us: AtomicI64::new(i64::MIN),
             first_clock_ms: AtomicI64::new(0),
             rate: AtomicU32::new(REQUESTED_RATE),
@@ -495,6 +930,10 @@ impl SystemCapture {
             stopped: AtomicBool::new(false),
             counts: BufferCounts::default(),
             format_logged: AtomicBool::new(false),
+            read_failure_logged: AtomicBool::new(false),
+            fallback_logged: AtomicBool::new(false),
+            last_read_status: AtomicI32::new(0),
+            last_list_status: AtomicI32::new(0),
         });
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -651,20 +1090,11 @@ impl SystemCapture {
     /// Read it as a funnel: `audio_buffers=0 video_buffers=0` means macOS never
     /// called back at all; `audio_buffers=0 video_buffers>0` means the stream is
     /// running but carries no audio; a non-zero `not_float`/`unreadable`/`empty`
-    /// means the buffers arrived and this file threw them away.
+    /// means the buffers arrived and this file threw them away; a non-zero
+    /// `fallback` means the audio survived, but only because the second-choice
+    /// read rescued buffers the primary read refused (`read_status` says why).
     pub fn diagnostics(&self) -> String {
-        let counts = &self.shared.counts;
-        format!(
-            "audio_buffers={} video_buffers={} not_float={} unreadable={} empty={} pushed_samples={} dropped_samples={} rate={}",
-            counts.audio.load(Ordering::Relaxed),
-            counts.other.load(Ordering::Relaxed),
-            counts.not_float.load(Ordering::Relaxed),
-            counts.unreadable.load(Ordering::Relaxed),
-            counts.empty.load(Ordering::Relaxed),
-            self.counters.pushed_samples(),
-            self.counters.dropped_samples(),
-            self.shared.rate.load(Ordering::Relaxed),
-        )
+        self.shared.diagnostics_summary()
     }
 
     /// Where on the meeting clock this channel started. -1 until the first
@@ -694,10 +1124,10 @@ impl SystemCapture {
             .unwrap_or_else(|e| e.into_inner()) = None;
         self.shared.stopped.store(false, Ordering::Relaxed);
         self.shared.counters.mark_running();
-        // A new stream gets to describe its own first buffer: the format can
-        // change under us when the output device does. The buffer counts stay
-        // cumulative, because they are the record of the whole meeting.
-        self.shared.format_logged.store(false, Ordering::Relaxed);
+        // The once-per-stream log lines start over; the counts and last
+        // refusal statuses stay, because they are the record of the whole
+        // meeting. The reasoning lives on the method.
+        self.shared.reset_per_stream_logs();
         self.shutdown = Arc::new(AtomicBool::new(false));
 
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), AudioError>>();
@@ -1183,9 +1613,358 @@ unsafe extern "C" {}
 mod tests {
     use super::*;
 
+    use objc2_core_audio_types::{
+        kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
+        AudioStreamBasicDescription,
+    };
+    use objc2_core_media::{
+        kCMBlockBufferAssureMemoryNowFlag, CMAudioFormatDescriptionCreate, CMFormatDescription,
+        CMItemCount, CMSampleTimingInfo,
+    };
+
     // Nothing here starts a stream: that needs a signed build, a real display
-    // and a person clicking Allow. What can be checked without hardware is the
-    // reasoning around it.
+    // and a person clicking Allow. But sample buffers themselves are plain
+    // CoreMedia objects, so the whole read path — the exact code that lost a
+    // real meeting's system channel (2026-08-24) — is exercised below on
+    // synthetic buffers, headless.
+
+    /// A `SystemShared` exactly as `open_blocking` builds one, so a test can
+    /// feed `handle_audio` and read what comes out the ring's other end.
+    fn shared_for_tests() -> (Arc<SystemShared>, RingConsumer) {
+        let (producer, consumer, counters) =
+            hand_over(REQUESTED_RATE, REQUESTED_CHANNELS, Instant::now());
+        let shared = Arc::new(SystemShared {
+            producer: Mutex::new(producer),
+            counters,
+            scratch: Mutex::new(Vec::new()),
+            pcm: Mutex::new(Vec::new()),
+            first_pts_us: AtomicI64::new(i64::MIN),
+            first_clock_ms: AtomicI64::new(0),
+            rate: AtomicU32::new(REQUESTED_RATE),
+            stopped_reason: Mutex::new(None),
+            stopped: AtomicBool::new(false),
+            counts: BufferCounts::default(),
+            format_logged: AtomicBool::new(false),
+            read_failure_logged: AtomicBool::new(false),
+            fallback_logged: AtomicBool::new(false),
+            last_read_status: AtomicI32::new(0),
+            last_list_status: AtomicI32::new(0),
+        });
+        (shared, consumer)
+    }
+
+    fn drained(consumer: &mut RingConsumer) -> Vec<f32> {
+        let mut out = Vec::new();
+        consumer.drain_into(&mut out);
+        out
+    }
+
+    fn f32_bytes(samples: &[f32]) -> Vec<u8> {
+        samples.iter().flat_map(|s| s.to_ne_bytes()).collect()
+    }
+
+    /// The format ScreenCaptureKit actually negotiates: packed 32-bit float
+    /// linear PCM (`format_flags=41` with the non-interleaved bit, as the
+    /// 2026-08-24 meeting's log recorded).
+    fn float_asbd(channels: u32, non_interleaved: bool) -> AudioStreamBasicDescription {
+        let mut flags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+        let bytes_per_frame = if non_interleaved { 4 } else { 4 * channels };
+        if non_interleaved {
+            flags |= kAudioFormatFlagIsNonInterleaved;
+        }
+        AudioStreamBasicDescription {
+            mSampleRate: 48_000.0,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: flags,
+            mBytesPerPacket: bytes_per_frame,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: bytes_per_frame,
+            mChannelsPerFrame: channels,
+            mBitsPerChannel: 32,
+            mReserved: 0,
+        }
+    }
+
+    fn asbd_format_description(
+        mut asbd: AudioStreamBasicDescription,
+    ) -> CFRetained<CMFormatDescription> {
+        let mut out: *const CMFormatDescription = std::ptr::null();
+        // SAFETY: `asbd` is a valid stack ASBD which the call copies; `out`
+        // is valid for the write.
+        let status = unsafe {
+            CMAudioFormatDescriptionCreate(
+                None,
+                NonNull::from(&mut asbd),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                None,
+                NonNull::from(&mut out),
+            )
+        };
+        assert_eq!(status, 0, "CoreMedia refused the format description");
+        // SAFETY: on success the call hands back a +1 reference.
+        unsafe { CFRetained::from_raw(NonNull::new(out.cast_mut()).expect("no description out")) }
+    }
+
+    fn audio_timing() -> CMSampleTimingInfo {
+        let clock = CMTime {
+            value: 0,
+            timescale: 48_000,
+            flags: CMTimeFlags::Valid,
+            epoch: 0,
+        };
+        CMSampleTimingInfo {
+            duration: CMTime { value: 1, ..clock },
+            presentationTimeStamp: clock,
+            decodeTimeStamp: CMTime {
+                value: 0,
+                timescale: 0,
+                flags: CMTimeFlags::empty(),
+                epoch: 0,
+            },
+        }
+    }
+
+    /// Builds a real `CMSampleBuffer` the way ScreenCaptureKit would deliver
+    /// one: a format description plus PCM attached through the write-side
+    /// twin of the read API, so CoreMedia itself owns the packing. `planes`
+    /// is one byte buffer per channel when non-interleaved, or a single
+    /// interleaved byte buffer; empty `planes` makes a dataless marker
+    /// buffer. Attaching data this way also marks it ready.
+    fn synthetic_buffer(
+        asbd: AudioStreamBasicDescription,
+        frames: usize,
+        planes: &[&[u8]],
+    ) -> CFRetained<CMSampleBuffer> {
+        let desc = asbd_format_description(asbd);
+        let timing = audio_timing();
+        let (timing_count, timing_ptr): (CMItemCount, *const CMSampleTimingInfo) = if frames > 0 {
+            (1, &timing)
+        } else {
+            (0, std::ptr::null())
+        };
+        let mut raw: *mut CMSampleBuffer = std::ptr::null_mut();
+        // SAFETY: the timing array pointer covers `timing_count` entries, the
+        // size array is empty, and the out-pointer is valid for the write. A
+        // dataless buffer may be created already-ready (a marker buffer).
+        let status = unsafe {
+            CMSampleBuffer::create(
+                None,
+                None,
+                planes.is_empty(),
+                None,
+                std::ptr::null_mut(),
+                Some(&desc),
+                frames as CMItemCount,
+                timing_count,
+                timing_ptr,
+                0,
+                std::ptr::null(),
+                NonNull::from(&mut raw),
+            )
+        };
+        assert_eq!(status, 0, "CoreMedia refused to create the sample buffer");
+        // SAFETY: on success the call hands back a +1 reference.
+        let sbuf = unsafe { CFRetained::from_raw(NonNull::new(raw).expect("no buffer out")) };
+
+        if !planes.is_empty() {
+            let channels_per_buffer = if planes.len() > 1 {
+                1
+            } else {
+                asbd.mChannelsPerFrame
+            };
+            let mut storage = AudioBufferListStorage::zeroed();
+            storage.list.mNumberBuffers = planes.len() as u32;
+            for (buffer, plane) in storage.buffers_mut(planes.len()).iter_mut().zip(planes) {
+                *buffer = AudioBuffer {
+                    mNumberChannels: channels_per_buffer,
+                    mDataByteSize: plane.len() as u32,
+                    mData: plane.as_ptr().cast_mut().cast(),
+                };
+            }
+            // SAFETY: every buffer in the list points at a live `planes`
+            // slice; the call copies the bytes into its own block buffer.
+            let status = unsafe {
+                sbuf.set_data_buffer_from_audio_buffer_list(
+                    None,
+                    None,
+                    kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+                    storage.list_ptr(),
+                )
+            };
+            assert_eq!(status, 0, "CoreMedia refused to attach the audio data");
+        }
+        sbuf
+    }
+
+    /// Builds a `CMSampleBuffer` whose data buffer exists but was never
+    /// marked ready — the shape of a buffer whose producer is still filling
+    /// it in. `set_data_buffer_from_audio_buffer_list` can't make one of
+    /// these (it marks the data ready itself), so the block buffer is
+    /// attached at creation with `data_ready: false`.
+    fn not_ready_buffer(
+        asbd: AudioStreamBasicDescription,
+        frames: usize,
+        byte_len: usize,
+    ) -> CFRetained<CMSampleBuffer> {
+        let desc = asbd_format_description(asbd);
+        let mut block_raw: *mut CMBlockBuffer = std::ptr::null_mut();
+        // SAFETY: a null memory block asks CoreMedia to allocate `byte_len`
+        // bytes itself (assured immediately by the flag); the out-pointer is
+        // valid for the write.
+        let status = unsafe {
+            CMBlockBuffer::create_with_memory_block(
+                None,
+                std::ptr::null_mut(),
+                byte_len,
+                None,
+                std::ptr::null(),
+                0,
+                byte_len,
+                kCMBlockBufferAssureMemoryNowFlag,
+                NonNull::from(&mut block_raw),
+            )
+        };
+        assert_eq!(status, 0, "CoreMedia refused to create the block buffer");
+        // SAFETY: on success the call hands back a +1 reference.
+        let block = unsafe { CFRetained::from_raw(NonNull::new(block_raw).expect("no block out")) };
+
+        let timing = audio_timing();
+        let mut raw: *mut CMSampleBuffer = std::ptr::null_mut();
+        // SAFETY: same argument as in `synthetic_buffer`; `data_ready: false`
+        // with no make-ready callback is a buffer that never becomes ready.
+        let status = unsafe {
+            CMSampleBuffer::create(
+                None,
+                Some(&block),
+                false,
+                None,
+                std::ptr::null_mut(),
+                Some(&desc),
+                frames as CMItemCount,
+                1,
+                &timing,
+                0,
+                std::ptr::null(),
+                NonNull::from(&mut raw),
+            )
+        };
+        assert_eq!(status, 0, "CoreMedia refused to create the sample buffer");
+        // SAFETY: on success the call hands back a +1 reference.
+        unsafe { CFRetained::from_raw(NonNull::new(raw).expect("no buffer out")) }
+    }
+
+    /// Whether this process can read PCM out of a fresh, valid sample buffer
+    /// at all, via both CoreMedia read calls — with the calls made *inline*,
+    /// deliberately not through `read_by_copying`/`read_via_block_buffer`. A
+    /// bug in those functions must fail the tests below; it must not be able
+    /// to disguise itself as a broken environment and skip them.
+    ///
+    /// This exists because CoreMedia itself has been observed refusing these
+    /// exact calls on freshly built synthetic buffers in bimodal windows: in
+    /// one 2026-08-24 review session, 16 consecutive runs of this module
+    /// failed — first with RequiredParameterMissing (-12731) from the copy
+    /// call, then with refusals of the block-buffer call — and then 47
+    /// consecutive runs of the *identical binary* passed, including under
+    /// artificial CPU load. Every FFI signature was verified against the
+    /// objc2-core-media 0.3.2 bindings; the trigger is environmental
+    /// (mediaserverd state, sandboxed execution, or similar), not
+    /// deterministic. So when even this canary is refused, the tests that
+    /// need CoreMedia to cooperate skip loudly instead of failing a gate on
+    /// weather — while any deterministic break in the production read path
+    /// still fails them on every run.
+    fn coremedia_read_canary() -> Result<(), String> {
+        let samples = [0.1f32, 0.2, 0.3, 0.4];
+        let bytes = f32_bytes(&samples);
+        let sbuf = synthetic_buffer(float_asbd(1, false), samples.len(), &[&bytes]);
+
+        // The copy call, descriptor built inline.
+        let mut out = [0.0f32; 4];
+        let mut storage = AudioBufferListStorage::zeroed();
+        storage.list.mNumberBuffers = 1;
+        storage.buffers_mut(1)[0] = AudioBuffer {
+            mNumberChannels: 1,
+            mDataByteSize: std::mem::size_of_val(&out) as u32,
+            mData: out.as_mut_ptr().cast(),
+        };
+        // SAFETY: the single buffer points at `out`, which lives for the
+        // whole call and is exactly as large as the size written above.
+        let status = unsafe {
+            sbuf.copy_pcm_data_into_audio_buffer_list(0, out.len() as i32, storage.list_ptr())
+        };
+        if status != 0 {
+            return Err(format!(
+                "the copy call refused the canary buffer: {status}({})",
+                sample_buffer_status_name(status)
+            ));
+        }
+        if out != samples {
+            return Err(format!("the copy call wrote back {out:?}"));
+        }
+
+        // The block-buffer call: size probe, then the list itself.
+        let mut needed = 0usize;
+        // SAFETY: a null buffer list with size 0 is the documented way to
+        // ask only for the needed size; the out-pointer is valid.
+        let probe = unsafe {
+            sbuf.audio_buffer_list_with_retained_block_buffer(
+                &mut needed,
+                std::ptr::null_mut(),
+                0,
+                None,
+                None,
+                kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+                std::ptr::null_mut(),
+            )
+        };
+        if needed == 0 || needed > std::mem::size_of::<AudioBufferListStorage>() {
+            return Err(format!(
+                "the size probe refused the canary buffer: {probe}({}), needed={needed}",
+                sample_buffer_status_name(probe)
+            ));
+        }
+        let mut storage = AudioBufferListStorage::zeroed();
+        let mut block: *mut CMBlockBuffer = std::ptr::null_mut();
+        // SAFETY: `needed` was checked against the real size of `storage`;
+        // the out-pointers are valid for writes.
+        let status = unsafe {
+            sbuf.audio_buffer_list_with_retained_block_buffer(
+                std::ptr::null_mut(),
+                storage.list_ptr().as_ptr(),
+                needed,
+                None,
+                None,
+                kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+                &mut block,
+            )
+        };
+        // SAFETY: when non-null, this is a +1 reference the call handed over.
+        let _block = NonNull::new(block).map(|b| unsafe { CFRetained::from_raw(b) });
+        if status != 0 {
+            return Err(format!(
+                "the block-buffer call refused the canary buffer: {status}({})",
+                sample_buffer_status_name(status)
+            ));
+        }
+        Ok(())
+    }
+
+    /// True when CoreMedia is cooperating; otherwise says loudly that the
+    /// calling test is being skipped, and why, so a quiet green run during a
+    /// refusal window is at least visibly quieter in the output.
+    fn coremedia_cooperates(test: &str) -> bool {
+        match coremedia_read_canary() {
+            Ok(()) => true,
+            Err(why) => {
+                eprintln!(
+                    "SKIPPED {test}: CoreMedia is refusing PCM reads in this environment right now — {why}"
+                );
+                false
+            }
+        }
+    }
 
     #[test]
     fn the_os_version_gate_answers_without_touching_a_device() {
@@ -1211,9 +1990,248 @@ mod tests {
     }
 
     #[test]
-    fn the_buffer_list_is_big_enough_for_a_real_stream() {
+    fn the_buffer_list_storage_matches_the_c_layout() {
+        // The whole fix rests on this layout: the crate's AudioBufferList
+        // declares one AudioBuffer and CoreMedia writes up to MAX_BUFFERS,
+        // so `_extra` must sit exactly where the C ABI expects buffer #2.
+        assert_eq!(std::mem::size_of::<AudioBuffer>(), 16);
+        assert_eq!(AudioBufferListStorage::BUFFERS_OFFSET, 8);
+        assert_eq!(
+            std::mem::size_of::<AudioBufferListStorage>(),
+            8 + 16 * MAX_BUFFERS
+        );
         assert!(MAX_BUFFERS >= usize::from(REQUESTED_CHANNELS));
-        assert_eq!(std::mem::size_of::<AudioBufferRaw>(), 16);
+    }
+
+    #[test]
+    fn a_deinterleaved_stereo_buffer_is_averaged_to_mono() {
+        // The exact shape ScreenCaptureKit delivered in the 2026-08-24
+        // meeting: 32-bit float, packed, non-interleaved, one buffer per
+        // channel. L=0.2 and R=0.6 must come out as 0.4 on the ring.
+        if !coremedia_cooperates("a_deinterleaved_stereo_buffer_is_averaged_to_mono") {
+            return;
+        }
+        let (shared, mut consumer) = shared_for_tests();
+        let left = f32_bytes(&[0.2; 4]);
+        let right = f32_bytes(&[0.6; 4]);
+        let sbuf = synthetic_buffer(float_asbd(2, true), 4, &[&left, &right]);
+        handle_audio(&shared, &sbuf);
+        let mono = drained(&mut consumer);
+        assert_eq!(mono.len(), 4, "{}", shared.diagnostics_summary());
+        for sample in &mono {
+            assert!((sample - 0.4).abs() < 1e-6, "expected 0.4, got {sample}");
+        }
+        assert_eq!(shared.counts.unreadable.load(Ordering::Relaxed), 0);
+        // The samples must have come through the *primary* copy read. A
+        // broken copy path whose refusals the fallback quietly rescues
+        // produces the right audio and the wrong implementation — mutation
+        // testing proved these tests were green with the interleaved copy
+        // descriptor completely broken until this assert existed.
+        assert_eq!(
+            shared.counts.fallback.load(Ordering::Relaxed),
+            0,
+            "the copy read did not carry this buffer: {}",
+            shared.diagnostics_summary()
+        );
+    }
+
+    #[test]
+    fn an_interleaved_stereo_buffer_is_averaged_to_mono() {
+        if !coremedia_cooperates("an_interleaved_stereo_buffer_is_averaged_to_mono") {
+            return;
+        }
+        let (shared, mut consumer) = shared_for_tests();
+        let frames = f32_bytes(&[0.2, 0.6, 0.2, 0.6, 0.2, 0.6]);
+        let sbuf = synthetic_buffer(float_asbd(2, false), 3, &[&frames]);
+        handle_audio(&shared, &sbuf);
+        let mono = drained(&mut consumer);
+        assert_eq!(mono.len(), 3, "{}", shared.diagnostics_summary());
+        for sample in &mono {
+            assert!((sample - 0.4).abs() < 1e-6, "expected 0.4, got {sample}");
+        }
+        assert_eq!(shared.counts.unreadable.load(Ordering::Relaxed), 0);
+        // Right audio via the wrong path is a fail: the interleaved copy
+        // descriptor had zero coverage while the fallback could rescue it.
+        assert_eq!(
+            shared.counts.fallback.load(Ordering::Relaxed),
+            0,
+            "the copy read did not carry this buffer: {}",
+            shared.diagnostics_summary()
+        );
+    }
+
+    #[test]
+    fn a_mono_buffer_passes_through_unscaled() {
+        if !coremedia_cooperates("a_mono_buffer_passes_through_unscaled") {
+            return;
+        }
+        let (shared, mut consumer) = shared_for_tests();
+        let samples = [0.25f32, -0.5, 1.0, 0.0];
+        let bytes = f32_bytes(&samples);
+        let sbuf = synthetic_buffer(float_asbd(1, false), 4, &[&bytes]);
+        handle_audio(&shared, &sbuf);
+        // Bit-exact: a single channel must not be averaged with anything.
+        assert_eq!(drained(&mut consumer), samples.to_vec());
+        // And it must have come through the primary copy read, not been
+        // rescued by the fallback after a refusal.
+        assert_eq!(
+            shared.counts.fallback.load(Ordering::Relaxed),
+            0,
+            "the copy read did not carry this buffer: {}",
+            shared.diagnostics_summary()
+        );
+    }
+
+    #[test]
+    fn a_buffer_with_no_samples_counts_as_empty_not_unreadable() {
+        let (shared, mut consumer) = shared_for_tests();
+        let sbuf = synthetic_buffer(float_asbd(2, true), 0, &[]);
+        handle_audio(&shared, &sbuf);
+        assert!(drained(&mut consumer).is_empty());
+        assert_eq!(shared.counts.empty.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.counts.unreadable.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn integer_pcm_is_refused_rather_than_guessed_at() {
+        // 16-bit signed integers reinterpreted as f32 would be deafening
+        // garbage; the counter has to say the buffer was refused for its
+        // format, not thrown away as unreadable.
+        let (shared, mut consumer) = shared_for_tests();
+        let asbd = AudioStreamBasicDescription {
+            mSampleRate: 48_000.0,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 2,
+            mBitsPerChannel: 16,
+            mReserved: 0,
+        };
+        let bytes: Vec<u8> = [100i16, -100, 200, -200, 300, -300, 400, -400]
+            .iter()
+            .flat_map(|s| s.to_ne_bytes())
+            .collect();
+        let sbuf = synthetic_buffer(asbd, 4, &[&bytes]);
+        handle_audio(&shared, &sbuf);
+        assert!(drained(&mut consumer).is_empty());
+        assert_eq!(shared.counts.not_float.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.counts.unreadable.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_fallback_read_hears_the_same_audio_as_the_copy() {
+        // The fallback is only ever taken when the copy call is refused,
+        // which no test can force CoreMedia to do — so it is called directly
+        // here, both to keep it from being dead code and to pin down that
+        // switching paths mid-meeting cannot change what is heard.
+        if !coremedia_cooperates("the_fallback_read_hears_the_same_audio_as_the_copy") {
+            return;
+        }
+        let left = f32_bytes(&[0.2; 4]);
+        let right = f32_bytes(&[0.6; 4]);
+        let sbuf = synthetic_buffer(float_asbd(2, true), 4, &[&left, &right]);
+
+        let mut pcm = Vec::new();
+        let mut copied = Vec::new();
+        let copy_status = read_by_copying(&sbuf, true, 2, 4, &mut pcm, &mut copied);
+        assert_eq!(
+            copy_status,
+            0,
+            "the copy read refused a valid buffer the canary could read: {copy_status}({})",
+            sample_buffer_status_name(copy_status)
+        );
+        let mut fallback = Vec::new();
+        if let Err((status, needed)) = read_via_block_buffer(&sbuf, 4, &mut fallback) {
+            panic!(
+                "the fallback read refused a valid buffer the canary could read: \
+                 {status}({}), needed={needed}, storage={}",
+                sample_buffer_status_name(status),
+                std::mem::size_of::<AudioBufferListStorage>()
+            );
+        }
+        assert_eq!(copied, fallback);
+        assert!((copied[0] - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_buffer_whose_data_never_became_ready_is_counted_apart() {
+        // "The data never arrived" points at the producer; "we could not
+        // read it" points here. The two must never share a counter.
+        let (shared, mut consumer) = shared_for_tests();
+        // 4 frames of non-interleaved stereo f32: 32 bytes, never made ready.
+        let sbuf = not_ready_buffer(float_asbd(2, true), 4, 32);
+        handle_audio(&shared, &sbuf);
+        assert!(drained(&mut consumer).is_empty());
+        assert_eq!(shared.counts.not_ready.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.counts.unreadable.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_planar_mixdown_averages_channels_and_passes_mono_through() {
+        let mut mono = Vec::new();
+        mix_planar_into(&mut mono, &[&[0.2, 0.4], &[0.6, 0.0]], 2);
+        assert!((mono[0] - 0.4).abs() < 1e-6);
+        assert!((mono[1] - 0.2).abs() < 1e-6);
+
+        // One channel: passthrough, bit-exact, no scaling.
+        mix_planar_into(&mut mono, &[&[0.5, -0.5]], 2);
+        assert_eq!(mono, vec![0.5, -0.5]);
+
+        // A short channel contributes what it has; the frame count holds.
+        mix_planar_into(&mut mono, &[&[1.0, 1.0], &[1.0]], 2);
+        assert!((mono[0] - 1.0).abs() < 1e-6);
+        assert!((mono[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_interleaved_mixdown_averages_each_frame() {
+        let mut mono = Vec::new();
+        mix_interleaved_into(&mut mono, &[0.2, 0.6, -0.2, -0.6], 2);
+        assert_eq!(mono.len(), 2);
+        assert!((mono[0] - 0.4).abs() < 1e-6);
+        assert!((mono[1] + 0.4).abs() < 1e-6);
+
+        // Mono: passthrough, bit-exact.
+        mix_interleaved_into(&mut mono, &[0.1, 0.2, 0.3], 1);
+        assert_eq!(mono, vec![0.1, 0.2, 0.3]);
+
+        // A trailing partial frame was never a whole frame; it is dropped.
+        mix_interleaved_into(&mut mono, &[0.5, 0.5, 0.5], 2);
+        assert_eq!(mono.len(), 1);
+    }
+
+    #[test]
+    fn a_reopened_stream_earns_its_own_log_lines_but_keeps_the_meetings_record() {
+        let (shared, _consumer) = shared_for_tests();
+        shared.format_logged.store(true, Ordering::Relaxed);
+        shared.read_failure_logged.store(true, Ordering::Relaxed);
+        shared.fallback_logged.store(true, Ordering::Relaxed);
+        shared.counts.fallback.fetch_add(7, Ordering::Relaxed);
+        shared
+            .last_read_status
+            .store(kCMSampleBufferError_ArrayTooSmall, Ordering::Relaxed);
+        shared
+            .last_list_status
+            .store(kCMSampleBufferError_BufferNotReady, Ordering::Relaxed);
+
+        shared.reset_per_stream_logs();
+
+        // The new stream gets its own once-per-stream lines...
+        assert!(!shared.format_logged.load(Ordering::Relaxed));
+        assert!(!shared.read_failure_logged.load(Ordering::Relaxed));
+        assert!(!shared.fallback_logged.load(Ordering::Relaxed));
+        // ...but the meeting's record of what went wrong survives.
+        assert_eq!(shared.counts.fallback.load(Ordering::Relaxed), 7);
+        assert_eq!(
+            shared.last_read_status.load(Ordering::Relaxed),
+            kCMSampleBufferError_ArrayTooSmall
+        );
+        assert_eq!(
+            shared.last_list_status.load(Ordering::Relaxed),
+            kCMSampleBufferError_BufferNotReady
+        );
     }
 
     #[test]
@@ -1277,6 +2295,99 @@ mod tests {
         let flag = Arc::clone(&ran);
         queue.exec_sync(move || flag.store(true, Ordering::SeqCst));
         assert!(ran.load(Ordering::SeqCst), "the queue never ran anything");
+    }
+
+    #[test]
+    fn read_failures_are_named_not_numbered() {
+        // The bug this instrumentation exists to fix: a real meeting's log
+        // could only say "unreadable=500", never which OSStatus macOS
+        // actually returned. Every status the failing branch can plausibly
+        // see must come back as a name, and an OSStatus nobody has catalogued
+        // yet must say "unknown" rather than panic or lie.
+        assert_eq!(
+            sample_buffer_status_name(kCMSampleBufferError_ArrayTooSmall),
+            "ArrayTooSmall"
+        );
+        assert_eq!(
+            sample_buffer_status_name(kCMSampleBufferError_InvalidMediaTypeForOperation),
+            "InvalidMediaTypeForOperation"
+        );
+        assert_eq!(
+            sample_buffer_status_name(kCMSampleBufferError_InvalidMediaFormat),
+            "InvalidMediaFormat"
+        );
+        assert_eq!(sample_buffer_status_name(-1), "unknown");
+    }
+
+    #[test]
+    fn the_diagnostics_line_carries_the_last_refusal() {
+        // `shared_for_tests` is constructed the same way `open_blocking`
+        // builds one, so this test breaks the moment a field is added there
+        // and forgotten here.
+        let (shared, _consumer) = shared_for_tests();
+
+        // Never failed: no status clauses at all, so a healthy meeting's
+        // diagnostics line doesn't grow a misleading "read_status=0(unknown)".
+        let line = shared.diagnostics_summary();
+        assert!(!line.contains("read_status"));
+        assert!(!line.contains("list_status"));
+        assert!(line.contains("not_ready=0"), "not in the funnel: {line}");
+        assert!(line.contains("fallback=0"), "not in the funnel: {line}");
+
+        shared.counts.unreadable.fetch_add(1, Ordering::Relaxed);
+        shared
+            .last_read_status
+            .store(kCMSampleBufferError_ArrayTooSmall, Ordering::Relaxed);
+        shared.last_list_status.store(
+            kCMSampleBufferError_InvalidMediaTypeForOperation,
+            Ordering::Relaxed,
+        );
+        let line = shared.diagnostics_summary();
+        assert!(
+            line.contains("read_status=-12737(ArrayTooSmall)"),
+            "diagnostics line did not name the last copy refusal: {line}"
+        );
+        assert!(
+            line.contains("list_status=-12741(InvalidMediaTypeForOperation)"),
+            "diagnostics line did not name the last fallback refusal: {line}"
+        );
+    }
+
+    #[test]
+    fn a_stream_carried_entirely_by_the_fallback_is_not_mistaken_for_a_healthy_one() {
+        // The 2026-08-24 class of failure, one notch less severe: every copy
+        // read refused, every buffer rescued by the fallback. No audio was
+        // lost — `unreadable` stays 0 — but the line must still say the
+        // stream ran on its second-choice read and name the refusal, or a
+        // permanently degraded meeting reads exactly like a healthy one.
+        let line = diagnostics_line(
+            500,
+            10,
+            0,
+            0,
+            500,
+            0,
+            0,
+            240_000,
+            0,
+            48_000,
+            kCMSampleBufferError_RequiredParameterMissing,
+            0,
+        );
+        assert!(line.contains("unreadable=0"), "wrong funnel: {line}");
+        assert!(
+            line.contains("fallback=500"),
+            "the rescue is invisible: {line}"
+        );
+        assert!(
+            line.contains("read_status=-12731(RequiredParameterMissing)"),
+            "the refusal that forced the fallback is unnamed: {line}"
+        );
+        // The fallback itself never failed, so no second status clause.
+        assert!(
+            !line.contains("list_status"),
+            "phantom fallback refusal: {line}"
+        );
     }
 
     #[test]

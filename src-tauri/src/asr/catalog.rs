@@ -504,11 +504,32 @@ pub struct DecodeParams {
     pub temperature: f32,
     /// How much to raise the temperature on each fallback attempt.
     pub temperature_inc: f32,
-    /// Gibberish guard: retry hotter above this entropy.
+    /// Loop guard: an answer whose tokens carry *less* variety than this is
+    /// thrown away and decoded again hotter.
+    ///
+    /// This is whisper.cpp's stand-in for OpenAI's `compression_ratio_threshold`
+    /// and it runs the other way round — a decoder stuck in a loop produces a
+    /// very predictable token stream, so the failure is entropy **below** the
+    /// bar, not above it (`whisper.cpp:7527`). 2.4 is the same number the two
+    /// projects agree on, and it is the number Echo has always used; it is
+    /// spelled out here because the 2026-08-24 meeting contained three-times
+    /// loops ("ma è un po' figgito" three times in one line) and the first
+    /// question anybody will ask of this file is whether the guard was on.
+    ///
+    /// Its limit, honestly: whisper.cpp only applies it to answers longer than
+    /// 32 tokens, so a short line that repeats itself twice is under the bar the
+    /// guard is measured over. Nothing in the binding can change that.
     pub entropy_thold: f32,
-    /// Retry hotter below this average log probability.
+    /// Below this average log probability per token, the answer is not trusted:
+    /// it is either decoded again hotter, or — when the model also thinks the
+    /// window was silence — dropped.
+    ///
+    /// One number, two jobs, and they pull in opposite directions. See
+    /// [`LIVE_LOGPROB_THOLD`].
     pub logprob_thold: f32,
-    /// Treat a window as silence above this probability.
+    /// Above this probability of "there was no speech here", the window is
+    /// treated as silence — but only if [`DecodeParams::logprob_thold`] also
+    /// says the words were a guess. See [`CAPTION_NO_SPEECH_THOLD`].
     pub no_speech_thold: f32,
 }
 
@@ -553,6 +574,70 @@ pub const CATCHUP_MAX_FALLBACKS: u32 = 2;
 /// legible: 0.0, 0.4, 0.8.
 pub const CATCHUP_TEMPERATURE_INC: f32 = 0.4;
 
+/// The loop guard, everywhere. See [`DecodeParams::entropy_thold`].
+///
+/// Named rather than inlined so a test can assert every lane still carries it:
+/// a lane that quietly lost it would show up as looped text in a transcript
+/// months later, which is exactly how the 2026-08-24 loops were found.
+pub const LOOP_ENTROPY_THOLD: f32 = 2.4;
+
+/// What a **live final** demands of itself before it believes its own words.
+///
+/// Raised from whisper.cpp's -1.0 after the 2026-08-24 meeting. The knob does
+/// two things at once (`whisper.cpp:7555` and `:7585`) and they trade against
+/// each other:
+///
+/// * it widens the silence gate — a window the model calls silence is only
+///   dropped if the words it produced anyway were *also* a guess, and at -1.0
+///   almost nothing counts as a guess;
+/// * it widens the fallback gate — an answer under the bar is decoded again at
+///   a higher temperature, which costs time.
+///
+/// -0.85 is a deliberately small step, and it is taken on the live lane rather
+/// than the disk lane for one reason: a live final that gets dropped leaves no
+/// text against that audio, and the catch-up pass reads exactly the stretches
+/// that have no text against them. Live, this is a *deferral*. On disk it would
+/// be a deletion.
+///
+/// It will not, on its own, catch the 33 phantoms of 2026-08-24: those were
+/// decoded confidently, well above any bar that leaves real quiet speech alone.
+/// That is [`crate::asr::phantom`]'s job, and the reason it exists.
+///
+/// The step is small for a reason worth spelling out: quiet, accented and
+/// far-field speech decodes around -0.5 to -0.9, so a bar much above this stops
+/// being a guard against nonsense and starts being a guard against soft-spoken
+/// people. The caption lane does not take this step at all — see
+/// [`CAPTION_NO_SPEECH_THOLD`].
+pub const LIVE_LOGPROB_THOLD: f32 = -0.85;
+
+/// How sure the model has to be that a **caption's** window was silence.
+///
+/// Lowered from whisper.cpp's 0.6, and it is the *only* half of the silence gate
+/// this lane moves. That gate is an AND of two beliefs (whisper.cpp:7585):
+///
+/// ```text
+/// no_speech_prob > no_speech_thold && avg_logprobs < logprob_thold
+/// ```
+///
+/// and moving both halves at once is not "more strictness", it is a different
+/// gate. The log-probability half was tried at -0.35 here and reverted, because
+/// -0.35 sits *inside* the band real speech decodes at — clean speech runs
+/// around -0.15 to -0.4, and quiet, accented or far-field speech routinely -0.5
+/// to -0.9 — which reduces the gate to `no_speech_prob > 0.5` alone for exactly
+/// the person Echo most needs to caption. Blank captions for one soft-spoken
+/// participant for a whole call is not the small, self-correcting cost the rest
+/// of this lane's reasoning is built on.
+///
+/// It would not have bought anything either. The phantoms of 2026-08-24 were
+/// decoded *confidently* — a hallucinated "Grazie." carries a high
+/// `avg_logprobs`, so no bar that leaves real speech alone catches it, on any
+/// lane. That is [`crate::asr::phantom`]'s job. What this half still does is
+/// drop a caption that is both probably-silence and word-salad, and that costs
+/// nobody anything.
+///
+/// Left at whisper.cpp's measured 0.6 on both lanes that write the transcript.
+pub const CAPTION_NO_SPEECH_THOLD: f32 = 0.5;
+
 impl DecodeParams {
     pub fn uses_beam_search(&self) -> bool {
         self.beam_size >= 2
@@ -587,9 +672,16 @@ impl DecodeParams {
     ///
     /// [`DecodeParams::live_final_degraded`] is the fallback for a machine that
     /// cannot keep up at this width.
+    ///
+    /// The one addition of 2026-08-24: a slightly higher bar for believing an
+    /// answer, because a live final that is dropped is re-read from disk by the
+    /// catch-up pass, and one that is wrong is in the transcript for good. See
+    /// [`LIVE_LOGPROB_THOLD`].
     pub const fn live_final(mut self) -> Self {
         self.temperature = 0.0;
         self.temperature_inc = LIVE_TEMPERATURE_INC;
+        self.logprob_thold = LIVE_LOGPROB_THOLD;
+        self.entropy_thold = LOOP_ENTROPY_THOLD;
         self
     }
 
@@ -621,14 +713,24 @@ impl DecodeParams {
     /// person opens the transcript, so the ladder is capped here for the same
     /// reason the beam is not: the beam buys words, the sixth temperature does
     /// not.
+    ///
+    /// The thresholds are deliberately *not* tightened here. This pass is the
+    /// last chance these words have: nothing reads the audio again afterwards,
+    /// so a window dropped here is a window that stays blank for ever. Silence
+    /// that talked its way into a line is taken off this lane after the decode
+    /// instead, by [`crate::asr::phantom`], which needs two pieces of evidence
+    /// rather than one threshold.
     pub const fn catch_up(mut self) -> Self {
         self.temperature = 0.0;
         self.temperature_inc = CATCHUP_TEMPERATURE_INC;
+        self.entropy_thold = LOOP_ENTROPY_THOLD;
         self
     }
 
     /// The same preset, decoding a **speculative caption**: greedy, one attempt,
-    /// nothing spent on a hypothesis that is about to be replaced.
+    /// nothing spent on a hypothesis that is about to be replaced — and the
+    /// quickest of the three lanes to call a window silence, though only in the
+    /// one way that cannot cost a quiet speaker their captions.
     pub const fn speculative(mut self) -> Self {
         self.beam_size = 0;
         self.best_of = 1;
@@ -636,6 +738,13 @@ impl DecodeParams {
         // No ladder: a caption that arrives late is worse than a caption that is
         // slightly wrong, and the final decode replaces it either way.
         self.temperature_inc = 0.0;
+        // With one rung, whisper.cpp never consults these for a retry — they
+        // only decide whether the window was silence. The half that means "the
+        // model heard no speech" moves; the half that means "the words are a
+        // guess" stays where whisper.cpp measured it, or a quiet speaker's
+        // captions go blank for the whole call. See [`CAPTION_NO_SPEECH_THOLD`].
+        self.no_speech_thold = CAPTION_NO_SPEECH_THOLD;
+        self.entropy_thold = LOOP_ENTROPY_THOLD;
         self
     }
 }
@@ -691,7 +800,9 @@ pub const PRESETS: &[AccuracyPreset] = &[AccuracyPreset {
         best_of: 5,
         temperature: 0.0,
         temperature_inc: 0.2,
-        entropy_thold: 2.4,
+        entropy_thold: LOOP_ENTROPY_THOLD,
+        // whisper.cpp's own measured defaults, and the disk pass keeps them: see
+        // `DecodeParams::catch_up`. The live lanes tighten them from here.
         logprob_thold: -1.0,
         no_speech_thold: 0.6,
     },
@@ -1208,10 +1319,6 @@ mod tests {
             );
             assert!(!speculative.uses_beam_search());
             assert_eq!(speculative.best_of, 1);
-            // The thresholds are untouched: they are about what counts as
-            // silence and gibberish, not about how hard to try.
-            assert_eq!(speculative.no_speech_thold, catchup.no_speech_thold);
-            assert_eq!(live.no_speech_thold, catchup.no_speech_thold);
             // The disk pass still tries harder than a live final — it just no
             // longer tries six times.
             assert!(
@@ -1240,10 +1347,77 @@ mod tests {
             5,
             "the cap is on the ladder, never on the beam"
         );
-        assert_eq!(everyday.catch_up().max_attempts(), 3, "0.0, 0.4, 0.8 on disk");
+        assert_eq!(
+            everyday.catch_up().max_attempts(),
+            3,
+            "0.0, 0.4, 0.8 on disk"
+        );
         // The uncapped preset is what the cap is measured against: six decodes
         // of the same window is what the disk pass used to allow itself.
         assert_eq!(everyday.max_attempts(), 6, "0.0, 0.2, … 1.0 uncapped");
+    }
+
+    /// The loop guard has to be on every lane, or a transcript full of
+    /// "ma è un po' figgito ma è un po' figgito" is what tells us months later
+    /// (2026-08-24).
+    #[test]
+    fn every_lane_carries_the_loop_guard_and_the_two_that_can_retry_have_a_ladder() {
+        let preset = default_preset().decode;
+        for (lane, params) in [
+            ("caption", preset.speculative()),
+            ("live final", preset.live_final()),
+            ("live final, behind", preset.live_final_degraded()),
+            ("disk", preset.catch_up()),
+        ] {
+            assert_eq!(
+                params.entropy_thold, LOOP_ENTROPY_THOLD,
+                "the {lane} lane lost the loop guard"
+            );
+        }
+        // A guard that catches a loop is only half of it: something has to
+        // decode the window again. Both lanes that write the transcript can.
+        assert_eq!(preset.live_final().max_attempts(), 2);
+        assert_eq!(preset.catch_up().max_attempts(), 3);
+        // The caption cannot, on purpose — it is replaced by the final either
+        // way, and a caption nobody waits for is not a caption.
+        assert_eq!(preset.speculative().max_attempts(), 1);
+    }
+
+    /// The silence gate, lane by lane. The direction of every one of these
+    /// numbers is load-bearing, so they are pinned rather than described.
+    #[test]
+    fn the_lanes_disagree_about_silence_exactly_where_they_are_meant_to() {
+        let preset = default_preset().decode;
+        let caption = preset.speculative();
+        let live = preset.live_final();
+        let disk = preset.catch_up();
+
+        // The caption is the quickest to call a window silence — but only by the
+        // half of the gate that means "the model heard no speech".
+        assert_eq!(caption.no_speech_thold, CAPTION_NO_SPEECH_THOLD);
+        assert!(caption.no_speech_thold < live.no_speech_thold);
+        // The other half is whisper.cpp's own, and stays there: the gate is an
+        // AND, and a bar inside the band real speech decodes at would blank a
+        // quiet participant's captions for the whole call rather than for the
+        // three seconds until the final replaces them.
+        assert_eq!(caption.logprob_thold, disk.logprob_thold);
+        assert!(caption.logprob_thold < live.logprob_thold);
+
+        // A live final asks a little more of itself than the disk pass, because
+        // what it drops the disk pass reads again.
+        assert_eq!(live.logprob_thold, LIVE_LOGPROB_THOLD);
+        assert!(live.logprob_thold > disk.logprob_thold);
+        assert_eq!(live.no_speech_thold, disk.no_speech_thold);
+
+        // The disk pass is the last chance these words have: whisper.cpp's own
+        // measured defaults, untouched.
+        assert_eq!(disk.logprob_thold, -1.0);
+        assert_eq!(disk.no_speech_thold, 0.6);
+
+        // The safety valve narrows the beam and nothing else.
+        let behind = preset.live_final_degraded();
+        assert_eq!(behind.logprob_thold, live.logprob_thold);
+        assert_eq!(behind.no_speech_thold, live.no_speech_thold);
     }
 
     // -----------------------------------------------------------------

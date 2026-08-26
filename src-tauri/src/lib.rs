@@ -40,7 +40,7 @@ use tauri::{AppHandle, Emitter, Listener, Manager, WindowEvent};
 
 use commands::AppState;
 use events::PanelState;
-use types::{CaptureStatus, TrayAction, TrayState};
+use types::{CaptureStatus, DetectionState, TrayAction, TrayState};
 
 /// Tray menu item ids. Also the ids the tray click handler matches on.
 mod tray_ids {
@@ -51,18 +51,35 @@ mod tray_ids {
     pub const QUIT: &str = "quit";
 }
 
-/// Three tray icons: waiting, a meeting seems to be happening, recording.
+/// Four tray icons: waiting, a meeting seems to be happening, recording, and
+/// still working on a meeting that has finished.
 const TRAY_ICON_IDLE: &[u8] = include_bytes!("../icons/tray-idle.png");
 const TRAY_ICON_DETECTED: &[u8] = include_bytes!("../icons/tray-detected.png");
 const TRAY_ICON_RECORDING: &[u8] = include_bytes!("../icons/tray-recording.png");
+const TRAY_ICON_PROCESSING: &[u8] = include_bytes!("../icons/tray-processing.png");
 
 /// The recording icon's pulse: the same mark with the dot breathing. Only ever
 /// on screen while something is being recorded (see [`panel::TrayAnimation`]).
-const TRAY_ICON_RECORDING_FRAMES: [&[u8]; panel::FRAME_COUNT] = [
+///
+/// `static` rather than `const` on purpose: the painter holds a
+/// `&'static [&'static [u8]]` into one of these sets, and a `const` is a value
+/// copied in wherever it is named, not a place to point at.
+static TRAY_ICON_RECORDING_FRAMES: [&[u8]; panel::FRAME_COUNT] = [
     include_bytes!("../icons/tray-recording-0.png"),
     include_bytes!("../icons/tray-recording-1.png"),
     include_bytes!("../icons/tray-recording-2.png"),
     include_bytes!("../icons/tray-recording-3.png"),
+];
+
+/// The working spinner: an arc travelling round Echo's dot, a quarter turn per
+/// frame. On screen only while a finished meeting still has work outstanding.
+/// Frame 0 is [`TRAY_ICON_PROCESSING`], so painting the state and painting the
+/// frames cannot disagree.
+static TRAY_ICON_PROCESSING_FRAMES: [&[u8]; panel::FRAME_COUNT] = [
+    include_bytes!("../icons/tray-processing-0.png"),
+    include_bytes!("../icons/tray-processing-1.png"),
+    include_bytes!("../icons/tray-processing-2.png"),
+    include_bytes!("../icons/tray-processing-3.png"),
 ];
 
 /// Flags the window handlers need synchronously, so they never await.
@@ -82,31 +99,102 @@ impl Default for UiFlags {
     }
 }
 
-/// Swap the tray icon. Called by the session and detection layers.
+/// Swap the tray icon and tell the UI what it now says. Called by the session
+/// and detection layers.
 pub fn set_tray_state(app: &AppHandle, state: TrayState) {
-    // The pulse only exists while the tray says "recording". Standing it down
-    // here as well as from the capture-state listener closes the one race worth
-    // caring about: a frame landing after the icon went back to idle would
-    // leave the menu bar claiming a recording that had finished.
-    if state != TrayState::Recording {
-        if let Some(animation) = app.try_state::<panel::TrayAnimation>() {
-            animation.stop();
+    schedule_tray_state(app, state);
+    let _ = app.emit(events::TRAY_STATE, events::TrayStatePayload { state });
+}
+
+/// Swap the tray icon and say nothing. The half of [`set_tray_state`] the event
+/// sink wants: it is already holding a `TrayState` event of its own to send, and
+/// sending it twice would be two of everything on the bus.
+///
+/// Never blocks and never panics — it sits on the path every event takes, and on
+/// 2026-08-24 one panic on that path stopped every event for the rest of a
+/// 35-minute meeting.
+pub fn schedule_tray_state(app: &AppHandle, state: TrayState) {
+    if let Some(animation) = app.try_state::<panel::TrayAnimation>() {
+        match state {
+            // The working spinner is the one animation capture cannot ask for:
+            // by the time it runs the recording is over, so the capture-state
+            // listener has already put the icon down. It is started from here,
+            // and only from here.
+            //
+            // Returning is the point of this arm. `apply` paints frame 0 on the
+            // way in and nothing at all when the spinner is already going, so a
+            // second "still working" — and there is one at every job edge —
+            // cannot yank the arc back to the top of its circle.
+            TrayState::Processing => {
+                animation.apply(
+                    panel::IconMotion::Working,
+                    Arc::new(panel::TrayPainter::new(
+                        app.clone(),
+                        &TRAY_ICON_PROCESSING_FRAMES,
+                    )),
+                );
+                return;
+            }
+            // The recording pulse belongs to the capture-state listener, which
+            // is the only thing that knows about pauses. All this has to do is
+            // make sure a working spinner is not still going round on top of a
+            // recording that has just started.
+            TrayState::Recording => {
+                if animation.motion() == panel::IconMotion::Working {
+                    animation.stop();
+                }
+            }
+            // The pulse only exists while the tray says "recording". Standing it
+            // down here as well as from the capture-state listener closes the
+            // one race worth caring about: a frame landing after the icon went
+            // back to idle would leave the menu bar claiming a recording that
+            // had finished, and nothing repaints until the tray state next
+            // changes.
+            //
+            // Stopping synchronously is necessary but not sufficient — aborting
+            // a timer does not reach into a tick that is already running, and
+            // that tick's frame can still be queued behind the paint below. So
+            // `stop` also retires the frames the old pulse has in flight (see
+            // [`panel::FrameToken`]), and the main thread drops them when it
+            // gets to them.
+            TrayState::Idle | TrayState::Detected => animation.stop(),
         }
     }
+    // The paint itself is an AppKit call, so it belongs on the main thread, and
+    // it is queued rather than waited on: whoever asked for this icon has a
+    // meeting to record and should not be parked behind a menu bar.
+    let handle = app.clone();
+    if app
+        .run_on_main_thread(move || paint_tray_state(&handle, state))
+        .is_err()
+    {
+        tracing::warn!(?state, "the menu bar icon could not be changed");
+    }
+}
+
+/// Put `state`'s icon on the tray. Main thread only.
+fn paint_tray_state(app: &AppHandle, state: TrayState) {
     let bytes = match state {
         TrayState::Idle => TRAY_ICON_IDLE,
         TrayState::Detected => TRAY_ICON_DETECTED,
         TrayState::Recording => TRAY_ICON_RECORDING,
+        TrayState::Processing => TRAY_ICON_PROCESSING,
     };
     paint_tray(app, bytes);
-    let _ = app.emit(events::TRAY_STATE, events::TrayStatePayload { state });
 }
 
-/// Paint one frame of the recording pulse. Deliberately quiet: the tray *state*
-/// has not changed, so no `TRAY_STATE` event goes out — twice a second of "still
-/// recording" would be noise on the bus.
-pub fn set_tray_frame(app: &AppHandle, frame: usize) {
-    paint_tray(app, TRAY_ICON_RECORDING_FRAMES[frame % panel::FRAME_COUNT]);
+/// Paint one frame of whichever animation is running — `frames` says which.
+/// Deliberately quiet: the tray *state* has not changed, so no `TRAY_STATE`
+/// event goes out — twice a second of "still recording" would be noise on the
+/// bus.
+///
+/// Main thread only; [`panel::TrayPainter`] is what gets it there, and it is
+/// what decides which set of frames this is.
+pub fn set_tray_frame(app: &AppHandle, frames: &[&[u8]], frame: usize) {
+    if frames.is_empty() {
+        return;
+    }
+    paint_tray(app, frames[frame % frames.len()]);
 }
 
 fn paint_tray(app: &AppHandle, bytes: &[u8]) {
@@ -321,7 +409,13 @@ fn on_capture_state(app: &AppHandle, status: CaptureStatus) {
     }
 
     if let Some(animation) = app.try_state::<panel::TrayAnimation>() {
-        animation.apply(motion, Arc::new(panel::TrayPainter::new(app.clone())));
+        animation.apply(
+            motion,
+            Arc::new(panel::TrayPainter::new(
+                app.clone(),
+                &TRAY_ICON_RECORDING_FRAMES,
+            )),
+        );
     }
 }
 
@@ -421,6 +515,17 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!(%error, "the meeting watcher could not start");
         }
 
+        // The tray rule needs to know whether a meeting is being detected, and
+        // the watcher is here rather than inside the session. Asked on every
+        // recompute, never mirrored: a copy of this would be one more thing that
+        // can be left saying yesterday's answer.
+        let handle = app.clone();
+        state.session.watch_detection(std::sync::Arc::new(move || {
+            handle
+                .try_state::<AppState>()
+                .is_some_and(|state| state.detect.status().state == DetectionState::Detected)
+        }));
+
         // Draining the jobs table, and the recovery scan that puts an
         // interrupted meeting in front of the person.
         let handle = app.clone();
@@ -483,7 +588,9 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn repo_requeue(db: &db::Db) -> u64 {
-    db::repo::requeue_orphaned_jobs(db).await.unwrap_or(0)
+    db::repo::requeue_orphaned_jobs(db, session::jobs::SETUP_INTERRUPTED)
+        .await
+        .unwrap_or(0)
 }
 
 /// Register or remove the login item. Returns what the operating system now

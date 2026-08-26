@@ -58,6 +58,7 @@
 //! journalled. [`spawn`] wires that up; [`spawn_with_captions`] is the seam the
 //! tests use to drive one task at a time.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -219,8 +220,33 @@ pub type CaptionFeed = mpsc::Receiver<OpenUtterance>;
 /// closes its own line; if the caption task happened to be showing a *different*
 /// line for that channel, this is how the speech task knows to retire it rather
 /// than leave it on screen for the rest of the meeting.
+///
+/// It also remembers the handful of lines that were **closed for good** — a
+/// stretch the capture layer measured as the microphone's copy of what the
+/// computer played. That is the one kind of closing a later caption can undo:
+/// captions decode on a task of their own, so one that was already in flight
+/// when the suppression arrived would land afterwards, on the same id, with
+/// `dropped: false` — putting the far side's words back on screen for the
+/// minute it takes the view to sweep them (`useTranscriptStream.ts`). Nothing
+/// else needs a memory like this, because everything else that closes a line is
+/// followed by text on the same id.
 #[derive(Debug, Default, Clone)]
-struct LiveLines(Arc<Mutex<Vec<Line>>>);
+struct LiveLines(Arc<Mutex<Register>>);
+
+/// How many suppressed lines are remembered.
+///
+/// A caption in flight and one snapshot waiting behind it, per channel, is four
+/// — and only a stretch that is *already* being captioned when it is suppressed
+/// can produce either. Eight is that with room to spare, and it is a ring
+/// rather than a set because the memory is only ever needed for as long as a
+/// decode takes.
+const SUPPRESSED_MEMORY: usize = 8;
+
+#[derive(Debug, Default)]
+struct Register {
+    open: Vec<Line>,
+    suppressed: VecDeque<String>,
+}
 
 /// A live line on screen, and the stretch of the meeting it covers.
 #[derive(Debug, Clone, PartialEq)]
@@ -232,28 +258,88 @@ struct Line {
 }
 
 impl LiveLines {
-    fn showing(&self, line: Line) {
-        let mut lines = self.0.lock().expect("live lines poisoned");
-        match lines.iter_mut().find(|open| open.channel == line.channel) {
-            Some(entry) => *entry = line,
-            None => lines.push(line),
+    /// Put a line on screen and emit it — **unless that stretch has been
+    /// suppressed**, in which case neither happens and this says so.
+    ///
+    /// `emit` runs while the register is locked, and that is the whole point of
+    /// the method existing. Checking a flag and then emitting would leave the
+    /// gap this closes: a suppression landing between the two would find
+    /// nothing on screen to close and the caption would arrive after it,
+    /// reopening a line nothing in the backend will ever close again. Under one
+    /// lock the two orderings are the only two there are — the caption goes out
+    /// first and [`LiveLines::suppress`] closes it, or the suppression is
+    /// recorded first and the caption never goes out.
+    fn show_unless_suppressed(&self, line: Line, emit: impl FnOnce()) -> bool {
+        let mut register = self.0.lock().expect("live lines poisoned");
+        if register.suppressed.iter().any(|id| *id == line.id) {
+            return false;
         }
+        register.show(line);
+        emit();
+        true
+    }
+
+    /// Retire this stretch's line for good and remember it.
+    ///
+    /// `close` is handed whatever *other* line the channel had open — a caption
+    /// that segmented the stretch differently, which nothing else would ever
+    /// close — and runs under the same lock, for the reason
+    /// [`LiveLines::show_unless_suppressed`] gives.
+    fn suppress(&self, id: &str, channel: Channel, close: impl FnOnce(Option<Line>)) {
+        let mut register = self.0.lock().expect("live lines poisoned");
+        register.suppressed.push_back(id.to_string());
+        while register.suppressed.len() > SUPPRESSED_MEMORY {
+            register.suppressed.pop_front();
+        }
+        let stale = register
+            .open
+            .iter()
+            .position(|open| open.channel == channel)
+            .map(|at| register.open.remove(at))
+            .filter(|line| line.id != id);
+        close(stale);
+    }
+
+    /// Has this stretch been closed for good? A cheap look, for the caption task
+    /// deciding whether a decode is worth paying for at all.
+    fn is_suppressed(&self, id: &str) -> bool {
+        let register = self.0.lock().expect("live lines poisoned");
+        register.suppressed.iter().any(|held| held == id)
     }
 
     /// Forget the line for this channel and say what it was.
     fn take(&self, channel: Channel) -> Option<Line> {
-        let mut lines = self.0.lock().expect("live lines poisoned");
-        let at = lines.iter().position(|open| open.channel == channel)?;
-        Some(lines.remove(at))
+        let mut register = self.0.lock().expect("live lines poisoned");
+        let at = register
+            .open
+            .iter()
+            .position(|open| open.channel == channel)?;
+        Some(register.open.remove(at))
     }
 
     fn drain(&self) -> Vec<Line> {
-        std::mem::take(&mut *self.0.lock().expect("live lines poisoned"))
+        std::mem::take(&mut self.0.lock().expect("live lines poisoned").open)
+    }
+}
+
+impl Register {
+    fn show(&mut self, line: Line) {
+        match self
+            .open
+            .iter_mut()
+            .find(|open| open.channel == line.channel)
+        {
+            Some(entry) => *entry = line,
+            None => self.open.push(line),
+        }
     }
 }
 
 /// The language this meeting has settled on, shared the same way: a caption
 /// borrows it rather than paying for a detection pass of its own.
+///
+/// A mirror of the engine's answer, never a decision of its own — see the note
+/// where it is written in [`transcribe`].
 #[derive(Debug, Default, Clone)]
 struct LiveLanguage(Arc<Mutex<Option<String>>>);
 
@@ -262,8 +348,15 @@ impl LiveLanguage {
         self.0.lock().expect("live language poisoned").clone()
     }
 
-    fn set(&self, language: &str) {
-        *self.0.lock().expect("live language poisoned") = Some(language.to_string());
+    /// Take this answer, and say whether it is news. A meeting that changes
+    /// language mid-way is news twice, which is why this is not "set once".
+    fn changed_to(&self, language: &str) -> bool {
+        let mut held = self.0.lock().expect("live language poisoned");
+        if held.as_deref() == Some(language) {
+            return false;
+        }
+        *held = Some(language.to_string());
+        true
     }
 }
 
@@ -314,8 +407,9 @@ pub(crate) fn spawn_with_captions(
     let feed_task = {
         let inner = inner.clone();
         let meeting_id = meeting_id.clone();
+        let lines = lines.clone();
         tokio::spawn(async move {
-            feed_loop(inner, meeting_id, feed, utterances_tx, snapshots).await;
+            feed_loop(inner, meeting_id, feed, utterances_tx, snapshots, lines).await;
             // The queue closing is what tells the speech task to drain; this is
             // what tells it *when* the drain started.
             let _ = over_tx.send(true);
@@ -692,6 +786,7 @@ async fn feed_loop(
     mut feed: CaptureFeed,
     utterances: mpsc::Sender<Utterance>,
     snapshots: Option<CaptionSender>,
+    lines: LiveLines,
 ) {
     let mut last_levels: Option<Instant> = None;
     let mut told_them_we_are_behind = false;
@@ -727,6 +822,78 @@ async fn feed_loop(
                     }
                     tracing::debug!("live text dropped an utterance; the audio is on disk");
                 }
+            }
+            CaptureSignal::UtteranceSuppressed {
+                channel,
+                t_start_ms,
+                t_end_ms,
+                evidence,
+            } => {
+                // These words are already going into the transcript from the
+                // computer's own side of the call, so there is nothing to
+                // decode: no engine, no queue.
+                //
+                // What *is* written is the decision itself — see
+                // [`remember_suppressed`]. Not text: a mark saying these
+                // seconds were heard and deliberately left alone, so the
+                // catch-up pass does not read them back and judge them a
+                // second time against audio it can align less well.
+                //
+                // `pending` is deliberately not touched. It counts utterances
+                // waiting for text, and a suppressed one never entered the
+                // bounded channel — nothing ever incremented it, so nothing may
+                // decrement it. Subtracting here would take the count below
+                // whatever is genuinely in flight, and it is an unsigned
+                // counter.
+                //
+                // What is owed is the half-written line on screen. Exactly the
+                // below-the-floor path's move: the id is a pure function of two
+                // fields this signal already carries, so no id has to be
+                // plumbed through capture to get here.
+                let id = live_line_id(channel, t_start_ms);
+                // Closed **for good**, which is what `suppress` adds over a
+                // plain `take`: a caption of this stretch may be decoding right
+                // now on the caption task, and it would land after this with
+                // the same id and `dropped: false` — the far side's words back
+                // on screen, on a line no final will ever arrive to replace,
+                // for the minute the view takes to sweep it. The register
+                // remembers the id so that caption is never shown, and the two
+                // closings below happen under the same lock so the caption
+                // cannot slip between them.
+                lines.suppress(&id, channel, |stale| {
+                    close_partial(&inner, &meeting_id, &id, channel, t_start_ms, t_end_ms);
+                    // …and whatever the caption task had open for this channel
+                    // goes with it. Without this, a caption that segmented the
+                    // stretch differently is a line nothing will ever close,
+                    // and it sits in the transcript for the rest of the
+                    // meeting.
+                    if let Some(stale) = stale {
+                        close_partial(
+                            &inner,
+                            &meeting_id,
+                            &stale.id,
+                            stale.channel,
+                            stale.t_start_ms,
+                            stale.t_end_ms,
+                        );
+                    }
+                });
+                remember_suppressed(
+                    &inner,
+                    &meeting_id,
+                    channel,
+                    t_start_ms,
+                    t_end_ms,
+                    &evidence,
+                )
+                .await;
+                tracing::debug!(
+                    ?channel,
+                    t_start_ms,
+                    t_end_ms,
+                    "this stretch is the computer's own audio coming back; the transcript \
+                     already has it from the other side"
+                );
             }
             CaptureSignal::SpeechSoFar(snapshot) => {
                 // A caption nobody has room for is a caption not worth having:
@@ -768,6 +935,53 @@ async fn feed_loop(
     }
     // Closing the channel is what tells the speech task to drain and stop.
     drop(utterances);
+}
+
+/// Write down that these seconds were heard and deliberately left without text.
+///
+/// The row is not a transcript row and it is not a deletion: it is the record
+/// of a decision, with the measurement that produced it, so the catch-up pass
+/// can subtract these seconds from its plan instead of re-deriving the verdict
+/// from audio it aligns less well (`migrations/0007_suppressed_spans.sql`).
+///
+/// **A failure here is not worth interrupting a meeting over.** Losing the row
+/// puts exactly one stretch back to the behaviour of before: catch-up reads it,
+/// judges it again, and usually agrees. So it is logged and the recording goes
+/// on — the same call [`journal`] makes about the meeting length, and the
+/// opposite of the call it makes about a chunk, which is audio and cannot be
+/// re-derived from anything.
+async fn remember_suppressed(
+    inner: &Arc<Inner>,
+    meeting_id: &str,
+    channel: Channel,
+    t_start_ms: i64,
+    t_end_ms: i64,
+    evidence: &crate::audio::bleed::BleedEvidence,
+) {
+    if let Err(error) = repo::record_suppressed_span(
+        &inner.db,
+        meeting_id,
+        &repo::SuppressedSpan {
+            channel,
+            t_start_ms,
+            t_end_ms,
+            reason: repo::SuppressionReason::Bleed,
+            decided_by: repo::DecidedBy::Live,
+            correlation: Some(evidence.correlation),
+            lag_ms: Some(evidence.lag_ms),
+            system_voice_ms: Some(evidence.system_voice_ms),
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            %error,
+            t_start_ms,
+            t_end_ms,
+            "could not write down that this stretch was left alone; it will be read \
+             back and judged again when the meeting ends"
+        );
+    }
 }
 
 /// Journal a chunk as committed. The writer has already flushed and fsynced it,
@@ -942,6 +1156,12 @@ async fn speech_loop(
     let mut failures = FailureRun::default();
     let mut carry = ContextCarry::default();
     let mut handoff = Handoff::default();
+    // The words Echo has been told about, read once as the meeting starts (see
+    // [`crate::asr::glossary`]). Once: this is a hot loop with a decode in it,
+    // and a word typed while a meeting is running is meant for the next one —
+    // the catch-up pass over this recording reads the list again anyway, so it
+    // still reaches this meeting's transcript in the end.
+    let glossary = crate::settings::glossary(&inner.db).await;
     // Whether the handshake with the disk pass has been answered yet.
     let mut answered_backlog = false;
 
@@ -1012,6 +1232,7 @@ async fn speech_loop(
             &mut speakers,
             &mut failures,
             &mut carry,
+            &glossary,
             &mut capture_over,
             &mut handoff,
             &stopping,
@@ -1128,6 +1349,7 @@ async fn transcribe(
     speakers: &mut SpeakerCache,
     failures: &mut FailureRun,
     carry: &mut ContextCarry,
+    glossary: &crate::asr::glossary::Glossary,
     capture_over: &mut tokio::sync::watch::Receiver<bool>,
     handoff: &mut Handoff,
     stopping: &AtomicBool,
@@ -1136,16 +1358,23 @@ async fn transcribe(
     let t_start_ms = utterance.t_start_ms;
     let t_end_ms = utterance.t_end_ms;
     let truncated = utterance.truncated;
+    // Read before the audio is handed to the engine: how much of this stretch
+    // the speech detector actually called speech is the second half of the test
+    // for a line silence talked the decoder into (see [`crate::asr::phantom`]).
+    let voiced_ms = utterance.measured_voice_ms();
     // The same line the captions were written on, so the final text replaces
     // them instead of appearing underneath them.
     let utterance_id = live_line_id(channel, t_start_ms);
     let hint = language.get();
     // Only across a forced cut, and only from the same channel in the same
     // language a moment earlier (codex §3 "Context and prompts").
-    let prompt = carry.prompt_for(channel, t_start_ms, hint.as_deref());
-    // The same words serve twice: as context going in, and as the thing the
-    // overlap at the front of this utterance is matched against coming out.
-    let carried = prompt.clone();
+    // The same tail serves twice — as context going in, and as the thing the
+    // overlap at the front of this utterance is matched against coming out —
+    // but not in the same wording: the prompt wants the spelling the transcript
+    // settled on, and the overlap has to be matched against what the engine
+    // actually wrote, because that is the alphabet this decode will arrive in.
+    let carried = carry.prompt_for(channel, t_start_ms, hint.as_deref());
+    let prompt = carried.as_ref().map(|tail| tail.words.clone());
 
     // What the captions were showing for this channel is this utterance's
     // business now, one way or another.
@@ -1175,11 +1404,20 @@ async fn transcribe(
         channel,
         t_start_ms,
         samples: utterance.samples,
-        language_hint: hint,
+        // No hint from here. Which language a meeting is in is the engine's
+        // decision, and it is the only place that sees enough of the meeting to
+        // make it — see [`crate::asr::language`] and the note above the mirror
+        // further down this function.
+        language_hint: None,
+        // The padding at both ends of an utterance is not evidence about the
+        // language; this is how much of it the detector called voice.
+        voiced_ms: Some(voiced_ms),
         want_partials: !captioned,
         // Live work gives way when the queue is full; the catch-up pass picks
         // this stretch up from disk instead (mantra 3).
         droppable: true,
+        // The meeting's own answer is exactly what a live utterance wants.
+        detect_afresh: false,
     };
     let on_partial = (!captioned).then(|| {
         partial_events(
@@ -1196,7 +1434,14 @@ async fn transcribe(
         inner,
         meeting_id,
         job,
-        DecodePlan::final_utterance().with_prompt(prompt),
+        // The vocabulary and the carried tail travel in the same slot, because
+        // they are the same thing: text Echo chose to put in front of this
+        // audio. This lane gets it and the caption lane does not — a caption is
+        // replaced within seconds by the final below, it is the cheapest and
+        // most latency-bound decode there is, and it is the one decoded as a
+        // single segment, which is where a prompt is most likely to be written
+        // back out into the text instead of read as context.
+        DecodePlan::final_utterance().with_prompt(glossary.context(prompt.as_deref())),
         on_partial,
         capture_over,
         handoff,
@@ -1272,12 +1517,28 @@ async fn transcribe(
     // one was cut through speech, this one restarted inside it and has just
     // re-read the last of its words; saying them twice is the artefact the
     // overlap trades a sliced word for, and this is where it is paid back.
-    let text = match carried.as_deref() {
-        Some(carried) => strip_overlap(transcription.text.trim(), carried),
+    let text = match carried.as_ref() {
+        Some(tail) => strip_overlap(transcription.text.trim(), &tail.heard),
         None => transcription.text.trim().to_string(),
     };
     let text = text.trim();
-    if text.is_empty() {
+    // Nothing but a stock courtesy phrase, over a stretch the detector found
+    // next to no voice in: the meeting of 2026-08-24 wrote "Grazie." twenty-six
+    // times this way, and once "Buonanotte." at half past ten in the morning.
+    // Both halves are required — a real "Grazie" carries several times this much
+    // voice and stays exactly where it is.
+    let phantom = crate::asr::phantom::is_phantom(text, voiced_ms);
+    if text.is_empty() || phantom {
+        if phantom {
+            tracing::debug!(
+                target: "echo::asr",
+                ?channel,
+                t_start_ms,
+                voiced_ms,
+                text,
+                "dropped a courtesy line the recording has no voice under"
+            );
+        }
         carry.forget(channel);
         close_partial(
             inner,
@@ -1290,14 +1551,47 @@ async fn transcribe(
         return None;
     }
 
-    if language.get().is_none() {
-        if let Some(detected) = transcription.language.clone() {
-            language.set(&detected);
-            if let Err(error) = repo::set_meeting_language(&inner.db, meeting_id, &detected).await {
+    // What language the meeting is in is not this line's decision.
+    //
+    // It used to be: whatever the first non-empty final came back as was written
+    // onto the meeting and passed as the hint for everything after it. On
+    // 2026-08-24 the first final was 2.3 seconds long and came back "Danish" at
+    // 0.522 confidence, and seventy-five minutes of Italian were written down as
+    // Danish — 880 segments and a recap — because from that moment on there was
+    // a hint, so nothing ever detected again.
+    //
+    // The engine gathers the evidence and decides (`crate::asr::language`); this
+    // only mirrors the answer, so the live view and the meeting row say what the
+    // engine settled on — including when it settles on something different
+    // halfway through, which is the whole point of asking again.
+    if let Some(settled) = inner.ports.asr.settled_language(meeting_id) {
+        if language.changed_to(&settled) {
+            if let Err(error) = repo::set_meeting_language(&inner.db, meeting_id, &settled).await {
                 tracing::debug!(%error, "could not store the meeting language");
             }
         }
     }
+
+    // Near misses against the words Echo was told about: "Nongula" and
+    // "sull'angolo" are Langola, and this is where they become it. After the
+    // phantom filter, so a line that is about to be thrown away is not repaired
+    // first; before the carry below, so the continuation of a cut sentence is
+    // prompted with the right spelling rather than the wrong one.
+    let heard = text;
+    let corrected = glossary.correct(text);
+    let (text, corrections) = match &corrected {
+        Some(fixed) => {
+            tracing::debug!(
+                target: "echo::asr",
+                ?channel,
+                t_start_ms,
+                changes = fixed.changes.len(),
+                "put right words the vocabulary knows"
+            );
+            (fixed.text.as_str(), fixed.changes.clone())
+        }
+        None => (text, Vec::new()),
+    };
 
     let speaker_id = channel_speaker(inner, meeting_id, channel, speakers).await;
     // What the engine actually read, never what we hoped it read
@@ -1308,7 +1602,7 @@ async fn transcribe(
     carry.remember(
         channel,
         truncated,
-        text,
+        Wordings { kept: text, heard },
         transcription.language.as_deref(),
         transcription.avg_confidence,
         span_end_ms,
@@ -1323,12 +1617,20 @@ async fn transcribe(
             channel,
             speaker_id,
             text: text.to_string(),
-            language: transcription.language,
+            // What these seconds were *heard* to be in, which is not the same
+            // as what they were read in: a stretch that inherited the meeting's
+            // answer records nothing, so the histogram this feeds is a set of
+            // observations and not a tally of the pin
+            // (`asr::Transcription::observed_language`). The carry above is a
+            // different question — it asks what the words were read in — so it
+            // keeps using the language itself.
+            language: transcription.observed_language(),
             avg_confidence: transcription.avg_confidence,
             revision: 1,
             is_final: true,
             model_name: transcription.model_name,
             model_revision: transcription.model_revision,
+            corrections,
         },
     ))
 }
@@ -1384,9 +1686,34 @@ struct ContextCarry {
     held: Vec<(Channel, Carry)>,
 }
 
+/// One finished line in both of its wordings.
+///
+/// They differ only where the vocabulary put a name right, and the carry needs
+/// each of them for a different job — see [`Carry`].
+#[derive(Debug, Clone, Copy)]
+struct Wordings<'a> {
+    /// The line as the transcript will keep it.
+    kept: &'a str,
+    /// The line as the engine wrote it.
+    heard: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Carry {
+    /// The tail as the transcript keeps it — the vocabulary already applied —
+    /// which is what the next decode is prompted with, so a name spelled right
+    /// once goes on being spelled right across the join.
     words: String,
+    /// The same tail exactly as the engine wrote it, before any repair.
+    ///
+    /// This is what the overlap at the front of the next utterance is matched
+    /// against, and it has to be the raw wording because the thing it is matched
+    /// *to* is raw: the continuation is a fresh decode of the same audio, and it
+    /// arrives before anything has been put right. Comparing a repaired tail
+    /// against a raw re-read finds no overlap at all — and the words most likely
+    /// to have been repaired are exactly the names a decoder stumbles over, so
+    /// the join would break precisely where this file works hardest.
+    heard: String,
     language: Option<String>,
     ends_at_ms: i64,
 }
@@ -1399,7 +1726,7 @@ impl ContextCarry {
         channel: Channel,
         starts_at_ms: i64,
         language: Option<&str>,
-    ) -> Option<String> {
+    ) -> Option<Carry> {
         let at = self.held.iter().position(|(c, _)| *c == channel)?;
         let (_, carry) = self.held.remove(at);
         // A pause, a lost source, a resumed recording: all of them show up here
@@ -1414,7 +1741,7 @@ impl ContextCarry {
                 return None;
             }
         }
-        Some(carry.words)
+        Some(carry)
     }
 
     /// Remember the tail of a final — or deliberately forget, which is most of
@@ -1423,7 +1750,7 @@ impl ContextCarry {
         &mut self,
         channel: Channel,
         truncated: bool,
-        text: &str,
+        line: Wordings<'_>,
         language: Option<&str>,
         confidence: Option<f32>,
         ends_at_ms: i64,
@@ -1433,18 +1760,19 @@ impl ContextCarry {
         // how whisper starts repeating itself.
         if !truncated
             || confidence.is_some_and(|c| c < CARRY_MIN_CONFIDENCE)
-            || looks_repetitive(text)
+            || looks_repetitive(line.kept)
         {
             self.forget(channel);
             return;
         }
-        let words = tail_words(text, CARRY_WORDS);
+        let words = tail_words(line.kept, CARRY_WORDS);
         if words.is_empty() {
             self.forget(channel);
             return;
         }
         let carry = Carry {
             words,
+            heard: tail_words(line.heard, CARRY_WORDS),
             language: language.map(str::to_string),
             ends_at_ms,
         };
@@ -1521,10 +1849,28 @@ fn tail_words(text: &str, count: usize) -> String {
     words[from..].join(" ")
 }
 
+/// Longest phrase a loop is looked for at.
+///
+/// Six words is about two seconds of speech. Beyond that a "repetition" is
+/// somebody making the same point twice, which is a thing people do.
+const LOOP_MAX_PHRASE_WORDS: usize = 6;
+
 /// Has this text already fallen into a loop?
 ///
 /// Feeding a repetition back in as context is how a stuck decoder stays stuck,
 /// so a piece that looks like one is not carried anywhere.
+///
+/// It used to look for one word three times or one *pair* three times, and that
+/// missed every loop the 2026-08-24 meeting actually produced: "ma è un po'
+/// figgito" three times over is a five-word phrase, and "secondo me secondo me
+/// … dobbiamo dobbiamo" is a two-word phrase whose repeats do not start on an
+/// even word boundary. So the phrase length is no longer assumed — anything
+/// from one word up to [`LOOP_MAX_PHRASE_WORDS`], repeated three times back to
+/// back, anywhere in the line.
+///
+/// Three repeats, not two: "sì, sì" and "no, no" are ordinary Italian, and a
+/// guard that ate them would silently drop the context across every second
+/// forced cut.
 fn looks_repetitive(text: &str) -> bool {
     let words: Vec<String> = text
         .split_whitespace()
@@ -1537,11 +1883,16 @@ fn looks_repetitive(text: &str) -> bool {
     if words.len() < 4 {
         return false;
     }
-    // The same word three times over, or the same pair of words three times.
-    words.windows(3).any(|w| w[0] == w[1] && w[1] == w[2])
-        || words
-            .windows(6)
-            .any(|w| w[0..2] == w[2..4] && w[2..4] == w[4..6])
+    for phrase in 1..=LOOP_MAX_PHRASE_WORDS.min(words.len() / 3) {
+        let run = phrase * 3;
+        if words
+            .windows(run)
+            .any(|w| w[..phrase] == w[phrase..phrase * 2] && w[..phrase] == w[phrase * 2..])
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1683,6 +2034,14 @@ async fn caption_loop(
         if !cadence.advanced(&snapshot) || snapshot.duration_ms() < CAPTION_MIN_MS {
             continue;
         }
+        // A look at a stretch that has since turned out to be the microphone's
+        // copy of what the computer played. [`LiveLines::show_unless_suppressed`]
+        // is what makes this safe; this is only what stops it costing a decode
+        // first. `Cadence` cannot do it: it gates repeat windows of an open
+        // stretch, and this one is closed for good.
+        if lines.is_suppressed(&live_line_id(snapshot.channel, snapshot.t_start_ms)) {
+            continue;
+        }
 
         let channel = snapshot.channel;
         let covers_to_ms = snapshot.window_end_ms();
@@ -1738,9 +2097,13 @@ async fn caption(
         // Whatever the meeting has settled on. A caption never pays for a
         // detection pass of its own.
         language_hint: language.get(),
+        // Speech that is still going: the detector has not finished measuring
+        // it, and a caption never votes on the language anyway.
+        voiced_ms: None,
         // The result *is* the partial; there is nothing to stream out of it.
         want_partials: false,
         droppable: true,
+        detect_afresh: false,
     };
 
     match inner
@@ -1754,26 +2117,44 @@ async fn caption(
             if text.is_empty() {
                 return;
             }
-            lines.showing(Line {
-                channel,
-                id: line.clone(),
-                t_start_ms,
-                t_end_ms,
-            });
-            inner
-                .ports
-                .events
-                .emit(UiEvent::TranscriptPartial(TranscriptPartialPayload {
-                    meeting_id: meeting_id.to_string(),
-                    utterance_id: line,
+            // Registered and emitted as one step, because this stretch may have
+            // been suppressed while the decode was running: these are the far
+            // side's own words coming back out of the microphone, already in
+            // the transcript from the cleaner copy, and putting them on screen
+            // now would undo the closing that took them off it. See
+            // [`LiveLines::show_unless_suppressed`].
+            let shown = lines.show_unless_suppressed(
+                Line {
+                    channel,
+                    id: line.clone(),
                     t_start_ms,
                     t_end_ms,
-                    channel,
-                    speaker_id: None,
-                    text: text.to_string(),
-                    language: transcription.language,
-                    dropped: false,
-                }));
+                },
+                || {
+                    inner
+                        .ports
+                        .events
+                        .emit(UiEvent::TranscriptPartial(TranscriptPartialPayload {
+                            meeting_id: meeting_id.to_string(),
+                            utterance_id: line.clone(),
+                            t_start_ms,
+                            t_end_ms,
+                            channel,
+                            speaker_id: None,
+                            text: text.to_string(),
+                            language: transcription.language.clone(),
+                            dropped: false,
+                        }));
+                },
+            );
+            if !shown {
+                tracing::debug!(
+                    ?channel,
+                    t_start_ms,
+                    "a caption of this stretch came back after it turned out to be the \
+                     computer's own audio; it is already in the transcript from the other side"
+                );
+            }
         }
         // A newer look at the same speech overtook this one, or there was no room
         // for it. Both are the queue working as intended.
@@ -1981,6 +2362,12 @@ fn segment_of(id: Id, draft: SegmentDraft) -> Segment {
         is_final: draft.is_final,
         model_name: draft.model_name,
         model_revision: draft.model_revision,
+        // A repair is not allowed to be invisible, and this is the payload the
+        // live view reads: dropping the list here left the dotted underline and
+        // its note off every line of a running meeting, and they appeared only
+        // if somebody reopened the transcript afterwards and it was re-read from
+        // the database.
+        corrections: draft.corrections,
     }
 }
 
@@ -2282,7 +2669,10 @@ mod tests {
         carry.remember(
             Channel::Mic,
             false,
-            "e quindi ci siamo",
+            Wordings {
+                kept: "e quindi ci siamo",
+                heard: "e quindi ci siamo",
+            },
             Some("it"),
             Some(0.9),
             8_000,
@@ -2293,7 +2683,10 @@ mod tests {
         carry.remember(
             Channel::Mic,
             true,
-            "allora il punto principale della riunione è",
+            Wordings {
+                kept: "allora il punto principale della riunione è",
+                heard: "allora il punto principale della riunione è",
+            },
             Some("it"),
             Some(0.9),
             28_000,
@@ -2301,9 +2694,44 @@ mod tests {
         let prompt = carry
             .prompt_for(Channel::Mic, 28_000, Some("it"))
             .expect("the continuation of a cut sentence gets its context");
-        assert!(prompt.ends_with("riunione è"));
+        assert!(prompt.words.ends_with("riunione è"));
         // Consumed: it can never resurface later in the meeting.
         assert!(carry.prompt_for(Channel::Mic, 28_000, Some("it")).is_none());
+    }
+
+    /// The tail is carried twice over, and the two copies are not the same
+    /// words.
+    ///
+    /// The prompt gets the spelling the transcript settled on, so the
+    /// continuation is nudged towards the right name. The overlap matcher gets
+    /// what the engine actually wrote, because the continuation it is compared
+    /// against is a raw decode: a repaired tail and a raw re-read share no
+    /// words, so the join would silently stop working — and it would stop
+    /// working on exactly the lines a name was repaired in.
+    #[test]
+    fn the_overlap_is_matched_against_what_the_engine_wrote_not_what_was_stored() {
+        let mut carry = ContextCarry::default();
+        carry.remember(
+            Channel::Mic,
+            true,
+            Wordings {
+                kept: "e quindi usiamo Langola",
+                heard: "e quindi usiamo Nongula",
+            },
+            Some("it"),
+            Some(0.9),
+            28_000,
+        );
+        let tail = carry
+            .prompt_for(Channel::Mic, 28_000, Some("it"))
+            .expect("a cut sentence carries");
+        assert!(tail.words.ends_with("usiamo Langola"));
+        assert!(tail.heard.ends_with("usiamo Nongula"));
+        // And the re-read of the overlap, which arrives raw, is stripped.
+        assert_eq!(
+            strip_overlap("usiamo Nongula per i dati", &tail.heard),
+            "per i dati"
+        );
     }
 
     #[test]
@@ -2312,7 +2740,10 @@ mod tests {
             carry.remember(
                 Channel::Mic,
                 true,
-                "e il secondo punto invece",
+                Wordings {
+                    kept: "e il secondo punto invece",
+                    heard: "e il secondo punto invece",
+                },
                 Some("it"),
                 Some(0.9),
                 28_000,
@@ -2344,7 +2775,10 @@ mod tests {
         carry.remember(
             Channel::Mic,
             true,
-            "forse qualcosa cosi",
+            Wordings {
+                kept: "forse qualcosa cosi",
+                heard: "forse qualcosa cosi",
+            },
             Some("it"),
             Some(0.2),
             28_000,
@@ -2356,7 +2790,10 @@ mod tests {
         carry.remember(
             Channel::Mic,
             true,
-            "sì sì sì sì",
+            Wordings {
+                kept: "sì sì sì sì",
+                heard: "sì sì sì sì",
+            },
             Some("it"),
             Some(0.95),
             28_000,
@@ -2369,7 +2806,10 @@ mod tests {
         carry.remember(
             Channel::Mic,
             true,
-            "e il secondo punto invece",
+            Wordings {
+                kept: "e il secondo punto invece",
+                heard: "e il secondo punto invece",
+            },
             None,
             None,
             28_000,
@@ -2396,6 +2836,566 @@ mod tests {
         assert!(looks_repetitive("e poi e poi e poi basta"));
         assert!(!looks_repetitive("allora il punto principale è questo"));
         assert!(!looks_repetitive("sì sì"), "twice is emphasis, not a loop");
+    }
+
+    /// The three loops the 2026-08-24 meeting actually produced. Not one of them
+    /// was caught by the old guard, which only knew about single words and
+    /// even-aligned pairs.
+    #[test]
+    fn the_loops_of_the_twenty_fourth_are_recognised() {
+        assert!(
+            looks_repetitive("ma è un po' figgito ma è un po' figgito ma è un po' figgito"),
+            "a five-word phrase three times over is a loop"
+        );
+        assert!(
+            looks_repetitive("Cambiarlo se se cambiarlo se possiamo se possiamo se possiamo"),
+            "the repeat does not have to start on an even word"
+        );
+        assert!(looks_repetitive(
+            "secondo me secondo me secondo me dobbiamo dobbiamo"
+        ));
+        // And the sentences a meeting is made of are still left alone.
+        assert!(!looks_repetitive(
+            "possiamo cambiarlo se vuoi, ma secondo me va bene così"
+        ));
+        assert!(
+            !looks_repetitive("il punto è il punto di partenza"),
+            "a phrase said twice is somebody making a point"
+        );
+        assert!(
+            !looks_repetitive("uno due tre uno due tre"),
+            "twice is not a loop, at any phrase length"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The microphone's copy of what the computer played
+    // -----------------------------------------------------------------------
+
+    /// The two things this signal owes: **the half-written line goes away**, and
+    /// **the decision is written down.**
+    ///
+    /// Without the first, a mic line that was suppressed sits in the transcript
+    /// with no text and no end for the rest of the meeting — a worse transcript
+    /// than the duplicated line suppression exists to remove. Without the
+    /// second, the catch-up pass reads the same seconds back and judges them
+    /// again, which is the defect of 2026-08-26: six stretches decided live,
+    /// five of them decided the same way offline, and one duplicate in the
+    /// finished transcript.
+    ///
+    /// And the three things it must *not* do: no engine, no line of transcript,
+    /// and no arithmetic on a count it never took part in.
+    #[tokio::test]
+    async fn a_suppressed_stretch_closes_its_line_and_writes_down_the_decision() {
+        let h = crate::session::mock::Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+
+        // One ordinary utterance either side, so this is a suppression in the
+        // middle of a meeting rather than a meeting made of one signal.
+        h.capture
+            .send(crate::session::ports::CaptureSignal::UtteranceReady(
+                Utterance {
+                    channel: Channel::Mic,
+                    t_start_ms: 0,
+                    t_end_ms: 2_000,
+                    samples: vec![0.0; 32_000],
+                    truncated: false,
+                    voiced_ms: 1_800,
+                },
+            ));
+        h.capture
+            .send(crate::session::ports::CaptureSignal::UtteranceSuppressed {
+                channel: Channel::Mic,
+                t_start_ms: 4_000,
+                t_end_ms: 12_000,
+                evidence: crate::audio::bleed::BleedEvidence {
+                    correlation: 0.86,
+                    lag_ms: 210,
+                    system_voice_ms: 6_400,
+                    unexplained_ms: 0,
+                    span_ms: 8_000,
+                },
+            });
+        h.settle().await;
+
+        let closed: Vec<_> = h
+            .events
+            .partials()
+            .into_iter()
+            .filter(|partial| partial.dropped)
+            .collect();
+        assert_eq!(closed.len(), 1, "exactly one line was retired");
+        let closed = &closed[0];
+        assert_eq!(
+            closed.utterance_id,
+            live_line_id(Channel::Mic, 4_000),
+            "the line closed has to be the one the captions were written on, or \
+             the half-written one stays on screen and a different one vanishes"
+        );
+        assert_eq!((closed.t_start_ms, closed.t_end_ms), (4_000, 12_000));
+        assert_eq!(closed.channel, Channel::Mic);
+        assert!(closed.text.is_empty());
+
+        // The engine was never asked, so the second copy cost nothing at all.
+        assert_eq!(
+            h.asr.calls(),
+            1,
+            "only the ordinary utterance reached the engine"
+        );
+        // …and the count of what is waiting for text is the ordinary
+        // utterance's alone. A suppressed one never entered the queue, so a
+        // decrement here would have wrapped an unsigned counter.
+        assert_eq!(h.session.status().await.pending_utterances, 0);
+
+        h.commit_chunk(&id, 0, 13_000).await;
+        // Stopping is what flushes the finals, so this reads the transcript a
+        // person is actually left with.
+        h.session.stop().await.unwrap();
+        let written = repo::get_segments(
+            &h.db,
+            &crate::types::TranscriptQuery {
+                meeting_id: id.clone(),
+                include_partial: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            written.len(),
+            1,
+            "the suppressed stretch must not be in the transcript in any form"
+        );
+        assert_eq!((written[0].t_start_ms, written[0].t_end_ms), (0, 2_000));
+
+        // What *is* written is the decision, with the measurement behind it.
+        // This is the promise that changed on 2026-08-26: suppression used to
+        // write nothing at all, and the catch-up pass therefore read the same
+        // seconds back and judged them a second time — five times out of six it
+        // agreed, and the sixth became the duplicate line this row exists to
+        // prevent.
+        let marks = repo::list_suppressed_spans(&h.db, &id).await.unwrap();
+        assert_eq!(marks.len(), 1, "one decision, one row");
+        assert_eq!(
+            (marks[0].channel, marks[0].t_start_ms, marks[0].t_end_ms),
+            (Channel::Mic, 4_000, 12_000),
+            "the row covers exactly the seconds that were left alone"
+        );
+        assert_eq!(marks[0].reason, repo::SuppressionReason::Bleed);
+        assert_eq!(
+            marks[0].decided_by,
+            repo::DecidedBy::Live,
+            "which pass decided is the first thing anybody will ask"
+        );
+        // …and the evidence, so a person reading this database later can see
+        // why those seconds have no words rather than guess.
+        assert_eq!(marks[0].correlation, Some(0.86));
+        assert_eq!(marks[0].lag_ms, Some(210));
+        assert_eq!(marks[0].system_voice_ms, Some(6_400));
+    }
+
+    /// The other half of retiring that line: **it has to stay retired.**
+    ///
+    /// A caption of the same stretch is decoded on a task of its own, so one
+    /// that was in flight when the suppression arrived lands afterwards — same
+    /// id, `dropped: false`, the far side's words back on screen on a line no
+    /// final will ever come to replace. Both orderings are asserted here,
+    /// because the whole reason the emit happens inside the register's lock is
+    /// that there are exactly two of them.
+    #[test]
+    fn a_caption_of_a_suppressed_stretch_never_puts_the_words_back() {
+        let lines = LiveLines::default();
+        let id = live_line_id(Channel::Mic, 4_000);
+        let caption = || Line {
+            channel: Channel::Mic,
+            id: id.clone(),
+            t_start_ms: 4_000,
+            t_end_ms: 12_000,
+        };
+
+        // Ordering one: the caption came back first. It goes on screen, and the
+        // suppression is what closes it — the line it closes is its own.
+        let mut shown = 0;
+        assert!(lines.show_unless_suppressed(caption(), || shown += 1));
+        assert_eq!(shown, 1);
+        let mut stale_closed = 0;
+        lines.suppress(&id, Channel::Mic, |stale| {
+            assert!(
+                stale.is_none(),
+                "the caption was on this very line; closing it twice would be a \
+                 second dropped event for a line already gone"
+            );
+            stale_closed += 1;
+        });
+        assert_eq!(stale_closed, 1, "the suppression always closes something");
+
+        // Ordering two: the suppression got there first, and the caption lands
+        // after it. Nothing is emitted and nothing is registered — a line the
+        // speech task would otherwise find open and retire all over again, or
+        // never find at all.
+        let mut shown_after = 0;
+        assert!(!lines.show_unless_suppressed(caption(), || shown_after += 1));
+        assert_eq!(
+            shown_after, 0,
+            "the far side's words went back on screen after the line was closed for good"
+        );
+        assert!(
+            lines.take(Channel::Mic).is_none(),
+            "a suppressed stretch was registered as the channel's open line"
+        );
+        // …and the caption task can see it early enough not to pay for the
+        // decode at all — a snapshot of this stretch queued behind the one in
+        // flight is dropped rather than decoded.
+        assert!(lines.is_suppressed(&id));
+
+        // Only that stretch. The next thing the person says is an ordinary line
+        // on an ordinary channel.
+        let next = Line {
+            channel: Channel::Mic,
+            id: live_line_id(Channel::Mic, 13_000),
+            t_start_ms: 13_000,
+            t_end_ms: 15_000,
+        };
+        assert!(!lines.is_suppressed(&next.id));
+        let mut shown_next = 0;
+        assert!(lines.show_unless_suppressed(next.clone(), || shown_next += 1));
+        assert_eq!(shown_next, 1);
+        assert_eq!(lines.take(Channel::Mic), Some(next));
+    }
+
+    /// A caption that segmented the stretch differently is the case the
+    /// suppression has to close *as well as* its own line — and it is handed to
+    /// the closing under the same lock, so nothing can put it back either.
+    #[test]
+    fn a_suppression_retires_a_caption_that_ran_to_a_different_line() {
+        let lines = LiveLines::default();
+        let captioned = Line {
+            channel: Channel::Mic,
+            id: live_line_id(Channel::Mic, 3_600),
+            t_start_ms: 3_600,
+            t_end_ms: 11_000,
+        };
+        assert!(lines.show_unless_suppressed(captioned.clone(), || {}));
+
+        let id = live_line_id(Channel::Mic, 4_000);
+        let mut closed = Vec::new();
+        lines.suppress(&id, Channel::Mic, |stale| closed.push(stale));
+        assert_eq!(
+            closed,
+            vec![Some(captioned)],
+            "a caption on a different line than the suppressed stretch is a line \
+             nothing else will ever close"
+        );
+
+        // The register is empty and the memory is short: a meeting full of
+        // copies must not accumulate ids for its whole length.
+        assert!(lines.take(Channel::Mic).is_none());
+        for later in 0..SUPPRESSED_MEMORY as i64 + 1 {
+            lines.suppress(
+                &live_line_id(Channel::Mic, (20 + later) * 1_000),
+                Channel::Mic,
+                |_| {},
+            );
+        }
+        assert!(
+            !lines.is_suppressed(&id),
+            "the oldest suppressed line is forgotten once nothing can still be decoding it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Silence that came back as words (2026-08-24)
+    // -----------------------------------------------------------------------
+
+    /// One meeting, one utterance, one answer from the engine — and what the
+    /// transcript ends up holding.
+    ///
+    /// `voiced_ms` out of a 1200 ms stretch is the whole difference between the
+    /// two outcomes these tests are about.
+    async fn what_gets_written(said: &str, voiced_ms: i64) -> Vec<String> {
+        let h = crate::session::mock::Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        h.asr.says(said);
+        h.capture
+            .send(crate::session::ports::CaptureSignal::UtteranceReady(
+                Utterance {
+                    channel: Channel::Mic,
+                    t_start_ms: 200,
+                    t_end_ms: 1_400,
+                    samples: vec![0.0; 19_200],
+                    truncated: false,
+                    voiced_ms,
+                },
+            ));
+        h.settle().await;
+        h.commit_chunk(&id, 0, 1_500).await;
+        // Stopping is what flushes the batch of finals to the database, so this
+        // reads the transcript a person would actually be left with.
+        h.session.stop().await.unwrap();
+        repo::get_segments(
+            &h.db,
+            &crate::types::TranscriptQuery {
+                meeting_id: id.clone(),
+                include_partial: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.text)
+        .collect()
+    }
+
+    /// The 2026-08-24 transcript said "Grazie." twenty-six times over dead air.
+    #[tokio::test]
+    async fn a_lone_grazie_over_near_silence_is_not_written_down() {
+        // One cough's worth of voice in 1200 ms.
+        assert!(what_gets_written("Grazie.", 96).await.is_empty());
+        assert!(what_gets_written("Buonanotte.", 96).await.is_empty());
+        assert!(what_gets_written("Ciao ciao", 64).await.is_empty());
+        assert!(
+            what_gets_written("Sottotitoli e revisione a cura di QTSS", 96)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// The other half of the rule, which is what makes it safe to have at all.
+    #[tokio::test]
+    async fn the_same_word_over_real_speech_stays_in_the_transcript() {
+        // Somebody really said it: 600 ms of voice in a 1200 ms stretch.
+        assert_eq!(what_gets_written("Grazie.", 600).await, vec!["Grazie."]);
+        // And the quiet version of the same thing: a soft-spoken "Grazie." the
+        // far-field detector only marked 224 ms of. Judged as a *share* of the
+        // stretch it would be 0.19 and gone — which is what the padding every
+        // mic utterance carries does to a share, and why the bar is a duration
+        // (see [`crate::asr::phantom::TOO_LITTLE_VOICE_MS`]).
+        assert_eq!(what_gets_written("Grazie.", 224).await, vec!["Grazie."]);
+        // And a sentence that merely contains it is never this filter's
+        // business, however quiet the stretch was.
+        assert_eq!(
+            what_gets_written("Grazie, allora vediamo domani.", 96).await,
+            vec!["Grazie, allora vediamo domani."]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // What language the meeting is in (2026-08-24)
+    // -----------------------------------------------------------------------
+
+    /// One utterance, one answer from the engine, and what the meeting row is
+    /// left saying about the language.
+    async fn language_after(settles_on: Option<&str>) -> Option<String> {
+        let h = crate::session::mock::Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        if let Some(language) = settles_on {
+            h.asr.settles_on(&id, language);
+        }
+        h.capture
+            .send(crate::session::ports::CaptureSignal::UtteranceReady(
+                Utterance {
+                    channel: Channel::Mic,
+                    t_start_ms: 200,
+                    t_end_ms: 2_500,
+                    samples: vec![0.0; 36_800],
+                    truncated: false,
+                    voiced_ms: 2_300,
+                },
+            ));
+        h.settle().await;
+        // Read while the meeting is still going: this is about what the live
+        // pass decides. What the disk pass makes of the finished transcript is
+        // a different question, and a later one.
+        repo::get_meeting(&h.db, &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .language
+    }
+
+    /// The 2026-08-24 meeting, from the outside. The first final came back with
+    /// a language on it — as every final does — and that used to be the end of
+    /// the argument: the meeting was pinned to it and nothing detected again.
+    /// A 2.3-second "sì" made seventy-five minutes of Italian Danish.
+    #[tokio::test]
+    async fn the_first_line_back_does_not_pin_the_meeting_language() {
+        assert_eq!(
+            language_after(None).await,
+            None,
+            "the engine has not settled on anything, so neither has the meeting"
+        );
+    }
+
+    /// And what does decide it: the engine, once it has heard enough to say so.
+    #[tokio::test]
+    async fn the_meeting_takes_the_language_the_engine_settled_on() {
+        assert_eq!(language_after(Some("it")).await.as_deref(), Some("it"));
+    }
+
+    /// People code-switch, so the answer is allowed to change while the meeting
+    /// is still going — and the row has to follow it, or the recap is written in
+    /// the language of the first ten minutes.
+    #[tokio::test]
+    async fn a_meeting_that_changes_language_changes_the_row_with_it() {
+        let h = crate::session::mock::Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        let said = |at: i64| {
+            h.capture
+                .send(crate::session::ports::CaptureSignal::UtteranceReady(
+                    Utterance {
+                        channel: Channel::Mic,
+                        t_start_ms: at,
+                        t_end_ms: at + 2_000,
+                        samples: vec![0.0; 32_000],
+                        truncated: false,
+                        voiced_ms: 1_800,
+                    },
+                ));
+        };
+
+        h.asr.settles_on(&id, "it");
+        said(200);
+        h.settle().await;
+        assert_eq!(
+            repo::get_meeting(&h.db, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .language
+                .as_deref(),
+            Some("it")
+        );
+
+        h.asr.settles_on(&id, "en");
+        said(10_000);
+        h.settle().await;
+        assert_eq!(
+            repo::get_meeting(&h.db, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .language
+                .as_deref(),
+            Some("en"),
+            "the meeting followed the language the engine moved to"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Words Echo should know (2026-08-24)
+    // -----------------------------------------------------------------------
+
+    /// The live lane end to end: the words go in front of the audio, and what
+    /// still comes back as "Nongula" is written down as "Langola" — with the
+    /// change recorded on the row, because this is text somebody reads as the
+    /// record of what was said.
+    #[tokio::test]
+    async fn a_live_final_is_prompted_with_the_words_and_the_line_is_put_right() {
+        let h = crate::session::mock::Harness::new().await;
+        crate::settings::add_word_to_know(&h.db, "Langola")
+            .await
+            .unwrap();
+        let id = h.session.start(Default::default()).await.unwrap();
+        h.asr.says("Allora Nongula è quello che usiamo.");
+        h.capture
+            .send(crate::session::ports::CaptureSignal::UtteranceReady(
+                Utterance {
+                    channel: Channel::Mic,
+                    t_start_ms: 200,
+                    t_end_ms: 1_400,
+                    samples: vec![0.0; 19_200],
+                    truncated: false,
+                    voiced_ms: 600,
+                },
+            ));
+        h.settle().await;
+        h.commit_chunk(&id, 0, 1_500).await;
+        h.session.stop().await.unwrap();
+
+        let rows = repo::get_segments(
+            &h.db,
+            &crate::types::TranscriptQuery {
+                meeting_id: id.clone(),
+                include_partial: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row = rows.first().expect("the utterance was written down");
+        assert_eq!(row.text, "Allora Langola è quello che usiamo.");
+        assert_eq!(
+            row.corrections,
+            vec![crate::types::Correction {
+                from: "Nongula".into(),
+                to: "Langola".into()
+            }]
+        );
+
+        let plans = h.asr.live_plans();
+        assert!(
+            plans
+                .iter()
+                .any(|(kind, prompt)| *kind == crate::asr::engine::JobKind::Final
+                    && prompt.as_deref() == Some("Langola.")),
+            "the lane whose text is kept was told the words: {plans:?}"
+        );
+        // …and the caption lane never is, whether or not this meeting produced
+        // one: a caption is replaced within seconds, it is the decode with the
+        // least time to spare, and it is the one asked for a single segment —
+        // which is where a prompt is likeliest to come back out as text.
+        assert!(
+            plans
+                .iter()
+                .filter(|(kind, _)| kind.is_speculative())
+                .all(|(_, prompt)| prompt.is_none()),
+            "a caption was given the vocabulary: {plans:?}"
+        );
+    }
+
+    /// With nothing in the list, the live pass decodes and writes exactly what
+    /// it did before any of this existed.
+    #[tokio::test]
+    async fn with_nothing_in_the_list_a_live_meeting_is_untouched() {
+        let h = crate::session::mock::Harness::new().await;
+        let id = h.session.start(Default::default()).await.unwrap();
+        h.asr.says("Allora Nongula è quello che usiamo.");
+        h.capture
+            .send(crate::session::ports::CaptureSignal::UtteranceReady(
+                Utterance {
+                    channel: Channel::Mic,
+                    t_start_ms: 200,
+                    t_end_ms: 1_400,
+                    samples: vec![0.0; 19_200],
+                    truncated: false,
+                    voiced_ms: 600,
+                },
+            ));
+        h.settle().await;
+        h.commit_chunk(&id, 0, 1_500).await;
+        h.session.stop().await.unwrap();
+
+        let rows = repo::get_segments(
+            &h.db,
+            &crate::types::TranscriptQuery {
+                meeting_id: id.clone(),
+                include_partial: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row = rows.first().expect("the utterance was written down");
+        assert_eq!(row.text, "Allora Nongula è quello che usiamo.");
+        assert!(row.corrections.is_empty());
+        assert!(
+            h.asr
+                .live_plans()
+                .iter()
+                .all(|(_, prompt)| prompt.is_none()),
+            "nothing goes in front of the audio"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2531,7 +3531,12 @@ mod tests {
             Ok(vec![0.2; samples as usize])
         }
 
-        fn open_stream(&self, _detector: Option<&std::path::Path>, channel: Channel) -> FakeStream {
+        fn open_stream(
+            &self,
+            _detector: Option<&std::path::Path>,
+            channel: Channel,
+            _listening: crate::audio::vad::Listening,
+        ) -> FakeStream {
             FakeStream { channel }
         }
     }
@@ -2550,6 +3555,7 @@ mod tests {
                 t_end_ms: t_start_ms + duration,
                 samples,
                 truncated: false,
+                voiced_ms: duration,
             }])
         }
 
@@ -2565,7 +3571,11 @@ mod tests {
     }
 
     impl crate::asr::catchup::Transcriber for Recorder {
-        async fn transcribe(&self, job: TranscribeJob) -> Result<Transcription, AsrError> {
+        async fn transcribe(
+            &self,
+            job: TranscribeJob,
+            _prompt: Option<String>,
+        ) -> Result<Transcription, AsrError> {
             let span = (job.t_start_ms, job.t_end_ms());
             self.asked.lock().expect("recorder").push(span);
             Ok(Transcription {
@@ -2615,6 +3625,7 @@ mod tests {
                 is_final: true,
                 model_name: Some("test".into()),
                 model_revision: Some("1".into()),
+                corrections: Vec::new(),
             },
         )
         .await

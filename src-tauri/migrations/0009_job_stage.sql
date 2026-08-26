@@ -1,0 +1,56 @@
+-- The stage a job is in is a fact about the job, so it lives on the job.
+--
+-- ## What was wrong
+--
+-- A job's stage — the one-time setup, the only stage there is — existed
+-- nowhere but in a single `JOB_PROGRESS` event, announced once, at the moment
+-- the stage began. Nothing stored it and nothing could ask for it afterwards.
+--
+-- That is survivable for a stage that begins while somebody is watching. It is
+-- not survivable for this one. The setup job is queued at launch, the job
+-- runner is started while the window is still loading, and the announcement
+-- goes out before a single screen is listening. Then the machine spends up to
+-- a quarter of an hour compiling the speech engine for itself with the corner
+-- pill absent, Settings saying Echo is ready, and nothing anywhere on screen
+-- admitting that the thing a person is about to record a meeting with is not
+-- available yet. If they start that meeting they pay the wait inside it — the
+-- exact failure of 2026-08-24 that the setup job was written to prevent.
+--
+-- The same hole showed on any Meeting screen opened after the announcement: it
+-- drew the job's own name over a bar at 0%, because the stage that would have
+-- corrected both had already been and gone.
+--
+-- ## So: one nullable column, and the row is the answer
+--
+-- `phase` holds the stage the job is in *right now*, or NULL for the ordinary
+-- case of a job that has no stage worth naming. Any screen mounting at any
+-- moment reads the row and draws what is true, instead of drawing what it
+-- happens to have overheard.
+--
+-- ## A stale stage would be a worse lie than no stage
+--
+-- The stage says "this is happening now", so it may never outlive the moment
+-- it describes. Two rules keep that true, both in `db::repo`:
+--
+--   * every write that changes a job's status clears it — starting, finishing,
+--     failing, being cancelled, being parked for a recording, being put back in
+--     the queue at launch. A row that is not running is not in a stage.
+--   * the first honest fraction a job reports after a stage clears it too
+--     (`session::jobs::Progress`). The catch-up job waits for the engine and
+--     then gets on with its own work; the stage is over at the moment the
+--     numbers start again.
+--
+-- A crash is covered by the first rule: `requeue_orphaned_jobs` rewrites the
+-- status of every row left mid-flight, and clears the stage in the same
+-- statement, so no stage can survive a launch.
+--
+-- ## Safe on a database that already has rows
+--
+-- A plain nullable column with no default. Every existing row gets NULL, which
+-- reads as "no stage", which is what every one of them is — the column did not
+-- exist while they ran. No backfill, and a job in flight over the upgrade keeps
+-- its status and its progress.
+--
+-- No new index. The column is only ever read alongside the row it belongs to,
+-- by id or by the status queries `idx_jobs_status` already serves.
+ALTER TABLE jobs ADD COLUMN phase TEXT;

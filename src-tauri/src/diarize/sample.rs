@@ -84,12 +84,49 @@ impl Pick {
 /// observation in it however many rows it has.
 pub const MIN_SPACING_MS: i64 = 10_000;
 
-/// The candidate segments of one voice, best first.
+/// How short a clip may be and still be worth *playing back*.
+///
+/// Strictly a playback floor: [`MIN_CLIP_MS`] is what a clip must be before it
+/// is worth teaching a profile from, and that bar does not move. But somebody
+/// who said one short word-group under their name still deserves to hear which
+/// voice the row belongs to, and four hundred milliseconds answers "is this
+/// Priya or Tom" better than an error does. Never used for learning.
+pub const PLAYABLE_CLIP_MS: i64 = 400;
+
+/// How far the sliding clip window moves per step when placing a cut inside an
+/// overlapped stretch. A quarter second is far finer than any real overlap
+/// boundary and keeps the search trivially cheap.
+const PLACEMENT_STEP_MS: i64 = 250;
+
+/// Where everybody else is talking: `(channel, from_ms, to_ms)` for every final
+/// attributed stretch that does not belong to `theirs`.
+///
+/// This is what "alone" is judged against, here and in [`ranked_candidates`] —
+/// per channel, because someone on the far end talking while the person at the
+/// keyboard talks is on a different recording and cannot be heard in this one.
+fn busy_intervals(segments: &[Segment], theirs: &BTreeSet<String>) -> Vec<(Channel, i64, i64)> {
+    segments
+        .iter()
+        .filter(|s| s.is_final && s.t_end_ms > s.t_start_ms)
+        .filter(|s| {
+            !s.speaker_id
+                .as_deref()
+                .is_some_and(|id| theirs.contains(id))
+        })
+        .map(|s| (s.channel, s.t_start_ms, s.t_end_ms))
+        .collect()
+}
+
+/// The candidate segments of one voice at least `min_ms` long, best first.
 ///
 /// "Best" is the ordering [`pick_window`] has always used: alone beats
 /// overlapped, longer beats shorter, more confident beats less, and the earliest
 /// of equals wins so the same meeting always answers the same way.
-fn ranked_candidates<'a>(segments: &'a [Segment], theirs: &BTreeSet<String>) -> Vec<&'a Segment> {
+fn ranked_candidates_at_least<'a>(
+    segments: &'a [Segment],
+    theirs: &BTreeSet<String>,
+    min_ms: i64,
+) -> Vec<&'a Segment> {
     let final_with_speaker = |s: &&Segment| -> bool {
         s.is_final && s.speaker_id.is_some() && s.t_end_ms > s.t_start_ms
     };
@@ -99,20 +136,14 @@ fn ranked_candidates<'a>(segments: &'a [Segment], theirs: &BTreeSet<String>) -> 
             .is_some_and(|id| theirs.contains(id))
     };
 
-    let others: Vec<&Segment> = segments
-        .iter()
-        .filter(final_with_speaker)
-        .filter(|s| !is_theirs(s))
-        .collect();
+    let busy = busy_intervals(segments, theirs);
 
     // "Alone" is judged per channel: someone on the far end talking at the same
     // time as the person at the keyboard is on a different recording and cannot
     // be heard in this one.
     let alone = |s: &Segment| -> bool {
-        !others.iter().any(|other| {
-            other.channel == s.channel
-                && other.t_start_ms < s.t_end_ms
-                && other.t_end_ms > s.t_start_ms
+        !busy.iter().any(|(channel, start, end)| {
+            *channel == s.channel && *start < s.t_end_ms && *end > s.t_start_ms
         })
     };
 
@@ -120,7 +151,7 @@ fn ranked_candidates<'a>(segments: &'a [Segment], theirs: &BTreeSet<String>) -> 
         .iter()
         .filter(final_with_speaker)
         .filter(|s| is_theirs(s))
-        .filter(|s| s.t_end_ms - s.t_start_ms >= MIN_CLIP_MS)
+        .filter(|s| s.t_end_ms - s.t_start_ms >= min_ms)
         .collect();
     out.sort_by_key(|s| {
         std::cmp::Reverse((
@@ -133,16 +164,52 @@ fn ranked_candidates<'a>(segments: &'a [Segment], theirs: &BTreeSet<String>) -> 
     out
 }
 
-/// The one moment to cut, or `None` when this person never talks alone for long
+/// Why there is no moment of this voice to hand over.
+///
+/// Two different answers, and they matter to the person asking. "No clear
+/// moment" means Echo looked through this voice's lines and none of them is a
+/// long enough stretch of them talking alone — a fact about how the meeting
+/// went. [`DiarizeError::NoLines`] means there were no lines to look through:
+/// the row exists but nothing in the transcript is on it, which on 2026-08-24
+/// was every third and fourth speaker of a meeting forced to four people.
+/// Saying "no clear moment" for that sends somebody looking for a recording
+/// fault that is not there.
+///
+/// Called only once the answer is already known to be no.
+pub fn why_no_moment(segments: &[Segment], theirs: &BTreeSet<String>) -> DiarizeError {
+    let has_lines = segments.iter().any(|s| {
+        s.is_final
+            && s.speaker_id
+                .as_deref()
+                .is_some_and(|id| theirs.contains(id))
+    });
+    if has_lines {
+        DiarizeError::NoVoiceSample
+    } else {
+        DiarizeError::NoLines
+    }
+}
+
+/// The one moment to cut, or `None` when this person never talks for long
 /// enough to be worth hearing.
 ///
 /// `theirs` is every speaker id that resolves to this person, merges included.
 /// `segments` is the whole meeting, not just theirs — the other people's
-/// segments are what "alone" is judged against.
+/// segments are what "alone" is judged against, and what a clip dodges inside
+/// an overlapped stretch ([`window_within`]).
 pub fn pick_window(segments: &[Segment], theirs: &BTreeSet<String>) -> Option<Pick> {
-    ranked_candidates(segments, theirs)
+    pick_window_at_least(segments, theirs, MIN_CLIP_MS)
+}
+
+fn pick_window_at_least(
+    segments: &[Segment],
+    theirs: &BTreeSet<String>,
+    min_ms: i64,
+) -> Option<Pick> {
+    let busy = busy_intervals(segments, theirs);
+    ranked_candidates_at_least(segments, theirs, min_ms)
         .first()
-        .map(|best| window_within(best))
+        .map(|best| window_within(best, &busy))
 }
 
 /// Up to `max` moments of this voice, chosen to be *different* moments.
@@ -174,13 +241,14 @@ pub fn pick_windows(segments: &[Segment], theirs: &BTreeSet<String>, max: usize)
         seg: &'a Segment,
         max: usize,
         spacing: i64,
+        busy: &[(Channel, i64, i64)],
         picked: &mut Vec<Pick>,
         taken: &mut Vec<&'a str>,
     ) {
         if picked.len() >= max || taken.contains(&seg.id.as_str()) {
             return;
         }
-        let window = window_within(seg);
+        let window = window_within(seg, busy);
         let crowded = picked
             .iter()
             .any(|p| p.channel == window.channel && (p.from_ms - window.from_ms).abs() < spacing);
@@ -191,25 +259,33 @@ pub fn pick_windows(segments: &[Segment], theirs: &BTreeSet<String>, max: usize)
         taken.push(seg.id.as_str());
     }
 
-    let ranked = ranked_candidates(segments, theirs);
+    let ranked = ranked_candidates_at_least(segments, theirs, MIN_CLIP_MS);
+    let busy = busy_intervals(segments, theirs);
     let mut picked: Vec<Pick> = Vec::new();
     let mut taken: Vec<&str> = Vec::new();
 
     for channel in [Channel::Mic, Channel::System] {
         if let Some(best) = ranked.iter().find(|s| s.channel == channel) {
-            take(best, max, MIN_SPACING_MS, &mut picked, &mut taken);
+            take(best, max, MIN_SPACING_MS, &busy, &mut picked, &mut taken);
         }
     }
     for spacing in [MIN_SPACING_MS, 0] {
         for seg in &ranked {
-            take(seg, max, spacing, &mut picked, &mut taken);
+            take(seg, max, spacing, &busy, &mut picked, &mut taken);
         }
     }
     picked
 }
 
-/// The middle of a stretch, minus its opening, capped at [`CLIP_MS`].
-fn window_within(segment: &Segment) -> Pick {
+/// Where to cut inside one stretch.
+///
+/// A short stretch is taken whole (minus its opening); a long one is placed by
+/// what the clip will contain. In a stretch nobody talks over, that is the
+/// middle, where a sentence is at its most sentence-like. In an overlapped
+/// stretch the window slides across and lands where the most of [`CLIP_MS`] is
+/// this person alone — there is no point teaching or playing a profile clip
+/// half full of somebody else when a cleaner quarter of the same turn exists.
+fn window_within(segment: &Segment, busy: &[(Channel, i64, i64)]) -> Pick {
     let lead_in = if segment.t_end_ms - segment.t_start_ms > LEAD_IN_MS + MIN_CLIP_MS {
         LEAD_IN_MS
     } else {
@@ -228,14 +304,41 @@ fn window_within(segment: &Segment) -> Pick {
         };
     }
 
-    // Long enough to choose within: sit the clip in the middle, where a
-    // sentence is at its most sentence-like.
+    // How much of [a, b) is free of everybody else on this channel.
+    let solo_ms = |a: i64, b: i64| -> i64 {
+        let covered = busy
+            .iter()
+            .filter(|(channel, s, e)| *channel == segment.channel && *s < b && *e > a)
+            .map(|(_, s, e)| b.min(*e) - a.max(*s))
+            .sum::<i64>();
+        (CLIP_MS - covered).max(0)
+    };
+
+    // Slide across the stretch. The untouched-stretch answer — centred — is
+    // where the search starts, and among equally clean windows the one nearest
+    // it wins; the tail-aligned window is always considered too, because the
+    // step grid can miss the one place the overlap ends exactly.
     let middle = (from + segment.t_end_ms) / 2;
-    let from_ms = (middle - CLIP_MS / 2).max(from);
+    let last_start = segment.t_end_ms - CLIP_MS;
+    let ideal_start = (middle - CLIP_MS / 2).clamp(from, last_start);
+    let mut best_from = ideal_start;
+    let mut best_solo = solo_ms(best_from, best_from + CLIP_MS);
+    // Every step-grid window, plus the tail-aligned one the grid can miss.
+    for candidate in (from..=last_start)
+        .step_by(PLACEMENT_STEP_MS as usize)
+        .chain(std::iter::once(last_start))
+    {
+        let solo = solo_ms(candidate, candidate + CLIP_MS);
+        let nearer = (candidate - ideal_start).abs() < (best_from - ideal_start).abs();
+        if solo > best_solo || (solo == best_solo && nearer) {
+            best_solo = solo;
+            best_from = candidate;
+        }
+    }
     Pick {
         channel: segment.channel,
-        from_ms,
-        to_ms: from_ms + CLIP_MS,
+        from_ms: best_from,
+        to_ms: best_from + CLIP_MS,
     }
 }
 
@@ -379,12 +482,7 @@ pub async fn clips_for(
         pcm.release();
     }
     // Back into the order they were asked for, so "the best moment" stays first.
-    out.sort_by_key(|(pick, _)| {
-        picks
-            .iter()
-            .position(|p| p == pick)
-            .unwrap_or(usize::MAX)
-    });
+    out.sort_by_key(|(pick, _)| picks.iter().position(|p| p == pick).unwrap_or(usize::MAX));
     Ok(out)
 }
 
@@ -453,8 +551,15 @@ pub async fn speaker_sample(
     .await
     .map_err(|e| DiarizeError::Failed(e.to_string()))?;
 
-    let Some(pick) = pick_window(&segments, &theirs) else {
-        return Err(DiarizeError::NoVoiceSample);
+    // Playback may go shorter than a profile clip: somebody who said one short
+    // thing under their name still deserves to hear the voice. The learning
+    // path keeps the strict floor; this is only ever a listen.
+    let pick = match pick_window(&segments, &theirs) {
+        Some(pick) => pick,
+        None => match pick_window_at_least(&segments, &theirs, PLAYABLE_CLIP_MS) {
+            Some(pick) => pick,
+            None => return Err(why_no_moment(&segments, &theirs)),
+        },
     };
 
     let chunks = repo::list_chunks(db, meeting_id, Some(pick.channel))
@@ -511,6 +616,7 @@ mod tests {
             is_final: true,
             model_name: None,
             model_revision: None,
+            corrections: Vec::new(),
         }
     }
 
@@ -608,6 +714,35 @@ mod tests {
         let pick = pick_window(&segments, &theirs(&["s1"])).unwrap();
         assert_eq!(pick.from_ms, LEAD_IN_MS);
         assert_eq!(pick.to_ms, 3_000);
+    }
+
+    /// A long stretch with somebody over part of it places the clip where the
+    /// most of it is this person alone, rather than blindly in the middle.
+    #[test]
+    fn an_overlapped_stretch_places_the_clip_where_the_voice_is_alone() {
+        let segments = vec![
+            // Twenty-four seconds of s1; s2 talks over the middle ten.
+            segment("a", "s1", Channel::Mic, 8_000, 32_000),
+            segment("b", "s2", Channel::Mic, 14_000, 24_000),
+        ];
+        let pick = pick_window(&segments, &theirs(&["s1"])).unwrap();
+        let overlaps_s2 = pick.to_ms > 14_000 && pick.from_ms < 24_000;
+        assert!(
+            !overlaps_s2,
+            "eight clean seconds exist on the right; got {pick:?}"
+        );
+    }
+
+    /// Playback may go shorter than a profile clip: one short line under the
+    /// name is still something to listen to.
+    #[test]
+    fn playback_falls_back_to_a_shorter_moment_than_learning_takes() {
+        let segments = vec![segment("a", "s1", Channel::Mic, 0, 500)];
+        assert_eq!(pick_window(&segments, &theirs(&["s1"])), None);
+        let pick =
+            pick_window_at_least(&segments, &theirs(&["s1"]), PLAYABLE_CLIP_MS).expect("playable");
+        assert_eq!(pick.from_ms, 0);
+        assert_eq!(pick.to_ms, 500);
     }
 
     #[test]
@@ -870,8 +1005,13 @@ mod tests {
         assert!(matches!(err, DiarizeError::AudioForgotten), "{err:?}");
     }
 
+    /// A row with no line of transcript on it says *that*, not "no clear
+    /// moment". The pass stopped making rows like this on 2026-08-24, but a
+    /// meeting from before it, or a rename, can still leave one — and telling
+    /// somebody there is no clear moment of a voice that never said anything
+    /// sends them hunting for a recording fault that is not there.
     #[tokio::test]
-    async fn a_speaker_nobody_has_ever_heard_is_turned_down_politely() {
+    async fn a_speaker_nobody_has_ever_heard_says_it_has_no_lines() {
         let dir = tempfile::tempdir().unwrap();
         let (db, meeting_id, _) = meeting_with_one_voice(dir.path(), true).await;
         let silent = repo::upsert_speaker(&db, &meeting_id, "speaker-02", "Speaker 2", false)
@@ -881,7 +1021,57 @@ mod tests {
         let err = speaker_sample(&db, &meeting_id, &silent.id)
             .await
             .expect_err("nothing is attributed to this speaker");
-        assert!(matches!(err, DiarizeError::NoVoiceSample), "{err:?}");
+        assert!(matches!(err, DiarizeError::NoLines), "{err:?}");
+    }
+
+    /// The other half, and the reason the two are told apart: this voice does
+    /// have lines, they are just all too short to recognise anybody *from*.
+    /// Learning still refuses — a profile built on a syllable teaches nothing —
+    /// but playback steps down to [`PLAYABLE_CLIP_MS`], because four hundred
+    /// milliseconds of somebody's voice tells a person whose row this is.
+    #[tokio::test]
+    async fn a_speaker_who_only_ever_says_a_syllable_can_still_be_heard_but_not_learned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, meeting_id, _) = meeting_with_one_voice(dir.path(), true).await;
+        let brief = repo::upsert_speaker(&db, &meeting_id, "speaker-02", "Speaker 2", false)
+            .await
+            .unwrap();
+        repo::insert_segments(
+            &db,
+            &[SegmentDraft {
+                meeting_id: meeting_id.clone(),
+                t_start_ms: 41_000,
+                t_end_ms: 41_000 + MIN_CLIP_MS - 100,
+                channel: Channel::Mic,
+                speaker_id: Some(brief.id.clone()),
+                text: "mm".into(),
+                revision: 1,
+                is_final: true,
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+
+        let theirs = theirs(&[&brief.id]);
+        let segments = repo::get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: meeting_id.clone(),
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Nothing at the learning floor...
+        assert_eq!(pick_window(&segments, &theirs), None);
+        // ...but playback hands over something listenable.
+        let clip = speaker_sample(&db, &meeting_id, &brief.id)
+            .await
+            .expect("a short line is still worth hearing");
+        assert!(clip.starts_with("UklGR"), "a wav, playable: {clip:?}");
     }
 
     // -- keeping several moments, for a profile ----------------------------
@@ -991,7 +1181,12 @@ mod tests {
             },
         ];
         let clips = clips_for(&db, &meeting_id, &picks).await.unwrap();
-        assert_eq!(clips.len(), 2, "{:?}", clips.iter().map(|c| c.0).collect::<Vec<_>>());
+        assert_eq!(
+            clips.len(),
+            2,
+            "{:?}",
+            clips.iter().map(|c| c.0).collect::<Vec<_>>()
+        );
         assert_eq!(clips[0].0, picks[0]);
         assert_eq!(clips[1].0, picks[1]);
         let expected = (6_000 * TARGET_SAMPLE_RATE as usize) / 1_000;
@@ -1007,7 +1202,10 @@ mod tests {
             from_ms: 12_000,
             to_ms: 18_000,
         }];
-        assert!(clips_for(&db, &meeting_id, &picks).await.unwrap().is_empty());
+        assert!(clips_for(&db, &meeting_id, &picks)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

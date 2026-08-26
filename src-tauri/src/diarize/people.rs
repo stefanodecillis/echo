@@ -520,7 +520,10 @@ pub fn match_remaining(cut: &mut super::pipeline::ScanCut, enrolment: &Enrolment
         }
     }
     for (track, found) in decided {
-        if best_for.get(found.person_id()).is_some_and(|(t, _)| *t == track) {
+        if best_for
+            .get(found.person_id())
+            .is_some_and(|(t, _)| *t == track)
+        {
             if let Some(slot) = cut.matches.get_mut(track) {
                 *slot = Some(found);
             }
@@ -541,9 +544,11 @@ pub struct Enrolled {
 #[derive(Debug, Clone, Default)]
 pub struct Enrolment {
     pub people: Vec<Enrolled>,
-    /// Profiles whose numbers were computed by a different network, so comparing
-    /// them would be meaningless. They are skipped silently and reported through
-    /// [`PersonInfo::needs_refresh`] (DESIGN §1).
+    /// Remembered voices that are **not** being matched at the moment and could
+    /// be: their numbers came from a different network, or they have no profile
+    /// at all. They are skipped silently and reported through
+    /// [`PersonInfo::needs_refresh`] (DESIGN §1). Non-zero is what makes the
+    /// pass run [`refresh_profiles`] before it counts anybody.
     pub stale: usize,
 }
 
@@ -586,15 +591,28 @@ pub async fn embedder_tag(db: &Db, path: &Path) -> String {
 }
 
 /// Everybody whose profile was computed by the network now in use.
+///
+/// `stale` is asked of the **people**, not of the profile rows. A voice with no
+/// profile at all is exactly as unmatched as one whose numbers came from another
+/// network, and [`merge`] makes that state on purpose every time it drops a
+/// centroid rather than average two networks together. Counting only mismatched
+/// rows left the merge survivor invisible to the one thing that repairs it — the
+/// gate in [`super::pipeline`] that runs [`refresh_profiles`] when this is
+/// non-zero — so Settings said Echo was refreshing while nothing ever was.
+///
+/// So this is [`repo::list_person_infos`]'s own `needs_refresh`, the field the
+/// person reads, narrowed to the people a refresh can actually put back:
+/// re-fingerprinting works off kept clips, and somebody with no samples left
+/// (see `a_person_with_nothing_usable_left_stops_being_matched`) would otherwise
+/// hold the gate open forever — a model loaded on every pass to finish no work.
 pub async fn enrolled(db: &Db, embedder_tag: &str) -> Result<Enrolment, DiarizeError> {
     let profiles = repo::list_person_profiles(db).await.map_err(failed)?;
     let mut out = Enrolment::default();
     for profile in profiles {
-        if profile.centroid.is_empty() || profile.sample_count == 0 {
-            continue;
-        }
-        if profile.embedder_asset_id != embedder_tag {
-            out.stale += 1;
+        if profile.centroid.is_empty()
+            || profile.sample_count == 0
+            || profile.embedder_asset_id != embedder_tag
+        {
             continue;
         }
         out.people.push(Enrolled {
@@ -603,6 +621,12 @@ pub async fn enrolled(db: &Db, embedder_tag: &str) -> Result<Enrolment, DiarizeE
             centroid: profile.centroid,
         });
     }
+    out.stale = repo::list_person_infos(db, embedder_tag)
+        .await
+        .map_err(failed)?
+        .into_iter()
+        .filter(|person| person.needs_refresh && person.sample_count > 0)
+        .count();
     Ok(out)
 }
 
@@ -757,7 +781,10 @@ pub async fn learn_from_confirmation(
 
     let picks = sample::pick_windows(&segments, &theirs, SAMPLES_PER_CONFIRMATION);
     if picks.is_empty() {
-        return Err(DiarizeError::NoVoiceSample);
+        // A voice with no lines at all and a voice with no clear moment in its
+        // lines are different answers to the person; `why_no_moment` owns the
+        // distinction.
+        return Err(sample::why_no_moment(&segments, &theirs));
     }
     let clips = sample::clips_for(db, meeting_id, &picks).await?;
     if clips.is_empty() {
@@ -978,7 +1005,11 @@ pub fn choose_evictions(samples: &[SampleFacts], keep: usize) -> Vec<Id> {
 /// Order matters: outliers go first, because a mislabelled sample is *also* an
 /// unusually well-spread one and would survive the cap on exactly the grounds
 /// that make it wrong.
-pub async fn curate(db: &Db, person_id: &str, embedder_tag: &str) -> Result<Curation, DiarizeError> {
+pub async fn curate(
+    db: &Db,
+    person_id: &str,
+    embedder_tag: &str,
+) -> Result<Curation, DiarizeError> {
     let rows = repo::list_person_samples(db, person_id)
         .await
         .map_err(failed)?;
@@ -1015,7 +1046,9 @@ pub async fn curate(db: &Db, person_id: &str, embedder_tag: &str) -> Result<Cura
 
     doomed.extend(outliers.iter().cloned());
     doomed.extend(evicted.iter().cloned());
-    repo::delete_person_samples(db, &doomed).await.map_err(failed)?;
+    repo::delete_person_samples(db, &doomed)
+        .await
+        .map_err(failed)?;
 
     let kept: Vec<&SampleFacts> = surviving
         .iter()
@@ -1030,15 +1063,9 @@ pub async fn curate(db: &Db, person_id: &str, embedder_tag: &str) -> Result<Cura
             .map_err(failed)?;
     } else {
         let centroid = centroid_of(kept.iter().map(|f| f.embedding.as_slice()));
-        repo::upsert_person_profile(
-            db,
-            person_id,
-            &centroid,
-            kept.len() as u32,
-            embedder_tag,
-        )
-        .await
-        .map_err(failed)?;
+        repo::upsert_person_profile(db, person_id, &centroid, kept.len() as u32, embedder_tag)
+            .await
+            .map_err(failed)?;
     }
 
     Ok(Curation {
@@ -1375,16 +1402,182 @@ pub async fn link(
             .map_err(failed)?;
         return Ok(());
     };
-    let person = repo::get_person(db, person_id)
+    // Through the merges, not straight at the row: a window opened before two
+    // names were made one still sends the old id, and the person it means is
+    // whoever that name is now.
+    let person = repo::resolve_person(db, person_id)
         .await
         .map_err(failed)?
         .ok_or_else(|| DiarizeError::Failed("Echo does not remember that voice".into()))?;
 
-    attach(db, &speaker, person_id, &person.name).await?;
-    if let Err(error) = learn_from_confirmation(db, meeting_id, speaker_id, person_id).await {
+    attach(db, &speaker, &person.id, &person.name).await?;
+    if let Err(error) = learn_from_confirmation(db, meeting_id, speaker_id, &person.id).await {
         tracing::debug!(%error, "linked a voice there was nothing new to learn from");
     }
     Ok(())
+}
+
+/// What became of a voice when two names were made one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceAfterMerge {
+    /// Nothing about the surviving voice changed: the merged name had no samples
+    /// to give it.
+    Unchanged,
+    /// The two sets of samples were measured by the same network, so they were
+    /// curated into one profile here and now. `kept` is how many samples the
+    /// surviving voice is described by.
+    Recomputed { kept: usize },
+    /// The samples arrived but their numbers were not comparable with the
+    /// survivor's, so the profile was dropped rather than averaged across two
+    /// different spaces. The person is reported as needing a refresh — which is
+    /// true — and [`refresh_profiles`] re-fingerprints every kept clip and puts
+    /// them back in service without anybody being asked anything.
+    ///
+    /// What makes that automatic rather than a promise: a person with no profile
+    /// counts towards [`Enrolment::stale`], which is the gate the pass checks
+    /// before it counts anybody, so the next meeting's pass rebuilds this voice
+    /// before it tries to recognise it.
+    NeedsRefresh,
+}
+
+/// What one merge did, for the log line and for the tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Merged {
+    /// False when the two were already one person. Nothing was written.
+    pub merged: bool,
+    pub samples_moved: u64,
+    pub speakers_relinked: u64,
+    pub voice: VoiceAfterMerge,
+}
+
+/// "These two are the same person": make one remembered voice out of two.
+///
+/// The same voice gets enrolled twice — once from a call, once from the room —
+/// and until now the only way to tidy that up was to delete one of them, which
+/// destroyed that half of the voice: its samples, its clips, and the ability to
+/// re-fingerprint it when the network changes. This keeps both halves.
+///
+/// [`repo::merge_people`] moves the samples and the links and records the merge;
+/// this half owns the one thing that layer cannot decide — **which network the
+/// numbers belong to**:
+///
+/// * Both sides measured by the same network → the samples are one set and
+///   [`curate`] makes one profile out of them, outliers and near-duplicates
+///   dropped exactly as a confirmation would. The surviving voice describes both
+///   from the moment this returns.
+/// * Anything else — one side never fingerprinted, or fingerprinted by a
+///   different network — → the survivor's profile is **dropped**, not averaged.
+///   Two centroids from two networks describe geometries neither one has been
+///   in (`0004_known_people.sql`), and a blend of them matches nobody. Settings
+///   then says this person needs a refresh, and the ordinary refresh re-embeds
+///   every kept clip and rebuilds the profile from the union.
+///
+/// **Not reversible.** The identity is: the merged name keeps its row pointing
+/// at the survivor. The voice is not: curating one set out of two deletes the
+/// samples it does not keep, and that deletion is what makes the survivor one
+/// voice rather than two. Ask before calling this.
+///
+/// Meetings are left exactly as they read. Speaker rows are re-pointed at the
+/// survivor, but the names on them were copied there when the link was made and
+/// stay as plain text — the same rule [`link`], [`super::rename`] and
+/// `delete_person` all follow, and for the same reason: a meeting somebody has
+/// already read does not rewrite itself.
+///
+/// Safe to call twice, in either order: the second call finds the two already
+/// one person and writes nothing.
+pub async fn merge(db: &Db, keep_id: &str, merge_id: &str) -> Result<Merged, DiarizeError> {
+    // Read both tags while both profile rows still exist — the merge deletes one
+    // of them, and after that there is no way to tell what space its numbers
+    // were in.
+    let keep_root = root_of(db, keep_id).await?;
+    let merge_root = root_of(db, merge_id).await?;
+    if keep_root == merge_root {
+        // Already one person — a second click, or a name somebody's other window
+        // merged a moment ago. Nothing to write and nothing to say.
+        return Ok(Merged {
+            merged: false,
+            samples_moved: 0,
+            speakers_relinked: 0,
+            voice: VoiceAfterMerge::Unchanged,
+        });
+    }
+    let keep_tag = profile_tag(db, &keep_root).await?;
+    let merge_tag = profile_tag(db, &merge_root).await?;
+
+    let moved = repo::merge_people(db, &keep_root, &merge_root)
+        .await
+        .map_err(|e| match e {
+            crate::db::DbError::Invalid(why) => DiarizeError::CannotMerge(why),
+            other => failed(other),
+        })?;
+    if !moved.merged {
+        return Ok(Merged {
+            merged: false,
+            samples_moved: 0,
+            speakers_relinked: 0,
+            voice: VoiceAfterMerge::Unchanged,
+        });
+    }
+
+    let voice = if moved.samples_moved == 0 {
+        VoiceAfterMerge::Unchanged
+    } else if keep_tag.is_some() && keep_tag == merge_tag {
+        let tag = keep_tag.clone().unwrap_or_default();
+        match curate(db, &keep_root, &tag).await {
+            Ok(curation) => VoiceAfterMerge::Recomputed {
+                kept: curation.kept,
+            },
+            Err(error) => {
+                // The merge itself has landed. Leaving a centroid that now
+                // describes the wrong set of samples would be worse than saying
+                // the voice needs looking at again, which is true and repairs
+                // itself the next time the refresh runs.
+                tracing::warn!(%error, "made one voice out of two but could not rebuild its profile");
+                repo::delete_person_profile(db, &keep_root)
+                    .await
+                    .map_err(failed)?;
+                VoiceAfterMerge::NeedsRefresh
+            }
+        }
+    } else {
+        repo::delete_person_profile(db, &keep_root)
+            .await
+            .map_err(failed)?;
+        VoiceAfterMerge::NeedsRefresh
+    };
+
+    tracing::info!(
+        samples_moved = moved.samples_moved,
+        speakers_relinked = moved.speakers_relinked,
+        suggestions_relinked = moved.suggestions_relinked,
+        aliases_flattened = moved.aliases_flattened,
+        voice = ?voice,
+        "made one remembered voice out of two"
+    );
+    Ok(Merged {
+        merged: true,
+        samples_moved: moved.samples_moved,
+        speakers_relinked: moved.speakers_relinked,
+        voice,
+    })
+}
+
+/// The id this name is kept under now, refusing a name Echo has never heard of.
+async fn root_of(db: &Db, person_id: &str) -> Result<Id, DiarizeError> {
+    repo::resolve_person(db, person_id)
+        .await
+        .map_err(failed)?
+        .map(|p| p.id)
+        .ok_or_else(|| DiarizeError::Failed("Echo does not remember that voice".into()))
+}
+
+/// Which network this person's numbers were measured by, if they have any.
+async fn profile_tag(db: &Db, person_id: &str) -> Result<Option<String>, DiarizeError> {
+    Ok(repo::person_profile(db, person_id)
+        .await
+        .map_err(failed)?
+        .filter(|p| !p.centroid.is_empty() && p.sample_count > 0)
+        .map(|p| p.embedder_asset_id))
 }
 
 /// The speaker row, if it is really one of this meeting's.
@@ -1695,7 +1888,10 @@ mod tests {
         // The ordering the whole module's reasoning depends on, and the
         // clearance over the closest stranger ever measured, at both levels.
         const {
-            assert!(TAU_SUGGEST < TAU_LINK, "asking must be easier than claiming");
+            assert!(
+                TAU_SUGGEST < TAU_LINK,
+                "asking must be easier than claiming"
+            );
             assert!(
                 TAU_LINK < TAU_STRONG,
                 "one fingerprint must be held to a higher bar than a cluster"
@@ -1777,7 +1973,10 @@ mod tests {
         }
         let dropped = find_outliers(&samples);
         assert_eq!(dropped.len(), 4, "{dropped:?}");
-        assert!(dropped.iter().all(|id| id.starts_with("wrong")), "{dropped:?}");
+        assert!(
+            dropped.iter().all(|id| id.starts_with("wrong")),
+            "{dropped:?}"
+        );
     }
 
     #[test]
@@ -1886,11 +2085,7 @@ mod tests {
     #[test]
     fn a_leftover_that_looks_like_two_people_goes_back_to_neither() {
         let people = vec![person(0, "Marco"), person(1, "Ada")];
-        let absorbed = absorb_leftovers(
-            &[print_scoring(&[0.70, 0.65])],
-            &people,
-            &[0, 1],
-        );
+        let absorbed = absorb_leftovers(&[print_scoring(&[0.70, 0.65])], &people, &[0, 1]);
         assert_eq!(absorbed, vec![None], "{MARGIN} of daylight or nothing");
     }
 
@@ -1912,9 +2107,8 @@ mod tests {
     #[tokio::test]
     async fn curating_comes_down_to_the_cap_and_rewrites_the_centroid() {
         let db = db().await;
-        let mut samples: Vec<(Vec<f32>, Channel)> = (0..28)
-            .map(|_| (sample_near(0, 0), Channel::Mic))
-            .collect();
+        let mut samples: Vec<(Vec<f32>, Channel)> =
+            (0..28).map(|_| (sample_near(0, 0), Channel::Mic)).collect();
         samples[0] = (sample_near(0, 3), Channel::System);
         let person_id = person_with_samples(&db, "Marco", &samples, "old-network").await;
 
@@ -1923,7 +2117,10 @@ mod tests {
         assert_eq!(curated.evicted, 28 - MAX_SAMPLES);
         assert_eq!(curated.outliers, 0);
         assert_eq!(
-            repo::list_person_samples(&db, &person_id).await.unwrap().len(),
+            repo::list_person_samples(&db, &person_id)
+                .await
+                .unwrap()
+                .len(),
             MAX_SAMPLES
         );
 
@@ -1951,9 +2148,8 @@ mod tests {
     #[tokio::test]
     async fn curating_a_profile_with_a_mislabel_in_it_drops_the_mislabel() {
         let db = db().await;
-        let mut samples: Vec<(Vec<f32>, Channel)> = (0..10)
-            .map(|i| (sample_near(0, i), Channel::Mic))
-            .collect();
+        let mut samples: Vec<(Vec<f32>, Channel)> =
+            (0..10).map(|i| (sample_near(0, i), Channel::Mic)).collect();
         samples.push((sample_near(3, 1), Channel::Mic));
         let person_id = person_with_samples(&db, "Marco", &samples, "n").await;
 
@@ -2008,7 +2204,13 @@ mod tests {
         let people = repo::list_person_infos(&db, "new").await.unwrap();
         let marco = people.iter().find(|p| p.name == "Marco").unwrap();
         assert!(marco.needs_refresh);
-        assert!(!people.iter().find(|p| p.name == "Luca").unwrap().needs_refresh);
+        assert!(
+            !people
+                .iter()
+                .find(|p| p.name == "Luca")
+                .unwrap()
+                .needs_refresh
+        );
     }
 
     #[tokio::test]
@@ -2019,13 +2221,19 @@ mod tests {
         let before = repo::list_person_profiles(&db).await.unwrap();
 
         let outcome = refresh_profiles(&db, Path::new("/nonexistent/fingerprints.onnx")).await;
-        assert!(matches!(outcome, Err(DiarizeError::NotInstalled)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Err(DiarizeError::NotInstalled)),
+            "{outcome:?}"
+        );
 
         let after = repo::list_person_profiles(&db).await.unwrap();
         assert_eq!(after.len(), before.len());
         assert_eq!(after[0].embedder_asset_id, "old");
         assert_eq!(
-            repo::list_person_samples(&db, &person_id).await.unwrap().len(),
+            repo::list_person_samples(&db, &person_id)
+                .await
+                .unwrap()
+                .len(),
             1,
             "a failed refresh must not cost anybody their samples"
         );
@@ -2148,6 +2356,247 @@ mod tests {
         (meeting.id, speaker.id)
     }
 
+    // -----------------------------------------------------------------------
+    // Two names, one voice
+    // -----------------------------------------------------------------------
+
+    /// The case the feature exists for: the same voice enrolled twice, once off
+    /// a call and once out of the room. Both sets of samples survive and the
+    /// profile that matches against them describes both.
+    #[tokio::test]
+    async fn merging_two_names_makes_one_voice_out_of_both_sets_of_samples() {
+        let db = db().await;
+        let keep = person_with_samples(
+            &db,
+            "Marco",
+            &[
+                (sample_near(0, 1), Channel::Mic),
+                (sample_near(0, 2), Channel::Mic),
+            ],
+            "wespeaker",
+        )
+        .await;
+        let dup = person_with_samples(
+            &db,
+            "Marco (call)",
+            &[(sample_near(0, 3), Channel::System)],
+            "wespeaker",
+        )
+        .await;
+
+        let done = merge(&db, &keep, &dup).await.unwrap();
+        assert!(done.merged);
+        assert_eq!(done.samples_moved, 1);
+        assert_eq!(done.voice, VoiceAfterMerge::Recomputed { kept: 3 });
+
+        let samples = repo::list_person_samples(&db, &keep).await.unwrap();
+        assert_eq!(samples.len(), 3, "nothing was thrown away");
+        assert!(
+            samples.iter().any(|s| s.condition == Channel::System),
+            "the voice heard down the call is in there too"
+        );
+        let profile = repo::person_profile(&db, &keep).await.unwrap().unwrap();
+        assert_eq!(profile.sample_count, 3);
+        assert_eq!(profile.embedder_asset_id, "wespeaker");
+
+        // One person, under the name that was kept.
+        let people = list_people(&db).await.unwrap();
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].name, "Marco");
+        assert_eq!(people[0].sample_count, 3);
+    }
+
+    /// Numbers from two different networks describe geometries neither one has
+    /// been in, so they are never averaged. The profile is dropped, the person
+    /// is honestly reported as needing a refresh, and every clip is still there
+    /// for the refresh to re-fingerprint.
+    #[tokio::test]
+    async fn merging_voices_measured_by_different_networks_asks_for_a_refresh() {
+        let db = db().await;
+        let keep = person_with_samples(
+            &db,
+            "Marco",
+            &[(sample_near(0, 1), Channel::Mic)],
+            "wespeaker",
+        )
+        .await;
+        let dup = person_with_samples(
+            &db,
+            "Marco (call)",
+            &[(sample_near(0, 2), Channel::System)],
+            "an-older-network",
+        )
+        .await;
+
+        let done = merge(&db, &keep, &dup).await.unwrap();
+        assert_eq!(done.voice, VoiceAfterMerge::NeedsRefresh);
+        assert!(repo::person_profile(&db, &keep).await.unwrap().is_none());
+        assert_eq!(
+            repo::list_person_samples(&db, &keep).await.unwrap().len(),
+            2,
+            "both clips survive; only the centroid was given up on"
+        );
+        let people = list_people(&db).await.unwrap();
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].sample_count, 2);
+        assert!(
+            people[0].needs_refresh,
+            "a person with no profile is honestly reported as needing one"
+        );
+    }
+
+    /// The other half of that sentence. Settings says Echo is refreshing, and
+    /// this is what makes it so: the survivor now has no profile row, and a
+    /// person with no profile counts towards the gate the pass checks before it
+    /// counts anybody. Without this the merge dropped a centroid that nothing
+    /// would ever rebuild — the person quietly stopped being recognised while
+    /// the screen promised a refresh was under way.
+    #[tokio::test]
+    async fn a_merged_voice_with_no_profile_is_what_makes_the_next_pass_rebuild_it() {
+        let db = db().await;
+        let keep = person_with_samples(
+            &db,
+            "Marco",
+            &[(sample_near(0, 1), Channel::Mic)],
+            "wespeaker",
+        )
+        .await;
+        let dup = person_with_samples(
+            &db,
+            "Marco (call)",
+            &[(sample_near(0, 2), Channel::System)],
+            "an-older-network",
+        )
+        .await;
+        assert_eq!(
+            merge(&db, &keep, &dup).await.unwrap().voice,
+            VoiceAfterMerge::NeedsRefresh
+        );
+
+        // Not matched at the moment — and counted, which is the gate.
+        let enrolment = enrolled(&db, "wespeaker").await.unwrap();
+        assert!(enrolment.people.is_empty(), "no centroid to match against");
+        assert_eq!(enrolment.stale, 1, "the pass must be told there is work");
+
+        // And the work is real: the refresh gets past its own early return and
+        // only stops for the missing network, so with one installed this voice
+        // is rebuilt from the clips both names kept.
+        let outcome = refresh_profiles(&db, Path::new("/nonexistent/fingerprints.onnx")).await;
+        assert!(
+            matches!(outcome, Err(DiarizeError::NotInstalled)),
+            "{outcome:?}"
+        );
+    }
+
+    /// The gate is deliberately stricter than the refresh it opens: it counts
+    /// only people a refresh could put back. A voice with nothing left to
+    /// re-fingerprint would otherwise hold it open on every pass forever, and
+    /// each pass would load the network to finish no work.
+    #[tokio::test]
+    async fn a_voice_with_nothing_left_to_re_fingerprint_does_not_hold_the_gate_open() {
+        let db = db().await;
+        let person_id = person_with_samples(&db, "Nobody", &[], "wespeaker").await;
+        curate(&db, &person_id, "wespeaker").await.unwrap();
+        assert!(repo::person_profile(&db, &person_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Still honestly reported to the person, and still not work to schedule.
+        let people = repo::list_person_infos(&db, "wespeaker").await.unwrap();
+        assert!(people[0].needs_refresh);
+        assert_eq!(enrolled(&db, "wespeaker").await.unwrap().stale, 0);
+    }
+
+    /// A name with no voice behind it has nothing to give, so the surviving
+    /// profile is left exactly as it was rather than rebuilt for no reason.
+    #[tokio::test]
+    async fn merging_a_name_with_no_samples_leaves_the_voice_untouched() {
+        let db = db().await;
+        let keep = person_with_samples(
+            &db,
+            "Marco",
+            &[(sample_near(0, 1), Channel::Mic)],
+            "wespeaker",
+        )
+        .await;
+        let before = repo::person_profile(&db, &keep).await.unwrap().unwrap();
+        let dup = repo::create_person(&db, "Marco?").await.unwrap();
+
+        let done = merge(&db, &keep, &dup.id).await.unwrap();
+        assert!(done.merged);
+        assert_eq!(done.voice, VoiceAfterMerge::Unchanged);
+        let after = repo::person_profile(&db, &keep).await.unwrap().unwrap();
+        assert_eq!(after.centroid, before.centroid);
+        assert_eq!(after.updated_at, before.updated_at);
+    }
+
+    /// Clicking it twice is not a second merge, and a window that has been open
+    /// since before a merge still means the person that name is now.
+    #[tokio::test]
+    async fn merging_the_same_two_people_again_changes_nothing() {
+        let db = db().await;
+        let keep = person_with_samples(
+            &db,
+            "Marco",
+            &[(sample_near(0, 1), Channel::Mic)],
+            "wespeaker",
+        )
+        .await;
+        let dup = person_with_samples(
+            &db,
+            "Marco (call)",
+            &[(sample_near(0, 2), Channel::System)],
+            "wespeaker",
+        )
+        .await;
+        merge(&db, &keep, &dup).await.unwrap();
+
+        let again = merge(&db, &keep, &dup).await.unwrap();
+        assert!(!again.merged);
+        let backwards = merge(&db, &dup, &keep).await.unwrap();
+        assert!(!backwards.merged);
+        assert_eq!(
+            repo::list_person_samples(&db, &keep).await.unwrap().len(),
+            2
+        );
+        assert_eq!(list_people(&db).await.unwrap().len(), 1);
+    }
+
+    /// A link asked for under the old name lands on the person that name is
+    /// now, rather than failing or re-creating the duplicate.
+    #[tokio::test]
+    async fn linking_by_a_merged_name_links_to_whoever_it_is_now() {
+        let db = db().await;
+        let (meeting_id, speaker_id) = meeting_with_a_speaker(&db, "Speaker 1").await;
+        let keep = person_with_samples(
+            &db,
+            "Marco",
+            &[(sample_near(0, 1), Channel::Mic)],
+            "wespeaker",
+        )
+        .await;
+        let dup = person_with_samples(
+            &db,
+            "Marco (call)",
+            &[(sample_near(0, 2), Channel::Mic)],
+            "wespeaker",
+        )
+        .await;
+        merge(&db, &keep, &dup).await.unwrap();
+
+        link(&db, &meeting_id, &speaker_id, Some(&dup))
+            .await
+            .unwrap();
+
+        let speaker = repo::get_speaker(&db, &speaker_id).await.unwrap().unwrap();
+        assert_eq!(speaker.person_id.as_deref(), Some(keep.as_str()));
+        assert_eq!(
+            speaker.display_name, "Marco",
+            "the name that got copied on is the surviving one"
+        );
+    }
+
     #[tokio::test]
     async fn deleting_a_person_releases_the_link_and_leaves_the_transcript_alone() {
         let db = db().await;
@@ -2159,7 +2608,9 @@ mod tests {
         repo::set_speaker_person(&db, &speaker_id, Some(&person_id))
             .await
             .unwrap();
-        repo::rename_speaker(&db, &speaker_id, "Marco").await.unwrap();
+        repo::rename_speaker(&db, &speaker_id, "Marco")
+            .await
+            .unwrap();
 
         repo::delete_person(&db, &person_id).await.unwrap();
 
@@ -2169,7 +2620,10 @@ mod tests {
             speaker.display_name, "Marco",
             "the name already read in this meeting stays as plain text"
         );
-        assert!(repo::list_person_samples(&db, &person_id).await.unwrap().is_empty());
+        assert!(repo::list_person_samples(&db, &person_id)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(repo::list_person_profiles(&db).await.unwrap().is_empty());
         assert!(repo::get_person(&db, &person_id).await.unwrap().is_none());
         // And the meeting itself is untouched.
@@ -2216,7 +2670,9 @@ mod tests {
         repo::set_speaker_person(&db, &speaker_id, Some(&person_id))
             .await
             .unwrap();
-        repo::rename_speaker(&db, &speaker_id, "Marco").await.unwrap();
+        repo::rename_speaker(&db, &speaker_id, "Marco")
+            .await
+            .unwrap();
 
         link(&db, &meeting_id, &speaker_id, None).await.unwrap();
 
@@ -2269,7 +2725,10 @@ mod tests {
         let person_id =
             person_with_samples(&db, "Marco", &[(sample_near(0, 1), Channel::Mic)], "n").await;
         let encoded = person_sample_audio(&db, &person_id).await.unwrap();
-        assert!(encoded.starts_with("UklGR"), "has to be a WAV: {encoded:.8}");
+        assert!(
+            encoded.starts_with("UklGR"),
+            "has to be a WAV: {encoded:.8}"
+        );
 
         let empty = repo::create_person(&db, "Never heard").await.unwrap();
         assert!(matches!(
@@ -2357,7 +2816,12 @@ mod tests {
         let speaker = repo::upsert_speaker(&db, &meeting.id, "speaker-01", "Speaker 1", false)
             .await
             .unwrap();
-        let turns = [(10_000, 20_000), (30_000, 40_000), (50_000, 60_000), (70_000, 80_000)];
+        let turns = [
+            (10_000, 20_000),
+            (30_000, 40_000),
+            (50_000, 60_000),
+            (70_000, 80_000),
+        ];
         for (from, to) in turns {
             repo::insert_segments(
                 &db,
@@ -2380,7 +2844,9 @@ mod tests {
             .await
             .unwrap();
 
-        let info = enroll(&db, &meeting.id, &speaker.id, "Marco").await.unwrap();
+        let info = enroll(&db, &meeting.id, &speaker.id, "Marco")
+            .await
+            .unwrap();
         assert_eq!(info.name, "Marco");
         assert_eq!(
             info.sample_count as usize, SAMPLES_PER_CONFIRMATION,
@@ -2412,7 +2878,9 @@ mod tests {
 
         // Confirming again adds more of the same voice without doubling anything
         // it already knows.
-        link(&db, &meeting.id, &speaker.id, Some(&info.id)).await.unwrap();
+        link(&db, &meeting.id, &speaker.id, Some(&info.id))
+            .await
+            .unwrap();
         let after = list_people(&db).await.unwrap();
         assert!(
             after[0].sample_count as usize <= MAX_SAMPLES,
@@ -2455,7 +2923,9 @@ mod tests {
         )
         .await
         .unwrap();
-        repo::recompute_speaking_time(db, &meeting.id).await.unwrap();
+        repo::recompute_speaking_time(db, &meeting.id)
+            .await
+            .unwrap();
         repo::set_speaker_centroid(db, &speaker.id, Some(centroid))
             .await
             .unwrap();
@@ -2466,8 +2936,13 @@ mod tests {
     async fn a_voice_in_three_meetings_is_offered_and_one_in_two_is_not() {
         let db = db().await;
         for i in 0..3 {
-            meeting_with_a_voice(&db, &format!("Sync {i}"), &sample_near(0, i), 60_000 + i as i64)
-                .await;
+            meeting_with_a_voice(
+                &db,
+                &format!("Sync {i}"),
+                &sample_near(0, i),
+                60_000 + i as i64,
+            )
+            .await;
         }
         for i in 0..2 {
             meeting_with_a_voice(&db, &format!("Other {i}"), &sample_near(3, i), 10_000).await;

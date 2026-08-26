@@ -1,4 +1,4 @@
-import { labels } from "./copy";
+import { jobLine, labels } from "./copy";
 import type { Job, JobKind, JobPhase } from "./types";
 
 /**
@@ -49,6 +49,68 @@ export function inProgressJob(jobs: Job[], kinds?: ReadonlySet<string>): Job | u
   );
 }
 
+/**
+ * The failure a screen still has to own up to, or `undefined` when there isn't
+ * one.
+ *
+ * A job row survives its own failure, and "Listen again" queues a fresh job
+ * beside the old one rather than replacing it — so "any job that failed" would
+ * pin a months-old failure to a transcript that has been rewritten twice since.
+ * Only the newest job of each kind speaks for that kind: if *that* one failed,
+ * nothing since has done the work, and the person is looking at a transcript
+ * missing whatever it was going to add.
+ *
+ * This exists because the failure that matters most here is the quietest one.
+ * The speaker files are allowed to arrive after the first recording, so a
+ * meeting can be recorded before Echo can tell voices apart; the pass then fails
+ * with a perfectly clear sentence that, until now, nothing on any screen showed
+ * — while the mic-only banner had already promised the person that Echo would
+ * work out who said what once the meeting ended.
+ */
+export function lastFailure(jobs: Job[], kinds?: ReadonlySet<string>): Job | undefined {
+  const mine = kinds ? jobs.filter((job) => kinds.has(job.kind)) : jobs;
+  const at = (stamp: string) => Date.parse(stamp) || 0;
+  const newestOfEachKind = new Map<string, Job>();
+  for (const job of mine) {
+    const seen = newestOfEachKind.get(job.kind);
+    if (!seen || at(job.createdAt) >= at(seen.createdAt)) newestOfEachKind.set(job.kind, job);
+  }
+  return [...newestOfEachKind.values()]
+    .filter((job) => job.status === "failed")
+    .sort((a, b) => at(b.updatedAt) - at(a.updatedAt))[0];
+}
+
+/** The kinds of job that are setup and nothing else: whatever they are doing,
+ * they are the reason Echo is not ready yet. */
+export const SETUP_KINDS: ReadonlySet<JobKind> = new Set<JobKind>(["download", "prepareEngine"]);
+
+/** The stage that is setup no matter whose job it belongs to. A catch-up that
+ * has to wait for the engine to be got ready is, for those minutes, the
+ * one-time setup — and it is the only thing on screen that can say so. */
+export const SETUP_PHASE: JobPhase = "preparingEngine";
+
+/**
+ * The setup job that is happening right now, out of everything unfinished.
+ *
+ * Its own function, and tested, because it is the answer the corner pill
+ * depends on at the one moment it cannot be told: an app update queues the
+ * one-time setup at launch, the core starts it while the window is still
+ * loading, and the announcement of its stage reaches nobody. The list of
+ * unfinished jobs is then the only place that stage still exists, for the
+ * quarter of an hour it lasts.
+ *
+ * Running only. A queued setup job is a job that has not started, and the pill
+ * is a sentence about something happening — the rule at the top of this file.
+ * The core runs one job at a time, so there is never more than one to choose
+ * between.
+ */
+export function setupJobUnderWay(jobs: Job[]): Job | undefined {
+  return jobs.find(
+    (job) =>
+      job.status === "running" && (SETUP_KINDS.has(job.kind) || job.phase === SETUP_PHASE),
+  );
+}
+
 /** Running jobs first, then the ones waiting — for a screen that lists them. */
 export function runningFirst(jobs: Job[]): Job[] {
   return [
@@ -65,6 +127,15 @@ export interface JobPresentation {
   fraction?: number;
   /** True while this is actually happening, false while it waits. */
   running: boolean;
+  /**
+   * True when this is parked because a recording is going on.
+   *
+   * A job is only ever `paused` for that one reason — starting a capture parks
+   * everything, and anything left parked by a crash is put back in the queue at
+   * launch — so the status carries the whole meaning, and a screen can say why
+   * the bar is not moving without asking anything else.
+   */
+  deferred: boolean;
 }
 
 /**
@@ -76,12 +147,28 @@ export interface JobPresentation {
  * a catch-up waiting for the engine to be got ready is not yet catching up on
  * anything. A queued job keeps its name and loses its bar.
  */
-export function presentJob(job: Job, phase: JobPhase | undefined = job.phase): JobPresentation {
+export function presentJob(job: Job): JobPresentation {
   const running = job.status === "running";
-  const label = phase ? labels.jobPhase[phase] : labels.jobKind[job.kind as JobKind];
+  const label = job.phase
+    ? labels.jobPhase[job.phase]
+    : labels.jobKind[job.kind as JobKind];
   return {
     label,
     fraction: running ? job.progress : undefined,
     running,
+    deferred: job.status === "paused",
   };
+}
+
+/**
+ * The one line a screen shows about a job: happening, waiting its turn, or set
+ * aside for a recording.
+ *
+ * One function so the three cases cannot drift apart between the four places
+ * that show them — and so that adding the third case did not mean adding a
+ * third branch to four different ternaries.
+ */
+export function jobSentence(shown: JobPresentation): string {
+  if (shown.deferred) return jobLine.deferred(shown.label);
+  return shown.running ? jobLine.running(shown.label) : jobLine.waiting(shown.label);
 }

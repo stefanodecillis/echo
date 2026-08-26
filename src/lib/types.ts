@@ -69,11 +69,33 @@ export type CaptureState =
 
 export type Channel = "mic" | "system" | "mixed";
 
+/**
+ * The two system-audio reasons are not one reason twice.
+ * `systemAudioUnavailable` means nothing this computer plays ever reached Echo,
+ * so the whole meeting is in the microphone recording and the offline pass will
+ * separate the voices in it. `systemAudioLost` means it was arriving and
+ * stopped — the lines already written carry real names, and the microphone tail
+ * is not separated by anything. They get different banners for that reason.
+ */
 export type DegradedReason =
   | "systemAudioUnavailable"
+  | "systemAudioLost"
   | "microphoneUnavailable"
+  | "nothingIsBeingHeard"
   | "transcriptBehind"
   | "storageLow";
+
+/**
+ * Whether Echo can understand speech right now.
+ *
+ * The core works this out fresh from what the engine is holding every time a
+ * `CaptureStatus` is built, and remembers it nowhere. That is what makes it safe
+ * to draw a banner from — but only along with the other half: while it says
+ * "preparing" or "unavailable", `useCaptureState` asks for the status outright
+ * every few seconds, so a missed event costs the banner a moment rather than the
+ * rest of the meeting.
+ */
+export type SpeechState = "idle" | "preparing" | "ready" | "unavailable";
 
 export interface CaptureStatus {
   state: CaptureState;
@@ -83,6 +105,8 @@ export interface CaptureStatus {
   degradedReason?: DegradedReason;
   pendingUtterances: number;
   startedAt?: Timestamp;
+  /** Always sent by the core — see `SpeechState`. */
+  speech: SpeechState;
 }
 
 export interface StartRecordingOptions {
@@ -193,7 +217,41 @@ export interface Segment {
   isFinal: boolean;
   modelName?: string;
   modelRevision?: string;
+  /**
+   * Words Echo put right against the list in Settings, absent on nearly every
+   * line. `from` is what was written down, `to` what replaced it — enough to
+   * show what happened and to put it back.
+   */
+  corrections?: Correction[];
 }
+
+export interface Correction {
+  from: string;
+  to: string;
+}
+
+/**
+ * A stretch of a meeting that has no words in it because Echo heard it and
+ * decided not to write it down.
+ *
+ * Nearly every such decision is the other people written down once instead of
+ * twice, and those seconds do have words; the core (`asr::left_out`) keeps only
+ * the ones that left the transcript silent, so a list of these is a list of
+ * places worth looking at.
+ */
+export interface LeftOutMoment {
+  tStartMs: number;
+  tEndMs: number;
+}
+
+/** One word in "Words Echo should know", and where it came from. */
+export interface VocabularyWord {
+  word: string;
+  source: VocabularySource;
+}
+
+/** `person` means Echo added it itself, from a voice somebody saved. */
+export type VocabularySource = "typed" | "person";
 
 export interface TranscriptQuery {
   meetingId: Id;
@@ -399,7 +457,8 @@ export type JobKind =
   | "summarize"
   | "export"
   | "download"
-  | "mixdown";
+  | "mixdown"
+  | "prepareEngine";
 
 export type JobStatus =
   | "queued"
@@ -420,12 +479,16 @@ export interface Job {
   createdAt: Timestamp;
   updatedAt: Timestamp;
   /**
-   * The stage this job last reported, when it has stages worth naming.
+   * The stage this job is in right now, when it is in one worth naming.
    *
-   * Not part of the row: the core carries it beside the job on
-   * `jobProgress`, and the screens that keep a list of jobs fold it in as it
-   * arrives (see `useMeetingDetail`) so that what is drawn is the job as it is
-   * now, not as it was when the list was fetched.
+   * Part of the row, so a screen that opens in the middle of a stage reads it
+   * the same as one that was already open. It used to travel only in the
+   * `jobProgress` event, which meant the one stage that matters — the one-time
+   * setup, announced at launch before the window has finished loading — was
+   * invisible to every screen for the quarter of an hour it lasts.
+   *
+   * Only ever set on a running job, and cleared by the core the moment the job
+   * moves on or has a fraction to report again.
    */
   phase?: JobPhase;
 }
@@ -659,7 +722,9 @@ export interface OnboardingState {
   localSummariesAvailable: boolean;
 }
 
-export type TrayState = "idle" | "detected" | "recording";
+/** Mirrors `TrayState` in types.rs. "processing" means the meeting has ended
+ *  and Echo is still finishing it off. */
+export type TrayState = "idle" | "detected" | "recording" | "processing";
 
 export type TrayAction = "start" | "stop" | "open" | "pauseDetection" | "quit";
 
@@ -718,8 +783,6 @@ export interface JobProgressPayload {
   job: Job;
   /** Ready-to-show sentence, e.g. "Writing your recap...". */
   label?: string;
-  /** Which stage of the job this is, when it has stages worth naming. */
-  phase?: JobPhase;
 }
 
 export interface DownloadProgressPayload {
@@ -747,6 +810,25 @@ export interface SpeakersUpdatedPayload {
   peopleCount: number;
   /** True when the count is the person's correction, not Echo's. */
   peopleCountIsOverride: boolean;
+  /**
+   * How many people the pass could actually tell apart, when this payload comes
+   * from a pass that has just run. Absent from every other emitter, which are
+   * announcing rows rather than a fresh separation.
+   *
+   * Below `peopleCount` when someone asked for more people than the recording
+   * holds. "Name your speakers" says so beside the number.
+   */
+  voicesFound?: number;
+  /**
+   * The best count Echo decided against, when the count is Echo's own automatic
+   * reading. Absent when the person set the count, and from every other
+   * emitter.
+   *
+   * A wrong count is the one speaker mistake nothing in the UI can fix after
+   * the fact (merges exist; splits do not), so the dialog shows what the
+   * runner-up said rather than leaving the decision unarguable.
+   */
+  alternativeCount?: number;
 }
 
 /**

@@ -11,8 +11,9 @@
 //!   hidden, never destroyed, so the second appearance is instant.
 //! * **The pulse** — while capture is recording, one 500ms timer swaps the tray
 //!   icon between four frames. Paused holds a single frame with no timer at all,
-//!   and stopping tears the timer down. There is no timer when nothing is being
-//!   recorded.
+//!   and stopping tears the timer down. The same timer, with the other frame
+//!   set, is the spinner that says Echo is still working on a meeting that has
+//!   finished ([`IconMotion::Working`]). There is no timer when neither is true.
 //!
 //! Everything that needs a real window is a thin wrapper around a pure
 //! function: [`top_right_of`] and [`under_anchor`] decide where the panel goes,
@@ -20,7 +21,7 @@
 //! meeting the ✕ has been used on is [`crate::detect`]'s bookkeeping, not this
 //! module's. Those are what the tests drive; no test opens a window.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -124,10 +125,15 @@ fn clamp_into(work: Area, panel: (f64, f64), margin: f64, wanted: (f64, f64)) ->
 // The tray icon's pulse
 // ---------------------------------------------------------------------------
 
-/// How often the recording icon changes frame.
+/// How often a moving tray icon changes frame. One cadence for both animations:
+/// they are never on screen at the same time, and a second speed would be a
+/// second timer to get wrong for no gain anyone can see at 44 pixels.
 pub const FRAME_INTERVAL_MS: u64 = 500;
 
-/// `icons/tray-recording-0.png` … `-3.png`.
+/// How many frames a tray animation has: `icons/tray-recording-0.png` … `-3.png`
+/// for the pulse, `icons/tray-processing-0.png` … `-3.png` for the spinner. The
+/// frame sets are interchangeable as far as everything below is concerned — the
+/// painter carries the one it belongs to (see [`TrayPainter`]).
 pub const FRAME_COUNT: usize = 4;
 
 /// Whether the tray icon should be moving, still, or left alone.
@@ -141,9 +147,26 @@ pub enum IconMotion {
     /// Paused: one frame, held. A paused recording is not a moving thing, and a
     /// timer that exists to change nothing is a timer that should not exist.
     Held,
+    /// The meeting is over and Echo is still working on it: the same timer, the
+    /// other frame set.
+    ///
+    /// Its own variant rather than [`IconMotion::Running`] with a different
+    /// painter, and that is the whole reason it exists: [`TrayAnimation::apply`]
+    /// is idempotent *per motion*, so a recording that ended and went straight
+    /// into being worked on would ask for `Running` again and be told nothing
+    /// had changed — leaving the recording pulse breathing away over a meeting
+    /// that had stopped. What is on screen has to be part of what the animation
+    /// thinks it is doing.
+    Working,
 }
 
 /// What capture being in `state` means for the icon.
+///
+/// Only ever `Off`, `Running` or `Held`: [`IconMotion::Working`] is not
+/// something capture can ask for, because by the time it runs the recording is
+/// over. That one comes from the tray *state* instead
+/// ([`crate::schedule_tray_state`]), which is the only thing that knows a
+/// finished meeting still has work outstanding.
 pub fn motion_for(state: CaptureState) -> IconMotion {
     match state {
         // Degraded is still recording, just with less than we wanted.
@@ -158,27 +181,98 @@ pub fn motion_for(state: CaptureState) -> IconMotion {
     }
 }
 
+/// Which pulse a frame came from, and whether that pulse is still the one the
+/// tray is showing.
+///
+/// Painting the menu bar means queueing work for the main thread, and that
+/// queue is first-in-first-out. A frame computed a moment before a recording
+/// ended can therefore be queued *behind* the idle icon and repaint the pulse
+/// on top of it — the menu bar then claims a recording that has finished, and
+/// nothing paints again until the tray state next changes.
+///
+/// Standing the timer down cannot prevent that on its own: `JoinHandle::abort`
+/// only takes effect at the task's next await point, and a task already past
+/// its tick runs [`Pulse::advance`] to completion, queue and all. So every
+/// frame carries the serial number of the pulse it belongs to, and the main
+/// thread drops the frame if that pulse has since been retired. The check
+/// happens where the ordering does.
+#[derive(Clone)]
+pub struct FrameToken {
+    epoch: Arc<AtomicU64>,
+    stamp: u64,
+}
+
+impl Default for FrameToken {
+    /// A token that is always current: what a one-off paint with no pulse
+    /// behind it carries.
+    fn default() -> Self {
+        Self {
+            epoch: Arc::new(AtomicU64::new(0)),
+            stamp: 0,
+        }
+    }
+}
+
+impl FrameToken {
+    /// True while the pulse this frame came from is still the current one.
+    pub fn is_current(&self) -> bool {
+        self.epoch.load(Ordering::SeqCst) == self.stamp
+    }
+}
+
 /// Somewhere to put a frame. The app paints the tray; tests count calls.
+///
+/// Implementations must honour `token`: a frame whose pulse has been retired is
+/// stale by the time it reaches the screen and must not be painted. See
+/// [`FrameToken`] for why the check has to happen this late.
 pub trait FramePainter: Send + Sync + 'static {
-    fn paint(&self, frame: usize);
+    fn paint(&self, frame: usize, token: &FrameToken);
 }
 
 /// The real painter: the same atomic icon-and-template swap
 /// [`crate::set_tray_state`] does, because setting the icon alone drops the
 /// template flag and a non-template icon is a black blob in a dark menu bar.
+///
+/// Which animation this is belongs to the painter rather than to the animation:
+/// [`Pulse`], [`FrameToken`] and the timer only ever deal in frame *numbers*, so
+/// a second animation costs a second frame set and nothing else.
 pub struct TrayPainter {
     app: AppHandle,
+    frames: &'static [&'static [u8]],
 }
 
 impl TrayPainter {
-    pub fn new(app: AppHandle) -> Self {
-        Self { app }
+    /// `frames` is the set this painter paints from — `crate::TRAY_ICON_*_FRAMES`.
+    pub fn new(app: AppHandle, frames: &'static [&'static [u8]]) -> Self {
+        Self { app, frames }
     }
 }
 
 impl FramePainter for TrayPainter {
-    fn paint(&self, frame: usize) {
-        crate::set_tray_frame(&self.app, frame);
+    fn paint(&self, frame: usize, token: &FrameToken) {
+        // Changing a menu bar icon is an AppKit call, and AppKit may only be
+        // touched from the main thread. Until 2026-08-24 this ran on whatever
+        // thread happened to be emitting — the capture pipeline, the speech
+        // thread, a job worker — which was a latent correctness bug on top of
+        // the stall it caused, because the paint also made those threads wait
+        // on the main thread before they could carry on.
+        //
+        // So: queue the frame and leave. Nobody is waiting on one step of a
+        // pulse, and if the main thread has gone there is no menu bar left to
+        // paint anyway.
+        let app = self.app.clone();
+        let frames = self.frames;
+        let token = token.clone();
+        let _ = self.app.run_on_main_thread(move || {
+            // Last possible moment, and the only honest one: whatever else is
+            // in this queue ahead of us has already run, so if the pulse that
+            // produced this frame is over, the icon on screen is the one that
+            // replaced it and painting now would undo that.
+            if !token.is_current() {
+                return;
+            }
+            crate::set_tray_frame(&app, frames, frame);
+        });
     }
 }
 
@@ -199,10 +293,21 @@ impl Pulse {
     }
 
     /// Move to the next frame and put it on screen. Wraps around.
-    pub fn advance(&self, painter: &dyn FramePainter) -> usize {
+    ///
+    /// `token` says which pulse this frame belongs to. A retired pulse gets no
+    /// further say in what the tray shows — not even in the frame counter,
+    /// which the pulse that replaced it is now using.
+    ///
+    /// This is the cheap half of the check. The load-bearing half is inside the
+    /// painter, on the main thread, because a token that is current here can
+    /// still be stale by the time the frame reaches the screen.
+    pub fn advance(&self, painter: &dyn FramePainter, token: &FrameToken) -> usize {
+        if !token.is_current() {
+            return self.frame();
+        }
         let next = (self.frame() + 1) % FRAME_COUNT;
         self.frame.store(next, Ordering::Relaxed);
-        painter.paint(next);
+        painter.paint(next, token);
         next
     }
 
@@ -218,12 +323,24 @@ struct AnimationInner {
 
 /// The pulse's whole existence: at most one timer, and which frame is showing.
 ///
-/// [`TrayAnimation::apply`] has to be called from inside a Tokio context — it
-/// spawns onto the *current* runtime deliberately, so tests can pause time.
-/// `lib.rs` hops onto Tauri's runtime before calling it.
+/// [`TrayAnimation::apply`] prefers to run its timer on the *current* Tokio
+/// runtime — deliberately, so tests can drive it — and settles for a still icon
+/// when there is no runtime to run one on. Nothing in here panics, blocks or
+/// waits on another thread: it sits on the path every capture-state event takes,
+/// and on 2026-08-24 a panic on that path took the whole event bus down with it.
 pub struct TrayAnimation {
+    /// Every lock on this recovers from poison instead of respecting it. Poison
+    /// only says *some thread panicked while holding the guard*; what is behind
+    /// it is a join handle and an enum, neither of which an unwind can leave
+    /// half-written. Refusing would turn one unrelated panic into a tray icon
+    /// that can never be stopped again — and, worse, into a fresh panic on the
+    /// event path every time anyone asked.
     inner: Mutex<AnimationInner>,
     pulse: Pulse,
+    /// The serial number of the pulse currently entitled to paint. Bumped by
+    /// every transition, which is what makes an in-flight frame from the
+    /// previous one drop instead of landing late. See [`FrameToken`].
+    epoch: Arc<AtomicU64>,
 }
 
 impl Default for TrayAnimation {
@@ -240,6 +357,7 @@ impl TrayAnimation {
                 motion: IconMotion::Off,
             }),
             pulse: Pulse::default(),
+            epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -249,19 +367,57 @@ impl TrayAnimation {
         self.pulse.clone()
     }
 
+    /// The token the pulse running right now stamps its frames with. Handed out
+    /// alongside [`TrayAnimation::pulse`] for the same reason.
+    pub fn token(&self) -> FrameToken {
+        FrameToken {
+            epoch: self.epoch.clone(),
+            stamp: self.epoch.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Retire every frame the old pulse still has in flight and open the new
+    /// one's epoch. Called by every transition, under the lock, before anything
+    /// paints.
+    fn retire_frames_in_flight(&self) -> FrameToken {
+        let stamp = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        FrameToken {
+            epoch: self.epoch.clone(),
+            stamp,
+        }
+    }
+
     /// Bring the timer in line with what capture is doing. Idempotent: asking
     /// for the motion that is already running changes nothing, so a stream of
     /// capture-state events does not restart the animation every few seconds.
+    ///
+    /// Safe to call from anywhere, runtime or not: a recording with no runtime
+    /// to hang a timer on gets a still recording icon and a line in the log,
+    /// which is a far better outcome than a panic on the event path.
     pub fn apply(&self, motion: IconMotion, painter: Arc<dyn FramePainter>) {
-        let mut inner = self.inner.lock().unwrap();
+        // The guard is held across the whole transition on purpose. Narrowing
+        // it to the bookkeeping alone — take the old task out under the lock,
+        // paint and spawn outside it — was considered and rejected: two
+        // `on_capture_state` tasks can be in here at once, and interleaving them
+        // would let the loser's timer outlive the winner's motion, a
+        // last-writer-wins race bought purely to shorten a critical section
+        // nobody is queueing on. Since the two hazards that used to sit under
+        // this lock are gone (the paint is now a push onto the main thread's
+        // queue, and asking for a runtime handle cannot panic), the section is
+        // now short as well as uncontended.
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.motion == motion {
             return;
         }
         // Whatever was running, stop it: every transition either needs a new
-        // timer or none at all.
+        // timer or none at all. `abort` alone is not enough — it lands at the
+        // task's next await, so a tick already in progress will finish and
+        // queue its frame — hence the epoch bump, which makes that frame arrive
+        // stale and be dropped rather than repaint a pulse that is over.
         if let Some(task) = inner.task.take() {
             task.abort();
         }
+        let token = self.retire_frames_in_flight();
         inner.motion = motion;
 
         match motion {
@@ -269,45 +425,71 @@ impl TrayAnimation {
             IconMotion::Held => {
                 // The strongest frame, standing still.
                 self.pulse.reset();
-                painter.paint(0);
+                painter.paint(0, &token);
             }
-            IconMotion::Running => {
+            // One timer, two animations. Which frames it paints is the painter's
+            // business, and the painter is the caller's choice.
+            IconMotion::Running | IconMotion::Working => {
                 self.pulse.reset();
-                painter.paint(0);
-                let pulse = self.pulse.clone();
-                inner.task = Some(tokio::spawn(async move {
-                    let mut ticker =
-                        tokio::time::interval(Duration::from_millis(FRAME_INTERVAL_MS));
-                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    // The first tick completes immediately and frame 0 is
-                    // already on screen.
-                    ticker.tick().await;
-                    loop {
-                        ticker.tick().await;
-                        pulse.advance(painter.as_ref());
+                painter.paint(0, &token);
+                // `tokio::spawn` used to be here, and it panics when there is no
+                // runtime on the calling thread. That panic sat on the event
+                // path, and one panic there was enough to stop every event for
+                // the rest of the meeting on 2026-08-24. Ask instead of assume:
+                // the recording frame is already on screen either way, so the
+                // worst case is an icon that says "recording" without breathing.
+                match tokio::runtime::Handle::try_current() {
+                    Ok(runtime) => {
+                        let pulse = self.pulse.clone();
+                        inner.task = Some(runtime.spawn(async move {
+                            let mut ticker =
+                                tokio::time::interval(Duration::from_millis(FRAME_INTERVAL_MS));
+                            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            // The first tick completes immediately and frame 0
+                            // is already on screen.
+                            ticker.tick().await;
+                            loop {
+                                ticker.tick().await;
+                                pulse.advance(painter.as_ref(), &token);
+                            }
+                        }));
                     }
-                }));
+                    Err(_) => tracing::warn!(
+                        ?motion,
+                        "the tray icon will hold still: nothing here can run its timer"
+                    ),
+                }
             }
         }
     }
 
     /// Tear the timer down. Called at stop, and on the way out.
+    ///
+    /// Returns having made two promises: no timer will produce another frame,
+    /// and no frame the old timer already produced will ever reach the screen.
+    /// The caller can queue the idle icon straight after and know nothing will
+    /// land on top of it.
     pub fn stop(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(task) = inner.task.take() {
             task.abort();
         }
+        self.retire_frames_in_flight();
         inner.motion = IconMotion::Off;
         self.pulse.reset();
     }
 
     /// Is a timer alive right now? The lifecycle promise, in one call.
     pub fn is_running(&self) -> bool {
-        self.inner.lock().unwrap().task.is_some()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .task
+            .is_some()
     }
 
     pub fn motion(&self) -> IconMotion {
-        self.inner.lock().unwrap().motion
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).motion
     }
 
     pub fn frame(&self) -> usize {
@@ -759,7 +941,8 @@ mod tests {
 
     // -- pulse lifecycle ---------------------------------------------------
 
-    /// Stands in for the menu bar: remembers every frame it was asked to show.
+    /// Stands in for the menu bar: remembers every frame it was asked to show,
+    /// and — like the real painter — refuses the ones whose pulse is over.
     #[derive(Default)]
     struct Spy {
         frames: Mutex<Vec<usize>>,
@@ -772,7 +955,10 @@ mod tests {
     }
 
     impl FramePainter for Spy {
-        fn paint(&self, frame: usize) {
+        fn paint(&self, frame: usize, token: &FrameToken) {
+            if !token.is_current() {
+                return;
+            }
             self.frames.lock().unwrap().push(frame);
         }
     }
@@ -806,7 +992,7 @@ mod tests {
         let spy = Spy::default();
         assert_eq!(pulse.frame(), 0, "the first frame is the resting one");
         for _ in 0..FRAME_COUNT + 1 {
-            pulse.advance(&spy);
+            pulse.advance(&spy, &FrameToken::default());
         }
         assert_eq!(spy.frames(), vec![1, 2, 3, 0, 1]);
         assert_eq!(pulse.frame(), 1);
@@ -839,7 +1025,8 @@ mod tests {
         let spy = Arc::new(Spy::default());
 
         animation.apply(IconMotion::Running, spy.clone());
-        animation.pulse().advance(spy.as_ref()); // the timer's first step
+        // The timer's first step.
+        animation.pulse().advance(spy.as_ref(), &animation.token());
         animation.apply(IconMotion::Running, spy.clone());
 
         assert_eq!(
@@ -856,7 +1043,7 @@ mod tests {
         let spy = Arc::new(Spy::default());
 
         animation.apply(IconMotion::Running, spy.clone());
-        animation.pulse().advance(spy.as_ref());
+        animation.pulse().advance(spy.as_ref(), &animation.token());
 
         animation.apply(IconMotion::Held, spy.clone());
         assert!(!animation.is_running(), "paused keeps no timer (mantra 1)");
@@ -923,6 +1110,141 @@ mod tests {
             spy.frames(),
             after_stop,
             "nothing paints the tray once the recording is over"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_computed_just_before_the_recording_ended_never_reaches_the_tray() {
+        // The race `stop` cannot win on its own. Aborting a timer does not
+        // reach into the tick already running, so that tick finishes and hands
+        // its frame to the painter — which, for the real tray, means queueing
+        // it for the main thread, possibly behind the idle icon. Landing there
+        // would leave the menu bar claiming a recording that had finished until
+        // the tray state next changed, which on 2026-08-24 was never.
+        let animation = TrayAnimation::new();
+        let spy = Arc::new(Spy::default());
+
+        animation.apply(IconMotion::Running, spy.clone());
+        // What the doomed tick is holding: the token it was handed when the
+        // pulse began.
+        let in_flight = animation.token();
+
+        animation.stop();
+        animation.pulse().advance(spy.as_ref(), &in_flight);
+
+        assert_eq!(
+            spy.frames(),
+            vec![0],
+            "the recording's first frame, and nothing from after it ended"
+        );
+        assert_eq!(
+            animation.frame(),
+            0,
+            "and it did not move the counter the next recording will use"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transition_retires_the_frames_the_last_pulse_still_has_in_flight() {
+        // The contract `TrayPainter` leans on: it checks the token on the main
+        // thread, at the last possible moment, and needs a token handed out
+        // before a transition to read as stale after it.
+        let animation = TrayAnimation::new();
+        let spy = Arc::new(Spy::default());
+
+        animation.apply(IconMotion::Running, spy.clone());
+        let token = animation.token();
+        assert!(token.is_current(), "nothing has happened to it yet");
+
+        animation.apply(IconMotion::Held, spy.clone());
+        assert!(!token.is_current(), "pausing retired it");
+
+        let token = animation.token();
+        animation.stop();
+        assert!(!token.is_current(), "so does stopping");
+    }
+
+    #[tokio::test]
+    async fn a_frame_from_the_pulse_before_a_pause_does_not_overwrite_the_held_one() {
+        // Same race, the other transition: pausing paints one frame and holds
+        // it, so a straggler from the pulse that just ended would leave the
+        // menu bar breathing a frame nobody asked for.
+        let animation = TrayAnimation::new();
+        let spy = Arc::new(Spy::default());
+
+        animation.apply(IconMotion::Running, spy.clone());
+        let in_flight = animation.token();
+
+        animation.apply(IconMotion::Held, spy.clone());
+        animation.pulse().advance(spy.as_ref(), &in_flight);
+
+        assert_eq!(spy.frames(), vec![0, 0], "the held frame is the last word");
+    }
+
+    #[test]
+    fn a_poisoned_animation_still_stops() {
+        // Poison the animation's lock the only way it can really happen: a
+        // thread panics while holding it. On 2026-08-24 a panic during an emit
+        // did exactly that, and every later caller then panicked in turn on the
+        // event path. A poisoned tray must now be nothing worse than a tray
+        // whose last transition was cut short.
+        let animation = TrayAnimation::new();
+        let spy = Arc::new(Spy::default());
+
+        // The panic below is the point of the test, not a failure of it, and it
+        // prints a backtrace line to the run's output. Deliberately left alone:
+        // the panic hook is one process-wide slot and `logging`'s own tests
+        // install and assert on theirs, so a test that swaps the hook out and
+        // back races every other test in this binary for it.
+        let panicked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = animation.inner.lock().unwrap();
+                    panic!("poisoning the tray animation on purpose");
+                })
+                .join()
+                .is_err()
+        });
+        assert!(panicked, "the thread was supposed to panic");
+        assert!(
+            animation.inner.lock().is_err(),
+            "the lock really is poisoned, so the rest of this test means something"
+        );
+
+        animation.stop();
+        assert!(!animation.is_running());
+        assert_eq!(animation.motion(), IconMotion::Off);
+
+        // And it still takes instructions afterwards.
+        animation.apply(IconMotion::Held, spy.clone());
+        assert_eq!(animation.motion(), IconMotion::Held);
+        assert_eq!(spy.frames(), vec![0]);
+    }
+
+    #[test]
+    fn a_recording_without_a_runtime_shows_a_still_icon_instead_of_panicking() {
+        // Deliberately a plain `#[test]`: with no runtime on this thread,
+        // `Handle::try_current` fails, which is exactly the situation that used
+        // to panic inside `tokio::spawn` — on the path every capture-state
+        // event takes.
+        let animation = TrayAnimation::new();
+        let spy = Arc::new(Spy::default());
+
+        animation.apply(IconMotion::Running, spy.clone());
+
+        assert!(
+            !animation.is_running(),
+            "there was nothing to run a timer on"
+        );
+        assert_eq!(
+            animation.motion(),
+            IconMotion::Running,
+            "the tray still knows a recording is happening"
+        );
+        assert_eq!(
+            spy.frames(),
+            vec![0],
+            "the recording icon is up, it just does not breathe"
         );
     }
 

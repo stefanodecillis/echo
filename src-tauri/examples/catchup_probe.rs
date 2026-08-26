@@ -66,7 +66,11 @@ struct Probe<'a> {
 }
 
 impl Transcriber for Probe<'_> {
-    async fn transcribe(&self, job: TranscribeJob) -> Result<Transcription, AsrError> {
+    async fn transcribe(
+        &self,
+        job: TranscribeJob,
+        prompt: Option<String>,
+    ) -> Result<Transcription, AsrError> {
         let t_start_ms = job.t_start_ms;
         let duration_ms = job.duration_ms();
         let samples = job.samples.len();
@@ -74,7 +78,7 @@ impl Transcriber for Probe<'_> {
         let peak = job.samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         let pinned = job.language_hint.clone();
 
-        let answer = self.engine.transcribe(job).await;
+        let answer = self.engine.transcribe(job, prompt).await;
         let outcome = match &answer {
             Ok(t) if t.text.trim().is_empty() => "ok (nothing said)".to_string(),
             Ok(t) => format!(
@@ -155,12 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // One millisecond of budget is one stretch per window: the pass as
             // it was before packing.
             "--no-packing" => pack_ms = 1,
-            "--pack-ms" => {
-                pack_ms = args
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0)
-            }
+            "--pack-ms" => pack_ms = args.next().and_then(|n| n.parse().ok()).unwrap_or(0),
             other => positional.push(other.to_string()),
         }
     }

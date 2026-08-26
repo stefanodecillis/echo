@@ -4,8 +4,8 @@ import { save } from "@tauri-apps/plugin-dialog";
 
 import { Button, Chip, Modal, ProgressBar } from "@/components";
 import { formatBytes } from "@/components/lib/format";
-import { channels, common, jobLine, meeting as copy, notices } from "@/lib/copy";
-import { isActive, presentJob, runningFirst } from "@/lib/jobs";
+import { channels, common, meeting as copy, notices } from "@/lib/copy";
+import { isActive, jobSentence, presentJob, runningFirst } from "@/lib/jobs";
 import { deleteMeeting, downloadRecording, toUiError } from "@/lib/ipc";
 import { useEchoStore } from "@/lib/store";
 import type { Channel, Id, MeetingDetail } from "@/lib/types";
@@ -130,7 +130,7 @@ export function InfoTab({ meetingId, detail }: InfoTabProps) {
               <div key={job.id} className="flex flex-col gap-1.5">
                 {shown.running && <ProgressBar value={shown.fraction} label={shown.label} />}
                 <span className="text-xs text-ink-faint">
-                  {shown.running ? jobLine.running(shown.label) : jobLine.waiting(shown.label)}
+                  {jobSentence(shown)}
                 </span>
               </div>
             );

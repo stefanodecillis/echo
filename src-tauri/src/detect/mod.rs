@@ -679,6 +679,11 @@ struct Inner {
     enabled: bool,
     snoozed_until: Option<DateTime<Utc>>,
     status: DetectionStatus,
+    /// The last tray state this watcher asked for. Not what the tray is showing
+    /// — that is the menu bar's business and other things paint it too — only
+    /// what this watcher last had to say, so a poll with no news repaints
+    /// nothing (mantra 1: an idle Echo is a poll and nothing else).
+    tray: Option<TrayState>,
 }
 
 /// The watcher. Owns the poll timer and the debounce state.
@@ -725,6 +730,7 @@ impl Watcher {
                     state: initial_state(enabled),
                     ..Default::default()
                 },
+                tray: None,
             }),
             debounce: Mutex::new(DebounceTracker::default()),
             db: OnceLock::new(),
@@ -963,7 +969,7 @@ impl Watcher {
         };
         let is_recording = capture_state == CaptureState::Recording;
 
-        let (new_status, previous_state) = {
+        let new_status = {
             let mut inner = self.inner.lock().unwrap();
             let state = if !inner.enabled {
                 DetectionState::Off
@@ -989,10 +995,35 @@ impl Watcher {
                 snoozed_until: inner.snoozed_until.map(|t| t.to_rfc3339()),
                 suggest_stop: is_recording && suggest_stop_latched,
             };
-            let previous_state = inner.status.state;
             inner.status = status.clone();
-            (status, previous_state)
+            status
         };
+
+        // What the menu bar should be showing, worked out the same way and from
+        // the same facts as the job runtime's own recompute — one rule, two
+        // callers, so they cannot disagree about an icon they both paint.
+        //
+        // Until 2026-08-25 this asked a narrower question ("did detection change
+        // its mind?") and answered it with Idle or Detected, which meant every
+        // detection edge wiped whatever else the icon was saying. With a state
+        // for "still working on the last meeting" that would have been a spinner
+        // deleted a few seconds after it appeared, every time.
+        let outstanding = match self.db.get() {
+            Some(db) => crate::session::jobs::outstanding_meeting_jobs(db).await,
+            // No database yet means launch has not finished; nothing can have
+            // been queued, so nothing is outstanding.
+            None => 0,
+        };
+        let wanted = crate::session::tray_state_for(
+            // The same span the engine is held for, and for the same reason: from
+            // the click to the last chunk being written, this machine is in the
+            // middle of a meeting. Asking the same function keeps a paused
+            // recording — which is not `Recording` but is certainly not idle —
+            // from being painted over by a detection poll.
+            crate::session::engine_is_needed_by_capture(capture_state),
+            matches!(new_status.state, DetectionState::Detected),
+            outstanding,
+        );
 
         let Some(app) = self.app.lock().unwrap().clone() else {
             return;
@@ -1000,14 +1031,19 @@ impl Watcher {
 
         let _ = app.emit(events::DETECTION, new_status.clone());
 
-        if !is_recording && previous_state != new_status.state {
-            crate::set_tray_state(
-                &app,
-                match new_status.state {
-                    DetectionState::Detected => TrayState::Detected,
-                    _ => TrayState::Idle,
-                },
-            );
+        let news = {
+            let mut inner = self.inner.lock().unwrap();
+            let news = inner.tray != Some(wanted);
+            inner.tray = Some(wanted);
+            news
+        };
+        // While a recording is on air the icon belongs to the pulse, which is
+        // driven by capture and knows about pauses. Detection has nothing to add
+        // there, and repainting would only interrupt the animation — so the
+        // answer is remembered (so the poll after the recording knows what
+        // changed) and not painted.
+        if news && !matches!(wanted, TrayState::Recording) {
+            crate::set_tray_state(&app, wanted);
         }
 
         if edge == StepEvent::Detected {

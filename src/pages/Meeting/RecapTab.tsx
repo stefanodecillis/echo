@@ -2,8 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 
 import { Button, EmptyState, ProgressBar } from "@/components";
 import { CheckIcon, CopyIcon, EchoMark } from "@/components/icons";
-import { common, meeting as copy, notices } from "@/lib/copy";
+import { common, jobLine, labels, meeting as copy, notices } from "@/lib/copy";
 import { updateActionItem } from "@/lib/ipc";
+import { inProgressJob, isActive, jobSentence, lastFailure, presentJob } from "@/lib/jobs";
 import { useEchoStore } from "@/lib/store";
 import type { ActionItem, Id, Job, MeetingDetail } from "@/lib/types";
 
@@ -11,6 +12,16 @@ import { ActionItemRow } from "./components/ActionItemRow";
 import { ExportMenu } from "./components/ExportMenu";
 import { RecapControls } from "./components/RecapControls";
 import { RecapMarkdown } from "./lib/markdown";
+
+/** Job kinds that mean "Echo is still writing this meeting down".
+ *
+ * The same pair the Transcript tab watches, for the same reason: there is no
+ * dedicated kind for "the transcript is being written", it is these two passes.
+ * The recap depends on their output, and the queue already runs them first — a
+ * queued recap is ordered by kind, so it starts after that meeting's transcript
+ * work whatever order things were asked for in. Nothing here changes that; this
+ * is only the tab finally saying it. */
+const TRANSCRIPT_JOB_KINDS = new Set(["transcribeCatchup", "diarize"]);
 
 export interface RecapTabProps {
   meetingId: Id;
@@ -40,6 +51,52 @@ export function RecapTab({ meetingId, meetingTitle, detail, setDetail }: RecapTa
       (j) => j.kind === "summarize" && (j.status === "running" || j.status === "queued"),
     );
   }, [detail.jobs, pendingJobId]);
+
+  // Is Echo still writing this meeting down? The one that is *running*, and
+  // only failing that the one that is waiting (see `lib/jobs.ts`).
+  const transcriptJob = useMemo(
+    () =>
+      inProgressJob(
+        detail.jobs.filter((j) => j.meetingId === meetingId && isActive(j)),
+        TRANSCRIPT_JOB_KINDS,
+      ),
+    [detail.jobs, meetingId],
+  );
+  const transcriptProgress = transcriptJob ? presentJob(transcriptJob) : undefined;
+
+  // A transcript pass that stopped without finishing. This is the edge that
+  // matters most here: the queue's ordering guarantees a recap comes *after*
+  // the transcript work, not that the transcript work succeeded. Writing a
+  // recap from a half-written transcript and saying nothing is the one outcome
+  // a person could not detect. Only while nothing is running — work in progress
+  // is the more useful thing to say about the same passes.
+  const transcriptFailure = useMemo(
+    () =>
+      transcriptJob
+        ? undefined
+        : lastFailure(
+            detail.jobs.filter((j) => j.meetingId === meetingId),
+            TRANSCRIPT_JOB_KINDS,
+          ),
+    [detail.jobs, meetingId, transcriptJob],
+  );
+
+  /** What the transcript is doing, said underneath whatever the recap is
+   * doing. `undefined` once the transcript is simply finished. */
+  const transcriptNote = transcriptProgress ? (
+    <span className="text-xs text-ink-faint">{jobSentence(transcriptProgress)}</span>
+  ) : transcriptFailure ? (
+    <>
+      <span className="text-xs font-medium text-ink-soft">
+        {jobLine.stopped(labels.jobKind[transcriptFailure.kind])}
+      </span>
+      <span className="text-xs text-ink-faint">
+        {transcriptFailure.error ?? notices.somethingWentWrong}
+      </span>
+    </>
+  ) : undefined;
+
+  const recapProgress = activeJob ? presentJob(activeJob) : undefined;
 
   useEffect(() => {
     if (!pendingJobId) return;
@@ -88,21 +145,62 @@ export function RecapTab({ meetingId, meetingTitle, detail, setDetail }: RecapTa
           <div className="echo-card p-6">
             <RecapMarkdown content={currentSummary.contentMd} />
           </div>
-        ) : activeJob ? (
+        ) : activeJob && recapProgress ? (
+          // Asked for, but not necessarily happening. A queued recap used to be
+          // labelled "Writing your recap…" over a moving bar, which is the
+          // wrong word for waiting — and while the transcript was still being
+          // written, the wrong *thing* to be talking about. Names what is
+          // actually true, and says what it is waiting for.
           <div className="echo-card flex flex-col items-center gap-4 px-6 py-16 text-center">
-            <h3 className="text-base font-semibold text-ink">{copy.recapWritingTitle}</h3>
-            <p className="max-w-sm text-sm text-ink-faint">{copy.recapWritingDescription}</p>
-            <div className="w-full max-w-xs">
-              <ProgressBar value={activeJob.progress} />
-            </div>
+            <h3 className="text-base font-semibold text-ink">
+              {recapProgress.running ? copy.recapWritingTitle : copy.recapWaitingTitle}
+            </h3>
+            <p className="max-w-sm text-sm text-ink-faint">
+              {transcriptProgress
+                ? copy.recapWaitingForTranscriptDescription
+                : transcriptFailure
+                  ? copy.recapTranscriptStoppedDescription
+                  : recapProgress.running
+                    ? copy.recapWritingDescription
+                    : copy.recapWaitingDescription}
+            </p>
+            {/* A bar only for work that has started: a job that has not begun
+                has made no progress to show (see `lib/jobs.ts`). */}
+            {recapProgress.running ? (
+              <div className="w-full max-w-xs">
+                <ProgressBar value={activeJob.progress} />
+              </div>
+            ) : (
+              <span className="text-xs text-ink-faint">{jobSentence(recapProgress)}</span>
+            )}
+            {transcriptNote && (
+              <div className="flex flex-col items-center gap-1">{transcriptNote}</div>
+            )}
           </div>
         ) : (
           <div className="echo-card">
             <EmptyState
               icon={<EchoMark className="h-8 w-8" />}
-              title={copy.noRecapTitle}
-              description={copy.noRecapDescription}
+              title={
+                transcriptProgress
+                  ? copy.noRecapWhileTranscribingTitle
+                  : transcriptFailure
+                    ? copy.recapTranscriptStoppedTitle
+                    : copy.noRecapTitle
+              }
+              description={
+                transcriptProgress
+                  ? copy.noRecapWhileTranscribingDescription
+                  : transcriptFailure
+                    ? copy.recapTranscriptStoppedDescription
+                    : copy.noRecapDescription
+              }
               action={
+                // Deliberately still enabled while the transcript is being
+                // written. The queue orders a recap after that meeting's
+                // transcript work, so this button makes a promise Echo already
+                // keeps — better than a disabled control that has to explain
+                // why it can't be pressed.
                 <RecapControls
                   meetingId={meetingId}
                   hasSummary={false}
@@ -111,6 +209,11 @@ export function RecapTab({ meetingId, meetingTitle, detail, setDetail }: RecapTa
                 />
               }
             />
+            {transcriptNote && (
+              <div className="flex flex-col items-center gap-1 border-t border-hairline px-6 py-3 text-center">
+                {transcriptNote}
+              </div>
+            )}
           </div>
         )}
 

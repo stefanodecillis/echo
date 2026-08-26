@@ -51,14 +51,14 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
-use crate::audio::{AudioError, CaptureConfig};
+use crate::audio::{AudioError, CaptureConfig, SYSTEM_AUDIO_UNAVAILABLE_AT_START};
 use crate::db::{repo, Db};
 use crate::events::{MeetingUpdatedPayload, NoticeLevel, NoticePayload};
 use crate::paths::AppPaths;
 use crate::session::ports::{CaptureHandle, CaptureStart, EventBus, EventSink, Ports, UiEvent};
 use crate::types::{
     CaptureState, CaptureStatus, Channel, DegradedReason, Id, JobKind, Marker, MarkerKind,
-    MeetingStatus, RecoveryAction, StartRecordingOptions, Timestamp, TrayState,
+    MeetingStatus, RecoveryAction, SpeechState, StartRecordingOptions, Timestamp, TrayState,
 };
 
 /// How long a stop waits for the live pipeline to write what it already has.
@@ -200,6 +200,11 @@ pub(crate) struct LiveState {
     pub(crate) elapsed_ms: i64,
     pub(crate) active_channels: Vec<Channel>,
     pub(crate) degraded_reason: Option<DegradedReason>,
+    /// The engine did not come up for this meeting. Cleared by the next Start,
+    /// because a new meeting is a new attempt — the only remembered half of
+    /// [`speech_state`], and only because "it failed" is not something the
+    /// engine itself keeps.
+    pub(crate) speech_load_failed: bool,
     /// Interrupted meetings waiting for a finish-or-discard answer.
     pub(crate) recovering: Vec<Id>,
 }
@@ -256,6 +261,14 @@ impl Inner {
             degraded_reason: live.degraded_reason,
             pending_utterances: self.pending.load(Ordering::SeqCst),
             started_at: live.started_at.clone(),
+            // Asked of the engine here, every time, rather than remembered by
+            // anything that emits: this status is polled as well as pushed, so
+            // a derived answer is one the UI can always get hold of.
+            speech: speech_state(
+                self.ports.asr.is_loaded(),
+                live.speech_load_failed,
+                live.state,
+            ),
         }
     }
 
@@ -292,7 +305,10 @@ impl Inner {
         tracing::warn!(?channel, ?reason, "capture degraded");
         let source_lost = matches!(
             reason,
-            DegradedReason::SystemAudioUnavailable | DegradedReason::MicrophoneUnavailable
+            DegradedReason::SystemAudioUnavailable
+                | DegradedReason::SystemAudioLost
+                | DegradedReason::MicrophoneUnavailable
+                | DegradedReason::NothingIsBeingHeard
         );
 
         let elapsed = {
@@ -377,10 +393,14 @@ impl Inner {
         let worth_keeping = recovery::meeting_has_content(self, meeting_id)
             .await
             .unwrap_or(true);
+        // The same rule as the ordinary close, for the same reason: a sliver of
+        // the transcript never decides what a meeting was in, and a row with no
+        // observed language on it leaves whatever was settled alone
+        // (`asr::language::spoken_in`).
         let language = repo::language_histogram(&self.db, meeting_id)
             .await
             .ok()
-            .and_then(|h| h.first().map(|(l, _)| l.clone()));
+            .and_then(|h| crate::asr::language::spoken_in(&h).dominant);
         let status = if worth_keeping {
             MeetingStatus::Processing
         } else {
@@ -560,6 +580,65 @@ pub fn engine_stays_resident(capturing: bool, outstanding_meeting_jobs: usize) -
     capturing || outstanding_meeting_jobs > 0
 }
 
+/// What the menu bar should be showing, from the three facts that decide it.
+///
+/// The same discipline as [`engine_stays_resident`], for the same reason: the
+/// icon is a rule over facts read fresh at every edge, never a flag somebody has
+/// to remember to clear. Two places ask it — the job runtime when the queue
+/// moves, the detection watcher on its poll — and because they ask the same
+/// question of the same facts they cannot disagree for longer than it takes the
+/// facts to settle.
+///
+/// The order of the arms *is* the rule:
+/// * a live recording outranks everything. It is the one state where the icon
+///   is answering "is this thing listening to me right now?", and nothing may
+///   take that answer away.
+/// * unfinished work outranks a detected meeting. "Still working on the last
+///   one" is news; "you could start recording" already has a panel and a
+///   notification of its own, and an icon is a poor place to nudge from.
+/// * detected outranks idle, which is what it has always meant.
+pub fn tray_state_for(
+    capturing: bool,
+    detected: bool,
+    outstanding_meeting_jobs: usize,
+) -> TrayState {
+    if capturing {
+        TrayState::Recording
+    } else if outstanding_meeting_jobs > 0 {
+        TrayState::Processing
+    } else if detected {
+        TrayState::Detected
+    } else {
+        TrayState::Idle
+    }
+}
+
+/// What to tell the person about speech, from the two facts that decide it.
+///
+/// Pure, so the rule can be read and tested without a meeting, a thread or a
+/// gigabyte of weights — and called on every status read rather than stored, so
+/// nothing here can go stale (see [`crate::types::SpeechState`]).
+///
+/// The order of the arms *is* the rule:
+/// * loaded wins over everything, including a load that failed earlier in this
+///   meeting. A later load repairs an earlier failure, and a banner that
+///   outlives the problem it described is worse than no banner at all.
+/// * a failure is worth saying whether or not a meeting is running: it is the
+///   answer to "why is nothing appearing", and the next Start clears it.
+/// * otherwise, a meeting that needs the engine and has not got it is
+///   `Preparing` — the state that had no way to be shown on 2026-08-24.
+pub fn speech_state(loaded: bool, load_failed: bool, capture: CaptureState) -> SpeechState {
+    if loaded {
+        SpeechState::Ready
+    } else if load_failed {
+        SpeechState::Unavailable
+    } else if engine_is_needed_by_capture(capture) {
+        SpeechState::Preparing
+    } else {
+        SpeechState::Idle
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The manager
 // ---------------------------------------------------------------------------
@@ -638,6 +717,16 @@ impl SessionManager {
         self.0.ports.events.clone()
     }
 
+    /// Let the tray rule ask the meeting watcher whether a meeting is happening.
+    ///
+    /// Wired at launch rather than in [`SessionManager::with_ports`] because the
+    /// watcher is the app's, not the session's — and asked on every recompute
+    /// rather than mirrored here, so there is nothing to go stale
+    /// (see [`tray_state_for`]).
+    pub fn watch_detection(&self, is_detected: Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.0.jobs.watch_detection(is_detected);
+    }
+
     /// Start recording. Writes the meeting row before opening any device.
     ///
     /// Already recording returns the meeting in progress.
@@ -675,6 +764,9 @@ impl SessionManager {
             live.elapsed_ms = 0;
             live.active_channels.clear();
             live.degraded_reason = None;
+            // A new meeting is a new attempt at the engine: whatever went wrong
+            // for the last one is not this meeting's news.
+            live.speech_load_failed = false;
         }
         inner.pending.store(0, Ordering::SeqCst);
         inner.emit_state();
@@ -727,6 +819,9 @@ impl SessionManager {
                 .capture_system_audio
                 .unwrap_or(settings.capture_system_audio),
             input_device_id: opts.input_device_id.clone().or(settings.input_device_id),
+            // Only so capture can look for the one file that switches bleed
+            // suppression off; nothing is written there from the audio threads.
+            log_dir: Some(inner.paths.log_dir.clone()),
         };
         let opened = inner.ports.capture.open(cfg).await;
         let CaptureStart {
@@ -785,7 +880,7 @@ impl SessionManager {
                 .note_degraded(
                     Some(Channel::System),
                     DegradedReason::SystemAudioUnavailable,
-                    "Echo is recording you, but it can't hear what this computer plays.",
+                    SYSTEM_AUDIO_UNAVAILABLE_AT_START,
                     &meeting.id,
                 )
                 .await;
@@ -861,9 +956,24 @@ impl SessionManager {
                 // weights had to be read or the graphics compiler had work to do.
                 // Whatever was said in the meantime is on disk, so read it back
                 // into the transcript before carrying on live.
-                Ok(()) => pipeline::catch_up_backlog(engine, engine_meeting, backlog).await,
+                Ok(()) => {
+                    // Before the backlog is read, not after it. Reading minutes
+                    // of audio back can itself take a while, and the thing the
+                    // banner is about — whether Echo can understand speech —
+                    // became true the moment the load returned.
+                    engine.emit_state();
+                    pipeline::catch_up_backlog(engine, engine_meeting, backlog).await
+                }
                 Err(error) => {
                     tracing::warn!(%error, "speech understanding is not ready");
+                    {
+                        let mut live = engine.live.lock().expect("capture state lock");
+                        live.speech_load_failed = true;
+                    }
+                    // The banner and the notice say the same thing, and they say
+                    // it at the same moment: the notice is a message that can be
+                    // missed, this is the state the screen can always ask for.
+                    engine.emit_state();
                     engine.notice(NoticePayload {
                         level: NoticeLevel::Warning,
                         message: "Echo is recording, but it can't write the words down yet. It \
@@ -939,10 +1049,17 @@ impl SessionManager {
             .await
             .unwrap_or(0);
         let duration_ms = duration_ms.max(committed);
+        // Most speaking time wins, but a language holding a sliver of the
+        // transcript never does — one sentence misread as Chinese is not what
+        // the meeting was in (`asr::language::spoken_in`). And nothing here is
+        // a copy of what the engine already settled on: a segment row only
+        // carries a language it was actually *heard* to be in
+        // (`asr::Transcription::observed_language`), so an empty answer leaves
+        // the row as it stands rather than writing the pin over itself.
         let language = repo::language_histogram(&inner.db, &meeting_id)
             .await
             .ok()
-            .and_then(|h| h.first().map(|(l, _)| l.clone()));
+            .and_then(|h| crate::asr::language::spoken_in(&h).dominant);
 
         repo::finish_meeting(
             &inner.db,
@@ -976,7 +1093,12 @@ impl SessionManager {
         inner.pending.store(0, Ordering::SeqCst);
         inner.transition(&CaptureEvent::Stopped);
         inner.emit_state();
-        inner.ports.events.emit(UiEvent::TrayState(TrayState::Idle));
+        // Not "idle": the recording is over but the meeting is not. Whatever
+        // `queue_finalization` just put in the table is outstanding work, and
+        // the icon says so until the last of it settles. Asked rather than
+        // asserted, so the discarded case — nothing queued, nothing to work on —
+        // answers itself.
+        inner.jobs.refresh_tray_state().await;
 
         if discarded {
             // `queue_finalization` already told the UI the row is gone, and
@@ -1054,7 +1176,9 @@ impl SessionManager {
             .degraded_reason;
         if let Some(
             reason @ (DegradedReason::SystemAudioUnavailable
-            | DegradedReason::MicrophoneUnavailable),
+            | DegradedReason::SystemAudioLost
+            | DegradedReason::MicrophoneUnavailable
+            | DegradedReason::NothingIsBeingHeard),
         ) = reason
         {
             inner.transition(&CaptureEvent::SourceLost(reason));
@@ -1208,10 +1332,13 @@ impl SessionManager {
     /// Start the loop that drains the jobs table. Called once at launch;
     /// calling it again does nothing.
     pub async fn start_job_runner(&self) -> Result<(), SessionError> {
+        self.retry_failed_speech_setup().await;
         // A crash leaves rows marked running, and a crash *during a recording*
         // leaves them parked. Neither can still be true, so both go back in the
-        // queue with their progress intact.
-        if let Err(error) = repo::requeue_orphaned_jobs(&self.0.db).await {
+        // queue with their progress intact — except a setup row the process died
+        // inside, which is settled as failed instead so the compile that took
+        // the app down is not started again at this launch and every one after.
+        if let Err(error) = repo::requeue_orphaned_jobs(&self.0.db, jobs::SETUP_INTERRUPTED).await {
             tracing::warn!(%error, "could not tidy the work queue");
         }
         // Nothing owns the machine at launch. Saying so out loud clears the
@@ -1223,6 +1350,41 @@ impl SessionManager {
         }
         self.0.jobs.start();
         Ok(())
+    }
+
+    /// Give the one-time speech setup another go, once, at launch.
+    ///
+    /// The whole automatic escape hatch from the one-attempt policy, and the
+    /// reason a single bad minute cannot leave a machine unwarmed for good.
+    ///
+    /// A setup row that failed without ever reaching the compile took its record
+    /// of the attempt back with it (`jobs::prepare_engine`), so the weights still
+    /// owe this machine a setup and the row is worth another go — and a launch
+    /// is the right distance to try from: far enough apart to be a different
+    /// day, a different disk and a different amount of free memory, where asking
+    /// again on the readiness polls would be a hundred identical failures a
+    /// minute. When the attempt *did* reach the compile, the marker written
+    /// before the load is still standing, this reads as "nothing owed", and the
+    /// row stays failed — which is the whole point of writing it first.
+    async fn retry_failed_speech_setup(&self) {
+        match crate::asr::models::warm_up_needed(&self.0.db).await {
+            Ok(Some(file_name)) => {
+                let Ok(payload) = serde_json::to_string(&file_name) else {
+                    return;
+                };
+                match repo::requeue_failed_setup_jobs(&self.0.db, &payload).await {
+                    Ok(n) if n > 0 => tracing::info!(
+                        rows = n,
+                        model = %file_name,
+                        "giving the one-time speech setup another go"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "could not pick the speech setup back up"),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::debug!(%error, "could not tell whether speech needs setting up"),
+        }
     }
 
     /// Make sure Echo has the speech model it wants, and get rid of any it does
@@ -1304,7 +1466,79 @@ impl SessionManager {
             }
         }
 
+        // Everything is here and nothing is being recorded: the moment to pay
+        // the one-time setup these weights need on this machine, if it has never
+        // been paid. Weights that arrived without a download job — a restore, a
+        // copy from another machine, an out-of-band unpack — have nobody else to
+        // pay it, and on 2026-08-24 that bill was settled by a real meeting,
+        // sixteen minutes of it, with nothing on screen to explain the silence.
+        //
+        // Not while recording: the meeting in progress is already loading the
+        // engine it needs, and a second reason to do the same thing helps
+        // nobody. `queue` deduplicates per kind, so the readiness polls that run
+        // several times a second join the row that exists rather than stacking
+        // rows; once the job has run, the marker it writes is what stops this.
+        if plan.can_serve() && plan.missing.is_empty() && !recording {
+            match crate::asr::models::warm_up_needed(&self.0.db).await {
+                Ok(Some(file_name)) => {
+                    if self.setup_already_failed_for(&file_name).await {
+                        // Tried, and it did not come off. Asking again here would
+                        // ask again a few milliseconds later too, and a few
+                        // milliseconds after that, for as long as the app is
+                        // open. That row gets its next go at the next launch
+                        // (`start_job_runner`), which is far enough away to be a
+                        // different day and a different disk.
+                    } else {
+                        match self
+                            .queue_job_with_payload(None, JobKind::PrepareEngine, &file_name)
+                            .await
+                        {
+                            Ok(_) => tracing::info!(
+                                model = %file_name,
+                                "queued the one-time setup these speech weights need on this machine"
+                            ),
+                            Err(error) => {
+                                tracing::warn!(%error, "could not queue the one-time speech setup")
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => tracing::debug!(
+                    %error,
+                    "could not tell whether the speech weights still need setting up"
+                ),
+            }
+        }
+
         plan.can_serve()
+    }
+
+    /// Whether the one-time setup for exactly these weights has already been
+    /// asked for and failed.
+    ///
+    /// A failed attempt that never reached the compile takes its marker back
+    /// with it, so [`crate::asr::models::warm_up_needed`] starts saying "still
+    /// owed" again the moment it ends — right, but not a reason to try again
+    /// this second. The failed row is the memory of the attempt for the rest of
+    /// the launch; a fresh one is queued for weights nobody has tried yet, so a
+    /// new model is never held back by an old model's bad day.
+    ///
+    /// Trouble reading the queue counts as "already failed": every other answer
+    /// leads to queueing a job, and a database that cannot answer this would
+    /// have it queued again on the next poll, and the next.
+    async fn setup_already_failed_for(&self, file_name: &str) -> bool {
+        let Ok(payload) = serde_json::to_string(file_name) else {
+            return true;
+        };
+        match repo::has_failed_job_with_payload(&self.0.db, JobKind::PrepareEngine, &payload).await
+        {
+            Ok(failed) => failed,
+            Err(error) => {
+                tracing::debug!(%error, "could not read the work queue");
+                true
+            }
+        }
     }
 
     /// Load speech understanding now, because the person asked. Nothing loads on
@@ -1395,8 +1629,17 @@ fn session_error_for(error: AudioError) -> SessionError {
 /// stack them.
 fn degraded_tag(reason: DegradedReason) -> &'static str {
     match reason {
-        DegradedReason::SystemAudioUnavailable => "systemAudioLost",
+        // The two system-audio reasons share a tag on purpose: they are the same
+        // banner slot, so the second one replaces the first rather than stacking
+        // a second sentence about the same channel.
+        DegradedReason::SystemAudioUnavailable | DegradedReason::SystemAudioLost => {
+            "systemAudioLost"
+        }
         DegradedReason::MicrophoneUnavailable => "microphoneLost",
+        // Its own slot: it is not the same banner as either of the two above.
+        // It replaces nothing and nothing replaces it, because by the time it
+        // is shown there is no other source left to report on.
+        DegradedReason::NothingIsBeingHeard => "nothingIsBeingHeard",
         DegradedReason::TranscriptBehind => "transcriptBehind",
         DegradedReason::StorageLow => "storageLow",
     }
@@ -1684,11 +1927,21 @@ mod tests {
 
         h.capture.send(ports::CaptureSignal::Degraded {
             channel: Some(Channel::System),
-            reason: DegradedReason::SystemAudioUnavailable,
-            message: "Echo stopped hearing what this computer plays.".into(),
+            reason: DegradedReason::SystemAudioLost,
+            message: crate::audio::SYSTEM_AUDIO_LOST_MESSAGE.into(),
         });
         h.settle().await;
-        assert_eq!(h.session.status().await.state, CaptureState::Degraded);
+        let status = h.session.status().await;
+        assert_eq!(status.state, CaptureState::Degraded);
+        // The reason a stream that died mid-meeting reports is its own, and the
+        // screen draws its banner from it: the mic-only banner would promise a
+        // separation of the microphone tail that this meeting never gets.
+        assert_eq!(
+            status.degraded_reason,
+            Some(DegradedReason::SystemAudioLost)
+        );
+        // Same banner slot as a system channel that never opened, so the second
+        // sentence replaces the first instead of stacking beside it.
         assert!(h.events.notice_tagged("systemAudioLost"));
 
         h.capture.send(ports::CaptureSignal::Recovered {
@@ -1746,6 +1999,7 @@ mod tests {
                 t_end_ms: 3_000,
                 samples: vec![0.0; 16_000],
                 truncated: false,
+                voiced_ms: 1_000,
             }));
 
         let stopped = h.session.stop().await.unwrap();
@@ -1855,6 +2109,49 @@ mod tests {
         assert!(h.session.status().await.meeting_id.is_none());
     }
 
+    /// The closing lie of the incident of 2026-08-21: forty-five minutes of
+    /// nothing, and the only thing the person was told was that it had been too
+    /// short to keep.
+    #[tokio::test]
+    async fn a_long_recording_that_saved_nothing_is_not_called_too_short() {
+        let h = Harness::new().await;
+        h.session.start(Default::default()).await.unwrap();
+        // Three quarters of an hour on the clock, not one chunk committed.
+        h.capture.set_elapsed(45 * 60_000);
+
+        assert!(h.session.stop().await.unwrap().is_none());
+
+        assert!(
+            !h.events.notice_tagged("nothingToKeep"),
+            "told somebody who recorded forty-five minutes that it was too short"
+        );
+        let told = h
+            .events
+            .notices()
+            .into_iter()
+            .find(|n| n.tag.as_deref() == Some("heardNothing"))
+            .expect("nobody was told the recording heard nothing");
+        assert!(
+            told.message.contains("couldn't hear anything"),
+            "{} does not say what actually happened",
+            told.message
+        );
+        assert!(
+            !told.message.contains("too short"),
+            "{} still calls it short",
+            told.message
+        );
+        assert_eq!(
+            told.level,
+            NoticeLevel::Warning,
+            "a lost recording slid past as an aside"
+        );
+        assert!(
+            told.persistent,
+            "the only record of what happened faded on its own"
+        );
+    }
+
     /// The journal is bookkeeping; the files are the truth. A stop that could not
     /// write its chunk rows in time must not cost someone their meeting.
     #[tokio::test]
@@ -1934,6 +2231,7 @@ mod tests {
                 t_end_ms: 1_400,
                 samples: vec![0.0; 16_000],
                 truncated: false,
+                voiced_ms: 1_000,
             }));
         h.settle().await;
         h.commit_chunk(&id, 0, 1_500).await;
@@ -2030,6 +2328,29 @@ mod tests {
         assert!(engine_stays_resident(false, 1));
         // And only then does the grace period start.
         assert!(!engine_stays_resident(false, 0));
+    }
+
+    /// The menu bar answers one question at a time, and the order of the
+    /// answers is the whole rule. A person glancing at the icon while a
+    /// meeting is being recorded must never be told about the last one.
+    #[test]
+    fn the_icon_says_recording_first_working_second_and_only_then_offers_a_meeting() {
+        // Listening outranks everything, including its own leftover work.
+        assert_eq!(tray_state_for(true, false, 0), TrayState::Recording);
+        assert_eq!(tray_state_for(true, true, 4), TrayState::Recording);
+
+        // The recording is over and the meeting is not: this is the state that
+        // did not exist, and the menu bar used to claim nothing was happening
+        // through every minute of it.
+        assert_eq!(tray_state_for(false, false, 1), TrayState::Processing);
+        // Still working outranks a meeting somebody could start: that nudge has
+        // a panel and a notification of its own.
+        assert_eq!(tray_state_for(false, true, 2), TrayState::Processing);
+
+        // And when nothing is outstanding the icon goes back to what it always
+        // meant.
+        assert_eq!(tray_state_for(false, true, 0), TrayState::Detected);
+        assert_eq!(tray_state_for(false, false, 0), TrayState::Idle);
     }
 
     /// The same predicate guards the model cleanup, and for the same reason: an
@@ -2251,6 +2572,7 @@ mod tests {
                 is_final: true,
                 model_name: Some("test".into()),
                 model_revision: Some("1".into()),
+                corrections: Vec::new(),
             },
         )
         .await
@@ -2309,6 +2631,7 @@ mod tests {
                 t_end_ms: 3_000,
                 samples: vec![0.0; 16_000],
                 truncated: false,
+                voiced_ms: 1_000,
             }));
 
         h.wait_until("the backlog to be read back", || {
@@ -2330,6 +2653,7 @@ mod tests {
                 t_end_ms: 3_900,
                 samples: vec![0.0; 6_400],
                 truncated: false,
+                voiced_ms: 300,
             }));
         tokio::time::sleep(Duration::from_millis(400)).await;
         h.settle().await;
@@ -2364,6 +2688,7 @@ mod tests {
                 t_end_ms: 37_000,
                 samples: vec![0.0; 16_000],
                 truncated: false,
+                voiced_ms: 1_000,
             }));
         h.wait_until("live text to carry on after the backlog", || {
             h.events
@@ -2436,6 +2761,323 @@ mod tests {
                 .await
                 .contains(&JobKind::TranscribeCatchup),
             "the finalize job owns it from there"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The one-time setup, and what the screen is told about speech
+    // -----------------------------------------------------------------------
+
+    /// Every file the level needs, on disk, with nothing in the table saying so
+    /// and no download job behind it. That is the machine of 2026-08-24: weights
+    /// that arrived some other way, owing this computer a setup nobody had paid.
+    async fn the_speech_files_are_simply_there(h: &Harness) {
+        crate::asr::models::sync_catalog(&h.db).await.unwrap();
+        for id in crate::asr::catalog::preset_asset_ids(crate::asr::catalog::DEFAULT_PRESET_ID) {
+            let entry = crate::asr::catalog::entry(id).expect("catalogued");
+            let path = crate::asr::models::install_path(&h.paths, entry);
+            if entry.is_bundle() {
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join("coremldata.bin"), b"x").unwrap();
+            } else {
+                std::fs::write(&path, b"weights").unwrap();
+            }
+        }
+    }
+
+    /// Every setup row there has ever been, finished or not.
+    async fn setup_jobs(h: &Harness) -> Vec<crate::types::Job> {
+        repo::list_jobs(
+            &h.db,
+            &JobQuery {
+                kind: Some(JobKind::PrepareEngine),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the work queue")
+    }
+
+    /// The readiness check runs at launch and again on every question the UI
+    /// asks — several times a second while a screen watches it. It has to end up
+    /// with exactly one setup row, and then with none at all.
+    #[tokio::test]
+    async fn the_one_time_speech_setup_is_asked_for_once_and_only_once() {
+        let h = Harness::new().await;
+        the_speech_files_are_simply_there(&h).await;
+
+        assert!(
+            h.session.ensure_speech_current().await,
+            "everything the level needs is on disk"
+        );
+        let queued = setup_jobs(&h).await;
+        assert_eq!(queued.len(), 1, "the setup is asked for: {queued:?}");
+
+        h.session.ensure_speech_current().await;
+        h.session.ensure_speech_current().await;
+        assert_eq!(
+            setup_jobs(&h).await.len(),
+            1,
+            "the readiness polls join the row that exists instead of stacking rows"
+        );
+
+        // And once it has been paid, nothing asks again — not even after the row
+        // is gone from the queue, which is the only thing dedup was doing.
+        repo::set_job_status(&h.db, &queued[0].id, JobStatus::Done, None)
+            .await
+            .unwrap();
+        let file_name = crate::asr::models::installed_speech_file_name(&h.db)
+            .await
+            .unwrap()
+            .expect("something is serving");
+        crate::asr::models::mark_warmed(&h.db, &file_name)
+            .await
+            .unwrap();
+
+        h.session.ensure_speech_current().await;
+        assert_eq!(
+            setup_jobs(&h).await.len(),
+            1,
+            "weights that have been through a load here owe nothing"
+        );
+    }
+
+    /// Mantra 3: a meeting already has the engine's whole attention. Asking for
+    /// the same load twice helps nobody, and the row would be parked anyway.
+    #[tokio::test]
+    async fn the_one_time_speech_setup_is_never_asked_for_during_a_meeting() {
+        let h = Harness::new().await;
+        the_speech_files_are_simply_there(&h).await;
+
+        h.session.start(Default::default()).await.unwrap();
+        h.settle().await;
+        h.session.ensure_speech_current().await;
+        assert!(
+            setup_jobs(&h).await.is_empty(),
+            "a meeting in progress is already loading the engine it needs"
+        );
+
+        // The moment it is over, the same check asks for it.
+        let id = h.session.status().await.meeting_id.expect("a meeting");
+        h.record_a_minute(&id).await;
+        h.session.stop().await.unwrap();
+        h.session.ensure_speech_current().await;
+        assert_eq!(setup_jobs(&h).await.len(), 1);
+    }
+
+    /// A setup that failed for a reason nobody can see from here — no room on
+    /// the disk, an engine that would not start — is asked for again, but at the
+    /// next launch and not a moment sooner. Asking on the readiness polls would
+    /// be the same failure a hundred times a minute, and never asking again
+    /// would hand the sixteen minutes of 2026-08-24 back to a real meeting.
+    #[tokio::test]
+    async fn a_setup_that_failed_gets_its_next_go_at_the_next_launch() {
+        let h = Harness::new().await;
+        the_speech_files_are_simply_there(&h).await;
+
+        h.session.ensure_speech_current().await;
+        let queued = setup_jobs(&h).await;
+        assert_eq!(queued.len(), 1);
+
+        // What a failure that never reached the compile leaves behind: a failed
+        // row, and no record of the attempt (`prepare_engine` takes that back).
+        repo::set_job_status(&h.db, &queued[0].id, JobStatus::Failed, Some("no"))
+            .await
+            .unwrap();
+        assert!(
+            crate::asr::models::warm_up_needed(&h.db)
+                .await
+                .unwrap()
+                .is_some(),
+            "the weights still owe this machine a setup"
+        );
+
+        for _ in 0..5 {
+            h.session.ensure_speech_current().await;
+        }
+        let after = setup_jobs(&h).await;
+        assert_eq!(
+            after.len(),
+            1,
+            "the row that failed is the memory of the attempt for the rest of the launch: {after:?}"
+        );
+        assert_eq!(after[0].status, JobStatus::Failed);
+
+        // And the next launch hands it back — the whole automatic way out of the
+        // one-attempt policy.
+        h.session.retry_failed_speech_setup().await;
+        let revived = setup_jobs(&h).await;
+        assert_eq!(revived.len(), 1, "the same row, not a new one");
+        assert_eq!(revived[0].status, JobStatus::Queued);
+    }
+
+    /// The other side of it: an attempt that got as far as the compile and then
+    /// took the app down with it keeps its marker, and no launch starts that
+    /// quarter of an hour again on its own.
+    #[tokio::test]
+    async fn a_setup_that_died_inside_the_compile_is_not_started_again() {
+        let h = Harness::new().await;
+        the_speech_files_are_simply_there(&h).await;
+
+        h.session.ensure_speech_current().await;
+        let queued = setup_jobs(&h).await;
+        assert_eq!(queued.len(), 1);
+        // Exactly what the process going down mid-compile leaves: a row still
+        // marked running, and the attempt on the record because it was written
+        // before the load.
+        let file_name = crate::asr::models::installed_speech_file_name(&h.db)
+            .await
+            .unwrap()
+            .expect("something is serving");
+        crate::asr::models::mark_warm_attempted(&h.db, &file_name)
+            .await
+            .unwrap();
+        repo::set_job_status(&h.db, &queued[0].id, JobStatus::Running, None)
+            .await
+            .unwrap();
+
+        // The launch that follows.
+        h.session.retry_failed_speech_setup().await;
+        repo::requeue_orphaned_jobs(&h.db, jobs::SETUP_INTERRUPTED)
+            .await
+            .unwrap();
+        let after = setup_jobs(&h).await;
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].status,
+            JobStatus::Failed,
+            "an interrupted compile is settled, not handed straight back"
+        );
+
+        // And nothing queues a fresh one either, however often the screen asks.
+        for _ in 0..5 {
+            h.session.ensure_speech_current().await;
+        }
+        assert_eq!(setup_jobs(&h).await.len(), 1);
+    }
+
+    /// The rule the banner is drawn from, with no meeting, no thread and no
+    /// weights in it.
+    #[test]
+    fn what_the_screen_is_told_about_speech_follows_from_what_is_true_now() {
+        use SpeechState as S;
+
+        // Nothing is being recorded and nothing is loaded: nothing to say.
+        assert_eq!(speech_state(false, false, CaptureState::Idle), S::Idle);
+        assert_eq!(speech_state(false, false, CaptureState::Stopped), S::Idle);
+        // Idle Echo that happens to be holding the weights is not news either
+        // way, but it is honestly ready.
+        assert_eq!(speech_state(true, false, CaptureState::Idle), S::Ready);
+
+        for state in [
+            CaptureState::Starting,
+            CaptureState::Recording,
+            CaptureState::Degraded,
+            CaptureState::Paused,
+            CaptureState::Stopping,
+        ] {
+            assert_eq!(
+                speech_state(false, false, state),
+                S::Preparing,
+                "{state:?}: a meeting waiting on the engine is the thing nobody could see"
+            );
+            assert_eq!(speech_state(true, false, state), S::Ready, "{state:?}");
+        }
+
+        // A load that failed is worth saying, wherever the capture has got to.
+        assert_eq!(
+            speech_state(false, true, CaptureState::Recording),
+            S::Unavailable
+        );
+        assert_eq!(
+            speech_state(false, true, CaptureState::Idle),
+            S::Unavailable
+        );
+
+        // And what is loaded wins over what once failed: a later load repairs an
+        // earlier failure, and a banner outliving its problem is worse than none.
+        assert_eq!(
+            speech_state(true, true, CaptureState::Recording),
+            S::Ready,
+            "the engine is up; nothing on screen may claim otherwise"
+        );
+        assert_eq!(speech_state(true, true, CaptureState::Idle), S::Ready);
+    }
+
+    /// The meeting of 2026-08-24, as the screen would see it now: the engine
+    /// takes its time, and the status says so from the click until it is up.
+    #[tokio::test]
+    async fn a_slow_engine_shows_as_getting_ready_and_then_as_ready() {
+        let h = Harness::new().await;
+        h.asr.prewarm_takes(Duration::from_millis(120));
+
+        h.session.start(Default::default()).await.unwrap();
+        let while_loading = h.events.capture_states();
+        assert!(
+            while_loading
+                .iter()
+                .any(|s| s.speech == SpeechState::Preparing),
+            "the wait is on the screen while it is happening: {while_loading:?}"
+        );
+        assert!(
+            while_loading.iter().all(|s| s.speech != SpeechState::Ready),
+            "nothing may claim to be ready before it is: {while_loading:?}"
+        );
+
+        h.wait_until("the engine to be announced as ready", || {
+            h.events
+                .capture_states()
+                .iter()
+                .any(|s| s.speech == SpeechState::Ready)
+        })
+        .await;
+
+        let seen = h.events.capture_states();
+        let first_ready = seen
+            .iter()
+            .position(|s| s.speech == SpeechState::Ready)
+            .expect("just waited for it");
+        assert!(
+            seen[..first_ready]
+                .iter()
+                .any(|s| s.speech == SpeechState::Preparing),
+            "Preparing comes first, and it is the whole point: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|s| s.speech != SpeechState::Unavailable),
+            "nothing failed here: {seen:?}"
+        );
+        assert_eq!(seen.last().map(|s| s.speech), Some(SpeechState::Ready));
+    }
+
+    /// And when it never comes up, the screen is told that too — in the same
+    /// breath as the banner, so the two cannot disagree.
+    #[tokio::test]
+    async fn a_meeting_whose_engine_never_arrives_says_so_on_the_screen() {
+        let h = Harness::new().await;
+        h.asr.fail_prewarm();
+
+        h.session.start(Default::default()).await.unwrap();
+        h.wait_until("the screen to be told", || {
+            h.events
+                .capture_states()
+                .iter()
+                .any(|s| s.speech == SpeechState::Unavailable)
+        })
+        .await;
+
+        assert!(
+            h.events.notice_tagged("speechNotReady"),
+            "the banner says the same thing at the same moment"
+        );
+        assert_eq!(
+            h.session.status().await.speech,
+            SpeechState::Unavailable,
+            "and asking for the status gives the same answer as the event did"
+        );
+        assert!(
+            is_live(h.session.status().await.state),
+            "mantra 3: the recording carries on regardless"
         );
     }
 

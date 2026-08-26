@@ -29,10 +29,13 @@
 //! dropped — belongs to the session pipeline, which is the thing actually
 //! waiting on the speech engine.
 
+pub mod bleed;
+pub mod bleed_guard;
 pub mod clock;
 pub mod mic;
 pub mod resample;
 pub mod ring;
+pub mod route;
 pub mod vad;
 pub mod writer;
 
@@ -55,6 +58,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+use crate::audio::bleed::{BleedEvidence, LAG_MIN_MS};
+use crate::audio::bleed_guard::{BleedGuard, Verdict};
 use crate::audio::clock::MeetingClock;
 use crate::audio::vad::{OpenSpeech, SpeechDetector, Utterance};
 use crate::audio::writer::{ChunkWriter, CommittedChunk};
@@ -100,10 +105,62 @@ const SNAPSHOT_OFFER_MS: i64 = 1_000;
 /// the first minute rather than at the end of the meeting.
 const SILENT_CHANNEL_GRACE: Duration = Duration::from_secs(10);
 
+/// Three sibling messages for the three ways the system channel can be
+/// missing: never opened, opened but silent, and opened then lost mid-meeting.
+/// They must never contradict each other or the banner on screen, so they are
+/// named consts in one place rather than three hand-typed string literals —
+/// that is exactly how the copy drifted before (four hand-maintained copies of
+/// one sentence, one of them wrong, incident of 2026-08-24). A test below
+/// sweeps all three together.
+///
 /// What the person is told when the computer's audio started but carries
-/// nothing. The same sentence the UI already uses for this reason.
-const SYSTEM_AUDIO_SILENT_MESSAGE: &str =
-    "Echo can hear you, but not the other people. It will keep recording.";
+/// nothing. Word for word `labels.degradedReason.systemAudioUnavailable` in
+/// `src/lib/copy.ts` — a test pins the two together.
+///
+/// The second sentence is a promise, and it is only keepable in this state.
+/// [`SilenceWatchdog`] counts frames for the whole recording and never resets
+/// them, so `WentSilent` can only fire when *no* system audio has ever arrived —
+/// which is the one case where `diarize::pipeline::voice_channel` picks
+/// `Source::MicOnly` and the offline pass really does re-cut the microphone
+/// recording into separate voices. A meeting that had system audio for even a
+/// minute takes the other branch and pins every microphone line to "You"
+/// forever, which is why the stream-died-mid-meeting case below promises
+/// nothing.
+pub const SYSTEM_AUDIO_SILENT_MESSAGE: &str = "Echo is recording through the microphone only, so it can't tell who is speaking — every line says You for now. It will work out who said what once the meeting ends.";
+
+/// What the person is told when the system channel never opened at all, so
+/// the recording started mic-only from t=0 (`session::mod::start`). Same state
+/// as [`SYSTEM_AUDIO_SILENT_MESSAGE`] — nothing from this computer will ever be
+/// in this recording — said as the thing that just happened rather than as the
+/// standing description the banner carries.
+pub const SYSTEM_AUDIO_UNAVAILABLE_AT_START: &str =
+    "Echo can't hear what this computer plays. It's recording through the microphone only.";
+
+/// What the person is told when a system-audio stream that was working dies
+/// mid-meeting. It says what changed and stops there: the labels on the lines
+/// already written are real, the ones from here on are not separated by the
+/// offline pass, and there is nothing useful to promise about either
+/// ([`crate::types::DegradedReason::SystemAudioLost`]).
+pub const SYSTEM_AUDIO_LOST_MESSAGE: &str =
+    "Echo stopped hearing what this computer plays. It's still recording through the microphone.";
+
+/// What the person is told when there is nothing left to hear: this recording
+/// has no microphone in it, and what the computer plays is not arriving either.
+///
+/// The fourth sibling, and the one that stops the other three from lying. Both
+/// sentences above are written for a recording that still has a microphone in
+/// it — one promises the offline pass will sort the voices out of the
+/// microphone recording, the other says Echo is "still recording through the
+/// microphone". Said to somebody who denied the microphone and is capturing
+/// only this computer, either one is false, and false in the direction that
+/// costs a meeting: it reads as "carry on, Echo has you". So a recording with
+/// no microphone and no arriving system audio gets its own reason
+/// ([`crate::types::DegradedReason::NothingIsBeingHeard`]) and its own
+/// sentence, which promises nothing and says what to do.
+///
+/// Word for word `labels.degradedReason.nothingIsBeingHeard` in
+/// `src/lib/copy.ts`; a test below pins the two together.
+pub const NOTHING_IS_BEING_HEARD_MESSAGE: &str = "Echo can't hear anything — there's no microphone in this recording, and nothing is coming from this computer. Nothing is being saved, so it's worth stopping and starting again.";
 
 /// Loudness is reported ten times a second, capped here rather than in the UI.
 const LEVELS_INTERVAL: Duration = Duration::from_millis(100);
@@ -163,6 +220,17 @@ pub struct CaptureConfig {
     pub capture_system_audio: bool,
     /// Specific input device, or the system default when None.
     pub input_device_id: Option<String>,
+    /// Where Echo's logs live, which is where the one file that switches bleed
+    /// suppression off is looked for
+    /// ([`crate::audio::bleed_guard::KILL_SWITCH_FILE`]).
+    ///
+    /// Plumbed through the config rather than read from a global, for the same
+    /// reason `audio_dir` is: this module is handed the folders it may touch
+    /// and finds none of them out for itself, so a test can point a recording
+    /// anywhere and every path in it stays inside the temporary directory.
+    /// `None` — the default, and every test that does not care — means there is
+    /// no folder to look in and therefore no kill switch.
+    pub log_dir: Option<PathBuf>,
 }
 
 impl CaptureConfig {
@@ -173,6 +241,7 @@ impl CaptureConfig {
             audio_dir: audio_dir.into(),
             capture_system_audio: true,
             input_device_id: None,
+            log_dir: None,
         }
     }
 
@@ -183,6 +252,11 @@ impl CaptureConfig {
 
     pub fn with_input_device(mut self, device_id: Option<String>) -> Self {
         self.input_device_id = device_id;
+        self
+    }
+
+    pub fn with_log_dir(mut self, log_dir: Option<PathBuf>) -> Self {
+        self.log_dir = log_dir;
         self
     }
 }
@@ -211,6 +285,42 @@ pub enum CaptureSignal {
     /// Speech was found. Whether it gets live text is the pipeline's decision;
     /// the audio is on disk either way.
     UtteranceReady(Utterance),
+    /// This stretch of the microphone was the microphone's copy of what the
+    /// computer played, so it is not offered for text — the same words are
+    /// already going into the transcript from the computer's own side of the
+    /// call ([`crate::audio::bleed`]).
+    ///
+    /// It carries no audio, because there is nothing left to decode: the
+    /// recording on disk is untouched and no text is written for these seconds.
+    /// Two things are owed instead — retiring the half-written line the live
+    /// view has been showing, which the first three fields name, and writing
+    /// down that the decision was made, which is what `evidence` is for.
+    ///
+    /// **The decision is recorded, and that is new.** It used to be that
+    /// suppression wrote nothing at all, on the reasoning that the catch-up
+    /// pass would reach the same verdict over the same audio and so the seconds
+    /// could simply be left blank. The live verification of 2026-08-26 measured
+    /// that: six stretches suppressed live, five of them suppressed again
+    /// offline, and the sixth written to the microphone channel as a duplicate
+    /// nobody said twice. The two passes do not always agree — the live one
+    /// judges against a ring on the meeting clock and a delay this machine has
+    /// already measured, the offline one reads paged audio off disk and always
+    /// searches cold — so the verdict is written down where the offline planner
+    /// can read it (`migrations/0007_suppressed_spans.sql`).
+    ///
+    /// **Suppression is deduplication, never deletion.** If it ever stops being
+    /// that — a recording with no system channel, a system channel that is not
+    /// live — [`crate::audio::bleed_guard::BleedGuard`] refuses to judge at all
+    /// and this signal is never sent.
+    UtteranceSuppressed {
+        channel: Channel,
+        t_start_ms: i64,
+        t_end_ms: i64,
+        /// What the guard measured. Kept whole rather than flattened into three
+        /// numbers, so the row and the log line say the same thing the
+        /// correlator said.
+        evidence: BleedEvidence,
+    },
     /// A look at speech that is *still going*, so the live view can show words
     /// while someone is still talking instead of only once they stop.
     ///
@@ -288,6 +398,32 @@ enum SilenceVerdict {
     CameBack,
 }
 
+/// What stands as proof that this recording is really running, so that "nothing
+/// arrived on the watched channel" means a failure rather than a stopped world.
+///
+/// Chosen once, when the recording opens, from whether there is a second source
+/// at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProofOfLife {
+    /// The microphone's own frames. The strongest proof there is: another
+    /// device, on another thread, handing over audio right now.
+    MicrophoneFrames,
+    /// There is no microphone in this recording, so there are no frames to
+    /// compare against and the meeting clock stands in — the amount of audio
+    /// this recording *should* contain by now, paused stretches removed
+    /// ([`crate::audio::clock::MeetingClock::audio_ms`]).
+    ///
+    /// Weaker than the microphone, and deliberately so. It is the only proof
+    /// available when somebody grants screen recording, denies the microphone
+    /// and records this computer alone — the configuration where the watchdog
+    /// used to be unable to fire at all, because its reference was the frames
+    /// of a device that was never opened. That person recorded three quarters
+    /// of an hour of nothing and was told about it only at the end, and wrongly
+    /// (incident of 2026-08-21). Weak proof that can speak beats strong proof
+    /// that cannot.
+    MeetingClock,
+}
+
 /// Notices a channel that opened successfully and then delivered nothing.
 ///
 /// This is the hole the first real meeting fell into: ScreenCaptureKit reported
@@ -296,39 +432,54 @@ enum SilenceVerdict {
 /// nobody else spoke — so nothing was reported, nothing was written, and the
 /// person found out afterwards.
 ///
-/// The reference channel is what makes the judgement safe: "no frames here" only
-/// means something when the *other* source is producing. A paused recording, a
-/// machine asleep or a pump that never ran move both counts together, and the
-/// watchdog stays quiet.
+/// The proof of life is what makes the judgement safe: "no frames here" only
+/// means something when the recording is otherwise going. A machine asleep or a
+/// pump that never ran leaves the proof unsatisfied along with the watched
+/// channel, and the watchdog stays quiet.
 ///
-/// No clock of its own and no I/O: the caller passes `now`, which is what makes
-/// this testable without waiting ten seconds.
+/// No clock of its own and no I/O: the caller passes `now` and the meeting
+/// clock's reading, which is what makes this testable without waiting ten
+/// seconds.
 #[derive(Debug)]
 struct SilenceWatchdog {
     started_at: Instant,
     grace: Duration,
+    proof: ProofOfLife,
     watched_frames: u64,
     reference_frames: u64,
+    /// Highest reading of the meeting clock's audio time seen so far. Only read
+    /// under [`ProofOfLife::MeetingClock`]; kept as a maximum because the clock
+    /// is monotonic and a lock taken under contention should never be able to
+    /// walk it backwards.
+    recorded_ms: i64,
     /// True once the person has been told, so the banner is sent once.
     reported: bool,
 }
 
 impl SilenceWatchdog {
-    fn new(started_at: Instant, grace: Duration) -> Self {
+    fn new(started_at: Instant, grace: Duration, proof: ProofOfLife) -> Self {
         Self {
             started_at,
             grace,
+            proof,
             watched_frames: 0,
             reference_frames: 0,
+            recorded_ms: 0,
             reported: false,
         }
     }
 
-    /// Count frames seen this tick on the watched channel and on the one that
-    /// proves the clock is running.
-    fn observe(&mut self, watched: u64, reference: u64) {
+    /// Count frames seen this tick on the watched channel and on the reference
+    /// one, and take this tick's reading of the meeting clock.
+    ///
+    /// `reference` is 0 for a recording with no microphone, and `recorded_ms` is
+    /// ignored for one that has a microphone: each proof reads only its own
+    /// half. Both are passed every tick anyway so the pump never has to know
+    /// which proof this watchdog was built with.
+    fn observe(&mut self, watched: u64, reference: u64, recorded_ms: i64) {
         self.watched_frames = self.watched_frames.saturating_add(watched);
         self.reference_frames = self.reference_frames.saturating_add(reference);
+        self.recorded_ms = self.recorded_ms.max(recorded_ms);
     }
 
     fn watched_frames(&self) -> u64 {
@@ -337,6 +488,10 @@ impl SilenceWatchdog {
 
     fn reference_frames(&self) -> u64 {
         self.reference_frames
+    }
+
+    fn proof(&self) -> ProofOfLife {
+        self.proof
     }
 
     /// `Some(..)` exactly on the tick the answer changes; `None` otherwise.
@@ -348,7 +503,16 @@ impl SilenceWatchdog {
             }
             return None;
         }
-        let clock_is_running = self.reference_frames > 0;
+        let clock_is_running = match self.proof {
+            ProofOfLife::MicrophoneFrames => self.reference_frames > 0,
+            // A whole grace period's worth of *recorded* audio, not of wall
+            // clock: the same ten seconds the patience below is measured in,
+            // but with paused stretches taken out. Somebody who starts a
+            // recording and pauses it to find the meeting link is not told the
+            // computer has gone quiet while they are paused — which is exactly
+            // what a bare wall-clock reading would do.
+            ProofOfLife::MeetingClock => self.recorded_ms >= self.grace.as_millis() as i64,
+        };
         let out_of_patience = now.duration_since(self.started_at) >= self.grace;
         if self.watched_frames == 0 && clock_is_running && out_of_patience {
             self.reported = true;
@@ -497,6 +661,11 @@ impl CaptureSession {
             )?,
             spawn_speech(
                 detector_path,
+                cfg.log_dir.clone(),
+                // Whether a system stream actually opened, not whether one was
+                // asked for: with no second copy being written, suppression
+                // could only ever be deletion.
+                channels.contains(&Channel::System),
                 Arc::clone(&shared),
                 Arc::clone(&frames),
                 signal_tx,
@@ -741,11 +910,24 @@ fn spawn_pump(
             let mut system_reported_lost = false;
             let mut next_reopen: Option<Instant> = None;
             let mut last_levels = Instant::now() - LEVELS_INTERVAL;
+            // Whether this recording has a microphone in it at all decides two
+            // things below: what proves the recording is running, and which
+            // sentence is true when the computer's audio goes quiet. Read once,
+            // because `mic` is taken at the end of the loop.
+            let has_microphone = mic.is_some();
             // Only watched when the computer's audio actually opened: a channel
             // that never started is already reported by `system_audio_error`.
-            let mut system_silence = system_capture
-                .is_some()
-                .then(|| SilenceWatchdog::new(Instant::now(), SILENT_CHANNEL_GRACE));
+            let mut system_silence = system_capture.is_some().then(|| {
+                SilenceWatchdog::new(
+                    Instant::now(),
+                    SILENT_CHANNEL_GRACE,
+                    if has_microphone {
+                        ProofOfLife::MicrophoneFrames
+                    } else {
+                        ProofOfLife::MeetingClock
+                    },
+                )
+            });
 
             loop {
                 let stopping = shared.stopping.load(Ordering::Relaxed);
@@ -776,7 +958,14 @@ fn spawn_pump(
                             _ => mic_frames += 1,
                         }
                     }
-                    watchdog.observe(system_frames, mic_frames);
+                    // `audio_ms`, not `now_ms`: the second reading is what the
+                    // watchdog leans on when there is no microphone, and a
+                    // paused recording must not look like a running one.
+                    let recorded_ms = clock
+                        .lock()
+                        .map(|c| c.audio_ms())
+                        .unwrap_or_else(|e| e.into_inner().audio_ms());
+                    watchdog.observe(system_frames, mic_frames, recorded_ms);
                 }
 
                 for mut frame in batch {
@@ -875,13 +1064,29 @@ fn spawn_pump(
                                     target: "echo::audio",
                                     system_frames = watchdog.watched_frames(),
                                     mic_frames = watchdog.reference_frames(),
+                                    proof = ?watchdog.proof(),
+                                    has_microphone,
                                     detail = %s.diagnostics(),
-                                    "the computer's audio started but has delivered nothing; recording the microphone only"
+                                    "the computer's audio started but has delivered nothing"
                                 );
+                                let (reason, message) = if has_microphone {
+                                    (
+                                        DegradedReason::SystemAudioUnavailable,
+                                        SYSTEM_AUDIO_SILENT_MESSAGE,
+                                    )
+                                } else {
+                                    // "Recording through the microphone only"
+                                    // is not true of a recording that has no
+                                    // microphone; nothing at all is arriving.
+                                    (
+                                        DegradedReason::NothingIsBeingHeard,
+                                        NOTHING_IS_BEING_HEARD_MESSAGE,
+                                    )
+                                };
                                 let _ = signals.send(CaptureSignal::Degraded {
                                     channel: Some(Channel::System),
-                                    reason: DegradedReason::SystemAudioUnavailable,
-                                    message: SYSTEM_AUDIO_SILENT_MESSAGE.to_string(),
+                                    reason,
+                                    message: message.to_string(),
                                 });
                             }
                             Some(SilenceVerdict::CameBack) => {
@@ -910,11 +1115,33 @@ fn spawn_pump(
                                 "system audio stopped: {:?}",
                                 s.stopped_reason()
                             );
+                            let (reason, message) = if has_microphone {
+                                (
+                                    // Not `SystemAudioUnavailable`: the banner
+                                    // that reason draws promises a separation
+                                    // of the microphone recording that a
+                                    // meeting with any system audio in it never
+                                    // gets, and calls lines "You" that already
+                                    // carry a real name.
+                                    DegradedReason::SystemAudioLost,
+                                    SYSTEM_AUDIO_LOST_MESSAGE,
+                                )
+                            } else {
+                                // And not `SystemAudioLost` either, for the same
+                                // reason the silent case above takes its own
+                                // branch: that sentence ends "It's still
+                                // recording through the microphone", and this
+                                // recording has no microphone to still be
+                                // recording through. It has nothing left.
+                                (
+                                    DegradedReason::NothingIsBeingHeard,
+                                    NOTHING_IS_BEING_HEARD_MESSAGE,
+                                )
+                            };
                             let _ = signals.send(CaptureSignal::Degraded {
                                 channel: Some(Channel::System),
-                                reason: DegradedReason::SystemAudioUnavailable,
-                                message: "Echo stopped hearing what your computer plays, and is still recording your microphone."
-                                    .to_string(),
+                                reason,
+                                message: message.to_string(),
                             });
                             next_reopen = Some(Instant::now() + REOPEN_BACKOFF);
                         }
@@ -984,6 +1211,8 @@ fn spawn_pump(
 
 fn spawn_speech(
     detector_path: Option<PathBuf>,
+    log_dir: Option<PathBuf>,
+    has_system_channel: bool,
     shared: Arc<SessionShared>,
     frames: Arc<FrameQueue>,
     signals: UnboundedSender<CaptureSignal>,
@@ -995,6 +1224,14 @@ fn spawn_speech(
                 SpeechDetector::load_or_fallback(detector_path.as_deref(), Channel::Mic);
             let mut system_detector =
                 SpeechDetector::load_or_fallback(detector_path.as_deref(), Channel::System);
+            // The detectors and the bleed guard are built together because they
+            // are the same kind of thing: one recording's worth of state, on
+            // the one thread that sees every frame and every utterance.
+            let mut guard = BleedGuard::new(log_dir.as_deref(), has_system_channel);
+            // …and every utterance leaves through here, a tick or two after the
+            // detector closed it, because the far side it is judged against is
+            // audio from after its own end. See [`FAR_SIDE_WAIT`].
+            let mut waiting = WaitingRoom::default();
             let mut batch: Vec<Frame> = Vec::new();
             let mut was_paused = false;
             // Set on resume, cleared per channel by the first frame that
@@ -1023,6 +1260,10 @@ fn spawn_speech(
                 if was_paused && !paused {
                     restart_mic = true;
                     restart_system = true;
+                    // …and the delay goes with them. The audio either side of a
+                    // pause is not adjacent, so a delay measured before it is
+                    // not a delay to search around after it.
+                    guard.forget_lag();
                     tracing::debug!(
                         target: "echo::audio",
                         "recording resumed; speech detection starts again"
@@ -1030,8 +1271,46 @@ fn spawn_speech(
                 }
                 was_paused = paused;
 
+                // The loudspeaker gate, re-read here and **nowhere else**.
+                // `poll_route` does its own two-second throttling; what this
+                // call site decides is which thread pays for it. A CoreAudio
+                // property read can stall, and the pump is three ring-seconds
+                // from losing audio, so it may never be the one to block — the
+                // speech thread falling behind costs live text, which is what
+                // gives way (mantra 3). `system_active` is passed live because
+                // suppression is only deduplication while the far side is
+                // actually being written down somewhere else.
+                guard.poll_route(
+                    shared.elapsed_ms.load(Ordering::Relaxed),
+                    shared.system_active.load(Ordering::Relaxed),
+                );
+
                 batch.clear();
                 frames.drain(&mut batch);
+                // **Pass one: the computer's audio into the ring, before either
+                // detector runs.**
+                //
+                // `spawn_pump` builds each tick's batch by draining the
+                // microphone first and the system stream second, so a single
+                // drain here would push every mic frame of this tick — and any
+                // utterance closing on them — through the judge while the ring
+                // still ended one tick back. A mic utterance is judged against
+                // the far side up to 200 ms *after* its own end (`LAG_MIN_MS`),
+                // so a ring twenty milliseconds stale is a coverage refusal on
+                // every utterance that closes at the head of the recording.
+                // (The other 200 ms of that tail is audio from the future when
+                // a stretch closes, which is what the [`WaitingRoom`] is for.)
+                //
+                // Safe to do first because it touches no detector state at all:
+                // the ring is placement by timestamp and nothing else, and the
+                // frames are then detected below in exactly the order and with
+                // exactly the effects they had before.
+                for frame in &batch {
+                    if frame.channel == Channel::System {
+                        guard.append_system(frame.t_start_ms, &frame.samples);
+                    }
+                }
+                // Pass two: unchanged.
                 for frame in batch.drain(..) {
                     let (detector, restart) = match frame.channel {
                         Channel::System => (&mut system_detector, &mut restart_system),
@@ -1039,13 +1318,18 @@ fn spawn_speech(
                     };
                     if std::mem::take(restart) {
                         if let Some(utterance) = detector.reset_at(frame.t_start_ms) {
-                            let _ = signals.send(CaptureSignal::UtteranceReady(utterance));
+                            waiting.hold(Instant::now(), utterance);
                         }
                     }
                     for utterance in detector.push(&frame.samples, frame.t_start_ms) {
-                        let _ = signals.send(CaptureSignal::UtteranceReady(utterance));
+                        waiting.hold(Instant::now(), utterance);
                     }
                 }
+                // Pass three: everything whose far side has arrived. This tick's
+                // system frames went into the ring above, so a stretch held over
+                // from an earlier tick is judged against a ring that has caught
+                // up with it.
+                waiting.release(&mut guard, &signals, Instant::now());
 
                 // Words on screen while someone is still talking. Only ever a
                 // look at what is open: the utterance itself still arrives when
@@ -1083,15 +1367,240 @@ fn spawn_speech(
                 if finished {
                     for detector in [&mut mic_detector, &mut system_detector] {
                         if let Some(utterance) = detector.finish() {
-                            let _ = signals.send(CaptureSignal::UtteranceReady(utterance));
+                            waiting.hold(Instant::now(), utterance);
                         }
                     }
+                    // Nothing more is coming — not another frame of the far
+                    // side, and no later tick to release on. Whatever is still
+                    // waiting is judged against the whole recording as the ring
+                    // holds it, and the last words of the meeting go out now
+                    // rather than half a second later.
+                    waiting.flush(&mut guard, &signals);
                     break;
                 }
                 std::thread::sleep(PUMP_INTERVAL * 2);
             }
+
+            report_bleed(&guard.report());
         })
         .map_err(|e| AudioError::Backend(e.to_string()))
+}
+
+/// The one door out of speech detection, and the only place an utterance is
+/// ever judged.
+///
+/// There are three places the speech thread takes an utterance from a detector
+/// — the ordinary push, the stretch a resume rebases and closes, and the final
+/// flush when the pump says nothing more is coming — and a copy of the far side
+/// escaping through any one of them is a duplicated line in somebody's
+/// transcript. So none of them sends: they all hand it to the
+/// [`WaitingRoom`], which hands it here, and there is exactly one
+/// `UtteranceReady` in the file to keep honest.
+///
+/// Everything that is not a measured copy goes on untouched, [`Verdict::Undecided`]
+/// included. An unanswered question is not evidence.
+fn send_utterance(
+    guard: &mut BleedGuard,
+    signals: &UnboundedSender<CaptureSignal>,
+    utterance: Utterance,
+) {
+    match guard.judge(&utterance) {
+        Verdict::Bleed(evidence) => {
+            tracing::debug!(
+                target: "echo::audio",
+                channel = ?utterance.channel,
+                t_start_ms = utterance.t_start_ms,
+                t_end_ms = utterance.t_end_ms,
+                correlation = evidence.correlation as f64,
+                lag_ms = evidence.lag_ms,
+                system_voice_ms = evidence.system_voice_ms,
+                unexplained_ms = evidence.unexplained_ms,
+                span_ms = evidence.span_ms,
+                "this stretch of the microphone is what this computer played coming back; \
+                 the transcript is getting these words from the computer's own side"
+            );
+            let _ = signals.send(CaptureSignal::UtteranceSuppressed {
+                channel: utterance.channel,
+                t_start_ms: utterance.t_start_ms,
+                t_end_ms: utterance.t_end_ms,
+                evidence,
+            });
+        }
+        Verdict::Undecided(_) | Verdict::Pass => {
+            let _ = signals.send(CaptureSignal::UtteranceReady(utterance));
+        }
+    }
+}
+
+/// Longest a stretch waits for the far side it will be judged against.
+///
+/// The wait is normally two or three ticks of this thread, and it is not
+/// optional: a verdict needs the computer's audio up to `LAG_MIN_MS` — 200 ms —
+/// *after* the stretch ends, and that audio has not been captured yet at the
+/// moment the stretch closes. The speech detector closes a stretch 416 ms after
+/// the last voiced window and dates it back to 288 ms after it
+/// (`vad::VadSettings::mic`), so about 128 ms of that tail is on hand and the
+/// other 72 ms is still in the future. Judging there is not a near miss, it is
+/// a structural one: every microphone utterance refused for coverage, for ever,
+/// on a ring in perfect health.
+///
+/// This is the cap for when the rest never arrives — the system stream died and
+/// the two-second route poll has not noticed, or the pump is starved. Half a
+/// second is several times the honest wait and well under the pause a person
+/// would read as the live text having stopped; past it the stretch goes out
+/// unjudged, which is the same thing an unanswered question has always meant
+/// here.
+const FAR_SIDE_WAIT: Duration = Duration::from_millis(500);
+
+/// Utterances on their way out of speech detection, waiting for the far side
+/// they will be judged against.
+///
+/// **One queue for both channels, released strictly from the front.** A
+/// microphone stretch waits and a system stretch never does, so releasing each
+/// as soon as it is ready would let the far side's own utterances overtake the
+/// microphone's by a tick or two — reordering the one sequence the pipeline
+/// downstream reads in order. Making the system channel wait behind a
+/// microphone stretch that is nearly ready costs it those same few ticks and
+/// keeps the order the detectors produced.
+#[derive(Debug, Default)]
+struct WaitingRoom {
+    queue: VecDeque<(Instant, Utterance)>,
+}
+
+impl WaitingRoom {
+    /// Take one utterance from a detector. Nothing is sent here: releasing is
+    /// the loop's business, once this tick's far side is in the ring.
+    fn hold(&mut self, now: Instant, utterance: Utterance) {
+        self.queue.push_back((now + FAR_SIDE_WAIT, utterance));
+    }
+
+    /// Send on everything at the front that can be judged now, or has waited
+    /// long enough that nothing more is coming.
+    fn release(
+        &mut self,
+        guard: &mut BleedGuard,
+        signals: &UnboundedSender<CaptureSignal>,
+        now: Instant,
+    ) {
+        while self.queue.front().is_some_and(|(deadline, utterance)| {
+            now >= *deadline || far_side_on_hand(guard, utterance)
+        }) {
+            let (_, utterance) = self.queue.pop_front().expect("just looked at the front");
+            send_utterance(guard, signals, utterance);
+        }
+    }
+
+    /// The recording is over: judge what is left against whatever is on hand.
+    /// There is no more far side coming, so waiting for it would only hold back
+    /// the last words of a meeting.
+    fn flush(&mut self, guard: &mut BleedGuard, signals: &UnboundedSender<CaptureSignal>) {
+        for (_, utterance) in self.queue.drain(..) {
+            send_utterance(guard, signals, utterance);
+        }
+    }
+}
+
+/// Is the far side this stretch would be judged against on hand yet?
+///
+/// Three ways the answer is yes without looking at the ring at all: the system
+/// channel's own utterances are the original and are never judged, an unarmed
+/// guard judges nothing, and a guard whose ring is empty is a guard with
+/// nothing to wait for. Otherwise the ring has to reach `LAG_MIN_MS` past the
+/// end of the stretch, which is exactly what
+/// [`crate::audio::bleed::covers_every_lag`] will be asked about a moment
+/// later — the same geometry, asked before the measurement rather than after
+/// it, so a stretch is held instead of being refused.
+fn far_side_on_hand(guard: &BleedGuard, utterance: &Utterance) -> bool {
+    if utterance.channel != Channel::Mic || !guard.armed() {
+        return true;
+    }
+    guard
+        .system_through_ms()
+        .is_some_and(|through_ms| through_ms >= utterance.t_end_ms - LAG_MIN_MS)
+}
+
+/// Stretches examined before "and never found one" is worth saying out loud.
+///
+/// Under this many, a meeting that suppressed nothing is just a meeting where
+/// nothing was played out loud, and there is nothing to report.
+const ENOUGH_EXAMINED: u64 = 20;
+
+/// …and of those, how many had the far side genuinely audible under them.
+///
+/// The number that turns "found nothing" into evidence. Ten is what
+/// [`crate::asr::catchup_bleed::ENOUGH_MISSED_CHANCES`] uses to decide the same
+/// thing about the same meeting from the other end, and for the same reason: on
+/// the 2026-08-25 recording every one of the twelve system-channel segments
+/// overlapped a mic segment, so a machine that is going to find copies finds
+/// them early.
+const ENOUGH_CHANCES: u64 = 10;
+
+/// Did this recording look hard for the microphone's copy and never once find
+/// one?
+///
+/// **This is the only thing that makes a machine whose true delay is outside
+/// the search window visible.** Such a machine fails silent and safe — nothing
+/// is suppressed, the transcript is exactly what it would have been — which is
+/// the right way to fail and an impossible way to notice. All three conditions
+/// are needed: an unarmed guard was not looking, a handful of stretches is not
+/// a sample, and stretches with no far side under them were never a chance to
+/// match.
+fn never_found_a_copy(report: &bleed_guard::BleedReport) -> bool {
+    report.armed
+        && report.suppressed == 0
+        && report.examined >= ENOUGH_EXAMINED
+        && report.opportunities >= ENOUGH_CHANCES
+}
+
+/// Was this recording asked over and over and never once *able* to answer?
+///
+/// The sibling of [`never_found_a_copy`], for the other silent failure: not a
+/// delay outside the search window, but the far side for those seconds never
+/// being on hand at all — a speech thread far behind the ring, a system stream
+/// delivering nothing while it still claims to be live, or a stretch of wiring
+/// that asks before the audio it needs exists (which is what [`FAR_SIDE_WAIT`]
+/// is there to stop). Every one of those fails safe, and every one of them
+/// leaves `examined` at zero, which is precisely where `never_found_a_copy`
+/// stops looking: its sample size condition can never be met, so without this
+/// the whole feature could be inert for a whole meeting and say nothing.
+fn never_had_the_far_side(report: &bleed_guard::BleedReport) -> bool {
+    report.armed && report.examined == 0 && report.undecided >= ENOUGH_EXAMINED
+}
+
+/// One line per recording about what bleed detection did, and a second one when
+/// what it did was nothing.
+fn report_bleed(report: &bleed_guard::BleedReport) {
+    tracing::info!(
+        target: "echo::audio",
+        armed = report.armed,
+        route = report.route.as_str(),
+        examined = report.examined,
+        suppressed = report.suppressed,
+        too_short = report.too_short,
+        undecided = report.undecided,
+        opportunities = report.opportunities,
+        lag_ms = ?report.lag_ms,
+        held_ms = report.held_ms,
+        dropped_backwards = report.dropped_backwards,
+        "listening for the microphone's copy of what this computer plays is finished"
+    );
+    if never_found_a_copy(report) {
+        tracing::info!(
+            target: "echo::audio",
+            examined = report.examined,
+            chances = report.opportunities,
+            "looked for the microphone's copy of what the computer played and never found it"
+        );
+    }
+    if never_had_the_far_side(report) {
+        tracing::warn!(
+            target: "echo::audio",
+            undecided = report.undecided,
+            held_ms = report.held_ms,
+            "the computer's audio for those seconds was never on hand, so not one stretch \
+             of the microphone could be compared against it"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1497,11 +2006,11 @@ mod tests {
     #[test]
     fn a_channel_that_started_but_never_delivers_is_reported_once() {
         let origin = Instant::now();
-        let mut w = SilenceWatchdog::new(origin, GRACE);
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MicrophoneFrames);
 
         // The microphone is producing, the computer's audio is not.
         for tick in 1..=9 {
-            w.observe(0, 50);
+            w.observe(0, 50, 0);
             assert_eq!(
                 w.poll(origin + Duration::from_secs(tick)),
                 None,
@@ -1516,7 +2025,7 @@ mod tests {
         );
         // And only once, however long it stays silent.
         for tick in 11..=30 {
-            w.observe(0, 50);
+            w.observe(0, 50, 0);
             assert_eq!(w.poll(origin + Duration::from_secs(tick)), None);
         }
     }
@@ -1524,9 +2033,9 @@ mod tests {
     #[test]
     fn a_channel_delivering_audio_is_never_reported() {
         let origin = Instant::now();
-        let mut w = SilenceWatchdog::new(origin, GRACE);
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MicrophoneFrames);
         for tick in 1..=60 {
-            w.observe(50, 50);
+            w.observe(50, 50, 0);
             assert_eq!(w.poll(origin + Duration::from_secs(tick)), None);
         }
         assert_eq!(w.watched_frames(), 3_000);
@@ -1538,9 +2047,9 @@ mod tests {
         // the whole recording is broken in a way this watchdog must not
         // misdescribe as "we can hear you but not them".
         let origin = Instant::now();
-        let mut w = SilenceWatchdog::new(origin, GRACE);
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MicrophoneFrames);
         for tick in 1..=60 {
-            w.observe(0, 0);
+            w.observe(0, 0, 0);
             assert_eq!(
                 w.poll(origin + Duration::from_secs(tick)),
                 None,
@@ -1552,17 +2061,17 @@ mod tests {
     #[test]
     fn a_channel_that_comes_back_is_reported_recovered_once() {
         let origin = Instant::now();
-        let mut w = SilenceWatchdog::new(origin, GRACE);
-        w.observe(0, 50);
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MicrophoneFrames);
+        w.observe(0, 50, 0);
         assert_eq!(w.poll(origin + GRACE), Some(SilenceVerdict::WentSilent));
 
         // The first real frame arrives a minute in.
-        w.observe(1, 50);
+        w.observe(1, 50, 0);
         assert_eq!(
             w.poll(origin + Duration::from_secs(60)),
             Some(SilenceVerdict::CameBack)
         );
-        w.observe(50, 50);
+        w.observe(50, 50, 0);
         assert_eq!(
             w.poll(origin + Duration::from_secs(61)),
             None,
@@ -1573,21 +2082,156 @@ mod tests {
     #[test]
     fn a_late_first_frame_inside_the_grace_period_is_not_a_failure() {
         let origin = Instant::now();
-        let mut w = SilenceWatchdog::new(origin, GRACE);
-        w.observe(0, 50);
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MicrophoneFrames);
+        w.observe(0, 50, 0);
         assert_eq!(w.poll(origin + Duration::from_secs(9)), None);
         // Nine and a bit seconds late is a slow start, not a broken channel.
-        w.observe(1, 50);
+        w.observe(1, 50, 0);
         assert_eq!(w.poll(origin + Duration::from_secs(20)), None);
+    }
+
+    // The two-channel tests above pass 0 for the meeting clock throughout, which
+    // is the point: with a microphone in the recording the clock is never read,
+    // and their timings are the ones that were already asserted before this
+    // watchdog knew what a meeting clock was.
+
+    #[test]
+    fn a_recording_with_no_microphone_still_notices_the_silence() {
+        // Screen recording granted, microphone denied. There is no second
+        // channel to compare against, so the meeting clock is the proof that
+        // the recording is running — and it has to be enough, because this is
+        // the exact configuration that recorded three quarters of an hour of
+        // nothing without a word being said about it.
+        let origin = Instant::now();
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MeetingClock);
+
+        for tick in 1..=9 {
+            w.observe(0, 0, tick as i64 * 1_000);
+            assert_eq!(
+                w.poll(origin + Duration::from_secs(tick)),
+                None,
+                "gave up after {tick}s, inside the grace period"
+            );
+        }
+
+        w.observe(0, 0, 10_000);
+        assert_eq!(
+            w.poll(origin + GRACE),
+            Some(SilenceVerdict::WentSilent),
+            "a recording with no microphone never found out it was hearing nothing"
+        );
+        // Once, as ever.
+        for tick in 11..=30 {
+            w.observe(0, 0, tick as i64 * 1_000);
+            assert_eq!(w.poll(origin + Duration::from_secs(tick)), None);
+        }
+    }
+
+    #[test]
+    fn a_paused_recording_with_no_microphone_is_not_blamed_on_the_computer() {
+        // Started, then paused a second in to go and find the meeting link. The
+        // wall clock runs on; the amount of audio this recording should contain
+        // does not, and that is the one the verdict is made from.
+        let origin = Instant::now();
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MeetingClock);
+        for tick in 1..=60 {
+            w.observe(0, 0, 1_000);
+            assert_eq!(
+                w.poll(origin + Duration::from_secs(tick)),
+                None,
+                "said the computer had gone quiet during a pause"
+            );
+        }
+        // Resumed: nine more seconds of real audio, and only the tenth decides.
+        for second in 2..=9 {
+            w.observe(0, 0, second * 1_000);
+            assert_eq!(
+                w.poll(origin + Duration::from_secs(60 + second as u64)),
+                None
+            );
+        }
+        w.observe(0, 0, 10_000);
+        assert_eq!(
+            w.poll(origin + Duration::from_secs(70)),
+            Some(SilenceVerdict::WentSilent)
+        );
+    }
+
+    #[test]
+    fn a_recording_with_no_microphone_that_gets_audio_says_nothing() {
+        let origin = Instant::now();
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MeetingClock);
+        for tick in 1..=60 {
+            w.observe(50, 0, tick as i64 * 1_000);
+            assert_eq!(
+                w.poll(origin + Duration::from_secs(tick)),
+                None,
+                "blamed a channel that was delivering audio all along"
+            );
+        }
+    }
+
+    #[test]
+    fn the_recording_that_hears_nothing_at_all_gets_its_own_sentence() {
+        // Copy lives in src/lib/copy.ts as
+        // labels.degradedReason.nothingIsBeingHeard. If it changes there it
+        // changes here.
+        assert_eq!(
+            NOTHING_IS_BEING_HEARD_MESSAGE,
+            "Echo can't hear anything — there's no microphone in this recording, and nothing is coming from this computer. Nothing is being saved, so it's worth stopping and starting again."
+        );
+        // The whole reason this sentence exists: neither of its two siblings may
+        // be said to somebody who has no microphone recording, because both of
+        // them make a promise about one.
+        assert!(
+            !NOTHING_IS_BEING_HEARD_MESSAGE.contains("microphone only")
+                && !NOTHING_IS_BEING_HEARD_MESSAGE.contains("still recording")
+                && !NOTHING_IS_BEING_HEARD_MESSAGE.contains("who said what"),
+            "{NOTHING_IS_BEING_HEARD_MESSAGE} promises something this state cannot keep"
+        );
+        assert!(
+            !NOTHING_IS_BEING_HEARD_MESSAGE.contains('!'),
+            "{NOTHING_IS_BEING_HEARD_MESSAGE} shouts at somebody who just lost a recording"
+        );
+        for jargon in [
+            "ScreenCaptureKit",
+            "SCStream",
+            "OSStatus",
+            "queue",
+            "buffer",
+            "stream",
+        ] {
+            assert!(
+                !NOTHING_IS_BEING_HEARD_MESSAGE.contains(jargon),
+                "{NOTHING_IS_BEING_HEARD_MESSAGE} leaks {jargon} to the person"
+            );
+        }
     }
 
     #[test]
     fn the_silent_channel_notice_is_the_sentence_the_ui_already_uses() {
-        // Copy lives in src/lib/copy.ts as notices.systemAudioLost and
-        // recording.micOnlyBanner. If it changes there it changes here.
+        // Copy lives in src/lib/copy.ts as labels.degradedReason.systemAudioUnavailable
+        // (and, by reference from there, live.micOnlyBanner and
+        // anchors.micOnlyBanner). If it changes there it changes here.
         assert_eq!(
             SYSTEM_AUDIO_SILENT_MESSAGE,
-            "Echo can hear you, but not the other people. It will keep recording."
+            "Echo is recording through the microphone only, so it can't tell who is speaking — every line says You for now. It will work out who said what once the meeting ends."
+        );
+        // ...and this one is labels.degradedReason.systemAudioLost (and, by
+        // reference, notices.systemAudioLost). The banner the person reads when
+        // a working stream dies mid-meeting is drawn from that key, not from the
+        // one above, because the sentence above would be false in that state:
+        // the lines already written carry real names, and the microphone tail is
+        // never re-cut into separate voices (`diarize::pipeline::voice_channel`
+        // takes the system branch for any meeting with system audio in it).
+        assert_eq!(
+            SYSTEM_AUDIO_LOST_MESSAGE,
+            "Echo stopped hearing what this computer plays. It's still recording through the microphone."
+        );
+        assert!(
+            !SYSTEM_AUDIO_LOST_MESSAGE.contains("You")
+                && !SYSTEM_AUDIO_LOST_MESSAGE.contains("who said what"),
+            "{SYSTEM_AUDIO_LOST_MESSAGE} makes a claim about labels it can't keep"
         );
         for jargon in [
             "ScreenCaptureKit",
@@ -1601,6 +2245,396 @@ mod tests {
                 !SYSTEM_AUDIO_SILENT_MESSAGE.contains(jargon),
                 "{SYSTEM_AUDIO_SILENT_MESSAGE} leaks {jargon} to the person"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The microphone's copy of what the computer played
+    // -----------------------------------------------------------------------
+
+    /// [`send_utterance`] is the only door out of speech detection, and this is
+    /// the guarantee that makes it worth having one: **a stretch the guard calls
+    /// a copy never leaves capture as something to write down.**
+    ///
+    /// `UtteranceReady` is the only way an utterance reaches the engine, so a
+    /// suppressed stretch producing none of them is the whole property, asserted
+    /// where it is decided rather than three signals downstream.
+    #[test]
+    fn a_suppressed_stretch_never_leaves_capture_as_one_to_write_down() {
+        use crate::audio::bleed::tests::{delayed, speech};
+        use crate::audio::route::Route;
+
+        const RATE: usize = TARGET_SAMPLE_RATE as usize;
+        /// One frame as the pump produces them: 20 ms.
+        const FRAME: usize = RATE * FRAME_MS as usize / 1_000;
+
+        /// A stretch of the microphone as the detector hands it over. `voiced_ms`
+        /// is half the duration, which is what a padded real utterance looks
+        /// like — see `bleed_guard`'s own tests for why claiming all of it would
+        /// not be the conservative choice.
+        fn mic(samples: &[f32], from_ms: i64, to_ms: i64) -> Utterance {
+            Utterance {
+                channel: Channel::Mic,
+                t_start_ms: from_ms,
+                t_end_ms: to_ms,
+                samples: samples[RATE * from_ms as usize / 1_000..RATE * to_ms as usize / 1_000]
+                    .to_vec(),
+                truncated: false,
+                voiced_ms: (to_ms - from_ms) / 2,
+            }
+        }
+
+        // Twenty seconds of the far side, appended frame by frame exactly as
+        // the two-pass drain appends it.
+        let system = speech(20_000, 21);
+        let mut guard = BleedGuard::new(None, true);
+        guard.set_route(Route::Loudspeaker, true);
+        for (tick, frame) in system.chunks(FRAME).enumerate() {
+            guard.append_system(tick as i64 * 20, frame);
+        }
+
+        let (signals, mut received) = unbounded_channel();
+        // The microphone's copy: 180 ms late and 25 dB down, a laptop speaker
+        // across a desk.
+        send_utterance(
+            &mut guard,
+            &signals,
+            mic(&delayed(&system, 180, 0.056), 6_000, 14_000),
+        );
+        // …and somebody in the room saying something of their own, over the
+        // same far side, through the same guard.
+        send_utterance(
+            &mut guard,
+            &signals,
+            mic(&speech(20_000, 22), 15_000, 19_500),
+        );
+        drop(signals);
+
+        let mut sent = Vec::new();
+        while let Ok(signal) = received.try_recv() {
+            sent.push(signal);
+        }
+        assert_eq!(sent.len(), 2, "one signal per utterance, always");
+        match &sent[0] {
+            CaptureSignal::UtteranceSuppressed {
+                channel,
+                t_start_ms,
+                t_end_ms,
+                evidence,
+            } => {
+                assert_eq!(*channel, Channel::Mic);
+                assert_eq!((*t_start_ms, *t_end_ms), (6_000, 14_000));
+                // The measurement travels with the verdict, because the session
+                // layer writes it down and a row that cannot say why it exists
+                // is worse than no row.
+                assert!(
+                    evidence.correlation >= crate::audio::bleed::BLEED_CORRELATION,
+                    "the signal carries the correlation that decided it: {evidence:?}"
+                );
+                assert!(evidence.span_ms > 0, "…and the span it was measured over");
+            }
+            other => panic!("the copy was offered for text: {other:?}"),
+        }
+        assert!(
+            matches!(&sent[1], CaptureSignal::UtteranceReady(u) if u.t_start_ms == 15_000),
+            "one suppression must not put capture in a mood to suppress the next thing it sees"
+        );
+        assert!(
+            !sent.iter().any(
+                |signal| matches!(signal, CaptureSignal::UtteranceReady(u) if u.t_start_ms == 6_000)
+            ),
+            "the suppressed stretch also went out as one to write down"
+        );
+    }
+
+    /// The geometry that decides whether any of this ever runs: **the far side a
+    /// stretch is judged against is audio from after the stretch ended.**
+    ///
+    /// A verdict needs the computer's audio to `LAG_MIN_MS` — 200 ms — past the
+    /// end of the microphone stretch. At the instant the detector closes one,
+    /// about 128 ms of that is on hand: it closes 416 ms after the last voiced
+    /// window and dates the stretch back to 288 ms after it. Judging there is
+    /// not a near miss but a permanent one, and it fails *safe*, which is what
+    /// makes it invisible: nothing is deleted, nothing is logged, and the
+    /// duplicated lines this exists to remove keep landing. So the stretch
+    /// waits the two or three ticks it takes for the rest to arrive.
+    #[test]
+    fn a_stretch_waits_for_the_far_side_that_comes_after_it() {
+        use crate::audio::bleed::tests::{delayed, speech};
+        use crate::audio::route::Route;
+
+        const RATE: usize = TARGET_SAMPLE_RATE as usize;
+        const FRAME: usize = RATE * FRAME_MS as usize / 1_000;
+
+        /// The far side, and the microphone's copy of it: 180 ms late and 25 dB
+        /// down, a laptop speaker across a desk.
+        fn far_side() -> (Vec<f32>, Vec<f32>) {
+            let system = speech(20_000, 21);
+            let mic = delayed(&system, 180, 0.056);
+            (system, mic)
+        }
+
+        /// The ring as the speech thread has it: frames of the far side, in
+        /// order, up to the tick that has arrived.
+        fn fill_to(guard: &mut BleedGuard, system: &[f32], appended_ms: &mut i64, to_ms: i64) {
+            while *appended_ms + FRAME_MS as i64 <= to_ms {
+                let from = RATE * *appended_ms as usize / 1_000;
+                guard.append_system(*appended_ms, &system[from..from + FRAME]);
+                *appended_ms += FRAME_MS as i64;
+            }
+        }
+
+        fn cut(source: &[f32], channel: Channel, from_ms: i64, to_ms: i64) -> Utterance {
+            Utterance {
+                channel,
+                t_start_ms: from_ms,
+                t_end_ms: to_ms,
+                samples: source[RATE * from_ms as usize / 1_000..RATE * to_ms as usize / 1_000]
+                    .to_vec(),
+                truncated: false,
+                voiced_ms: (to_ms - from_ms) / 2,
+            }
+        }
+
+        let (system, mic) = far_side();
+        let mut guard = BleedGuard::new(None, true);
+        guard.set_route(Route::Loudspeaker, true);
+        let mut appended = 0i64;
+        // Exactly what the ring holds at the moment a stretch ending at 10 s is
+        // closed: 128 ms of tail, and not one hop more.
+        fill_to(&mut guard, &system, &mut appended, 10_128);
+
+        let (signals, mut received) = unbounded_channel();
+        let mut waiting = WaitingRoom::default();
+        let now = Instant::now();
+        waiting.hold(now, cut(&mic, Channel::Mic, 2_000, 10_000));
+        // …and the far side's own next utterance behind it, which never waits
+        // for anything itself.
+        waiting.hold(now, cut(&system, Channel::System, 10_100, 12_000));
+        waiting.release(&mut guard, &signals, now);
+        assert!(
+            received.try_recv().is_err(),
+            "judged the moment it closed, against a far side 72 ms short of what \
+             every delay in the search needs — which is a refusal every time"
+        );
+
+        // Three more ticks of the far side, which is all the wait ever is.
+        fill_to(&mut guard, &system, &mut appended, 10_200);
+        waiting.release(&mut guard, &signals, now);
+
+        let first = received.try_recv().expect("the wait was over");
+        assert!(
+            matches!(
+                first,
+                CaptureSignal::UtteranceSuppressed {
+                    channel: Channel::Mic,
+                    t_start_ms: 2_000,
+                    ..
+                }
+            ),
+            "the copy went out as one to write down after waiting for the far \
+             side that proves it is a copy: {first:?}"
+        );
+        // The system channel's own stretch was behind it in the one queue, and
+        // came out behind it: waiting must not reorder the two channels.
+        assert!(
+            matches!(
+                received.try_recv(),
+                Ok(CaptureSignal::UtteranceReady(u)) if u.channel == Channel::System
+            ),
+            "the far side's own utterance overtook the microphone stretch it was queued behind"
+        );
+    }
+
+    /// …and it is a wait, not a hold: a far side that stops arriving — a system
+    /// stream that died while it still claims to be live — must not keep the
+    /// microphone's words off the screen.
+    #[test]
+    fn a_stretch_stops_waiting_when_the_far_side_stops_coming() {
+        use crate::audio::bleed::tests::{delayed, speech};
+        use crate::audio::route::Route;
+
+        const RATE: usize = TARGET_SAMPLE_RATE as usize;
+        let system = speech(20_000, 21);
+        let mic = delayed(&system, 180, 0.056);
+        let mut guard = BleedGuard::new(None, true);
+        guard.set_route(Route::Loudspeaker, true);
+        // The far side stops 128 ms past the end of the stretch and never comes
+        // back.
+        guard.append_system(0, &system[..RATE * 10_128 / 1_000]);
+
+        let (signals, mut received) = unbounded_channel();
+        let mut waiting = WaitingRoom::default();
+        let now = Instant::now();
+        waiting.hold(
+            now,
+            Utterance {
+                channel: Channel::Mic,
+                t_start_ms: 2_000,
+                t_end_ms: 10_000,
+                samples: mic[RATE * 2..RATE * 10].to_vec(),
+                truncated: false,
+                voiced_ms: 4_000,
+            },
+        );
+        waiting.release(
+            &mut guard,
+            &signals,
+            now + FAR_SIDE_WAIT - Duration::from_millis(1),
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "gave up before the wait was up"
+        );
+
+        waiting.release(&mut guard, &signals, now + FAR_SIDE_WAIT);
+        let sent = received.try_recv().expect("the wait ran out");
+        assert!(
+            matches!(&sent, CaptureSignal::UtteranceReady(u) if u.t_start_ms == 2_000
+                && u.samples.len() == RATE * 8),
+            "a stretch nothing could be judged against goes out whole and \
+             unjudged, audio and all: {sent:?}"
+        );
+    }
+
+    /// Nothing waits for a far side that is not being kept: an unarmed guard —
+    /// headphones, no system channel, the kill switch — judges nothing, so
+    /// holding its utterances would be latency bought for no reason at all.
+    #[test]
+    fn nothing_waits_when_there_is_nothing_to_judge_against() {
+        use crate::audio::route::Route;
+
+        let mut headphones = BleedGuard::new(None, true);
+        headphones.set_route(Route::Headphones, true);
+        let mic = Utterance {
+            channel: Channel::Mic,
+            t_start_ms: 2_000,
+            t_end_ms: 10_000,
+            samples: vec![0.0; TARGET_SAMPLE_RATE as usize * 8],
+            truncated: false,
+            voiced_ms: 4_000,
+        };
+        assert!(far_side_on_hand(&headphones, &mic));
+
+        // Armed, but the far side of this stretch is genuinely not there yet.
+        let mut armed = BleedGuard::new(None, true);
+        armed.set_route(Route::Loudspeaker, true);
+        assert!(
+            !far_side_on_hand(&armed, &mic),
+            "an armed guard with an empty ring has everything to wait for"
+        );
+        // The computer's own utterances are the original; there is nothing for
+        // them to be a copy of, so they never wait.
+        assert!(far_side_on_hand(
+            &armed,
+            &Utterance {
+                channel: Channel::System,
+                ..mic.clone()
+            }
+        ));
+    }
+
+    /// The silent failure this whole change would otherwise have: a machine
+    /// whose true delay is outside the search window suppresses nothing and
+    /// transcribes exactly as it did before, which is safe and invisible.
+    #[test]
+    fn a_meeting_that_looked_hard_and_found_nothing_says_so() {
+        let looked_and_found_nothing = bleed_guard::BleedReport {
+            armed: true,
+            route: route::Route::Loudspeaker,
+            examined: 40,
+            suppressed: 0,
+            undecided: 0,
+            too_short: 12,
+            opportunities: 30,
+            lag_ms: None,
+            dropped_backwards: 0,
+            held_ms: 30_000,
+        };
+        assert!(never_found_a_copy(&looked_and_found_nothing));
+
+        // A meeting where nobody played anything out loud offered nothing to
+        // find a copy of, and saying "never found it" about it would be noise.
+        assert!(!never_found_a_copy(&bleed_guard::BleedReport {
+            opportunities: 2,
+            ..looked_and_found_nothing
+        }));
+        // A handful of stretches is not a sample.
+        assert!(!never_found_a_copy(&bleed_guard::BleedReport {
+            examined: 6,
+            opportunities: 6,
+            ..looked_and_found_nothing
+        }));
+        // A guard that was never armed was not looking.
+        assert!(!never_found_a_copy(&bleed_guard::BleedReport {
+            armed: false,
+            ..looked_and_found_nothing
+        }));
+        // …and one that found copies has nothing to complain about.
+        assert!(!never_found_a_copy(&bleed_guard::BleedReport {
+            suppressed: 1,
+            ..looked_and_found_nothing
+        }));
+
+        // The other silent failure, and the one `never_found_a_copy` is blind
+        // to by construction: never having the far side to compare against
+        // leaves `examined` at zero, so its sample-size condition can never be
+        // met however long the meeting runs.
+        let never_had_anything_to_compare = bleed_guard::BleedReport {
+            examined: 0,
+            opportunities: 0,
+            undecided: 40,
+            ..looked_and_found_nothing
+        };
+        assert!(!never_found_a_copy(&never_had_anything_to_compare));
+        assert!(never_had_the_far_side(&never_had_anything_to_compare));
+        // A meeting that was measuring fine and refused a few stretches along
+        // the way is an ordinary meeting.
+        assert!(!never_had_the_far_side(&bleed_guard::BleedReport {
+            undecided: 40,
+            ..looked_and_found_nothing
+        }));
+        // A handful of refusals is not a pattern.
+        assert!(!never_had_the_far_side(&bleed_guard::BleedReport {
+            undecided: 3,
+            ..never_had_anything_to_compare
+        }));
+        // …and a guard that was never armed was not looking.
+        assert!(!never_had_the_far_side(&bleed_guard::BleedReport {
+            armed: false,
+            ..never_had_anything_to_compare
+        }));
+    }
+
+    #[test]
+    fn every_system_audio_message_says_what_changed_and_claims_nothing_more() {
+        // The three sibling messages for "the system channel is missing" must
+        // never contradict each other or read like a panic — this sweeps all
+        // three in one place so a future edit to any of them stays honest.
+        for message in [
+            SYSTEM_AUDIO_SILENT_MESSAGE,
+            SYSTEM_AUDIO_UNAVAILABLE_AT_START,
+            SYSTEM_AUDIO_LOST_MESSAGE,
+        ] {
+            assert!(message.ends_with('.'), "{message}");
+            assert!(!message.contains('!'), "{message}");
+            assert!(
+                !message.to_lowercase().contains("recording you"),
+                "{message} claims Echo is recording the person specifically, which it can't tell"
+            );
+            for jargon in [
+                "ScreenCaptureKit",
+                "SCStream",
+                "OSStatus",
+                "queue",
+                "buffer",
+                "stream",
+            ] {
+                assert!(
+                    !message.contains(jargon),
+                    "{message} leaks {jargon} to the person"
+                );
+            }
         }
     }
 
@@ -1631,6 +2665,11 @@ mod tests {
         let cfg = CaptureConfig::new("abc", "/tmp/echo-test");
         assert!(cfg.capture_system_audio, "system audio is on by default");
         assert!(cfg.input_device_id.is_none());
+        assert!(
+            cfg.log_dir.is_none(),
+            "a capture told about no log folder looks in none, so no test can \
+             pick up somebody's real kill-switch file"
+        );
         let cfg = cfg.with_system_audio(false);
         assert!(!cfg.capture_system_audio);
     }

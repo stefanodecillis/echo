@@ -224,8 +224,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 t_start_ms: end_ms - window_ms,
                 samples,
                 language_hint: Some("it".into()),
+                // Nothing measured the speech in this window, so the whole
+                // window stands in for it.
+                voiced_ms: None,
                 want_partials: false,
                 droppable: true,
+                detect_afresh: false,
             };
             let started = Instant::now();
             let answer = engine

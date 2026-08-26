@@ -176,7 +176,10 @@ pub fn split_line(
 
     // Two voices, each with a real share of the line and each heard clearly.
     let mut held: Vec<(usize, i64)> = Vec::new();
-    for run in owned.iter().filter(|r| runs.iter().any(|k| k.speaker == r.speaker)) {
+    for run in owned
+        .iter()
+        .filter(|r| runs.iter().any(|k| k.speaker == r.speaker))
+    {
         let ms = timeline::span_ms(run.span);
         match held.iter_mut().find(|(s, _)| *s == run.speaker) {
             Some((_, total)) => *total += ms,
@@ -512,12 +515,7 @@ mod tests {
     #[test]
     fn a_short_interjection_between_two_turns_of_one_voice_makes_three_pieces() {
         let (text, tracks) = dialogue();
-        let pieces = split_line(
-            facts((223_072, 229_632)),
-            text,
-            &tracks,
-            &[0.9, 0.9],
-        );
+        let pieces = split_line(facts((223_072, 229_632)), text, &tracks, &[0.9, 0.9]);
         // The interjection is 1.3 s — under MIN_PIECE_MS, so it is not given a
         // line of its own and the whole thing stays on one voice.
         assert!(pieces.is_none(), "{pieces:?}");
@@ -527,10 +525,7 @@ mod tests {
     fn a_long_enough_interjection_does_get_its_own_line() {
         let text = "No io domani sera prendo l'aereo e vengo in Italia. \
                     Ah ok ho capito bene. E domani la vabbe stacchero prima.";
-        let tracks = vec![
-            vec![(0, 4_000), (7_000, 11_000)],
-            vec![(4_000, 7_000)],
-        ];
+        let tracks = vec![vec![(0, 4_000), (7_000, 11_000)], vec![(4_000, 7_000)]];
         let pieces =
             split_line(facts((0, 11_000)), text, &tracks, &[0.9, 0.9]).expect("three pieces");
         assert_eq!(pieces.len(), 3);
@@ -637,7 +632,10 @@ mod tests {
             .sum();
         assert_eq!(words, text.split_whitespace().count());
         assert_eq!(
-            pieces.iter().map(|p| timeline::span_ms(p.span)).sum::<i64>(),
+            pieces
+                .iter()
+                .map(|p| timeline::span_ms(p.span))
+                .sum::<i64>(),
             8_000
         );
     }
