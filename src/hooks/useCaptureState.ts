@@ -83,11 +83,77 @@ function sameStatus(a: CaptureStatus, b: CaptureStatus): boolean {
   );
 }
 
+/**
+ * How long the poll stays quiet about failing after saying so once.
+ *
+ * The same shape and the same reasoning as `TauriEvents::emit` on the Rust
+ * side: the first failure is written down at once, and then nothing for half a
+ * minute, so a channel failing on every tick cannot fill the console it is
+ * supposed to explain. Half a minute is ten ticks of the close watch and three
+ * of the slow one — long enough to be quiet, short enough that a transport
+ * dying half an hour into a meeting still says so while it is still happening.
+ */
+const POLL_TROUBLE_INTERVAL_MS = 30_000;
+
+/** How many reads in a row have come back with nothing, and when the last
+ * complaint about it went out. Module state, like everything else this poll
+ * shares, because there is one poll for the whole app. */
+let failedReads = 0;
+let complainedAtMs = 0;
+
+/**
+ * The poll could not reach the core.
+ *
+ * This poll is the floor under a dead event transport — it exists because on
+ * 2026-08-24 the transport died mid-meeting and every screen drawn from events
+ * froze on the last one that got through. A floor that fails in silence is not
+ * a floor: the screen would freeze exactly as it did that day, with nothing
+ * anywhere to debug from. So it counts, and it says so.
+ *
+ * Not to the person. There is nothing they can do about it, the screen still
+ * holds the last thing that was true, and an app that interrupts a meeting to
+ * report its own plumbing is worse than one that carries on. To whoever is
+ * looking at the console, with a count — which is the whole difference between
+ * the two cases: one failed read is a blip the next tick fixes, and a number
+ * that keeps climbing is the incident above, happening again.
+ */
+function readFailed(err: unknown): void {
+  failedReads += 1;
+  const now = Date.now();
+  if (!complaintIsDue(failedReads, now - complainedAtMs)) return;
+  complainedAtMs = now;
+  console.warn(`Echo: could not read what is happening (${failedReads} in a row)`, err);
+}
+
+/**
+ * Whether a failed read is worth a line, given how many have failed in a row
+ * and how long it has been since the last time one was written down.
+ *
+ * The first one always is — a log that starts half a minute after the trouble
+ * did leaves whoever is reading it guessing about the gap. Everything after it
+ * waits for the interval, which is what stops a channel failing on every tick
+ * from filling the console it is supposed to explain.
+ */
+export function complaintIsDue(failures: number, sinceLastComplaintMs: number): boolean {
+  return failures <= 1 || sinceLastComplaintMs >= POLL_TROUBLE_INTERVAL_MS;
+}
+
+/** A read came back. Says so once if the failures had been reported, because a
+ * count that stops climbing looks the same in a console as one that was never
+ * read again. */
+function readWorked(): void {
+  if (failedReads === 0) return;
+  const failed = failedReads;
+  failedReads = 0;
+  console.info(`Echo: reading what is happening works again, after ${failed} that did not`);
+}
+
 /** Ask the core what is happening and put the answer in the store. */
 function refreshCaptureState(): void {
   const asked = stateSeq;
   getCaptureState()
     .then((s) => {
+      readWorked();
       // Anything that landed while this was in the air knows more than it does.
       if (stateSeq !== asked) return;
       const store = useEchoStore.getState();
@@ -100,9 +166,14 @@ function refreshCaptureState(): void {
       stateSeq += 1;
       store.setCaptureState(s);
     })
-    .catch(() => {
-      // Stay with what is on screen; the next tick or the next event corrects
-      // it, and nothing here is worth bothering the user with.
+    .catch((err) => {
+      // Stay with what is on screen. That is the right answer for one failed
+      // read — the next tick corrects it — and the wrong one for a channel that
+      // has stopped answering altogether, which is the case this poll was
+      // written to catch and the case the screen cannot tell apart from a quiet
+      // meeting. Nothing here is worth bothering the person with either way;
+      // `readFailed` is what keeps the second case from being invisible.
+      readFailed(err);
     });
 }
 
@@ -162,6 +233,11 @@ function watchWindowReturns(): () => void {
  * before an event that has since arrived is dropped as well, so asking can only
  * ever catch the screen up, never wind it back.
  *
+ * And when the asking itself stops working, it says so — to the console, with a
+ * count of how many reads in a row have come back with nothing. This poll is
+ * the floor under a dead event transport; a floor that fails in silence leaves
+ * the screen frozen with nothing to explain it.
+ *
  * Safe to call from as many components as need it — the Live screen, the
  * sidebar's live indicator, a "Stop" button in Settings — since they all read
  * and write the same store entry (`src/lib/store.ts`).
@@ -177,6 +253,7 @@ export function useCaptureState(): CaptureStatus {
     const asked = stateSeq;
     getCaptureState()
       .then((s) => {
+        readWorked();
         // The first event can beat the first answer; when it does, the event is
         // the newer of the two and this one is history.
         if (stateSeq !== asked) return;
@@ -184,9 +261,12 @@ export function useCaptureState(): CaptureStatus {
         stateSeq += 1;
         setCaptureState(s);
       })
-      .catch(() => {
-        // Stay on the idle default; the event stream corrects it once the
-        // core is ready, and nothing here is worth bothering the user with.
+      .catch((err) => {
+        // Stay on the idle default. This one is only corrected by the event
+        // stream — it is asked once and never again — so if the channel is the
+        // thing that is broken, an idle-looking app is what a person gets, and
+        // the console line is the only trace of why.
+        readFailed(err);
       });
   }, [setCaptureState]);
 
