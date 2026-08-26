@@ -213,10 +213,11 @@ pub async fn apply(db: &Db, patch: &SettingsPatch) -> Result<Settings, DbError> 
 /// stays deleted.
 ///
 /// A row that will not parse is an empty list, never an error: nothing about
-/// this is worth failing a meeting over.
+/// this is worth failing a meeting over. A database that cannot be *read* at
+/// all is a different thing, and does fail — see [`stored_list`].
 pub async fn words_to_know(db: &Db) -> Result<Vec<VocabularyWord>, DbError> {
-    let typed = stored_list(db, keys::VOCABULARY_TYPED).await;
-    let removed = stored_list(db, keys::VOCABULARY_REMOVED).await;
+    let typed = stored_list(db, keys::VOCABULARY_TYPED).await?;
+    let removed = stored_list(db, keys::VOCABULARY_REMOVED).await?;
     let people = repo::list_people(db).await?;
 
     let mut words: Vec<VocabularyWord> = Vec::new();
@@ -263,15 +264,14 @@ pub async fn glossary(db: &Db) -> crate::asr::glossary::Glossary {
 /// two commands are exact opposites however many times they are used.
 pub async fn add_word_to_know(db: &Db, word: &str) -> Result<Vec<VocabularyWord>, DbError> {
     let word = word.trim();
-    let mut typed = stored_list(db, keys::VOCABULARY_TYPED).await;
-    let mut removed = stored_list(db, keys::VOCABULARY_REMOVED).await;
+    let mut typed = stored_list(db, keys::VOCABULARY_TYPED).await?;
+    let mut removed = stored_list(db, keys::VOCABULARY_REMOVED).await?;
     removed.retain(|r| !same_word(r, word));
     if !word.is_empty() && !typed.iter().any(|t| same_word(t, word)) {
         typed.push(word.to_string());
     }
     typed.truncate(crate::asr::glossary::MAX_ENTRIES);
-    store_list(db, keys::VOCABULARY_TYPED, &typed).await?;
-    store_list(db, keys::VOCABULARY_REMOVED, &removed).await?;
+    store_lists(db, &typed, &removed).await?;
     words_to_know(db).await
 }
 
@@ -279,15 +279,14 @@ pub async fn add_word_to_know(db: &Db, word: &str) -> Result<Vec<VocabularyWord>
 /// left.
 pub async fn remove_word_to_know(db: &Db, word: &str) -> Result<Vec<VocabularyWord>, DbError> {
     let word = word.trim();
-    let mut typed = stored_list(db, keys::VOCABULARY_TYPED).await;
-    let mut removed = stored_list(db, keys::VOCABULARY_REMOVED).await;
+    let mut typed = stored_list(db, keys::VOCABULARY_TYPED).await?;
+    let mut removed = stored_list(db, keys::VOCABULARY_REMOVED).await?;
     typed.retain(|t| !same_word(t, word));
     if !word.is_empty() && !removed.iter().any(|r| same_word(r, word)) {
         removed.push(word.to_string());
     }
     removed.truncate(crate::asr::glossary::MAX_ENTRIES);
-    store_list(db, keys::VOCABULARY_TYPED, &typed).await?;
-    store_list(db, keys::VOCABULARY_REMOVED, &removed).await?;
+    store_lists(db, &typed, &removed).await?;
     words_to_know(db).await
 }
 
@@ -298,18 +297,53 @@ fn same_word(a: &str, b: &str) -> bool {
     a.trim().to_lowercase() == b.trim().to_lowercase()
 }
 
-async fn stored_list(db: &Db, key: &str) -> Vec<String> {
-    repo::get_setting(db, key)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
-        .unwrap_or_default()
+/// One stored half of the vocabulary.
+///
+/// The two ways this can go wrong are not the same way, and treating them as
+/// one is how somebody's words used to disappear:
+///
+/// * **the row will not parse** — an empty list, exactly as [`words_to_know`]
+///   promises. A value left by an older build, or scribbled on, must not brick
+///   the Words screen or fail a meeting, and nothing readable is thrown away.
+/// * **the read itself failed** — an error, always. The pool holds five
+///   connections and gives up asking for one after fifteen seconds, so a read
+///   can fail at a busy moment while the write a few lines later succeeds.
+///   Answering "empty" there and letting the caller write that back deletes
+///   every word somebody typed, reports success, and leaves nothing on disk or
+///   in the log to put them back from.
+async fn stored_list(db: &Db, key: &str) -> Result<Vec<String>, DbError> {
+    let Some(raw) = repo::get_setting(db, key).await? else {
+        return Ok(Vec::new());
+    };
+    match serde_json::from_str::<Vec<String>>(&raw) {
+        Ok(words) => Ok(words),
+        Err(error) => {
+            tracing::warn!(
+                key,
+                %error,
+                "a saved list of words could not be understood, so Echo is starting that list over"
+            );
+            Ok(Vec::new())
+        }
+    }
 }
 
-async fn store_list(db: &Db, key: &str, words: &[String]) -> Result<(), DbError> {
-    let json = serde_json::to_string(words).unwrap_or_else(|_| "[]".to_string());
-    repo::set_setting(db, key, &json).await
+/// Write both halves of the list at once.
+///
+/// One transaction rather than two writes, because the two halves are two
+/// sides of one edit: a failure landing between them used to leave the typed
+/// list rewritten and the record of what was deleted not, with nothing to say
+/// which half had happened.
+async fn store_lists(db: &Db, typed: &[String], removed: &[String]) -> Result<(), DbError> {
+    let pairs = [
+        (keys::VOCABULARY_TYPED.to_string(), encode_list(typed)),
+        (keys::VOCABULARY_REMOVED.to_string(), encode_list(removed)),
+    ];
+    repo::set_settings(db, &pairs).await
+}
+
+fn encode_list(words: &[String]) -> String {
+    serde_json::to_string(words).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Absolute storage directory, resolved through [`crate::paths`].
@@ -600,6 +634,93 @@ mod tests {
         // …and writing to it puts it back in a state that parses.
         add_word_to_know(&db, "Langola").await.unwrap();
         assert_eq!(words_to_know(&db).await.unwrap().len(), 1);
+    }
+
+    /// Store a value the database will hand back but this code cannot read: a
+    /// stand-in, in a test, for every way a read can fail for real — a
+    /// connection nobody could get hold of inside fifteen seconds, a file
+    /// locked by the catch-up pass, a disk that answered with an error.
+    async fn make_unreadable(db: &Db, key: &str) {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(vec![0xFF_u8, 0xFE, 0xFD])
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    async fn raw_value(db: &Db, key: &str) -> Vec<u8> {
+        let row: (Vec<u8>,) = sqlx::query_as("SELECT value FROM settings WHERE key = ?1")
+            .bind(key)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        row.0
+    }
+
+    /// The one this is all for. Adding and removing a word are read-modify-
+    /// writes, so a read that quietly answers "empty" is a write that deletes
+    /// everything — and the old code said `Ok` while it did it.
+    #[tokio::test]
+    async fn a_read_that_fails_does_not_erase_the_list() {
+        let db = connect_in_memory().await.unwrap();
+        // A name somebody took off the list on purpose, which has to survive.
+        repo::create_person(&db, "Gianluca").await.unwrap();
+        remove_word_to_know(&db, "Gianluca").await.unwrap();
+        make_unreadable(&db, keys::VOCABULARY_TYPED).await;
+        let before = raw_value(&db, keys::VOCABULARY_TYPED).await;
+
+        assert!(
+            stored_list(&db, keys::VOCABULARY_TYPED).await.is_err(),
+            "a read that failed must not come back as an empty list"
+        );
+        assert!(
+            add_word_to_know(&db, "Langola").await.is_err(),
+            "a word that was not added must not report success"
+        );
+        assert!(
+            remove_word_to_know(&db, "Marco").await.is_err(),
+            "a word that was not removed must not report success"
+        );
+        assert!(words_to_know(&db).await.is_err());
+
+        // Nothing was written over: the words are still there for whoever
+        // repairs the database, and the deliberate deletion still stands.
+        assert_eq!(raw_value(&db, keys::VOCABULARY_TYPED).await, before);
+        assert_eq!(
+            stored_list(&db, keys::VOCABULARY_REMOVED).await.unwrap(),
+            vec!["Gianluca".to_string()]
+        );
+    }
+
+    /// A meeting is never failed over this — but it does not pretend either.
+    #[tokio::test]
+    async fn a_database_that_cannot_answer_leaves_the_decoder_alone() {
+        let db = connect_in_memory().await.unwrap();
+        make_unreadable(&db, keys::VOCABULARY_TYPED).await;
+        assert!(glossary(&db).await.is_empty());
+    }
+
+    /// Both halves of an edit land, or neither does.
+    #[tokio::test]
+    async fn the_two_halves_of_an_edit_are_written_together() {
+        let db = connect_in_memory().await.unwrap();
+        repo::create_person(&db, "Gianluca").await.unwrap();
+        remove_word_to_know(&db, "Gianluca").await.unwrap();
+
+        // Adding it back both types it and takes it off the removed list.
+        add_word_to_know(&db, "Gianluca").await.unwrap();
+        assert_eq!(
+            stored_list(&db, keys::VOCABULARY_TYPED).await.unwrap(),
+            vec!["Gianluca".to_string()]
+        );
+        assert!(stored_list(&db, keys::VOCABULARY_REMOVED)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// The list feeds a prompt with a hard cap on it, so the list itself has one
