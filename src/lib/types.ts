@@ -465,12 +465,16 @@ export interface Job {
   createdAt: Timestamp;
   updatedAt: Timestamp;
   /**
-   * The stage this job last reported, when it has stages worth naming.
+   * The stage this job is in right now, when it is in one worth naming.
    *
-   * Not part of the row: the core carries it beside the job on
-   * `jobProgress`, and the screens that keep a list of jobs fold it in as it
-   * arrives (see `useMeetingDetail`) so that what is drawn is the job as it is
-   * now, not as it was when the list was fetched.
+   * Part of the row, so a screen that opens in the middle of a stage reads it
+   * the same as one that was already open. It used to travel only in the
+   * `jobProgress` event, which meant the one stage that matters — the one-time
+   * setup, announced at launch before the window has finished loading — was
+   * invisible to every screen for the quarter of an hour it lasts.
+   *
+   * Only ever set on a running job, and cleared by the core the moment the job
+   * moves on or has a fraction to report again.
    */
   phase?: JobPhase;
 }
@@ -765,8 +769,6 @@ export interface JobProgressPayload {
   job: Job;
   /** Ready-to-show sentence, e.g. "Writing your recap...". */
   label?: string;
-  /** Which stage of the job this is, when it has stages worth naming. */
-  phase?: JobPhase;
 }
 
 export interface DownloadProgressPayload {

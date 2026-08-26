@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { inProgressJob, lastFailure } from "./jobs";
-import type { Job, JobKind, JobStatus } from "./types";
+import { inProgressJob, lastFailure, setupJobUnderWay } from "./jobs";
+import type { Job, JobKind, JobPhase, JobStatus } from "./types";
 
 /**
  * Both functions here were written to fix a specific wrong screen, and both
@@ -20,9 +20,10 @@ function job(
     id = `${kind}-${status}`,
     createdAt = "2026-08-25T10:00:00Z",
     updatedAt,
-  }: { id?: string; createdAt?: string; updatedAt?: string } = {},
+    phase,
+  }: { id?: string; createdAt?: string; updatedAt?: string; phase?: JobPhase } = {},
 ): Job {
-  return { id, kind, status, createdAt, updatedAt: updatedAt ?? createdAt };
+  return { id, kind, status, createdAt, updatedAt: updatedAt ?? createdAt, phase };
 }
 
 describe("inProgressJob", () => {
@@ -117,5 +118,34 @@ describe("lastFailure", () => {
       job("diarize", "done", { id: "real", createdAt: "2026-08-25T12:00:00Z" }),
     ];
     expect(lastFailure(jobs)).toBeUndefined();
+  });
+});
+
+describe("setupJobUnderWay", () => {
+  // The launch this was written for: an app update queues the one-time setup,
+  // the core starts it before the window has finished loading, and the stage is
+  // announced to nobody. Everything the corner pill knows, it knows from here.
+  it("finds the setup job in the list the pill reads on mount", () => {
+    const jobs = [job("prepareEngine", "running", { phase: "preparingEngine" })];
+    expect(setupJobUnderWay(jobs)?.kind).toBe("prepareEngine");
+    expect(setupJobUnderWay(jobs)?.phase).toBe("preparingEngine");
+  });
+
+  it("counts any job that is waiting on the engine, whatever it is called", () => {
+    // A catch-up sitting in the setup stage is, for those minutes, the setup —
+    // and the only thing on screen that can say so.
+    const jobs = [job("transcribeCatchup", "running", { phase: "preparingEngine" })];
+    expect(setupJobUnderWay(jobs)?.kind).toBe("transcribeCatchup");
+  });
+
+  it("says nothing about a setup job that has not started", () => {
+    // The pill is a sentence about something happening. Queued is not.
+    expect(setupJobUnderWay([job("prepareEngine", "queued")])).toBeUndefined();
+    expect(setupJobUnderWay([job("download", "paused")])).toBeUndefined();
+  });
+
+  it("ignores ordinary work, stage or no stage", () => {
+    const jobs = [job("summarize", "running"), job("diarize", "queued")];
+    expect(setupJobUnderWay(jobs)).toBeUndefined();
   });
 });

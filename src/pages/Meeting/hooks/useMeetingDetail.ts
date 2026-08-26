@@ -121,11 +121,12 @@ export function useMeetingDetail(meetingId: Id | undefined): UseMeetingDetailRes
 
   useEvent(EVENTS.jobProgress, (payload) => {
     if (payload.job.meetingId !== meetingIdRef.current) return;
-    // The stage travels beside the job rather than in it, and it is the truer
-    // description of what is happening — a catch-up job waiting for the engine
-    // to be got ready is not yet catching up on anything. Folded in here so
-    // every screen reading `detail.jobs` gets it (see `lib/jobs.ts`).
-    const job = { ...payload.job, phase: payload.phase };
+    // The job carries its own stage, so this row replaces the fetched one
+    // whole. It used to arrive beside the job and be folded in here, which
+    // meant a screen opened after the announcement drew the job's own name over
+    // a bar at 0% — a catch-up job waiting for the engine to be got ready is
+    // not catching up on anything yet, and said so to nobody.
+    const job = payload.job;
     setDetail((prev) => {
       const jobs = prev.jobs.some((j) => j.id === job.id)
         ? prev.jobs.map((j) => (j.id === job.id ? job : j))

@@ -183,6 +183,9 @@ pub struct Progress {
     last: std::sync::Mutex<Option<Instant>>,
     /// Where the job already was. Resumed work never appears to go backwards.
     floor: f32,
+    /// The stage written on the row right now, so the first fraction after one
+    /// knows there is something to take back off it.
+    stage: tokio::sync::Mutex<Option<crate::events::JobPhase>>,
 }
 
 impl Progress {
@@ -194,12 +197,19 @@ impl Progress {
             events,
             last: std::sync::Mutex::new(None),
             floor,
+            stage: tokio::sync::Mutex::new(None),
         }
     }
 
     /// 0.0..=1.0. The ends always go through; the middle is capped.
     pub async fn set(&self, value: f32) {
         let value = value.clamp(0.0, 1.0).max(self.floor);
+        // A number to report means the stage is over — the catch-up job waits
+        // for the engine and then gets on with its own work. Taken off the row
+        // before the rate cap can turn this call into a no-op, because a
+        // sentence about a one-time setup left standing over a moving bar is a
+        // lie the same size as the missing one the column was added to fix.
+        self.leave_stage().await;
         let forced = value <= 0.0 || value >= 1.0;
         if !forced && !self.due() {
             return;
@@ -210,28 +220,54 @@ impl Progress {
         let mut job = self.job.clone();
         job.status = JobStatus::Running;
         job.progress = Some(value);
+        job.phase = None;
         self.events.emit(UiEvent::JobProgress(JobProgressPayload {
             label: Some(label_for(job.kind).to_string()),
             job,
-            phase: None,
         }));
     }
 
     /// This job has moved on to a stage of its own, with no fraction to report.
     ///
     /// Progress in the table is left exactly where it was — the stage is a fact
-    /// about now, not a rewind — but the event carries no number, because there
-    /// is no honest one to carry and a bar frozen at 100% for a quarter of an
-    /// hour reads as broken.
-    pub fn phase(&self, phase: crate::events::JobPhase) {
+    /// about now, not a rewind — but nothing carries a number, because there is
+    /// no honest one to carry and a bar frozen at 100% for a quarter of an hour
+    /// reads as broken.
+    ///
+    /// Written to the row as well as announced. The announcement is one moment;
+    /// the stage it describes can last a quarter of an hour, and the screen that
+    /// has to show it may not exist yet when the moment passes (the setup job is
+    /// queued at launch, before the window has finished loading). The row is
+    /// what any screen mounting later reads.
+    pub async fn phase(&self, phase: crate::events::JobPhase) {
+        if let Err(error) = repo::set_job_phase(&self.db, &self.job.id, Some(phase)).await {
+            // Back to what it was before: the announcement below still reaches
+            // whoever is listening now, and only a screen opened later loses the
+            // sentence.
+            tracing::warn!(%error, job = %self.job.id, "could not store what this work is doing");
+        }
+        *self.stage.lock().await = Some(phase);
         let mut job = self.job.clone();
         job.status = JobStatus::Running;
         job.progress = None;
+        job.phase = Some(phase);
         self.events.emit(UiEvent::JobProgress(JobProgressPayload {
             label: Some(phase_label_for(phase).to_string()),
             job,
-            phase: Some(phase),
         }));
+    }
+
+    /// Take the stage back off the row, if it is wearing one.
+    async fn leave_stage(&self) {
+        let mut stage = self.stage.lock().await;
+        if stage.is_none() {
+            return;
+        }
+        if let Err(error) = repo::set_job_phase(&self.db, &self.job.id, None).await {
+            tracing::warn!(%error, job = %self.job.id, "could not clear what this work was doing");
+            return;
+        }
+        *stage = None;
     }
 
     fn due(&self) -> bool {
@@ -361,7 +397,9 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
     // announcing a stage for that puts a pill on screen that blinks once at the
     // end of every meeting for no reason anybody could name.
     if !ctx.asr.is_loaded() {
-        ctx.progress.phase(crate::events::JobPhase::PreparingEngine);
+        ctx.progress
+            .phase(crate::events::JobPhase::PreparingEngine)
+            .await;
     }
     if let Err(error) = ctx.asr.prewarm().await {
         return Err(asr_failure(&ctx.cancel, error));
@@ -1010,7 +1048,9 @@ async fn download(ctx: &JobContext) -> Result<(), JobFailure> {
     // Announced as its own stage first. Everything above this line has a
     // fraction; nothing below it does, and the eighteen minutes are all below
     // it (field report of 2026-08-21).
-    ctx.progress.phase(crate::events::JobPhase::PreparingEngine);
+    ctx.progress
+        .phase(crate::events::JobPhase::PreparingEngine)
+        .await;
     if let Err(error) = ctx.asr.prewarm().await {
         tracing::warn!(%error, "the new weights did not load on the first attempt");
     }
@@ -1094,7 +1134,9 @@ async fn prepare_engine(ctx: &JobContext) -> Result<(), JobFailure> {
 
     // Everything from here has no fraction to report, so it says what it is
     // instead of leaving a bar somewhere it will sit for a quarter of an hour.
-    ctx.progress.phase(crate::events::JobPhase::PreparingEngine);
+    ctx.progress
+        .phase(crate::events::JobPhase::PreparingEngine)
+        .await;
     tracing::info!(model = %file_name, "getting the speech engine ready for this machine");
 
     // No cancel check around the load, and none after it, on purpose.
@@ -1613,13 +1655,18 @@ impl JobRuntime {
         status
     }
 
+    /// Say where a job stands, from the row as it reads now — stage included,
+    /// because the stage is the truer sentence when there is one.
     fn announce(&self, job: &Job) {
+        let label = match job.phase {
+            Some(phase) => phase_label_for(phase).to_string(),
+            None => label_for(job.kind).to_string(),
+        };
         self.ports
             .events
             .emit(UiEvent::JobProgress(JobProgressPayload {
                 job: job.clone(),
-                label: Some(label_for(job.kind).to_string()),
-                phase: None,
+                label: Some(label),
             }));
     }
 
@@ -1758,6 +1805,9 @@ impl JobRuntime {
 
         let mut started = job.clone();
         started.status = JobStatus::Running;
+        // The status write above cleared any stage the row had; this is a job
+        // beginning, and it is not in one yet.
+        started.phase = None;
         self.announce(&started);
 
         let ctx = JobContext {
@@ -2299,7 +2349,7 @@ mod tests {
         let announced = seen.job_progress();
         let stage = announced
             .iter()
-            .find(|p| p.phase == Some(crate::events::JobPhase::PreparingEngine))
+            .find(|p| p.job.phase == Some(crate::events::JobPhase::PreparingEngine))
             .expect("the stage was announced");
         assert!(
             stage.job.progress.is_none(),
@@ -2492,7 +2542,7 @@ mod tests {
         catch_up(&ctx).await.expect("the catch-up should finish");
 
         assert!(
-            seen.job_progress().iter().all(|p| p.phase.is_none()),
+            seen.job_progress().iter().all(|p| p.job.phase.is_none()),
             "nothing to announce: the engine was already up"
         );
     }
@@ -2975,6 +3025,47 @@ mod tests {
         }
     }
 
+    /// The stage goes on the row, not only into an announcement nobody may be
+    /// there to hear — and the first honest fraction takes it back off.
+    ///
+    /// The launch case is the whole reason: the setup job is queued while the
+    /// window is still loading, so the announcement lands before any screen is
+    /// listening, and the row is all the corner pill has to go on when it
+    /// finally mounts. And the catch-up case is why it has to come off again:
+    /// that job waits for the engine, then gets on with its own work, and
+    /// "Finishing one-time setup…" over a moving bar would be the same lie
+    /// pointing the other way.
+    #[tokio::test]
+    async fn a_stage_is_stored_while_it_lasts_and_only_while_it_lasts() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let job = repo::ensure_job(&db, None, JobKind::PrepareEngine)
+            .await
+            .unwrap();
+        let (ctx, _seen) = context_for(&db, job.clone()).await;
+
+        ctx.progress
+            .phase(crate::events::JobPhase::PreparingEngine)
+            .await;
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().phase,
+            Some(crate::events::JobPhase::PreparingEngine),
+            "a screen mounting now has to be able to read what is happening"
+        );
+
+        // Rate-capped or not, a fraction ends the stage: `set` was just called
+        // with 0.05, which the cap would ordinarily swallow.
+        ctx.progress.set(0.05).await;
+        assert!(
+            repo::get_job(&db, &job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase
+                .is_none(),
+            "the stage is over the moment there are numbers again"
+        );
+    }
+
     /// A stage with no fraction says so, rather than leaving a bar parked at the
     /// last number it had.
     #[tokio::test]
@@ -2989,17 +3080,20 @@ mod tests {
             error: None,
             created_at: String::new(),
             updated_at: String::new(),
+            phase: None,
         };
         let (ctx, seen) = context_for(&db, job).await;
         ctx.progress.set(1.0).await;
-        ctx.progress.phase(crate::events::JobPhase::PreparingEngine);
+        ctx.progress
+            .phase(crate::events::JobPhase::PreparingEngine)
+            .await;
 
         let announced = seen.job_progress();
         assert_eq!(announced.len(), 2);
         assert_eq!(announced[0].job.progress, Some(1.0));
-        assert!(announced[0].phase.is_none());
+        assert!(announced[0].job.phase.is_none());
         assert_eq!(
-            announced[1].phase,
+            announced[1].job.phase,
             Some(crate::events::JobPhase::PreparingEngine)
         );
         assert!(

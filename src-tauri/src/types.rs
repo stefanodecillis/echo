@@ -1004,6 +1004,44 @@ impl JobStatus {
     }
 }
 
+/// A stage inside one job that a person would read as a different activity.
+///
+/// Almost no job needs one: "Writing your recap…" is the whole of what the
+/// recap job does. The download is the exception. Its second half is not a
+/// download at all — the bytes have arrived and are being made ready to use on
+/// this particular machine, which on Apple silicon is a one-off that can take
+/// many minutes — and a progress bar that has been sitting at 100% since the
+/// bytes landed is not an honest account of it (field report of 2026-08-21: a
+/// person watched a bar for eighteen minutes with no idea what was happening,
+/// under a sentence about a job that had not started).
+///
+/// Stored on the job row rather than only announced, because the stage that
+/// matters most begins before any screen exists to hear about it — see
+/// `migrations/0009_job_stage.sql`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JobPhase {
+    /// The bytes are in; this machine is being got ready to use them. There is
+    /// no fraction to report and none can be invented, so the UI shows this as
+    /// work in progress without a number.
+    PreparingEngine,
+}
+
+impl JobPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobPhase::PreparingEngine => "preparing_engine",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "preparing_engine" => Some(JobPhase::PreparingEngine),
+            _ => None,
+        }
+    }
+}
+
 /// Row of `jobs`. Persisted so work survives a restart.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1020,6 +1058,13 @@ pub struct Job {
     pub error: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    /// The stage this job is in right now, when it is in one worth naming.
+    ///
+    /// Only ever set on a row that is running, and cleared by every write that
+    /// changes the status or reports a fraction, so a screen can read it
+    /// straight off the row without asking when it was last true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<JobPhase>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1515,6 +1560,8 @@ mod tests {
         ] {
             assert_eq!(JobStatus::parse(s.as_str()), Some(s));
         }
+        let stage = JobPhase::PreparingEngine;
+        assert_eq!(JobPhase::parse(stage.as_str()), Some(stage));
         for k in [
             MarkerKind::ActionItem,
             MarkerKind::Highlight,

@@ -80,6 +80,37 @@ export function lastFailure(jobs: Job[], kinds?: ReadonlySet<string>): Job | und
     .sort((a, b) => at(b.updatedAt) - at(a.updatedAt))[0];
 }
 
+/** The kinds of job that are setup and nothing else: whatever they are doing,
+ * they are the reason Echo is not ready yet. */
+export const SETUP_KINDS: ReadonlySet<JobKind> = new Set<JobKind>(["download", "prepareEngine"]);
+
+/** The stage that is setup no matter whose job it belongs to. A catch-up that
+ * has to wait for the engine to be got ready is, for those minutes, the
+ * one-time setup — and it is the only thing on screen that can say so. */
+export const SETUP_PHASE: JobPhase = "preparingEngine";
+
+/**
+ * The setup job that is happening right now, out of everything unfinished.
+ *
+ * Its own function, and tested, because it is the answer the corner pill
+ * depends on at the one moment it cannot be told: an app update queues the
+ * one-time setup at launch, the core starts it while the window is still
+ * loading, and the announcement of its stage reaches nobody. The list of
+ * unfinished jobs is then the only place that stage still exists, for the
+ * quarter of an hour it lasts.
+ *
+ * Running only. A queued setup job is a job that has not started, and the pill
+ * is a sentence about something happening — the rule at the top of this file.
+ * The core runs one job at a time, so there is never more than one to choose
+ * between.
+ */
+export function setupJobUnderWay(jobs: Job[]): Job | undefined {
+  return jobs.find(
+    (job) =>
+      job.status === "running" && (SETUP_KINDS.has(job.kind) || job.phase === SETUP_PHASE),
+  );
+}
+
 /** Running jobs first, then the ones waiting — for a screen that lists them. */
 export function runningFirst(jobs: Job[]): Job[] {
   return [
@@ -116,9 +147,11 @@ export interface JobPresentation {
  * a catch-up waiting for the engine to be got ready is not yet catching up on
  * anything. A queued job keeps its name and loses its bar.
  */
-export function presentJob(job: Job, phase: JobPhase | undefined = job.phase): JobPresentation {
+export function presentJob(job: Job): JobPresentation {
   const running = job.status === "running";
-  const label = phase ? labels.jobPhase[phase] : labels.jobKind[job.kind as JobKind];
+  const label = job.phase
+    ? labels.jobPhase[job.phase]
+    : labels.jobKind[job.kind as JobKind];
   return {
     label,
     fraction: running ? job.progress : undefined,

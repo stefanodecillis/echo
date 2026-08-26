@@ -17,9 +17,9 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 use super::{Db, DbError};
 use crate::types::{
     ActionItem, ActionItemPatch, AssetKind, AudioChunk, Channel, Correction, Id, Job, JobKind,
-    JobQuery, JobStatus, Marker, MarkerKind, Meeting, MeetingDetail, MeetingQuery, MeetingStatus,
-    MeetingSummary, ModelInfo, Provider, SearchHit, SearchQuery, Segment, SegmentDraft, Speaker,
-    Summary, Template, TranscriptQuery,
+    JobPhase, JobQuery, JobStatus, Marker, MarkerKind, Meeting, MeetingDetail, MeetingQuery,
+    MeetingStatus, MeetingSummary, ModelInfo, Provider, SearchHit, SearchQuery, Segment,
+    SegmentDraft, Speaker, Summary, Template, TranscriptQuery,
 };
 
 /// Sentinels wrapped around FTS matches before HTML escaping, then swapped for
@@ -2684,6 +2684,7 @@ pub async fn create_job(db: &Db, meeting_id: Option<&str>, kind: JobKind) -> Res
         error: None,
         created_at: ts.clone(),
         updated_at: ts,
+        phase: None,
     })
 }
 
@@ -2750,7 +2751,7 @@ pub async fn get_job_payload(db: &Db, id: &str) -> Result<Option<String>, DbErro
 
 pub async fn get_job(db: &Db, id: &str) -> Result<Option<Job>, DbError> {
     let row = sqlx::query(
-        "SELECT id, meeting_id, kind, status, progress, error, created_at, updated_at
+        "SELECT id, meeting_id, kind, status, progress, error, created_at, updated_at, phase
          FROM jobs WHERE id = ?1",
     )
     .bind(id)
@@ -2761,7 +2762,7 @@ pub async fn get_job(db: &Db, id: &str) -> Result<Option<Job>, DbError> {
 
 pub async fn list_jobs(db: &Db, q: &JobQuery) -> Result<Vec<Job>, DbError> {
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-        "SELECT id, meeting_id, kind, status, progress, error, created_at, updated_at
+        "SELECT id, meeting_id, kind, status, progress, error, created_at, updated_at, phase
          FROM jobs WHERE 1 = 1",
     );
     if let Some(m) = &q.meeting_id {
@@ -2782,19 +2783,28 @@ pub async fn list_jobs(db: &Db, q: &JobQuery) -> Result<Vec<Job>, DbError> {
     rows.into_iter().map(row_to_job).collect()
 }
 
+/// Write down where a job stands, and drop whatever stage it was in.
+///
+/// The stage is only ever true of a job that is running this second, so every
+/// change of status ends it: starting, finishing, failing, being cancelled,
+/// being parked for a recording, being put back in the queue. Clearing it in
+/// the same statement is what makes it safe for a screen to read the stage off
+/// the row without asking how old it is.
 pub async fn set_job_status(
     db: &Db,
     id: &str,
     status: JobStatus,
     error: Option<&str>,
 ) -> Result<(), DbError> {
-    sqlx::query("UPDATE jobs SET status = ?2, error = ?3, updated_at = ?4 WHERE id = ?1")
-        .bind(id)
-        .bind(status.as_str())
-        .bind(error)
-        .bind(now())
-        .execute(db)
-        .await?;
+    sqlx::query(
+        "UPDATE jobs SET status = ?2, error = ?3, phase = NULL, updated_at = ?4 WHERE id = ?1",
+    )
+    .bind(id)
+    .bind(status.as_str())
+    .bind(error)
+    .bind(now())
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -2808,10 +2818,31 @@ pub async fn set_job_progress(db: &Db, id: &str, progress: f32) -> Result<(), Db
     Ok(())
 }
 
+/// Put the job into a stage, or take it out of one.
+///
+/// `None` is not a tidy-up nobody needs: a job that has finished waiting for
+/// the engine and started reporting fractions again is no longer in that stage,
+/// and a sentence about a one-time setup left standing over a moving bar is a
+/// lie the same size as the missing one this column was added to fix.
+///
+/// `updated_at` is deliberately not touched. The stage is about what is
+/// happening, and it is announced in the same breath it is written; moving the
+/// timestamp would make a fifteen-minute silence look like fifteen minutes of
+/// activity to anything reading the table for signs of life.
+pub async fn set_job_phase(db: &Db, id: &str, phase: Option<JobPhase>) -> Result<(), DbError> {
+    sqlx::query("UPDATE jobs SET phase = ?2 WHERE id = ?1")
+        .bind(id)
+        .bind(phase.map(|p| p.as_str()))
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 /// Recording has absolute priority: park everything that is running.
 pub async fn pause_active_jobs(db: &Db) -> Result<u64, DbError> {
     let r = sqlx::query(
-        "UPDATE jobs SET status = 'paused', updated_at = ?1 WHERE status IN ('running', 'queued')",
+        "UPDATE jobs SET status = 'paused', phase = NULL, updated_at = ?1
+         WHERE status IN ('running', 'queued')",
     )
     .bind(now())
     .execute(db)
@@ -2821,11 +2852,13 @@ pub async fn pause_active_jobs(db: &Db) -> Result<u64, DbError> {
 
 /// Recording stopped; let background work continue.
 pub async fn resume_paused_jobs(db: &Db) -> Result<u64, DbError> {
-    let r =
-        sqlx::query("UPDATE jobs SET status = 'queued', updated_at = ?1 WHERE status = 'paused'")
-            .bind(now())
-            .execute(db)
-            .await?;
+    let r = sqlx::query(
+        "UPDATE jobs SET status = 'queued', phase = NULL, updated_at = ?1
+             WHERE status = 'paused'",
+    )
+    .bind(now())
+    .execute(db)
+    .await?;
     Ok(r.rows_affected())
 }
 
@@ -2850,7 +2883,7 @@ pub async fn resume_paused_jobs(db: &Db) -> Result<u64, DbError> {
 /// Returns how many rows were touched either way.
 pub async fn requeue_orphaned_jobs(db: &Db, setup_interrupted: &str) -> Result<u64, DbError> {
     let settled = sqlx::query(
-        "UPDATE jobs SET status = 'failed', error = ?2, updated_at = ?1
+        "UPDATE jobs SET status = 'failed', error = ?2, phase = NULL, updated_at = ?1
          WHERE status = 'running' AND kind = ?3",
     )
     .bind(now())
@@ -2860,7 +2893,7 @@ pub async fn requeue_orphaned_jobs(db: &Db, setup_interrupted: &str) -> Result<u
     .await?
     .rows_affected();
     let r = sqlx::query(
-        "UPDATE jobs SET status = 'queued', updated_at = ?1
+        "UPDATE jobs SET status = 'queued', phase = NULL, updated_at = ?1
          WHERE status IN ('running', 'paused')",
     )
     .bind(now())
@@ -2881,7 +2914,7 @@ pub async fn requeue_orphaned_jobs(db: &Db, setup_interrupted: &str) -> Result<u
 /// cannot become the tight loop that queueing on every readiness poll would.
 pub async fn requeue_failed_setup_jobs(db: &Db, payload: &str) -> Result<u64, DbError> {
     let r = sqlx::query(
-        "UPDATE jobs SET status = 'queued', error = NULL, updated_at = ?1
+        "UPDATE jobs SET status = 'queued', error = NULL, phase = NULL, updated_at = ?1
          WHERE status = 'failed' AND kind = ?2 AND payload = ?3",
     )
     .bind(now())
@@ -2931,7 +2964,7 @@ pub async fn has_failed_job_with_payload(
 /// meeting lost transcript.
 pub async fn next_queued_job(db: &Db) -> Result<Option<Job>, DbError> {
     let row = sqlx::query(
-        "SELECT id, meeting_id, kind, status, progress, error, created_at, updated_at
+        "SELECT id, meeting_id, kind, status, progress, error, created_at, updated_at, phase
          FROM jobs WHERE status = 'queued'
          ORDER BY CASE kind
                     WHEN 'download' THEN 0
@@ -3461,6 +3494,10 @@ fn row_to_action_item(row: sqlx::sqlite::SqliteRow) -> Result<ActionItem, DbErro
 fn row_to_job(row: sqlx::sqlite::SqliteRow) -> Result<Job, DbError> {
     let kind: String = row.try_get("kind").map_err(decode)?;
     let status: String = row.try_get("status").map_err(decode)?;
+    let phase: Option<String> = row.try_get("phase").map_err(decode)?;
+    let phase = phase
+        .map(|p| JobPhase::parse(&p).ok_or_else(|| bad_enum("phase", &p)))
+        .transpose()?;
     Ok(Job {
         id: row.try_get("id").map_err(decode)?,
         meeting_id: row.try_get("meeting_id").map_err(decode)?,
@@ -3470,6 +3507,7 @@ fn row_to_job(row: sqlx::sqlite::SqliteRow) -> Result<Job, DbError> {
         error: row.try_get("error").map_err(decode)?,
         created_at: row.try_get("created_at").map_err(decode)?,
         updated_at: row.try_get("updated_at").map_err(decode)?,
+        phase,
     })
 }
 
@@ -6005,6 +6043,113 @@ mod tests {
             .await
             .unwrap();
         assert!(get_job_payload(&db, &plain.id).await.unwrap().is_none());
+    }
+
+    /// The stage a job is in has to survive being announced, or the screen that
+    /// mounts a minute later has nothing to read.
+    ///
+    /// This is the launch case in full: the one-time setup is queued before the
+    /// window has finished loading, so the announcement of its stage reaches
+    /// nobody, and for the next quarter of an hour the row is the only thing
+    /// that knows what the machine is busy with.
+    #[tokio::test]
+    async fn the_stage_a_job_is_in_is_on_the_row_and_comes_off_it() {
+        let (db, m) = seeded().await;
+        let job = ensure_job(&db, Some(&m.id), JobKind::PrepareEngine)
+            .await
+            .unwrap();
+        assert!(job.phase.is_none(), "a job starts in no stage at all");
+
+        set_job_phase(&db, &job.id, Some(JobPhase::PreparingEngine))
+            .await
+            .unwrap();
+        assert_eq!(
+            get_job(&db, &job.id).await.unwrap().unwrap().phase,
+            Some(JobPhase::PreparingEngine),
+            "read back by id"
+        );
+        let listed = list_jobs(
+            &db,
+            &JobQuery {
+                meeting_id: Some(m.id.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            listed.first().and_then(|j| j.phase),
+            Some(JobPhase::PreparingEngine),
+            "and by the listing every screen loads on mount"
+        );
+
+        // Put back. Nothing is in a stage it has left.
+        set_job_phase(&db, &job.id, None).await.unwrap();
+        assert!(get_job(&db, &job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase
+            .is_none());
+    }
+
+    /// A stage that outlived the moment it described would be a new lie, not a
+    /// fix — "Finishing one-time setup…" over a job that has finished, failed,
+    /// or is parked behind a recording. Every write that moves a job's status
+    /// ends its stage, including the bulk ones nothing calls one row at a time.
+    #[tokio::test]
+    async fn no_stage_survives_the_job_moving_on() {
+        let (db, m) = seeded().await;
+        let in_a_stage = |db: Db, id: String| async move {
+            set_job_phase(&db, &id, Some(JobPhase::PreparingEngine))
+                .await
+                .unwrap();
+        };
+        let stage_of =
+            |db: Db, id: String| async move { get_job(&db, &id).await.unwrap().unwrap().phase };
+
+        let job = ensure_job(&db, Some(&m.id), JobKind::PrepareEngine)
+            .await
+            .unwrap();
+
+        // Finished, however it finished.
+        in_a_stage(db.clone(), job.id.clone()).await;
+        set_job_status(&db, &job.id, JobStatus::Done, None)
+            .await
+            .unwrap();
+        assert!(stage_of(db.clone(), job.id.clone()).await.is_none());
+
+        // Parked for a recording, and let go again afterwards.
+        set_job_status(&db, &job.id, JobStatus::Running, None)
+            .await
+            .unwrap();
+        in_a_stage(db.clone(), job.id.clone()).await;
+        pause_active_jobs(&db).await.unwrap();
+        assert!(stage_of(db.clone(), job.id.clone()).await.is_none());
+        in_a_stage(db.clone(), job.id.clone()).await;
+        resume_paused_jobs(&db).await.unwrap();
+        assert!(stage_of(db.clone(), job.id.clone()).await.is_none());
+
+        // And the launch sweep, which is what catches a stage left by a crash:
+        // the process went down mid-compile, so nothing was ever able to clear
+        // it from inside the job.
+        set_job_status(&db, &job.id, JobStatus::Running, None)
+            .await
+            .unwrap();
+        in_a_stage(db.clone(), job.id.clone()).await;
+        requeue_orphaned_jobs(&db, "interrupted").await.unwrap();
+        assert!(stage_of(db.clone(), job.id.clone()).await.is_none());
+
+        // The one-a-launch retry of the setup, same rule.
+        set_job_payload(&db, &job.id, Some("\"w.bin\""))
+            .await
+            .unwrap();
+        set_job_status(&db, &job.id, JobStatus::Failed, Some("no"))
+            .await
+            .unwrap();
+        in_a_stage(db.clone(), job.id.clone()).await;
+        requeue_failed_setup_jobs(&db, "\"w.bin\"").await.unwrap();
+        assert!(stage_of(db.clone(), job.id.clone()).await.is_none());
     }
 
     /// The row has to be able to name its own directory and its playback file

@@ -1,7 +1,8 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-import { EVENTS } from "../lib/ipc";
-import type { JobKind, JobPhase } from "../lib/types";
+import { EVENTS, listJobs } from "../lib/ipc";
+import { SETUP_KINDS, SETUP_PHASE, setupJobUnderWay } from "../lib/jobs";
+import type { JobPhase } from "../lib/types";
 import { useEvent } from "./useEvent";
 
 /** Where the one-time setup has got to, as the job itself reports it. */
@@ -13,15 +14,6 @@ export interface SetupJobState {
   /** The stage it is in, when it is in one worth naming. */
   phase?: JobPhase;
 }
-
-/** The kinds of job that are setup and nothing else: whatever they are doing,
- * they are the reason Echo is not ready yet. */
-const SETUP_KINDS = new Set<JobKind>(["download", "prepareEngine"]);
-
-/** The stage that is setup no matter whose job it belongs to. A catch-up that
- * has to wait for the engine to be got ready is, for those minutes, the
- * one-time setup — and it is the only thing on screen that can say so. */
-const SETUP_PHASE: JobPhase = "preparingEngine";
 
 /**
  * How long a followed job has to have said nothing before another setup job is
@@ -64,13 +56,56 @@ const GONE_QUIET_MS = 30_000;
  * the followed job has gone quiet for `GONE_QUIET_MS`, the next setup event from
  * anywhere takes the pill over — or clears it. Nothing here waits for an event
  * that may never come.
+ *
+ * Nor does it wait for one that has already been. The state of play is asked
+ * for on mount as well as listened for, because the job whose stage lasts
+ * longest is the one whose stage is announced earliest — before the window that
+ * would draw it exists at all.
  */
 export function useSetupJob(): SetupJobState {
   const [state, setState] = useState<SetupJobState>({ running: false });
   const followingRef = useRef<{ id: string; heardAt: number } | null>(null);
+  /** Whether any announcement has been acted on yet. The answer read on mount
+   * is only ever the opening position, and an event that beat it knows more. */
+  const heardRef = useRef(false);
+
+  // What is already happening, asked for outright.
+  //
+  // Without this the pill could only ever show a stage it happened to be
+  // listening for, and the stage that matters most begins before it exists: an
+  // app update queues the one-time setup at launch, the core starts it while
+  // the window is still loading, and its announcement reaches nobody. That left
+  // a machine compiling the speech engine for a quarter of an hour with no
+  // pill, Settings saying Echo was ready, and a person free to start the
+  // meeting that would then have to wait for it — the whole of what the setup
+  // job was written to prevent.
+  useEffect(() => {
+    let cancelled = false;
+    listJobs({ activeOnly: true })
+      .then((jobs) => {
+        if (cancelled || heardRef.current) return;
+        const job = setupJobUnderWay(jobs);
+        if (!job) return;
+        heardRef.current = true;
+        followingRef.current = { id: job.id, heardAt: Date.now() };
+        setState({ running: true, fraction: job.progress, phase: job.phase });
+      })
+      .catch((err) => {
+        // Nothing a person can do about it and nothing worth a banner — the
+        // announcements still work for anything that starts from here on. But
+        // it means the pill can be blind to a setup already under way, so
+        // whoever is looking at the console should see that it went missing
+        // (same standard as `useEvent`).
+        console.warn("Echo: could not ask what setup is already under way", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEvent(EVENTS.jobProgress, (payload) => {
-    const { job, phase } = payload;
+    const { job } = payload;
+    const phase = job.phase;
     const isSetup = SETUP_KINDS.has(job.kind) || phase === SETUP_PHASE;
     const following = followingRef.current;
 
@@ -78,6 +113,7 @@ export function useSetupJob(): SetupJobState {
       // A job that was only worth following while it sat in the setup stage,
       // and has now moved on to its own work.
       if (following?.id === job.id) {
+        heardRef.current = true;
         followingRef.current = null;
         setState({ running: false });
       }
@@ -97,10 +133,11 @@ export function useSetupJob(): SetupJobState {
     }
 
     const running = job.status === "running";
+    heardRef.current = true;
     followingRef.current = running ? { id: job.id, heardAt: Date.now() } : null;
     setState({
       running,
-      fraction: job.progress ?? undefined,
+      fraction: job.progress,
       phase,
     });
   });
