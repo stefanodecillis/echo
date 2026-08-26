@@ -202,6 +202,10 @@ pub(crate) struct MockAsr {
     /// Hold inside the catch-up pass until something cancels it: how a real
     /// pass behaves when the next meeting starts while it is still reading.
     catch_up_waits_to_be_stopped: AtomicBool,
+    /// Hold inside the pass after it has been cancelled, until a test lets it
+    /// go: a pass on its way out, with the machine free to change hands again
+    /// behind it. The window the 2026-08-26 stall lived in.
+    catch_up_holds_on_its_way_out: AtomicBool,
     /// Set the moment the catch-up pass begins, so a test can wait for the job
     /// to really be in flight before it takes the machine away.
     catch_up_started: AtomicBool,
@@ -245,6 +249,7 @@ impl MockAsr {
             calls: AtomicU32::new(0),
             catch_up_segments: AtomicU32::new(0),
             catch_up_waits_to_be_stopped: AtomicBool::new(false),
+            catch_up_holds_on_its_way_out: AtomicBool::new(false),
             catch_up_started: AtomicBool::new(false),
             fail_prewarm: AtomicBool::new(false),
             cancel_prewarm: AtomicBool::new(false),
@@ -293,6 +298,19 @@ impl MockAsr {
     pub(crate) fn catch_up_waits_to_be_stopped(&self) {
         self.catch_up_waits_to_be_stopped
             .store(true, Ordering::SeqCst);
+    }
+
+    /// Hold the pass inside itself once it has been cancelled, so a test can
+    /// decide what the machine is doing by the time it reports back.
+    pub(crate) fn catch_up_holds_on_its_way_out(&self) {
+        self.catch_up_holds_on_its_way_out
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Let a pass held by [`MockAsr::catch_up_holds_on_its_way_out`] report.
+    pub(crate) fn let_the_catch_up_report(&self) {
+        self.catch_up_holds_on_its_way_out
+            .store(false, Ordering::SeqCst);
     }
 
     /// The next catch-up pass finishes, but with these stretches unread — an
@@ -447,6 +465,12 @@ impl AsrPort for MockAsr {
             while self.catch_up_waits_to_be_stopped.load(Ordering::SeqCst)
                 && !control.cancel.as_ref().is_some_and(|c| c())
             {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            // On its way out, and not out yet. A real pass has a window here
+            // too — the drain to finish, the last row to write — and the machine
+            // can change hands twice inside it.
+            while self.catch_up_holds_on_its_way_out.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
             // A pass that was stopped part-way has one thing it may say about

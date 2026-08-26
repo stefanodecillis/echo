@@ -1245,6 +1245,19 @@ pub struct JobRuntime {
     running: std::sync::Mutex<Option<(Id, Cancel)>>,
     /// A recording owns the machine.
     blocked: AtomicBool,
+    /// Held while who owns the machine changes, and while the row of a job a
+    /// recording stopped is written.
+    ///
+    /// [`JobRuntime::blocked`] is what decides between `paused` and `queued` for
+    /// such a job, and under this lock the read of the flag and the row that
+    /// follows from it cannot be split by a `release()` landing in between. That
+    /// split is the whole of the 2026-08-26 stall: a job already back in the
+    /// queue was written straight back to `paused`, where nothing un-parks it
+    /// (see [`JobRuntime::park_for_a_recording`]).
+    ///
+    /// Nothing slow happens under it — a flag and one statement — and no other
+    /// lock is taken while it is held.
+    parking: tokio::sync::Mutex<()>,
     /// Asked "is a capture live right now?" once the session spine has wired
     /// itself up.
     ///
@@ -1271,6 +1284,7 @@ impl JobRuntime {
             ports,
             running: std::sync::Mutex::new(None),
             blocked: AtomicBool::new(false),
+            parking: tokio::sync::Mutex::new(()),
             capturing: std::sync::Mutex::new(None),
             detecting: std::sync::Mutex::new(None),
             stopped: AtomicBool::new(false),
@@ -1453,14 +1467,20 @@ impl JobRuntime {
 
     /// A recording is starting. Park everything, keep it resumable.
     pub async fn preempt(&self) -> Result<(), DbError> {
-        self.blocked.store(true, Ordering::SeqCst);
-        if let Ok(running) = self.running.lock() {
-            if let Some((id, cancel)) = running.as_ref() {
-                tracing::info!(job = %id, "parking background work for a recording");
-                cancel.preempt();
+        let parked = {
+            // Under the lock with the write, so a job on its way out cannot read
+            // this flag on one side of a `release()` and write its row on the
+            // other.
+            let _ordering = self.parking.lock().await;
+            self.blocked.store(true, Ordering::SeqCst);
+            if let Ok(running) = self.running.lock() {
+                if let Some((id, cancel)) = running.as_ref() {
+                    tracing::info!(job = %id, "parking background work for a recording");
+                    cancel.preempt();
+                }
             }
-        }
-        let parked = repo::pause_active_jobs(&self.db).await?;
+            repo::pause_active_jobs(&self.db).await?
+        };
         if parked > 0 {
             tracing::info!(parked, "background work parked");
             // And say so on the screens, not only in the menu bar. A meeting
@@ -1494,8 +1514,14 @@ impl JobRuntime {
 
     /// The recording finished. Let the parked work continue.
     pub async fn release(&self) -> Result<(), DbError> {
-        self.blocked.store(false, Ordering::SeqCst);
-        let resumed = repo::resume_paused_jobs(&self.db).await?;
+        let resumed = {
+            // The other half of the pair, and the reason for the lock: this used
+            // to put a job back in the queue only for that job's own last words
+            // to write `paused` over it.
+            let _ordering = self.parking.lock().await;
+            self.blocked.store(false, Ordering::SeqCst);
+            repo::resume_paused_jobs(&self.db).await?
+        };
         if resumed > 0 {
             tracing::info!(resumed, "background work picked back up");
             // The other edge of the same sentence. Parking says "paused until
@@ -1538,6 +1564,53 @@ impl JobRuntime {
             }
         }
         self.wake.notify_one();
+    }
+
+    /// Write down that a recording stopped this job: parked while the recording
+    /// still holds the machine, straight back in the queue when it does not.
+    ///
+    /// It used to be `paused`, always — and `release()` is the only thing that
+    /// un-parks a row. A job that reported itself stopped **after** `release()`
+    /// had already put it back in the queue wrote `paused` over that, and then
+    /// sat there: `active_only` counts parked work, so the menu bar stayed on
+    /// Processing, 1.6 GB of speech weights stayed loaded, the meeting never
+    /// left "Processing" in the library, and the screen said "paused until the
+    /// recording ends" while nothing was recording and nothing would ever end.
+    /// The next recording to finish does clear it, so it is a stall rather than
+    /// a stop — but for somebody who does not record again it never ends, and
+    /// that sentence is false for the whole of it.
+    ///
+    /// [`JobRuntime::parking`] is what makes the answer trustworthy: the flag is
+    /// read and the row is written with no `release()` able to fit between them.
+    ///
+    /// Shutting down comes through here too, and comes out `queued`. That is
+    /// what it should be: nothing is recording, and a row waiting for a
+    /// recording to end would be waiting for something that already happened.
+    async fn park_for_a_recording(&self, job_id: &str) -> JobStatus {
+        let _ordering = self.parking.lock().await;
+        let status = if self.blocked.load(Ordering::SeqCst) {
+            JobStatus::Paused
+        } else {
+            JobStatus::Queued
+        };
+        if let Err(error) = repo::set_job_status(&self.db, job_id, status, None).await {
+            tracing::warn!(%error, job = %job_id, "could not record work a recording stopped");
+        }
+        status
+    }
+
+    /// Write down how a job that reached its own end ended.
+    async fn record_end(
+        &self,
+        job_id: &str,
+        status: JobStatus,
+        error: Option<String>,
+    ) -> JobStatus {
+        if let Err(failed) = repo::set_job_status(&self.db, job_id, status, error.as_deref()).await
+        {
+            tracing::warn!(error = %failed, "could not record how the work ended");
+        }
+        status
     }
 
     fn announce(&self, job: &Job) {
@@ -1662,15 +1735,20 @@ impl JobRuntime {
             if let Ok(mut running) = self.running.lock() {
                 *running = None;
             }
-            if let Err(error) =
-                repo::set_job_status(&self.db, &job.id, JobStatus::Paused, None).await
-            {
-                tracing::warn!(%error, "could not park work for a recording");
-            }
+            let status = self.park_for_a_recording(&job.id).await;
             if let Ok(Some(parked)) = repo::get_job(&self.db, &job.id).await {
                 self.announce(&parked);
             }
-            tracing::info!(job = %job.id, "a recording claimed the machine before this could start");
+            tracing::info!(
+                job = %job.id,
+                status = status.as_str(),
+                "a recording claimed the machine before this could start"
+            );
+            // The recording ended in the moment this took, so the row is queued
+            // rather than parked and the loop has work to come back to.
+            if matches!(status, JobStatus::Queued) {
+                self.wake.notify_one();
+            }
             return;
         }
         if let Err(error) = repo::set_job_status(&self.db, &job.id, JobStatus::Running, None).await
@@ -1705,19 +1783,28 @@ impl JobRuntime {
             other => other,
         };
 
-        let (status, error) = match outcome {
-            Ok(()) => (JobStatus::Done, None),
-            Err(JobFailure::Preempted) => (JobStatus::Paused, None),
-            Err(JobFailure::Cancelled) => (JobStatus::Cancelled, None),
-            Err(JobFailure::Failed(message)) => (JobStatus::Failed, Some(message)),
+        let status = match outcome {
+            Ok(()) => self.record_end(&job.id, JobStatus::Done, None).await,
+            Err(JobFailure::Cancelled) => {
+                self.record_end(&job.id, JobStatus::Cancelled, None).await
+            }
+            Err(JobFailure::Failed(message)) => {
+                self.record_end(&job.id, JobStatus::Failed, Some(message))
+                    .await
+            }
+            // Not a status this can decide on its own: parking is only right
+            // while a recording still holds the machine
+            // ([`JobRuntime::park_for_a_recording`]).
+            Err(JobFailure::Preempted) => self.park_for_a_recording(&job.id).await,
         };
-
-        if let Err(error) = repo::set_job_status(&self.db, &job.id, status, error.as_deref()).await
-        {
-            tracing::warn!(%error, "could not record how the work ended");
-        }
         if let Ok(mut running) = self.running.lock() {
             *running = None;
+        }
+        // A recording that ended while this job was on its way out leaves it
+        // queued, not parked. Nothing else will notice that on its own when
+        // `execute` was driven from outside the loop.
+        if matches!(status, JobStatus::Queued) {
+            self.wake.notify_one();
         }
 
         if let Ok(Some(finished)) = repo::get_job(&self.db, &job.id).await {
@@ -2613,6 +2700,129 @@ mod tests {
                 assert!(!lower.contains(word), "{message:?} leaks {word:?}");
             }
         }
+    }
+
+    /// A runner with one job in it and an engine a test can hold on to.
+    fn a_runtime_around(db: &Db, asr: Arc<super::super::mock::MockAsr>) -> Arc<JobRuntime> {
+        let events = crate::session::ports::EventBus::new();
+        events.set(Arc::new(super::super::mock::CollectingEvents::default()));
+        JobRuntime::new(
+            db.clone(),
+            crate::paths::AppPaths::rooted_at(std::env::temp_dir().join("echo-jobs"), None),
+            crate::session::ports::Ports {
+                capture: Arc::new(super::super::mock::MockCapture::new()),
+                asr,
+                executor: Arc::new(DefaultJobExecutor),
+                events,
+            },
+        )
+    }
+
+    /// The stall of 2026-08-26: a job that reported itself stopped **after** the
+    /// recording had already ended and put it back in the queue was written
+    /// straight back to `paused`, and nothing un-parks a row outside
+    /// `release()`.
+    ///
+    /// What that cost, for as long as it lasted: the menu bar pinned on
+    /// Processing, 1.6 GB of speech weights held, the meeting stuck on
+    /// "Processing" in the library, and a screen reading "paused until the
+    /// recording ends" with nothing recording and nothing left to end. The next
+    /// recording to finish cleared it — so for anybody who recorded again it was
+    /// a stall, and for anybody who did not it was the end of that meeting.
+    #[tokio::test]
+    async fn a_job_already_back_in_the_queue_is_not_parked_behind_a_recording_that_ended() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let (_meeting_id, job) = a_meeting_mid_catch_up(&db).await;
+
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        // Still reading when the recording starts, and still on its way out
+        // when it ends: the whole of the race, held open.
+        asr.catch_up_waits_to_be_stopped();
+        asr.catch_up_holds_on_its_way_out();
+        let runtime = a_runtime_around(&db, asr.clone());
+
+        let running = {
+            let runtime = runtime.clone();
+            let job = job.clone();
+            tokio::spawn(async move { runtime.execute(job).await })
+        };
+        while !asr.catch_up_started() {
+            tokio::task::yield_now().await;
+        }
+
+        runtime.preempt().await.unwrap();
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
+            JobStatus::Paused,
+            "the recording has the machine, so the work waits for it"
+        );
+        // And now the recording ends, while the pass is still on its way out.
+        runtime.release().await.unwrap();
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
+            JobStatus::Queued
+        );
+
+        asr.let_the_catch_up_report();
+        running.await.unwrap();
+
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
+            JobStatus::Queued,
+            "nothing is recording, so there is nothing for this work to wait behind"
+        );
+        assert_eq!(
+            repo::next_queued_job(&db)
+                .await
+                .unwrap()
+                .map(|queued| queued.id),
+            Some(job.id),
+            "and the loop can reach it, which is what makes it not stuck"
+        );
+    }
+
+    /// The other side of the same ordering, which the fix must not trade away:
+    /// while the recording really does still have the machine, work parks.
+    #[tokio::test]
+    async fn work_a_recording_is_still_holding_parks_and_waits_for_it() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let (_meeting_id, job) = a_meeting_mid_catch_up(&db).await;
+
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        asr.catch_up_waits_to_be_stopped();
+        asr.catch_up_holds_on_its_way_out();
+        let runtime = a_runtime_around(&db, asr.clone());
+
+        let running = {
+            let runtime = runtime.clone();
+            let job = job.clone();
+            tokio::spawn(async move { runtime.execute(job).await })
+        };
+        while !asr.catch_up_started() {
+            tokio::task::yield_now().await;
+        }
+
+        runtime.preempt().await.unwrap();
+        // No release: the meeting is still being recorded when the pass reports.
+        asr.let_the_catch_up_report();
+        running.await.unwrap();
+
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
+            JobStatus::Paused,
+            "a recording has absolute priority, and this work still has to happen"
+        );
+        assert!(
+            repo::next_queued_job(&db).await.unwrap().is_none(),
+            "and nothing may pick it up while the recording is running"
+        );
+
+        // And it comes back the moment the recording is over.
+        runtime.release().await.unwrap();
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().status,
+            JobStatus::Queued
+        );
     }
 
     /// The same thing one level up, where the damage was actually recorded: the
