@@ -28,6 +28,21 @@
 //! One condition alone would be wrong in both directions. Plenty of real
 //! meetings end with somebody saying only "Grazie", and plenty of quiet windows
 //! contain a real short answer. Two conditions is the whole design.
+//!
+//! # The sibling rule, and why it is not here
+//!
+//! The recording of 2026-08-26 produced a second family of lines nobody said:
+//! `you` at 160 ms and `Bye.` four times consecutively at 40 ms each, three of
+//! them at confidence 0.99 to 1.0. This filter never saw them, and should not
+//! have: "you" is not a courtesy phrase, and no deny-list that stayed honest
+//! would ever hold it. What gives those lines away is not what they say but how
+//! *narrow* they are — forty milliseconds is two frames of mel, and the speech
+//! detector will not open a stretch under
+//! [`crate::audio::vad::MIN_UTTERANCE_MS`].
+//!
+//! That is a judgement about a span rather than about words: it needs no list,
+//! no detector and no language, so it lives where spans are made, at the
+//! splitter — see [`crate::asr::catchup`]'s `MIN_LINE_MS`.
 
 /// Less voice than this under a stock phrase, and nobody said it.
 ///
