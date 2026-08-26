@@ -398,8 +398,38 @@ pub struct CatchUpReport {
     /// into one span for the log.
     pub from_ms: i64,
     pub to_ms: i64,
+    /// Windows the engine refused once and was asked about a second time (see
+    /// [`decode_pack`]). Distinct from `fallback_attempts`, which is a second
+    /// *reading* of a window that decoded perfectly well in the wrong language:
+    /// this one is a second attempt at a window that came back as an error.
+    pub windows_retried: u32,
+    /// The stretches this pass could not read at all, after asking twice.
+    ///
+    /// Empty for every pass that worked, which is nearly all of them. Non-empty,
+    /// it is the one thing on this report that is about the person's transcript
+    /// being **short** rather than about what went into it, and it is carried as
+    /// spans rather than a count because two things downstream need the seconds
+    /// themselves: the live guesses over them are the only text those seconds
+    /// have and must not be swept away with the rest, and the sentence the
+    /// person is shown says how much of their recording is missing.
+    ///
+    /// The spans stay holes in the coverage the next pass plans from, so a
+    /// re-run reads them again — nothing here writes them off for good.
+    pub unread: Vec<UnreadSpan>,
     /// The language the meeting settled on, when the engine worked one out.
     pub language: Option<String>,
+}
+
+/// A stretch of one channel a pass could not read back off the recording.
+///
+/// One packed window that answered with an error both times it was asked. On
+/// the meeting clock, so it can be matched against the live text sitting over
+/// the same seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnreadSpan {
+    pub channel: Channel,
+    pub from_ms: i64,
+    pub to_ms: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -732,7 +762,6 @@ where
     let mut done_ms: i64 = 0;
     let window = options.window();
     let budget = options.pack();
-    let mut skipped: u32 = 0;
     // One record for the whole meeting, both channels: "how confidently does
     // this recording read" is a fact about the meeting, and the two sides of a
     // call are the same conversation.
@@ -884,16 +913,7 @@ where
                             .await?
                     }
                 };
-                match decode_pack(
-                    &work,
-                    packed,
-                    samples,
-                    &mut report,
-                    &mut skipped,
-                    &mut reads,
-                )
-                .await?
-                {
+                match decode_pack(&work, packed, samples, &mut report, &mut reads).await? {
                     Outcome::Carried => {}
                     Outcome::Cancelled => {
                         return Err(cut_short(&report, &options, done_ms, total_ms));
@@ -911,9 +931,11 @@ where
         }
     }
 
-    if skipped > 0 {
+    if !report.unread.is_empty() {
         tracing::warn!(
-            skipped,
+            unread = report.unread.len(),
+            unread_ms = report.unread_ms(),
+            retried = report.windows_retried,
             written = report.segments_written,
             "some stretches of this recording would not decode"
         );
@@ -938,6 +960,12 @@ where
         left_alone_ms = report.left_alone_ms,
         inherited_lag_ms = ?report.inherited_lag_ms,
         words_corrected = report.words_corrected,
+        // What this pass left behind. Nothing else in this line is about text
+        // that is *missing*, and a hole in somebody's transcript is the one
+        // number a reader of this log should not have to derive.
+        windows_retried = report.windows_retried,
+        unread = report.unread.len(),
+        unread_ms = report.unread_ms(),
         audio_ms = total_ms,
         "catch-up pass finished"
     );
@@ -1204,7 +1232,6 @@ async fn decode_pack<T: Transcriber>(
     pack: Pack,
     samples: Vec<f32>,
     report: &mut CatchUpReport,
-    skipped: &mut u32,
     reads: &mut HowThisMeetingReads,
 ) -> Result<Outcome, AsrError> {
     if samples.is_empty() {
@@ -1234,16 +1261,55 @@ async fn decode_pack<T: Transcriber>(
     report.stretches_packed += pack.stretches;
     report.windows_decoded += 1;
     let prompt = work.glossary.prompt();
-    match transcribe_with_prior(
+    // Held back so the window can be asked for a second time; a copy of the
+    // audio costs nothing next to a decode of it, and the same reasoning is
+    // already why [`transcribe_with_prior`] keeps one.
+    let ask_again = job.clone();
+    let read = match transcribe_with_prior(
         work.transcriber,
         job,
         prior.as_deref(),
-        prompt,
+        prompt.clone(),
         report,
         reads,
     )
     .await
     {
+        Err(AsrError::Cancelled) => return Ok(Outcome::Cancelled),
+        // **Once**, and immediately. What fails here fails per call — the
+        // engine's queue closed under this job, a decode came back short, a
+        // read of the weights went wrong — and a second call is a fresh one, so
+        // there is nothing to wait for. Two refusals in a row are about this
+        // audio or this engine rather than about luck, and a third would only
+        // make the pass longer to arrive at the same answer. What the second
+        // attempt buys is the sentence a one-off would otherwise have cost:
+        // these seconds are exactly the stretch the app promised to fill in
+        // when the meeting ended.
+        Err(first) => {
+            // Not `windows_decoded`: that number is packed windows against
+            // `stretches_packed`, which is what packing bought, and a second
+            // attempt at one window does not make it two windows.
+            report.windows_retried += 1;
+            tracing::debug!(
+                target: "echo::asr",
+                %first,
+                t_start_ms = pack.from_ms,
+                window_ms = pack.len_ms(),
+                "a window would not read; asking the engine once more"
+            );
+            transcribe_with_prior(
+                work.transcriber,
+                ask_again,
+                prior.as_deref(),
+                prompt,
+                report,
+                reads,
+            )
+            .await
+        }
+        first => first,
+    };
+    match read {
         Ok(text) => {
             // These seconds have now been read off the recording, which is the
             // truth (mantra 3), so the live guesses over them are superseded —
@@ -1319,14 +1385,26 @@ async fn decode_pack<T: Transcriber>(
         Err(AsrError::Cancelled) => return Ok(Outcome::Cancelled),
         // One bad window must not abandon the rest of the meeting — nor fill
         // the log with one line per window while it does.
+        //
+        // The span goes on the report, not just into a counter: these seconds
+        // end the pass with no text of their own, and two things downstream
+        // have to know exactly which seconds they are. The live guesses over
+        // them are the only text they have and must survive the sweep that
+        // clears the rest, and the person is owed a sentence saying part of
+        // their recording could not be read (`session::jobs`).
         Err(e) => {
-            *skipped += 1;
-            if *skipped == 1 || skipped.is_multiple_of(SKIP_LOG_EVERY) {
+            report.unread.push(UnreadSpan {
+                channel: work.channel,
+                from_ms: pack.from_ms,
+                to_ms: pack.to_ms,
+            });
+            let count = report.unread.len() as u32;
+            if count == 1 || count.is_multiple_of(SKIP_LOG_EVERY) {
                 tracing::warn!(
                     %e,
                     t_start_ms = pack.from_ms,
                     window_ms = pack.len_ms(),
-                    count = *skipped,
+                    count,
                     "skipped a window that would not decode"
                 );
             }
@@ -1600,6 +1678,54 @@ fn improves_on(second: &Transcription, first: &Transcription) -> bool {
 }
 
 impl CatchUpReport {
+    /// How much of the meeting clock has no text against it because it would
+    /// not decode.
+    ///
+    /// Merged, and across both channels: the two sides of a call overlap on the
+    /// clock, and a person asking "how much of my meeting is missing" is asking
+    /// about the conversation, not about a sum of channels that would count the
+    /// same half-minute twice.
+    pub fn unread_ms(&self) -> i64 {
+        let mut spans: Vec<(i64, i64)> = self
+            .unread
+            .iter()
+            .map(|span| (span.from_ms, span.to_ms))
+            .collect();
+        merge(&mut spans);
+        span_ms(&spans)
+    }
+
+    /// The same stretches, joined up, one list per channel.
+    ///
+    /// Joined because a pass that fails one window usually fails its neighbours
+    /// too — an engine that has fallen over fails every window that is left —
+    /// and the caller turns each of these into a clause of one `DELETE`. Merged,
+    /// a whole meeting that would not read is two spans; unmerged it is one per
+    /// half-minute, and a long enough meeting would build a statement SQLite
+    /// refuses to bind, which would leave the live text of a *good* meeting
+    /// standing. Per channel because the two sides of a call overlap on the
+    /// clock and a stretch of one is not a stretch of the other.
+    pub fn unread_merged(&self) -> Vec<(Channel, i64, i64)> {
+        let mut channels: Vec<Channel> = Vec::new();
+        for span in &self.unread {
+            if !channels.contains(&span.channel) {
+                channels.push(span.channel);
+            }
+        }
+        let mut out = Vec::new();
+        for channel in channels {
+            let mut spans: Vec<(i64, i64)> = self
+                .unread
+                .iter()
+                .filter(|span| span.channel == channel)
+                .map(|span| (span.from_ms, span.to_ms))
+                .collect();
+            merge(&mut spans);
+            out.extend(spans.into_iter().map(|(from, to)| (channel, from, to)));
+        }
+        out
+    }
+
     fn report_language<T: Transcriber>(&mut self, transcriber: &T, meeting_id: &str) {
         self.language = transcriber.settled_language(meeting_id);
     }
@@ -4717,6 +4843,250 @@ mod tests {
             vec![(0, 120_000)],
             "between them the two passes wrote down the whole meeting"
         );
+    }
+
+    /// An engine that refuses to read one window: the first time it is asked,
+    /// or every time.
+    ///
+    /// Picked by decode order rather than by the clock, because where the
+    /// windows fall is the packer's business. It writes down what it turned
+    /// down, so a test can hold the report against the real span.
+    struct RefusesAWindow {
+        /// The decode to refuse, counting from zero.
+        nth: u32,
+        /// How many asks in a row it refuses. One is the blip a second ask
+        /// covers; two is a window that will not read at all.
+        asks_refused: u32,
+        calls: AtomicU32,
+        refused: Mutex<Vec<(Ch, i64)>>,
+    }
+
+    impl RefusesAWindow {
+        fn nth(nth: u32, asks_refused: u32) -> Self {
+            Self {
+                nth,
+                asks_refused,
+                calls: AtomicU32::new(0),
+                refused: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Channel and start on the meeting clock of every ask it turned down.
+        fn refused(&self) -> Vec<(Ch, i64)> {
+            self.refused.lock().unwrap().clone()
+        }
+
+        fn asked(&self) -> u32 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Transcriber for RefusesAWindow {
+        async fn transcribe(
+            &self,
+            job: TranscribeJob,
+            _prompt: Option<String>,
+        ) -> Result<Transcription, AsrError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n >= self.nth && n < self.nth + self.asks_refused {
+                self.refused
+                    .lock()
+                    .unwrap()
+                    .push((job.channel, job.t_start_ms));
+                return Err(AsrError::Transcribe(WHISPER_MINUS_SIX.to_string()));
+            }
+            Ok(Transcription {
+                channel: job.channel,
+                t_start_ms: job.t_start_ms,
+                t_end_ms: job.t_end_ms(),
+                text: "so we agreed to ship it on Friday".into(),
+                language: Some("en".into()),
+                avg_confidence: Some(0.9),
+                model_name: Some("test weights".into()),
+                model_revision: Some("rev1".into()),
+                ..Default::default()
+            })
+        }
+
+        fn settled_language(&self, _meeting_id: &str) -> Option<String> {
+            Some("en".into())
+        }
+    }
+
+    /// A window the engine answers with an error is asked about a second time,
+    /// and the second answer is what the transcript is made of.
+    ///
+    /// What fails here fails per call — a queue that closed under the job, a
+    /// read of the weights that went wrong — over audio that is perfectly good.
+    /// One error used to cost that stretch its words outright, on the pass whose
+    /// whole job is to fill in the stretches the live text missed.
+    #[tokio::test]
+    async fn a_window_the_engine_refuses_once_is_asked_again_and_costs_nothing() {
+        let db = connect_in_memory().await.unwrap();
+        // Two minutes of microphone audio, four windows of it.
+        let id = meeting_with_audio(&db, 4).await;
+        let engine = RefusesAWindow::nth(1, 1);
+
+        let report = run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &FakeAudio::with_speech(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            engine.refused().len(),
+            1,
+            "this test is only worth anything if the engine really refused"
+        );
+        assert_eq!(report.windows_retried, 1);
+        assert!(
+            report.unread.is_empty(),
+            "the second ask worked, so nothing was left unread: {:?}",
+            report.unread
+        );
+        assert_eq!(report.unread_ms(), 0);
+        assert_eq!(
+            transcribed_spans(&db, &id, Ch::Mic).await.unwrap(),
+            vec![(0, 120_000)],
+            "the whole meeting is written down, refusal and all"
+        );
+        // A second attempt at one window does not make it two windows: that
+        // number is what packing bought, and `windows_retried` carries the rest.
+        assert_eq!(report.windows_decoded, 4);
+        assert_eq!(
+            engine.asked(),
+            report.windows_decoded + report.windows_retried
+        );
+    }
+
+    /// A window that will not read however often it is asked ends the pass with
+    /// no text against it — and the pass says exactly which seconds those are.
+    ///
+    /// It used to say so into a counter and nowhere else: the job finished at
+    /// 100%, the live guesses over the stretch were swept away with the rest,
+    /// and a person was left a gap where a promise had been. The span is on the
+    /// report because two things downstream need the seconds themselves — the
+    /// guesses that have to survive, and the sentence the person is shown.
+    #[tokio::test]
+    async fn a_window_that_will_not_read_at_all_is_reported_as_unread() {
+        let db = connect_in_memory().await.unwrap();
+        let id = meeting_with_audio(&db, 4).await;
+        let engine = RefusesAWindow::nth(1, 2);
+
+        let report = run(
+            &engine,
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &FakeAudio::with_speech(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            engine.refused().len(),
+            2,
+            "asked twice, and a third would only make the pass longer"
+        );
+        assert_eq!(report.windows_retried, 1);
+        let (channel, from_ms) = engine.refused()[0];
+        assert_eq!(report.unread.len(), 1, "{:?}", report.unread);
+        let hole = report.unread[0];
+        assert_eq!(hole.channel, channel);
+        assert_eq!(hole.from_ms, from_ms);
+        assert!(hole.to_ms > hole.from_ms);
+        assert_eq!(report.unread_ms(), hole.to_ms - hole.from_ms);
+        assert!(
+            report.segments_written >= 3,
+            "one window it could not read must not abandon the other three"
+        );
+
+        // And it stays a hole rather than being written off: a pass that runs
+        // later works its plan out from the transcript, and reads these seconds
+        // again.
+        let later = FakeAudio::with_speech();
+        run(
+            &FakeEngine::saying("what the first pass could not read"),
+            &db,
+            &id,
+            CatchUpOptions {
+                window_ms: 30_000,
+                ..Default::default()
+            },
+            &later,
+        )
+        .await
+        .unwrap();
+        assert!(
+            later
+                .reads()
+                .iter()
+                .any(|(_, from, to)| *from <= hole.from_ms && *to >= hole.to_ms),
+            "the stretch nothing read is the stretch the next pass goes for: {:?}",
+            later.reads()
+        );
+        assert_eq!(
+            transcribed_spans(&db, &id, Ch::Mic).await.unwrap(),
+            vec![(0, 120_000)],
+            "between them the two passes wrote down the whole meeting"
+        );
+    }
+
+    /// Neighbouring holes join up, and the two sides of a call stay apart.
+    ///
+    /// The runner turns each of these into a clause of one `DELETE`, and an
+    /// engine that has fallen over refuses every window that is left — a whole
+    /// meeting unjoined is one span per half-minute, which is how a statement
+    /// gets long enough for SQLite to refuse it.
+    #[test]
+    fn unread_stretches_are_joined_up_per_channel() {
+        let report = CatchUpReport {
+            unread: vec![
+                UnreadSpan {
+                    channel: Ch::Mic,
+                    from_ms: 30_000,
+                    to_ms: 60_000,
+                },
+                UnreadSpan {
+                    channel: Ch::System,
+                    from_ms: 30_000,
+                    to_ms: 60_000,
+                },
+                UnreadSpan {
+                    channel: Ch::Mic,
+                    from_ms: 0,
+                    to_ms: 30_000,
+                },
+                UnreadSpan {
+                    channel: Ch::Mic,
+                    from_ms: 90_000,
+                    to_ms: 120_000,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            report.unread_merged(),
+            vec![
+                (Ch::Mic, 0, 60_000),
+                (Ch::Mic, 90_000, 120_000),
+                (Ch::System, 30_000, 60_000),
+            ]
+        );
+        // Both sides of the call lost the same half-minute. The meeting lost
+        // that half-minute once, and that is the number a person is told.
+        assert_eq!(report.unread_ms(), 90_000);
     }
 
     #[tokio::test]

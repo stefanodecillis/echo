@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
+use crate::asr::catchup::{CatchUpReport, UnreadSpan};
 use crate::asr::engine::PartialFn;
 use crate::asr::{AsrError, TranscribeJob, Transcription};
 use crate::audio::{AudioError, CaptureConfig, CaptureStarted};
@@ -227,6 +228,9 @@ pub(crate) struct MockAsr {
     /// the row, so "was this one forgotten" is the only way to tell that a
     /// wrong language is really gone.
     forgotten: std::sync::Mutex<Vec<String>>,
+    /// Stretches the next catch-up pass reports it could not read back at all.
+    /// Empty unless a test says otherwise, because that is the ordinary case.
+    catch_up_unread: std::sync::Mutex<Vec<UnreadSpan>>,
     /// What the engine has settled on for each meeting. Empty until a test says
     /// otherwise: the real engine settles on evidence, not on the first line it
     /// managed to write (see [`crate::asr::language`]).
@@ -250,6 +254,7 @@ impl MockAsr {
             backlog_writes: std::sync::Mutex::new(Vec::new()),
             backlog_calls: std::sync::Mutex::new(Vec::new()),
             live_plans: std::sync::Mutex::new(Vec::new()),
+            catch_up_unread: std::sync::Mutex::new(Vec::new()),
             forgotten: std::sync::Mutex::new(Vec::new()),
             settled: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -288,6 +293,12 @@ impl MockAsr {
     pub(crate) fn catch_up_waits_to_be_stopped(&self) {
         self.catch_up_waits_to_be_stopped
             .store(true, Ordering::SeqCst);
+    }
+
+    /// The next catch-up pass finishes, but with these stretches unread — an
+    /// engine that refused the same window twice.
+    pub(crate) fn catch_up_leaves_unread(&self, spans: Vec<UnreadSpan>) {
+        *self.catch_up_unread.lock().unwrap() = spans;
     }
 
     /// Has a catch-up pass begun?
@@ -430,7 +441,7 @@ impl AsrPort for MockAsr {
         _meeting_id: &'a str,
         _not_before_ms: Option<i64>,
         control: crate::session::ports::CatchUpControl,
-    ) -> BoxFuture<'a, Result<u32, AsrError>> {
+    ) -> BoxFuture<'a, Result<CatchUpReport, AsrError>> {
         Box::pin(async move {
             self.catch_up_started.store(true, Ordering::SeqCst);
             while self.catch_up_waits_to_be_stopped.load(Ordering::SeqCst)
@@ -446,7 +457,11 @@ impl AsrPort for MockAsr {
             if let Some(report) = &control.on_progress {
                 report(1.0);
             }
-            Ok(self.catch_up_segments.load(Ordering::SeqCst))
+            Ok(CatchUpReport {
+                segments_written: self.catch_up_segments.load(Ordering::SeqCst),
+                unread: self.catch_up_unread.lock().unwrap().clone(),
+                ..CatchUpReport::default()
+            })
         })
     }
 

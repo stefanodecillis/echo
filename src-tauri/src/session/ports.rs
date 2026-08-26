@@ -19,6 +19,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+use crate::asr::catchup::CatchUpReport;
 use crate::asr::engine::{EngineWorker, PartialFn};
 use crate::asr::{AsrError, TranscribeJob, Transcription};
 use crate::audio::{AudioError, CaptureConfig, CaptureSession, CaptureStarted};
@@ -251,18 +252,23 @@ pub trait AsrPort: Send + Sync + 'static {
     /// transcript, and the two channels reach different lengths, so one offset
     /// for both would quietly lose words that are sitting on disk.
     ///
-    /// The count that comes back is a count from a pass that **finished**. A
-    /// pass stopped part-way — `control.cancel` went true, usually because a
-    /// recording started — answers `Err(AsrError::Cancelled)` and no count at
+    /// What comes back is the report of a pass that **finished**. A pass
+    /// stopped part-way — `control.cancel` went true, usually because a
+    /// recording started — answers `Err(AsrError::Cancelled)` and no report at
     /// all, so a caller cannot read "it wrote some lines" as "it is done" (see
     /// [`crate::asr::catchup::cut_short`]).
+    ///
+    /// The whole report rather than the line count, because a finished pass has
+    /// something to say beyond how much it wrote: `unread` is the stretches it
+    /// could not read at all, and the runner owes the person a sentence about
+    /// those and has to spare the live text sitting over them.
     fn catch_up<'a>(
         &'a self,
         db: &'a Db,
         meeting_id: &'a str,
         not_before_ms: Option<i64>,
         control: CatchUpControl,
-    ) -> BoxFuture<'a, Result<u32, AsrError>>;
+    ) -> BoxFuture<'a, Result<CatchUpReport, AsrError>>;
 
     /// [`AsrPort::catch_up`] for a meeting that is **still being recorded**:
     /// everything already on disk up to `to_ms` that has no text against it yet.
@@ -287,7 +293,8 @@ pub trait AsrPort: Send + Sync + 'static {
         _to_ms: i64,
         control: CatchUpControl,
     ) -> BoxFuture<'a, Result<u32, AsrError>> {
-        self.catch_up(db, meeting_id, None, control)
+        let pass = self.catch_up(db, meeting_id, None, control);
+        Box::pin(async move { Ok(pass.await?.segments_written) })
     }
 
     /// Give the memory back (mantra 1).
@@ -457,7 +464,7 @@ impl AsrPort for EngineAsr {
         meeting_id: &'a str,
         not_before_ms: Option<i64>,
         control: CatchUpControl,
-    ) -> BoxFuture<'a, Result<u32, AsrError>> {
+    ) -> BoxFuture<'a, Result<CatchUpReport, AsrError>> {
         Box::pin(async move {
             // `pause_while` is deliberately left unset. A recording preempts this
             // job through the same cancel flag, which parks the row and frees the
@@ -487,7 +494,7 @@ impl AsrPort for EngineAsr {
             )
             .await;
             self.remember_an_unasked_compile().await;
-            Ok(report?.segments_written)
+            report
         })
     }
 

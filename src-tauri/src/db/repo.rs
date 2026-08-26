@@ -924,6 +924,44 @@ pub async fn delete_partial_segments(db: &Db, meeting_id: &str) -> Result<u64, D
     Ok(r.rows_affected())
 }
 
+/// [`delete_partial_segments`], sparing the guesses that sit over stretches the
+/// final pass could **not** read.
+///
+/// The sweep exists because a finished pass has replaced every guess with text
+/// read off the recording. When a window would not decode, that is not true of
+/// its seconds: nothing replaced them, and the live guess is the only text they
+/// will ever have unless somebody reads the meeting again. Deleting it turns a
+/// stretch a person watched appear on screen into nothing at all, which is
+/// worse than the hole it was covering.
+///
+/// Overlap, not containment, for the same reason as
+/// [`delete_partial_segments_in`]: a guess that straddles the edge of an unread
+/// stretch is partly about seconds nothing replaced, and half a sentence is not
+/// worth deleting the other half for.
+pub async fn delete_partial_segments_except(
+    db: &Db,
+    meeting_id: &str,
+    keep: &[(Channel, i64, i64)],
+) -> Result<u64, DbError> {
+    if keep.is_empty() {
+        return delete_partial_segments(db, meeting_id).await;
+    }
+    let mut qb: QueryBuilder<Sqlite> =
+        QueryBuilder::new("DELETE FROM segments WHERE is_final = 0 AND meeting_id = ");
+    qb.push_bind(meeting_id);
+    for (channel, from_ms, to_ms) in keep {
+        qb.push(" AND NOT (channel = ");
+        qb.push_bind(channel.as_str());
+        qb.push(" AND t_start_ms < ");
+        qb.push_bind(*to_ms);
+        qb.push(" AND t_end_ms > ");
+        qb.push_bind(*from_ms);
+        qb.push(")");
+    }
+    let r = qb.build().execute(db).await?;
+    Ok(r.rows_affected())
+}
+
 /// What [`clear_transcript`] took away.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClearedTranscript {
@@ -3577,6 +3615,94 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    /// The sweep after a finished catch-up pass takes the guesses the pass
+    /// replaced, and leaves the ones it did not.
+    ///
+    /// A window that would not read leaves its seconds with no text of their
+    /// own. The guess over them is the only thing a person watched appear there,
+    /// so deleting it turns a rough sentence into nothing at all.
+    #[tokio::test]
+    async fn the_guesses_over_a_stretch_nothing_read_survive_the_sweep() {
+        let (db, m) = seeded().await;
+        let guess = |start: i64, channel: Channel| SegmentDraft {
+            channel,
+            is_final: false,
+            ..draft(&m.id, start, "half heard gue")
+        };
+        // Two on the microphone: one over the stretch nothing read, one clear of
+        // it. One on the computer's side at the same time as the unread stretch,
+        // which is a different channel and so a different set of seconds.
+        insert_segment(&db, &guess(30_000, Channel::Mic))
+            .await
+            .unwrap();
+        insert_segment(&db, &guess(90_000, Channel::Mic))
+            .await
+            .unwrap();
+        insert_segment(&db, &guess(30_000, Channel::System))
+            .await
+            .unwrap();
+        // And a real line, which is never a guess and never swept.
+        insert_segment(&db, &draft(&m.id, 90_000, "read off the recording"))
+            .await
+            .unwrap();
+
+        let taken = delete_partial_segments_except(&db, &m.id, &[(Channel::Mic, 25_000, 45_000)])
+            .await
+            .unwrap();
+        assert_eq!(taken, 2);
+
+        let left = get_segments(
+            &db,
+            &TranscriptQuery {
+                meeting_id: m.id.clone(),
+                include_partial: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let guesses: Vec<(Channel, i64)> = left
+            .iter()
+            .filter(|s| !s.is_final)
+            .map(|s| (s.channel, s.t_start_ms))
+            .collect();
+        assert_eq!(
+            guesses,
+            vec![(Channel::Mic, 30_000)],
+            "only the guess over seconds nothing replaced stays"
+        );
+        assert!(
+            left.iter().any(|s| s.is_final),
+            "the sweep is about guesses and touches nothing else"
+        );
+    }
+
+    /// Nothing was left unread, so nothing is spared: a pass that read the whole
+    /// meeting back clears every guess, exactly as it always did.
+    #[tokio::test]
+    async fn with_nothing_left_unread_every_guess_goes() {
+        let (db, m) = seeded().await;
+        for start in [0, 30_000, 60_000] {
+            insert_segment(
+                &db,
+                &SegmentDraft {
+                    is_final: false,
+                    ..draft(&m.id, start, "half heard gue")
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            delete_partial_segments_except(&db, &m.id, &[])
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(count_segments(&db, &m.id).await.unwrap(), 0);
     }
 
     #[tokio::test]

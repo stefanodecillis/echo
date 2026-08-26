@@ -402,7 +402,7 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
     // dropped mid-meeting is *behind* the end of the transcript, and the two
     // channels reach different lengths, so "carry on from where the text ends"
     // would lose words that are sitting on disk (mantra 3).
-    let written = ctx
+    let pass = ctx
         .asr
         .catch_up(&ctx.db, &meeting_id, None, control)
         .await
@@ -416,10 +416,13 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
     // cancellation is an error now, and a preempted job is parked instead —
     // `release()` puts it back in the queue and the next pass reads the holes
     // this one did not get to.
-    let written = written?;
+    let pass = pass?;
 
-    // Live partials are superseded now.
-    if let Err(error) = repo::delete_partial_segments(&ctx.db, &meeting_id).await {
+    // Live partials are superseded now — except over stretches this pass could
+    // not read, where nothing superseded them and the guess is the only text
+    // those seconds have (see [`repo::delete_partial_segments_except`]).
+    let unread: Vec<(Channel, i64, i64)> = pass.unread_merged();
+    if let Err(error) = repo::delete_partial_segments_except(&ctx.db, &meeting_id, &unread).await {
         tracing::debug!(%error, "could not clear live text");
     }
     if let Ok(hist) = repo::language_histogram(&ctx.db, &meeting_id).await {
@@ -431,9 +434,84 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
         }
     }
 
-    tracing::info!(meeting = %meeting_id, written, "catch-up finished");
+    let unread_ms = pass.unread_ms();
+    tracing::info!(
+        meeting = %meeting_id,
+        written = pass.segments_written,
+        unread = pass.unread.len(),
+        unread_ms,
+        "catch-up finished"
+    );
+    // A pass that finished with holes in it is still a pass that finished: the
+    // job goes down as done at full progress, because it did everything it can
+    // do. What must not happen is that being the whole of the story — the
+    // stretch that would not read is the one the app promised to fill in when
+    // the meeting ended, and a promise that failed is said out loud.
+    if let Some(notice) = unread_stretch_notice(&meeting_id, unread_ms) {
+        tracing::warn!(
+            meeting = %meeting_id,
+            unread = pass.unread.len(),
+            unread_ms,
+            "part of this recording would not read back; the live text over it was kept"
+        );
+        ctx.events.emit(UiEvent::Notice(notice));
+    }
     ctx.progress.set(1.0).await;
     Ok(())
+}
+
+/// Say it out loud when a finished catch-up pass left part of the recording
+/// unread — and say nothing at all otherwise.
+///
+/// The pass is allowed to give up on a window: it asks the engine twice and
+/// carries on rather than abandoning the rest of the meeting. What it is not
+/// allowed to do is give up quietly. Those seconds are exactly the ones the app
+/// promised to come back for — "Echo will fill in the rest when the meeting
+/// ends" — so when it cannot, the person hears it rather than finding a gap
+/// months later.
+///
+/// The live text over the stretch is kept (`session::jobs::catch_up`), and the
+/// second sentence says so: it is the difference between "some of this is
+/// rough" and "some of this is gone", and the person reading the transcript can
+/// see which lines are which.
+fn unread_stretch_notice(meeting_id: &str, unread_ms: i64) -> Option<NoticePayload> {
+    if unread_ms <= 0 {
+        return None;
+    }
+    Some(NoticePayload {
+        level: NoticeLevel::Warning,
+        message: unread_stretch_message(unread_ms),
+        persistent: false,
+        meeting_id: Some(meeting_id.to_string()),
+        // One meeting, one such message: reading it again replaces the sentence
+        // rather than stacking a second copy of it.
+        tag: Some("someOfItUnread".into()),
+    })
+}
+
+/// What Echo says when it could not read part of a recording back.
+///
+/// Rounded up to the nearest minute, and never below "less than a minute": the
+/// exact figure is a sum of window spans, which is precise about the wrong
+/// thing — a person wants to know whether to go back and listen, and "about 3
+/// minutes" answers that while "2 minutes 47 seconds" pretends to an accuracy
+/// this number does not have. Up rather than down, because rounding a shortfall
+/// down is the direction that flatters Echo.
+fn unread_stretch_message(unread_ms: i64) -> String {
+    // `div_ceil` on a signed integer is not settled in the compiler this builds
+    // on, and rounding up is one line of arithmetic.
+    let how_much = if unread_ms < 60_000 {
+        "less than a minute".to_string()
+    } else {
+        match (unread_ms + 59_999) / 60_000 {
+            1 => "about a minute".to_string(),
+            minutes => format!("about {minutes} minutes"),
+        }
+    };
+    format!(
+        "Echo couldn't read {how_much} of this recording back. \
+         The live text from then is still here."
+    )
 }
 
 async fn diarize(ctx: &JobContext) -> Result<(), JobFailure> {
@@ -1812,6 +1890,15 @@ mod tests {
         db: &Db,
         job: Job,
     ) -> (JobContext, Arc<super::super::mock::CollectingEvents>) {
+        context_with_asr(db, job, Arc::new(super::super::mock::MockAsr::new())).await
+    }
+
+    /// [`context_for`] for a test that has to set the engine up first.
+    async fn context_with_asr(
+        db: &Db,
+        job: Job,
+        asr: Arc<super::super::mock::MockAsr>,
+    ) -> (JobContext, Arc<super::super::mock::CollectingEvents>) {
         let events = crate::session::ports::EventBus::new();
         let seen = Arc::new(super::super::mock::CollectingEvents::default());
         events.set(seen.clone());
@@ -1824,7 +1911,7 @@ mod tests {
                     std::env::temp_dir().join("echo-jobs"),
                     None,
                 ),
-                asr: Arc::new(super::super::mock::MockAsr::new()),
+                asr,
                 events,
                 cancel: Cancel::new(),
                 progress,
@@ -2422,6 +2509,110 @@ mod tests {
                 .is_none_or(|p| p < 1.0),
             "an interrupted pass does not leave a full bar behind"
         );
+    }
+
+    /// A pass that finished with a hole in it does not finish quietly.
+    ///
+    /// The live text told the person "Echo will fill in the rest when the
+    /// meeting ends". When a window would not read, that stretch is exactly the
+    /// rest — and the runner used to clear the guesses over it anyway and mark
+    /// the job done at 100%, so the seconds a person watched appear on screen
+    /// during the meeting were gone and nothing anywhere said so.
+    #[tokio::test]
+    async fn a_stretch_that_would_not_read_keeps_its_live_text_and_is_said_out_loud() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let (meeting_id, job) = a_meeting_mid_catch_up(&db).await;
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        // The fixture's guess sits at 30 s–40 s on the microphone, and this is
+        // the window the engine would not read either time it was asked.
+        asr.catch_up_leaves_unread(vec![crate::asr::catchup::UnreadSpan {
+            channel: crate::types::Channel::Mic,
+            from_ms: 30_000,
+            to_ms: 60_000,
+        }]);
+        let (ctx, seen) = context_with_asr(&db, job.clone(), asr).await;
+
+        catch_up(&ctx).await.expect("the pass itself finished");
+
+        assert_eq!(
+            live_guesses(&db, &meeting_id).await,
+            1,
+            "nothing replaced those seconds, so the guess is all the text they have"
+        );
+        let notices = seen.notices();
+        let said = notices
+            .iter()
+            .find(|n| n.tag.as_deref() == Some("someOfItUnread"))
+            .expect("a hole in somebody's transcript is their business, not only the log's");
+        assert_eq!(
+            said.message,
+            "Echo couldn't read less than a minute of this recording back. \
+             The live text from then is still here."
+        );
+        assert_eq!(said.meeting_id.as_deref(), Some(meeting_id.as_str()));
+        assert_eq!(said.level, NoticeLevel::Warning);
+        // The pass did everything it can do, so the row is done — the sentence
+        // is what carries the shortfall, not a job stuck at 90%.
+        assert_eq!(
+            repo::get_job(&db, &job.id).await.unwrap().unwrap().progress,
+            Some(1.0)
+        );
+    }
+
+    /// And a pass with nothing to declare declares nothing: every guess goes,
+    /// because the real reading replaced all of them.
+    #[tokio::test]
+    async fn a_pass_that_read_the_whole_meeting_clears_the_live_text_and_says_nothing() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let (meeting_id, job) = a_meeting_mid_catch_up(&db).await;
+        let (ctx, seen) = context_for(&db, job).await;
+
+        catch_up(&ctx).await.unwrap();
+
+        assert_eq!(live_guesses(&db, &meeting_id).await, 0);
+        assert!(
+            !seen.notice_tagged("someOfItUnread"),
+            "nothing was missing, so there is nothing to interrupt anybody about"
+        );
+    }
+
+    /// The sentence a person actually reads, at each of the three sizes it comes
+    /// in, and with none of the words the mechanism thinks in.
+    #[test]
+    fn the_unread_sentence_reads_as_one_and_carries_no_jargon() {
+        assert!(
+            unread_stretch_notice("m", 0).is_none(),
+            "nothing unread is nothing to say"
+        );
+        assert!(unread_stretch_notice("m", -1).is_none());
+
+        assert!(unread_stretch_message(20_000).contains("less than a minute"));
+        assert!(unread_stretch_message(60_000).contains("about a minute"));
+        // Rounded up: rounding a shortfall down is the direction that flatters
+        // Echo, and a person deciding whether to go back and listen is owed the
+        // larger number.
+        assert!(unread_stretch_message(61_000).contains("about 2 minutes"));
+        assert!(unread_stretch_message(167_000).contains("about 3 minutes"));
+
+        let banned = [
+            "window", "decode", "buffer", "stream", "vad", "segment", "span", "whisper", "engine",
+            "asr", "retry",
+        ];
+        for unread_ms in [1_i64, 20_000, 60_000, 61_000, 3_600_000] {
+            let message = unread_stretch_message(unread_ms);
+            assert!(
+                message.ends_with('.'),
+                "{message:?} should read as sentences"
+            );
+            assert!(
+                !message.contains('!'),
+                "{message:?} is shouting at somebody"
+            );
+            let lower = message.to_lowercase();
+            for word in banned {
+                assert!(!lower.contains(word), "{message:?} leaks {word:?}");
+            }
+        }
     }
 
     /// The same thing one level up, where the damage was actually recorded: the
