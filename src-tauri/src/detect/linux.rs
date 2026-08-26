@@ -20,6 +20,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use pipewire as pw;
+use pw::loop_::Timeout;
 
 use super::DetectError;
 
@@ -35,8 +36,15 @@ pub fn input_device_in_use() -> Result<bool, DetectError> {
 fn probe() -> Result<bool, pw::Error> {
     pw::init();
 
-    let main_loop = pw::main_loop::MainLoop::new(None)?;
-    let context = pw::context::Context::new(&main_loop)?;
+    // pipewire 0.10 split every owning handle into a `…Box` (unique ownership,
+    // the dependency proved by a lifetime) and a `…Rc` (shared ownership, the
+    // dependency held alive by a refcount). This probe takes the `Box` variants:
+    // the whole graph is built, pumped and dropped inside this one stack frame,
+    // nothing escapes into a callback that outlives it, and unique ownership is
+    // exactly what that is. The borrow checker then proves the teardown order
+    // PipeWire needs (registry, then core, then context, then loop) for free.
+    let main_loop = pw::main_loop::MainLoopBox::new(None)?;
+    let context = pw::context::ContextBox::new(main_loop.loop_(), None)?;
     let core = context.connect(None)?;
     let registry = core.get_registry()?;
 
@@ -83,7 +91,9 @@ fn probe() -> Result<bool, pw::Error> {
     // `PROBE_TIMEOUT`, whether or not the `done` callback ever arrives.
     let deadline = Instant::now() + PROBE_TIMEOUT;
     while !done.get() && Instant::now() < deadline {
-        main_loop.loop_().iterate(Duration::from_millis(20));
+        main_loop
+            .loop_()
+            .iterate(Timeout::Finite(Duration::from_millis(20)));
     }
 
     Ok(found.get())

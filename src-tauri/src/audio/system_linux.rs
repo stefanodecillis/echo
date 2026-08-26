@@ -381,17 +381,30 @@ fn run_loop(
 
     pw::init();
 
-    let mainloop = pw::main_loop::MainLoop::new(None).map_err(|e| e.to_string())?;
-    let context = pw::context::Context::new(&mainloop).map_err(|e| e.to_string())?;
-    let core = context.connect(None).map_err(|e| e.to_string())?;
+    // pipewire 0.10 split every owning handle into a `…Box` (unique ownership,
+    // dependency proved by a lifetime) and a `…Rc` (shared ownership, dependency
+    // held alive by a refcount). The capture path takes the `Rc` variants, for
+    // two reasons that are both about lifetime rather than taste:
+    //
+    //  * the control-channel closure needs a handle of its own on the loop, so a
+    //    `Control::Stop` arriving from another thread can `quit()` the loop that
+    //    `run()` is currently blocked in. Only `MainLoopRc` is `Clone`.
+    //  * the stream must stay alive across callbacks for the whole recording,
+    //    and `StreamRc` owns the `CoreRc` it was built from, which owns the
+    //    `ContextRc`, which owns the loop. Nothing underneath the stream can be
+    //    dropped while the stream is still there to be called back into.
+    let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| e.to_string())?;
+    let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| e.to_string())?;
+    let core = context.connect_rc(None).map_err(|e| e.to_string())?;
 
     let quit = mainloop.clone();
     let _control = control.attach(mainloop.loop_(), move |message| match message {
         Control::Stop => quit.quit(),
     });
 
-    let stream = pw::stream::Stream::new(
-        &core,
+    // `StreamRc::new` takes the core by value: the stream keeps it alive.
+    let stream = pw::stream::StreamRc::new(
+        core,
         "echo-system-audio",
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
@@ -482,7 +495,7 @@ fn run_loop(
                     mono.push(frame.iter().sum::<f32>() * scale);
                 }
             }
-            producer.push(mono);
+            producer.push(mono.as_slice());
         })
         .state_changed(|_stream, state, _old, new| {
             if let pw::stream::StreamState::Error(message) = new {
