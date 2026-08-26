@@ -253,7 +253,8 @@ pub fn mean_normalize(f: &mut Fbank) {
         return;
     }
     let mut means = vec![0.0f32; NUM_MEL_BINS];
-    for frame in f.data.chunks_exact(NUM_MEL_BINS) {
+    let (frames, _trailing) = f.data.as_chunks::<NUM_MEL_BINS>();
+    for frame in frames {
         for (mean, value) in means.iter_mut().zip(frame) {
             *mean += value;
         }
@@ -262,7 +263,8 @@ pub fn mean_normalize(f: &mut Fbank) {
     for m in means.iter_mut() {
         *m /= n;
     }
-    for frame in f.data.chunks_exact_mut(NUM_MEL_BINS) {
+    let (frames, _trailing) = f.data.as_chunks_mut::<NUM_MEL_BINS>();
+    for frame in frames {
         for (value, mean) in frame.iter_mut().zip(&means) {
             *value -= mean;
         }

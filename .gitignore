@@ -51,3 +51,6 @@ logs/
 !.env.example
 *.p12
 *.pem
+
+# Linux cross-checks run in Docker with their own target directory.
+src-tauri/target-linux/

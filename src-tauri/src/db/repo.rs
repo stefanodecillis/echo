@@ -1748,9 +1748,8 @@ pub fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
 
 /// The inverse of [`embedding_to_blob`].
 pub fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
+    let (whole, _trailing) = blob.as_chunks::<4>();
+    whole.iter().copied().map(f32::from_le_bytes).collect()
 }
 
 /// Row of `people`.

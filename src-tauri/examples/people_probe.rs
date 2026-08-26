@@ -98,10 +98,8 @@ struct Row {
 
 fn decode_centroid(blob: Option<Vec<u8>>) -> Vec<f32> {
     blob.map(|bytes| {
-        bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect()
+        let (whole, _trailing) = bytes.as_chunks::<4>();
+        whole.iter().copied().map(f32::from_le_bytes).collect()
     })
     .unwrap_or_default()
 }
