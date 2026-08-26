@@ -78,6 +78,19 @@ pub const MIN_UTTERANCE_SAMPLES: usize =
 /// How far back a forced cut looks for a real pause to cut at.
 const FORCED_CUT_SEARCH_MS: i64 = 3_000;
 
+/// How far below the voice around it a moment has to sit before a forced cut
+/// will treat it as a gap between words rather than a soft syllable.
+///
+/// A fraction of *this stretch's own* loudness, not a fixed level: a whisper in
+/// a quiet room and a raised voice in a noisy one are then judged the same way.
+/// 0.15 is about 16 dB down. Syllable-to-syllable variation inside ordinary
+/// speech is 6-10 dB, so this cannot fire in the middle of a word; the closure
+/// before a `p` or a `t` does reach 25-30 dB down, but it lasts 30-100 ms, and
+/// averaging over the whole span (the pause tier's own 128 ms) pulls it back
+/// above the bar. Anything that stays this quiet for that long is not a
+/// consonant — it is the speaker drawing breath.
+const QUIET_ENOUGH: f32 = 0.15;
+
 /// Most audio a [`Segmenter::snapshot`] carries: the tail of what is open.
 ///
 /// Deliberately a little more than the live pipeline's caption window, so the
@@ -426,7 +439,7 @@ struct OpenUtterance {
     samples: Vec<f32>,
     /// One entry per whole window of `samples`: was that window speech?
     ///
-    /// Kept so a forced cut can look for a real pause instead of guessing from
+    /// Kept so a forced cut looks for a real pause *first*, and only then at
     /// loudness — the quietest 32 ms of a vowel is still a vowel.
     voiced: Vec<bool>,
     /// Length up to and including the last window that was speech.
@@ -443,6 +456,34 @@ impl OpenUtterance {
     fn recompute_voiced_len(&mut self) {
         let voiced_windows = self.voiced.len() - self.trailing_silence();
         self.voiced_len = voiced_windows * WINDOW_SAMPLES;
+    }
+}
+
+/// What a forced cut landed on, and therefore how much is known about it.
+///
+/// Three origins kept apart on purpose, because they are not equally good
+/// evidence and only one of them means nothing was split. The quietest moment
+/// is a guess about where a gap probably is: it takes exactly the same contract
+/// as cutting where the cap fell — the piece is flagged truncated and the
+/// continuation re-reads the overlap — and moves only *where* the join lands.
+/// Calling it a pause would tell the rest of Echo that no word was split, and
+/// nothing here knows that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seam {
+    /// A stretch nothing called speech, long enough to be a real gap.
+    APause,
+    /// No such stretch, but a stretch far below the voice around it.
+    TheQuietestMoment,
+    /// Nothing to go on: the sample where the length cap tripped.
+    WhereTheCapFell,
+}
+
+impl Seam {
+    /// Did the join go through speech? Only a real pause is evidence that it
+    /// did not. The other two may land mid-word, so the piece emitted says so
+    /// and the continuation carries audio across the join.
+    const fn splits_speech(self) -> bool {
+        !matches!(self, Self::APause)
     }
 }
 
@@ -735,30 +776,42 @@ impl Segmenter {
     /// [`VadSettings::max_utterance_ms`] without a pause the segmenter would
     /// close on, and the engine will not take a longer window.
     ///
-    /// Two ways to cut, and which one happened is what `truncated` says:
+    /// Three places the cut can land, and [`Seam`] is which one it was:
     ///
     /// * **At a real pause.** If the last few seconds contain a stretch of
     ///   silence at least [`VadSettings::min_forced_silence_ms`] long, the cut
     ///   lands in the middle of it: the piece emitted keeps a tail, the
-    ///   continuation keeps a pre-roll, and nothing is split. Looking for the
-    ///   *quietest window* instead — what this used to do — is not the same
-    ///   thing at all: the quietest 32 ms of a monologue may still be a vowel.
-    /// * **Through speech.** Failing that, the cut goes where the cap is, and
-    ///   the continuation starts [`VadSettings::forced_overlap_ms`] earlier — it
-    ///   re-reads the end of what was just emitted. A word that straddles the
-    ///   join is then whole in the second piece, and the engine has real
-    ///   acoustic context to start from instead of a cold start mid-syllable.
+    ///   continuation keeps a pre-roll, and nothing is split.
+    /// * **At the quietest moment.** Failing that, the quietest span of the
+    ///   same width in the same region, if it is [`QUIET_ENOUGH`] below the
+    ///   voice around it. This is *not* the old "cut at the quietest window":
+    ///   the quietest 32 ms of a monologue may still be a vowel, which is why
+    ///   the span is the pause tier's own 128 ms and why it has a bar to clear
+    ///   at all. It promises no less and no more than the tier below it —
+    ///   truncated, with the overlap — it only moves the join somewhere less
+    ///   likely to be mid-word. Honestly: Silero usually calls such a trough
+    ///   silence itself, so on a recording made with the model on disk this
+    ///   rarely fires. It is here for the loudness fallback, which hears a
+    ///   quiet breath as continuing speech — that is, for first-launch
+    ///   recordings made before the download finished.
+    /// * **Where the cap fell.** When even the quietest moment is loud, the cut
+    ///   goes where the cap is, and the continuation starts
+    ///   [`VadSettings::forced_overlap_ms`] earlier — it re-reads the end of
+    ///   what was just emitted. A word that straddles the join is then whole in
+    ///   the second piece, and the engine has real acoustic context to start
+    ///   from instead of a cold start mid-syllable.
     fn force_cut(&mut self) -> Option<Utterance> {
-        let (cut, at_pause) = self.find_forced_cut()?;
+        let (cut, seam) = self.find_forced_cut()?;
+        let splits_speech = seam.splits_speech();
         let overlap = self.settings.overlap_samples();
         let open = self.open.as_mut()?;
 
-        // A pause needs no overlap: nothing was split. A cut through speech
-        // carries audio over, so the join can be read across.
-        let keep_from = if at_pause {
-            cut
-        } else {
+        // A pause needs no overlap: nothing was split. A cut that may have gone
+        // through speech carries audio over, so the join can be read across.
+        let keep_from = if splits_speech {
             cut.saturating_sub(overlap)
+        } else {
+            cut
         };
         let start_pos = open.start_pos;
         let emitted: Vec<f32> = open.samples[..cut].to_vec();
@@ -797,17 +850,18 @@ impl Segmenter {
             t_start_ms,
             t_end_ms: self.pos_to_ms(start_pos + emitted.len() as u64),
             samples: emitted,
-            truncated: !at_pause,
+            truncated: splits_speech,
             voiced_ms: emitted_voiced_ms,
         })
     }
 
-    /// Where to cut the open utterance, and whether that spot is a real pause.
+    /// Where to cut the open utterance, and what evidence that spot rests on.
     ///
     /// Prefers the longest qualifying pause in the search region, latest first
     /// on a tie: the longer the silence, the more likely it is the end of a
-    /// sentence rather than a breath between two words.
-    fn find_forced_cut(&self) -> Option<(usize, bool)> {
+    /// sentence rather than a breath between two words. Failing a pause, the
+    /// quietest moment in the same region; failing that, where the cap fell.
+    fn find_forced_cut(&self) -> Option<(usize, Seam)> {
         let open = self.open.as_ref()?;
         let len = open.samples.len();
         let windows = open.voiced.len();
@@ -834,9 +888,57 @@ impl Segmenter {
         match best {
             // Halfway through the pause: both sides of the join keep some of it.
             // Never zero, so a cut always makes progress.
-            Some((run, start)) => Some(((start + run / 2).max(1) * WINDOW_SAMPLES, true)),
-            None => Some((len, false)),
+            Some((run, start)) => Some(((start + run / 2).max(1) * WINDOW_SAMPLES, Seam::APause)),
+            // Halfway through the quiet span, for the same reason.
+            None => match self.find_quietest_span(open, search_from, need) {
+                Some(start) => Some((
+                    (start + need / 2).max(1) * WINDOW_SAMPLES,
+                    Seam::TheQuietestMoment,
+                )),
+                None => Some((len, Seam::WhereTheCapFell)),
+            },
         }
+    }
+
+    /// The first window of the quietest `need`-window span in the search
+    /// region — or `None` when the whole region is loud.
+    ///
+    /// `None` is the ordinary answer, not a failure: most of the time somebody
+    /// really is talking without a break, and then the cut belongs where the cap
+    /// fell, which is the *latest* cut available and so keeps the most words in
+    /// the piece going out. The bar is never lowered until something clears it:
+    /// a tier that always finds something is a tier whose answer means nothing.
+    ///
+    /// Measured in whole windows and stepped one window at a time, so the cut
+    /// this produces is a multiple of [`WINDOW_SAMPLES`] by construction rather
+    /// than by rounding afterwards — every offset the segmenter hands out stays
+    /// an exact number of milliseconds.
+    fn find_quietest_span(
+        &self,
+        open: &OpenUtterance,
+        search_from: usize,
+        need: usize,
+    ) -> Option<usize> {
+        let last_start = open.voiced.len().checked_sub(need)?;
+        // What this speaker's voice measures in this very stretch, so the bar
+        // travels with the room and the microphone instead of being guessed
+        // once. Silence before the first word is not part of the voice.
+        let reference = rms(&open.samples[..open.voiced_len]);
+        let bar = reference * QUIET_ENOUGH;
+
+        let mut quietest: Option<(f32, usize)> = None;
+        for start in search_from..=last_start {
+            let from = start * WINDOW_SAMPLES;
+            let level = rms(&open.samples[from..from + need * WINDOW_SAMPLES]);
+            if quietest.is_none_or(|(best_level, _)| level < best_level) {
+                quietest = Some((level, start));
+            }
+        }
+        // Strictly below, so a stretch with no voice in it at all (reference
+        // zero) declines rather than cutting at an arbitrary spot.
+        quietest
+            .filter(|(level, _)| *level < bar)
+            .map(|(_, start)| start)
     }
 
     /// End of stream: emit whatever is still open.
@@ -2246,8 +2348,9 @@ mod tests {
         let settings = VadSettings::mic();
         let mut d = SpeechDetector::without_model(Channel::Mic);
         let mut audio = room_noise(200);
-        // Not one breath in seventy seconds: there is nowhere good to cut, so
-        // every cut has to go through speech.
+        // Not one breath in seventy seconds, and never a moment quieter than the
+        // rest: there is nowhere good to cut, so every cut has to go through
+        // speech where the cap fell.
         audio.extend(tone(70_000, 300.0, 0.3));
         audio.extend(room_noise(1_000));
 
@@ -2269,6 +2372,24 @@ mod tests {
         let (last, forced) = out.split_last().unwrap();
         assert!(forced.iter().all(|u| u.truncated), "{out:#?}");
         assert!(!last.truncated);
+
+        // Uniformly loud audio gives the quietest-moment tier nothing to find,
+        // and it says so rather than settling for the least loud vowel: every
+        // forced piece runs the full length of the cap, which is the latest cut
+        // available and so the one that keeps the most words together.
+        let cap_ms = samples_to_ms(settings.max_samples());
+        for u in forced {
+            assert_eq!(
+                u.duration_ms(),
+                cap_ms,
+                "a piece was cut early, so something claimed to find a quiet moment"
+            );
+        }
+        // And every cut sits on a window boundary, so the pieces tile the
+        // timeline with no rounding gap between them.
+        for u in &out {
+            assert_eq!(u.samples.len() % WINDOW_SAMPLES, 0, "{u:#?}");
+        }
 
         let overlap_ms = samples_to_ms(settings.overlap_samples());
         assert!(
@@ -2323,6 +2444,152 @@ mod tests {
             quiet_tail < 0.05,
             "the first piece ends mid-word: {quiet_tail}"
         );
+        assert_eq!(out[0].samples.len() % WINDOW_SAMPLES, 0, "{:#?}", out[0]);
+    }
+
+    /// The tier the loudness fallback is for.
+    ///
+    /// Before the speech model has been downloaded, a breath taken without
+    /// going properly silent reads as continuing speech, so there is no pause to
+    /// cut at — but there is still an obvious place to put the join, and it is
+    /// not wherever the cap happened to fall.
+    #[test]
+    fn a_monologue_with_a_quiet_moment_but_no_pause_is_cut_at_the_quiet_moment() {
+        let settings = VadSettings::mic();
+        let mut d = SpeechDetector::without_model(Channel::Mic);
+        let mut audio = room_noise(200);
+        audio.extend(tone(21_300, 300.0, 0.3));
+        // Far below the voice around it, and far too loud to be silence: the
+        // loudness gate calls all of this speech.
+        audio.extend(tone(200, 300.0, 0.02));
+        audio.extend(tone(3_000, 300.0, 0.3));
+        audio.extend(room_noise(1_000));
+
+        let mut out = feed(&mut d, &audio, 0);
+        out.extend(d.finish());
+        assert!(out.len() >= 2, "{out:#?}");
+
+        // Nothing in there was ever called silence, so the pause tier had
+        // nothing to offer.
+        let breath_ms = 21_500;
+        let cap_ms = samples_to_ms(settings.max_samples());
+        let first = &out[0];
+        assert!(
+            (breath_ms - 200..breath_ms + 200).contains(&first.duration_ms()),
+            "the cut missed the quiet moment at {breath_ms} ms: {first:#?}"
+        );
+        assert!(
+            first.duration_ms() < cap_ms,
+            "the cut fell at the cap ({cap_ms} ms) instead of the quiet moment"
+        );
+        // It really is quiet where the join landed.
+        let tail = rms(&first.samples[first.samples.len() - WINDOW_SAMPLES..]);
+        assert!(
+            tail < 0.15 * rms(&first.samples),
+            "the join is mid-word: {tail}"
+        );
+
+        // And it promises no more than a cut at the cap would: nobody measured
+        // whether a word was split, so the piece says it was and the
+        // continuation re-reads the join.
+        assert!(
+            first.truncated,
+            "a cut at the quietest moment claimed to be a pause"
+        );
+        let overlap_ms = samples_to_ms(settings.overlap_samples());
+        assert_eq!(
+            out[1].t_start_ms,
+            first.t_end_ms - overlap_ms,
+            "the join carried no audio: {:#?} then {:#?}",
+            first,
+            out[1]
+        );
+        let carried = ms_to_samples(overlap_ms);
+        assert_eq!(
+            &out[1].samples[..carried],
+            &first.samples[first.samples.len() - carried..],
+            "the overlap is not the same audio"
+        );
+        assert_eq!(first.samples.len() % WINDOW_SAMPLES, 0, "{first:#?}");
+    }
+
+    /// One window at a time, with the speech decision spelled out.
+    ///
+    /// Lets a test build audio no gate would ever produce — a stretch nothing
+    /// called speech that is *louder* than a stretch something did — which is
+    /// the only way to ask which of the two a forced cut prefers.
+    fn push_flat(seg: &mut Segmenter, ms: usize, amp: f32, is_speech: bool) -> Vec<Utterance> {
+        let window = vec![amp; WINDOW_SAMPLES];
+        let mut out = Vec::new();
+        for _ in 0..(RATE * ms / 1_000 / WINDOW_SAMPLES) {
+            out.extend(seg.push_window(&window, is_speech));
+        }
+        out
+    }
+
+    /// A pause is better evidence than quiet, however quiet the quiet is.
+    ///
+    /// Being told "nobody is speaking here" is knowledge about the words; being
+    /// told "this is the softest part" is knowledge about the loudness. A cut at
+    /// the first splits nothing and can say so, so it wins even when the second
+    /// looks more inviting.
+    #[test]
+    fn a_pause_beats_a_quieter_moment_that_is_nobody_pausing() {
+        let settings = VadSettings::mic();
+        let mut seg = Segmenter::with_settings(Channel::Mic, settings);
+        let mut out = push_flat(&mut seg, 200, 0.0, false);
+        out.extend(push_flat(&mut seg, 21_300, 0.3, true));
+        // A breath: not loud, and nothing called it speech.
+        out.extend(push_flat(&mut seg, 200, 0.02, false));
+        out.extend(push_flat(&mut seg, 1_000, 0.3, true));
+        // Quieter still — but this is somebody speaking softly.
+        out.extend(push_flat(&mut seg, 200, 0.001, true));
+        out.extend(push_flat(&mut seg, 2_000, 0.3, true));
+
+        assert_eq!(out.len(), 1, "{out:#?}");
+        let first = &out[0];
+        assert!(
+            !first.truncated,
+            "the cut passed over a real pause for a quieter non-pause"
+        );
+        assert!(
+            (21_300..21_700).contains(&first.duration_ms()),
+            "the cut landed at {} ms, not in the pause at 21.5 s",
+            first.duration_ms()
+        );
+    }
+
+    /// Whichever tier answers, the answer is a whole number of windows.
+    ///
+    /// Every offset the segmenter hands out is derived from this, so a cut that
+    /// landed on a fraction of a window would put a rounding gap between two
+    /// pieces of one sentence.
+    #[test]
+    fn every_forced_cut_lands_on_a_window_boundary() {
+        let settings = VadSettings::mic();
+        for (what, breath_amp, breath_is_speech) in [
+            ("a real pause", 0.0, false),
+            ("a quiet moment", 0.02, true),
+            ("nothing at all", 0.3, true),
+        ] {
+            let mut seg = Segmenter::with_settings(Channel::Mic, settings);
+            let mut out = push_flat(&mut seg, 200, 0.0, false);
+            out.extend(push_flat(&mut seg, 21_300, 0.3, true));
+            out.extend(push_flat(&mut seg, 200, breath_amp, breath_is_speech));
+            out.extend(push_flat(&mut seg, 4_000, 0.3, true));
+            out.extend(seg.finish());
+
+            assert!(out.len() >= 2, "{what}: {out:#?}");
+            for u in &out {
+                assert_eq!(u.samples.len() % WINDOW_SAMPLES, 0, "{what}: {u:#?}");
+                assert_eq!(
+                    u.t_end_ms - u.t_start_ms,
+                    samples_to_ms(u.samples.len()),
+                    "{what}: the window claimed does not match the audio"
+                );
+                assert_eq!((u.t_end_ms - u.t_start_ms) % WINDOW_MS, 0, "{what}: {u:#?}");
+            }
+        }
     }
 
     #[test]
