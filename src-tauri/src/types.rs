@@ -202,6 +202,17 @@ pub enum DegradedReason {
     SystemAudioLost,
     /// Microphone gone, we keep what the computer plays.
     MicrophoneUnavailable,
+    /// Nothing is reaching Echo at all: this recording has no microphone in it,
+    /// and what the computer plays is not arriving either.
+    ///
+    /// The state the other two system-audio reasons cannot describe without
+    /// lying, because both of their sentences end in a promise about the
+    /// microphone recording — one says the offline pass will sort the voices
+    /// out of it, the other says Echo is still recording through it. Somebody
+    /// who denied the microphone and is capturing this computer alone has no
+    /// microphone recording, so a banner drawn from either reason reads as
+    /// "carry on, Echo has you" while nothing whatever is being saved.
+    NothingIsBeingHeard,
     /// Live text is behind; audio on disk is complete and will catch up.
     TranscriptBehind,
     /// Disk is nearly full.

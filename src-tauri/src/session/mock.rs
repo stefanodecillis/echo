@@ -646,6 +646,19 @@ impl CollectingEvents {
             })
     }
 
+    /// Every banner that went out, in order — the words, not just the tag.
+    pub(crate) fn notices(&self) -> Vec<crate::events::NoticePayload> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::Notice(payload) => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every job announcement, in order.
     pub(crate) fn job_progress(&self) -> Vec<crate::events::JobProgressPayload> {
         self.seen

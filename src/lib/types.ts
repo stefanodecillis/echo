@@ -81,6 +81,7 @@ export type DegradedReason =
   | "systemAudioUnavailable"
   | "systemAudioLost"
   | "microphoneUnavailable"
+  | "nothingIsBeingHeard"
   | "transcriptBehind"
   | "storageLow";
 

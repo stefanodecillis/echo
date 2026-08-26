@@ -144,6 +144,24 @@ pub const SYSTEM_AUDIO_UNAVAILABLE_AT_START: &str =
 pub const SYSTEM_AUDIO_LOST_MESSAGE: &str =
     "Echo stopped hearing what this computer plays. It's still recording through the microphone.";
 
+/// What the person is told when there is nothing left to hear: this recording
+/// has no microphone in it, and what the computer plays is not arriving either.
+///
+/// The fourth sibling, and the one that stops the other three from lying. Both
+/// sentences above are written for a recording that still has a microphone in
+/// it — one promises the offline pass will sort the voices out of the
+/// microphone recording, the other says Echo is "still recording through the
+/// microphone". Said to somebody who denied the microphone and is capturing
+/// only this computer, either one is false, and false in the direction that
+/// costs a meeting: it reads as "carry on, Echo has you". So a recording with
+/// no microphone and no arriving system audio gets its own reason
+/// ([`crate::types::DegradedReason::NothingIsBeingHeard`]) and its own
+/// sentence, which promises nothing and says what to do.
+///
+/// Word for word `labels.degradedReason.nothingIsBeingHeard` in
+/// `src/lib/copy.ts`; a test below pins the two together.
+pub const NOTHING_IS_BEING_HEARD_MESSAGE: &str = "Echo can't hear anything — there's no microphone in this recording, and nothing is coming from this computer. Nothing is being saved, so it's worth stopping and starting again.";
+
 /// Loudness is reported ten times a second, capped here rather than in the UI.
 const LEVELS_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -380,6 +398,32 @@ enum SilenceVerdict {
     CameBack,
 }
 
+/// What stands as proof that this recording is really running, so that "nothing
+/// arrived on the watched channel" means a failure rather than a stopped world.
+///
+/// Chosen once, when the recording opens, from whether there is a second source
+/// at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProofOfLife {
+    /// The microphone's own frames. The strongest proof there is: another
+    /// device, on another thread, handing over audio right now.
+    MicrophoneFrames,
+    /// There is no microphone in this recording, so there are no frames to
+    /// compare against and the meeting clock stands in — the amount of audio
+    /// this recording *should* contain by now, paused stretches removed
+    /// ([`crate::audio::clock::MeetingClock::audio_ms`]).
+    ///
+    /// Weaker than the microphone, and deliberately so. It is the only proof
+    /// available when somebody grants screen recording, denies the microphone
+    /// and records this computer alone — the configuration where the watchdog
+    /// used to be unable to fire at all, because its reference was the frames
+    /// of a device that was never opened. That person recorded three quarters
+    /// of an hour of nothing and was told about it only at the end, and wrongly
+    /// (incident of 2026-08-21). Weak proof that can speak beats strong proof
+    /// that cannot.
+    MeetingClock,
+}
+
 /// Notices a channel that opened successfully and then delivered nothing.
 ///
 /// This is the hole the first real meeting fell into: ScreenCaptureKit reported
@@ -388,39 +432,54 @@ enum SilenceVerdict {
 /// nobody else spoke — so nothing was reported, nothing was written, and the
 /// person found out afterwards.
 ///
-/// The reference channel is what makes the judgement safe: "no frames here" only
-/// means something when the *other* source is producing. A paused recording, a
-/// machine asleep or a pump that never ran move both counts together, and the
-/// watchdog stays quiet.
+/// The proof of life is what makes the judgement safe: "no frames here" only
+/// means something when the recording is otherwise going. A machine asleep or a
+/// pump that never ran leaves the proof unsatisfied along with the watched
+/// channel, and the watchdog stays quiet.
 ///
-/// No clock of its own and no I/O: the caller passes `now`, which is what makes
-/// this testable without waiting ten seconds.
+/// No clock of its own and no I/O: the caller passes `now` and the meeting
+/// clock's reading, which is what makes this testable without waiting ten
+/// seconds.
 #[derive(Debug)]
 struct SilenceWatchdog {
     started_at: Instant,
     grace: Duration,
+    proof: ProofOfLife,
     watched_frames: u64,
     reference_frames: u64,
+    /// Highest reading of the meeting clock's audio time seen so far. Only read
+    /// under [`ProofOfLife::MeetingClock`]; kept as a maximum because the clock
+    /// is monotonic and a lock taken under contention should never be able to
+    /// walk it backwards.
+    recorded_ms: i64,
     /// True once the person has been told, so the banner is sent once.
     reported: bool,
 }
 
 impl SilenceWatchdog {
-    fn new(started_at: Instant, grace: Duration) -> Self {
+    fn new(started_at: Instant, grace: Duration, proof: ProofOfLife) -> Self {
         Self {
             started_at,
             grace,
+            proof,
             watched_frames: 0,
             reference_frames: 0,
+            recorded_ms: 0,
             reported: false,
         }
     }
 
-    /// Count frames seen this tick on the watched channel and on the one that
-    /// proves the clock is running.
-    fn observe(&mut self, watched: u64, reference: u64) {
+    /// Count frames seen this tick on the watched channel and on the reference
+    /// one, and take this tick's reading of the meeting clock.
+    ///
+    /// `reference` is 0 for a recording with no microphone, and `recorded_ms` is
+    /// ignored for one that has a microphone: each proof reads only its own
+    /// half. Both are passed every tick anyway so the pump never has to know
+    /// which proof this watchdog was built with.
+    fn observe(&mut self, watched: u64, reference: u64, recorded_ms: i64) {
         self.watched_frames = self.watched_frames.saturating_add(watched);
         self.reference_frames = self.reference_frames.saturating_add(reference);
+        self.recorded_ms = self.recorded_ms.max(recorded_ms);
     }
 
     fn watched_frames(&self) -> u64 {
@@ -429,6 +488,10 @@ impl SilenceWatchdog {
 
     fn reference_frames(&self) -> u64 {
         self.reference_frames
+    }
+
+    fn proof(&self) -> ProofOfLife {
+        self.proof
     }
 
     /// `Some(..)` exactly on the tick the answer changes; `None` otherwise.
@@ -440,7 +503,16 @@ impl SilenceWatchdog {
             }
             return None;
         }
-        let clock_is_running = self.reference_frames > 0;
+        let clock_is_running = match self.proof {
+            ProofOfLife::MicrophoneFrames => self.reference_frames > 0,
+            // A whole grace period's worth of *recorded* audio, not of wall
+            // clock: the same ten seconds the patience below is measured in,
+            // but with paused stretches taken out. Somebody who starts a
+            // recording and pauses it to find the meeting link is not told the
+            // computer has gone quiet while they are paused — which is exactly
+            // what a bare wall-clock reading would do.
+            ProofOfLife::MeetingClock => self.recorded_ms >= self.grace.as_millis() as i64,
+        };
         let out_of_patience = now.duration_since(self.started_at) >= self.grace;
         if self.watched_frames == 0 && clock_is_running && out_of_patience {
             self.reported = true;
@@ -838,11 +910,24 @@ fn spawn_pump(
             let mut system_reported_lost = false;
             let mut next_reopen: Option<Instant> = None;
             let mut last_levels = Instant::now() - LEVELS_INTERVAL;
+            // Whether this recording has a microphone in it at all decides two
+            // things below: what proves the recording is running, and which
+            // sentence is true when the computer's audio goes quiet. Read once,
+            // because `mic` is taken at the end of the loop.
+            let has_microphone = mic.is_some();
             // Only watched when the computer's audio actually opened: a channel
             // that never started is already reported by `system_audio_error`.
-            let mut system_silence = system_capture
-                .is_some()
-                .then(|| SilenceWatchdog::new(Instant::now(), SILENT_CHANNEL_GRACE));
+            let mut system_silence = system_capture.is_some().then(|| {
+                SilenceWatchdog::new(
+                    Instant::now(),
+                    SILENT_CHANNEL_GRACE,
+                    if has_microphone {
+                        ProofOfLife::MicrophoneFrames
+                    } else {
+                        ProofOfLife::MeetingClock
+                    },
+                )
+            });
 
             loop {
                 let stopping = shared.stopping.load(Ordering::Relaxed);
@@ -873,7 +958,14 @@ fn spawn_pump(
                             _ => mic_frames += 1,
                         }
                     }
-                    watchdog.observe(system_frames, mic_frames);
+                    // `audio_ms`, not `now_ms`: the second reading is what the
+                    // watchdog leans on when there is no microphone, and a
+                    // paused recording must not look like a running one.
+                    let recorded_ms = clock
+                        .lock()
+                        .map(|c| c.audio_ms())
+                        .unwrap_or_else(|e| e.into_inner().audio_ms());
+                    watchdog.observe(system_frames, mic_frames, recorded_ms);
                 }
 
                 for mut frame in batch {
@@ -972,13 +1064,29 @@ fn spawn_pump(
                                     target: "echo::audio",
                                     system_frames = watchdog.watched_frames(),
                                     mic_frames = watchdog.reference_frames(),
+                                    proof = ?watchdog.proof(),
+                                    has_microphone,
                                     detail = %s.diagnostics(),
-                                    "the computer's audio started but has delivered nothing; recording the microphone only"
+                                    "the computer's audio started but has delivered nothing"
                                 );
+                                let (reason, message) = if has_microphone {
+                                    (
+                                        DegradedReason::SystemAudioUnavailable,
+                                        SYSTEM_AUDIO_SILENT_MESSAGE,
+                                    )
+                                } else {
+                                    // "Recording through the microphone only"
+                                    // is not true of a recording that has no
+                                    // microphone; nothing at all is arriving.
+                                    (
+                                        DegradedReason::NothingIsBeingHeard,
+                                        NOTHING_IS_BEING_HEARD_MESSAGE,
+                                    )
+                                };
                                 let _ = signals.send(CaptureSignal::Degraded {
                                     channel: Some(Channel::System),
-                                    reason: DegradedReason::SystemAudioUnavailable,
-                                    message: SYSTEM_AUDIO_SILENT_MESSAGE.to_string(),
+                                    reason,
+                                    message: message.to_string(),
                                 });
                             }
                             Some(SilenceVerdict::CameBack) => {
@@ -1007,15 +1115,33 @@ fn spawn_pump(
                                 "system audio stopped: {:?}",
                                 s.stopped_reason()
                             );
+                            let (reason, message) = if has_microphone {
+                                (
+                                    // Not `SystemAudioUnavailable`: the banner
+                                    // that reason draws promises a separation
+                                    // of the microphone recording that a
+                                    // meeting with any system audio in it never
+                                    // gets, and calls lines "You" that already
+                                    // carry a real name.
+                                    DegradedReason::SystemAudioLost,
+                                    SYSTEM_AUDIO_LOST_MESSAGE,
+                                )
+                            } else {
+                                // And not `SystemAudioLost` either, for the same
+                                // reason the silent case above takes its own
+                                // branch: that sentence ends "It's still
+                                // recording through the microphone", and this
+                                // recording has no microphone to still be
+                                // recording through. It has nothing left.
+                                (
+                                    DegradedReason::NothingIsBeingHeard,
+                                    NOTHING_IS_BEING_HEARD_MESSAGE,
+                                )
+                            };
                             let _ = signals.send(CaptureSignal::Degraded {
                                 channel: Some(Channel::System),
-                                // Not `SystemAudioUnavailable`: the banner that
-                                // reason draws promises a separation of the
-                                // microphone recording that a meeting with any
-                                // system audio in it never gets, and calls lines
-                                // "You" that already carry a real name.
-                                reason: DegradedReason::SystemAudioLost,
-                                message: SYSTEM_AUDIO_LOST_MESSAGE.to_string(),
+                                reason,
+                                message: message.to_string(),
                             });
                             next_reopen = Some(Instant::now() + REOPEN_BACKOFF);
                         }
@@ -1880,11 +2006,11 @@ mod tests {
     #[test]
     fn a_channel_that_started_but_never_delivers_is_reported_once() {
         let origin = Instant::now();
-        let mut w = SilenceWatchdog::new(origin, GRACE);
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MicrophoneFrames);
 
         // The microphone is producing, the computer's audio is not.
         for tick in 1..=9 {
-            w.observe(0, 50);
+            w.observe(0, 50, 0);
             assert_eq!(
                 w.poll(origin + Duration::from_secs(tick)),
                 None,
@@ -1899,7 +2025,7 @@ mod tests {
         );
         // And only once, however long it stays silent.
         for tick in 11..=30 {
-            w.observe(0, 50);
+            w.observe(0, 50, 0);
             assert_eq!(w.poll(origin + Duration::from_secs(tick)), None);
         }
     }
@@ -1907,9 +2033,9 @@ mod tests {
     #[test]
     fn a_channel_delivering_audio_is_never_reported() {
         let origin = Instant::now();
-        let mut w = SilenceWatchdog::new(origin, GRACE);
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MicrophoneFrames);
         for tick in 1..=60 {
-            w.observe(50, 50);
+            w.observe(50, 50, 0);
             assert_eq!(w.poll(origin + Duration::from_secs(tick)), None);
         }
         assert_eq!(w.watched_frames(), 3_000);
@@ -1921,9 +2047,9 @@ mod tests {
         // the whole recording is broken in a way this watchdog must not
         // misdescribe as "we can hear you but not them".
         let origin = Instant::now();
-        let mut w = SilenceWatchdog::new(origin, GRACE);
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MicrophoneFrames);
         for tick in 1..=60 {
-            w.observe(0, 0);
+            w.observe(0, 0, 0);
             assert_eq!(
                 w.poll(origin + Duration::from_secs(tick)),
                 None,
@@ -1935,17 +2061,17 @@ mod tests {
     #[test]
     fn a_channel_that_comes_back_is_reported_recovered_once() {
         let origin = Instant::now();
-        let mut w = SilenceWatchdog::new(origin, GRACE);
-        w.observe(0, 50);
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MicrophoneFrames);
+        w.observe(0, 50, 0);
         assert_eq!(w.poll(origin + GRACE), Some(SilenceVerdict::WentSilent));
 
         // The first real frame arrives a minute in.
-        w.observe(1, 50);
+        w.observe(1, 50, 0);
         assert_eq!(
             w.poll(origin + Duration::from_secs(60)),
             Some(SilenceVerdict::CameBack)
         );
-        w.observe(50, 50);
+        w.observe(50, 50, 0);
         assert_eq!(
             w.poll(origin + Duration::from_secs(61)),
             None,
@@ -1956,12 +2082,130 @@ mod tests {
     #[test]
     fn a_late_first_frame_inside_the_grace_period_is_not_a_failure() {
         let origin = Instant::now();
-        let mut w = SilenceWatchdog::new(origin, GRACE);
-        w.observe(0, 50);
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MicrophoneFrames);
+        w.observe(0, 50, 0);
         assert_eq!(w.poll(origin + Duration::from_secs(9)), None);
         // Nine and a bit seconds late is a slow start, not a broken channel.
-        w.observe(1, 50);
+        w.observe(1, 50, 0);
         assert_eq!(w.poll(origin + Duration::from_secs(20)), None);
+    }
+
+    // The two-channel tests above pass 0 for the meeting clock throughout, which
+    // is the point: with a microphone in the recording the clock is never read,
+    // and their timings are the ones that were already asserted before this
+    // watchdog knew what a meeting clock was.
+
+    #[test]
+    fn a_recording_with_no_microphone_still_notices_the_silence() {
+        // Screen recording granted, microphone denied. There is no second
+        // channel to compare against, so the meeting clock is the proof that
+        // the recording is running — and it has to be enough, because this is
+        // the exact configuration that recorded three quarters of an hour of
+        // nothing without a word being said about it.
+        let origin = Instant::now();
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MeetingClock);
+
+        for tick in 1..=9 {
+            w.observe(0, 0, tick as i64 * 1_000);
+            assert_eq!(
+                w.poll(origin + Duration::from_secs(tick)),
+                None,
+                "gave up after {tick}s, inside the grace period"
+            );
+        }
+
+        w.observe(0, 0, 10_000);
+        assert_eq!(
+            w.poll(origin + GRACE),
+            Some(SilenceVerdict::WentSilent),
+            "a recording with no microphone never found out it was hearing nothing"
+        );
+        // Once, as ever.
+        for tick in 11..=30 {
+            w.observe(0, 0, tick as i64 * 1_000);
+            assert_eq!(w.poll(origin + Duration::from_secs(tick)), None);
+        }
+    }
+
+    #[test]
+    fn a_paused_recording_with_no_microphone_is_not_blamed_on_the_computer() {
+        // Started, then paused a second in to go and find the meeting link. The
+        // wall clock runs on; the amount of audio this recording should contain
+        // does not, and that is the one the verdict is made from.
+        let origin = Instant::now();
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MeetingClock);
+        for tick in 1..=60 {
+            w.observe(0, 0, 1_000);
+            assert_eq!(
+                w.poll(origin + Duration::from_secs(tick)),
+                None,
+                "said the computer had gone quiet during a pause"
+            );
+        }
+        // Resumed: nine more seconds of real audio, and only the tenth decides.
+        for second in 2..=9 {
+            w.observe(0, 0, second * 1_000);
+            assert_eq!(
+                w.poll(origin + Duration::from_secs(60 + second as u64)),
+                None
+            );
+        }
+        w.observe(0, 0, 10_000);
+        assert_eq!(
+            w.poll(origin + Duration::from_secs(70)),
+            Some(SilenceVerdict::WentSilent)
+        );
+    }
+
+    #[test]
+    fn a_recording_with_no_microphone_that_gets_audio_says_nothing() {
+        let origin = Instant::now();
+        let mut w = SilenceWatchdog::new(origin, GRACE, ProofOfLife::MeetingClock);
+        for tick in 1..=60 {
+            w.observe(50, 0, tick as i64 * 1_000);
+            assert_eq!(
+                w.poll(origin + Duration::from_secs(tick)),
+                None,
+                "blamed a channel that was delivering audio all along"
+            );
+        }
+    }
+
+    #[test]
+    fn the_recording_that_hears_nothing_at_all_gets_its_own_sentence() {
+        // Copy lives in src/lib/copy.ts as
+        // labels.degradedReason.nothingIsBeingHeard. If it changes there it
+        // changes here.
+        assert_eq!(
+            NOTHING_IS_BEING_HEARD_MESSAGE,
+            "Echo can't hear anything — there's no microphone in this recording, and nothing is coming from this computer. Nothing is being saved, so it's worth stopping and starting again."
+        );
+        // The whole reason this sentence exists: neither of its two siblings may
+        // be said to somebody who has no microphone recording, because both of
+        // them make a promise about one.
+        assert!(
+            !NOTHING_IS_BEING_HEARD_MESSAGE.contains("microphone only")
+                && !NOTHING_IS_BEING_HEARD_MESSAGE.contains("still recording")
+                && !NOTHING_IS_BEING_HEARD_MESSAGE.contains("who said what"),
+            "{NOTHING_IS_BEING_HEARD_MESSAGE} promises something this state cannot keep"
+        );
+        assert!(
+            !NOTHING_IS_BEING_HEARD_MESSAGE.contains('!'),
+            "{NOTHING_IS_BEING_HEARD_MESSAGE} shouts at somebody who just lost a recording"
+        );
+        for jargon in [
+            "ScreenCaptureKit",
+            "SCStream",
+            "OSStatus",
+            "queue",
+            "buffer",
+            "stream",
+        ] {
+            assert!(
+                !NOTHING_IS_BEING_HEARD_MESSAGE.contains(jargon),
+                "{NOTHING_IS_BEING_HEARD_MESSAGE} leaks {jargon} to the person"
+            );
+        }
     }
 
     #[test]

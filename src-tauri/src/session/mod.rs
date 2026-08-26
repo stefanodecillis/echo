@@ -308,6 +308,7 @@ impl Inner {
             DegradedReason::SystemAudioUnavailable
                 | DegradedReason::SystemAudioLost
                 | DegradedReason::MicrophoneUnavailable
+                | DegradedReason::NothingIsBeingHeard
         );
 
         let elapsed = {
@@ -1176,7 +1177,8 @@ impl SessionManager {
         if let Some(
             reason @ (DegradedReason::SystemAudioUnavailable
             | DegradedReason::SystemAudioLost
-            | DegradedReason::MicrophoneUnavailable),
+            | DegradedReason::MicrophoneUnavailable
+            | DegradedReason::NothingIsBeingHeard),
         ) = reason
         {
             inner.transition(&CaptureEvent::SourceLost(reason));
@@ -1634,6 +1636,10 @@ fn degraded_tag(reason: DegradedReason) -> &'static str {
             "systemAudioLost"
         }
         DegradedReason::MicrophoneUnavailable => "microphoneLost",
+        // Its own slot: it is not the same banner as either of the two above.
+        // It replaces nothing and nothing replaces it, because by the time it
+        // is shown there is no other source left to report on.
+        DegradedReason::NothingIsBeingHeard => "nothingIsBeingHeard",
         DegradedReason::TranscriptBehind => "transcriptBehind",
         DegradedReason::StorageLow => "storageLow",
     }
@@ -2101,6 +2107,49 @@ mod tests {
         assert!(h.events.notice_tagged("nothingToKeep"));
         assert_eq!(h.session.status().await.state, CaptureState::Stopped);
         assert!(h.session.status().await.meeting_id.is_none());
+    }
+
+    /// The closing lie of the incident of 2026-08-21: forty-five minutes of
+    /// nothing, and the only thing the person was told was that it had been too
+    /// short to keep.
+    #[tokio::test]
+    async fn a_long_recording_that_saved_nothing_is_not_called_too_short() {
+        let h = Harness::new().await;
+        h.session.start(Default::default()).await.unwrap();
+        // Three quarters of an hour on the clock, not one chunk committed.
+        h.capture.set_elapsed(45 * 60_000);
+
+        assert!(h.session.stop().await.unwrap().is_none());
+
+        assert!(
+            !h.events.notice_tagged("nothingToKeep"),
+            "told somebody who recorded forty-five minutes that it was too short"
+        );
+        let told = h
+            .events
+            .notices()
+            .into_iter()
+            .find(|n| n.tag.as_deref() == Some("heardNothing"))
+            .expect("nobody was told the recording heard nothing");
+        assert!(
+            told.message.contains("couldn't hear anything"),
+            "{} does not say what actually happened",
+            told.message
+        );
+        assert!(
+            !told.message.contains("too short"),
+            "{} still calls it short",
+            told.message
+        );
+        assert_eq!(
+            told.level,
+            NoticeLevel::Warning,
+            "a lost recording slid past as an aside"
+        );
+        assert!(
+            told.persistent,
+            "the only record of what happened faded on its own"
+        );
     }
 
     /// The journal is bookkeeping; the files are the truth. A stop that could not

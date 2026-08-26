@@ -374,9 +374,9 @@ async fn discard_empty_meeting_inner(inner: &Arc<Inner>, meeting_id: &str, annou
     inner.ports.asr.forget_meeting(meeting_id);
     inner.cancel_jobs_for(meeting_id).await;
 
-    let dir = match repo::get_meeting(&inner.db, meeting_id).await {
-        Ok(Some(meeting)) => audio_dir_of(inner, &meeting),
-        _ => inner.paths.meeting_dir(meeting_id),
+    let (dir, ran_for_ms) = match repo::get_meeting(&inner.db, meeting_id).await {
+        Ok(Some(meeting)) => (audio_dir_of(inner, &meeting), meeting.duration_ms),
+        _ => (inner.paths.meeting_dir(meeting_id), 0),
     };
     match repo::delete_meeting(&inner.db, meeting_id).await {
         Ok(files) => {
@@ -401,7 +401,7 @@ async fn discard_empty_meeting_inner(inner: &Arc<Inner>, meeting_id: &str, annou
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    tracing::info!(meeting = %meeting_id, "nothing was recorded, so nothing was kept");
+    tracing::info!(meeting = %meeting_id, ran_for_ms, "nothing was recorded, so nothing was kept");
     inner.ports.events.emit(UiEvent::MeetingUpdated(
         crate::events::MeetingUpdatedPayload {
             meeting_id: meeting_id.to_string(),
@@ -412,13 +412,56 @@ async fn discard_empty_meeting_inner(inner: &Arc<Inner>, meeting_id: &str, annou
         },
     ));
     if announce {
-        inner.notice(NoticePayload {
+        inner.notice(ending_notice(ran_for_ms));
+    }
+}
+
+/// How long a recording has to have run before "too short to keep" is a lie
+/// about it.
+///
+/// Half a minute, and the two numbers either side of it are what pick it.
+/// [`super::MIN_KEPT_MS`] is three seconds — the shape of pressing Start and
+/// Stop while looking for the right button, and the only shape the old sentence
+/// was ever written for. `SILENT_CHANNEL_GRACE` in `crate::audio` is ten seconds —
+/// how long a source that opened may deliver nothing before the watchdog says
+/// so on screen. Past both, a person has watched a timer run, watched a banner
+/// they may already have been shown, and waited: they know how long that
+/// recording was, and being told it was too short reads as Echo not knowing
+/// what it just did. Under half a minute, the quieter sentence is still true
+/// enough and is the kinder one — nobody wants a warning about the half-second
+/// they mis-clicked.
+const HEARD_NOTHING_AFTER_MS: i64 = 30_000;
+
+/// The last thing a person hears about a recording that is being deleted.
+///
+/// Two endings, because there are two things that happen and only one of them
+/// used to be said. Deleting the meeting is right in both — see
+/// [`discard_empty_meeting`] — but a recording that ran for three quarters of an
+/// hour and saved nothing is not "too short", and saying so was the closing lie
+/// of the incident of 2026-08-21: a silent failure, then a false explanation,
+/// then the folder gone.
+///
+/// The long ending is a `Warning` and persistent on purpose. Nothing was kept,
+/// so there is no meeting left to open and look at afterwards — this sentence is
+/// the entire record of what happened, and a toast that fades in four seconds is
+/// only a quieter kind of silence (the rule this branch exists for).
+fn ending_notice(ran_for_ms: i64) -> NoticePayload {
+    if ran_for_ms >= HEARD_NOTHING_AFTER_MS {
+        NoticePayload {
+            level: NoticeLevel::Warning,
+            message: "Echo couldn't hear anything for that whole recording, so there was nothing to keep. Check that Echo is allowed to use your microphone and to record this computer's audio.".into(),
+            persistent: true,
+            meeting_id: None,
+            tag: Some("heardNothing".into()),
+        }
+    } else {
+        NoticePayload {
             level: NoticeLevel::Info,
             message: "That one was too short to keep, so Echo let it go.".into(),
             persistent: false,
             meeting_id: None,
             tag: Some("nothingToKeep".into()),
-        });
+        }
     }
 }
 
@@ -458,4 +501,66 @@ pub(crate) async fn queue_finalization(
         inner.jobs.queue(Some(meeting_id), kind).await?;
     }
     Ok(Finalized::Queued)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mis_click_and_a_lost_meeting_do_not_get_the_same_ending() {
+        let mis_click = ending_notice(1_500);
+        assert_eq!(mis_click.tag.as_deref(), Some("nothingToKeep"));
+        assert!(!mis_click.persistent, "a mis-click nagged");
+        assert_eq!(mis_click.level, NoticeLevel::Info);
+
+        let lost = ending_notice(45 * 60_000);
+        assert_eq!(lost.tag.as_deref(), Some("heardNothing"));
+        assert!(lost.persistent, "the only record of it faded on its own");
+        assert_eq!(lost.level, NoticeLevel::Warning);
+        assert!(
+            !lost.message.contains("too short"),
+            "{} calls three quarters of an hour short",
+            lost.message
+        );
+        assert!(
+            lost.message.contains("couldn't hear anything"),
+            "{} does not say what actually happened",
+            lost.message
+        );
+    }
+
+    /// The boundary is a decision, so it is asserted rather than left to drift.
+    #[test]
+    fn the_honest_ending_starts_at_half_a_minute() {
+        assert_eq!(
+            ending_notice(HEARD_NOTHING_AFTER_MS - 1).tag.as_deref(),
+            Some("nothingToKeep")
+        );
+        assert_eq!(
+            ending_notice(HEARD_NOTHING_AFTER_MS).tag.as_deref(),
+            Some("heardNothing")
+        );
+        const {
+            assert!(
+                HEARD_NOTHING_AFTER_MS > super::super::MIN_KEPT_MS,
+                "the honest ending starts before the meeting is even worth keeping"
+            )
+        };
+    }
+
+    /// Zero jargon, and no shouting at somebody who has just lost a recording.
+    #[test]
+    fn both_endings_are_said_in_the_app_s_own_voice() {
+        for ran_for_ms in [0, 45 * 60_000] {
+            let message = ending_notice(ran_for_ms).message;
+            assert!(!message.contains('!'), "{message} shouts");
+            for jargon in ["buffer", "stream", "chunk", "OSStatus", "segment"] {
+                assert!(
+                    !message.contains(jargon),
+                    "{message} leaks {jargon} to the person"
+                );
+            }
+        }
+    }
 }

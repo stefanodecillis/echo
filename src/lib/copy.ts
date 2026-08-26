@@ -85,6 +85,16 @@ export const labels = {
       "Echo stopped hearing what this computer plays. It's still recording through the microphone.",
     microphoneUnavailable:
       "Echo can hear the meeting, but not your own microphone.",
+    /** Nothing is arriving at all: this recording has no microphone in it and
+     * what the computer plays is not coming through either. Its own sentence
+     * because both of the two above end in a promise about the microphone
+     * recording — one that the offline pass will sort the voices out of it, one
+     * that Echo is still recording through it — and a person who denied the
+     * microphone has no microphone recording for either promise to be about.
+     * Pinned to `NOTHING_IS_BEING_HEARD_MESSAGE` in
+     * `src-tauri/src/audio/mod.rs`. */
+    nothingIsBeingHeard:
+      "Echo can't hear anything — there's no microphone in this recording, and nothing is coming from this computer. Nothing is being saved, so it's worth stopping and starting again.",
     transcriptBehind: "Catching up on the last few minutes.",
     storageLow: "Running low on space. Recording keeps going — free up room soon.",
   },
