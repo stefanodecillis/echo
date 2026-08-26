@@ -300,9 +300,15 @@ async fn run_fixture(
     }
 
     let started = std::time::Instant::now();
-    let scanned = pipeline::scan(&db, &meeting.id, segmenter, embedder, &DiarizeControl::new())
-        .await?
-        .expect("the fixture has audio");
+    let scanned = pipeline::scan(
+        &db,
+        &meeting.id,
+        segmenter,
+        embedder,
+        &DiarizeControl::new(),
+    )
+    .await?
+    .expect("the fixture has audio");
     let cut = scanned.cut_for(None);
     println!(
         "    {} fingerprints of {} dimensions, {} clusters found (of {}), {:.1} s",
@@ -500,7 +506,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. mixed: one enrolled voice plus two strangers.
     let mixed_voices: Vec<&str> = vec![pool[0], pool[2], pool[3]];
     let mixed = run_fixture(
-        "mixed", &mixed_voices, 1, &root, &work, &segmenter, &embedder,
+        "mixed",
+        &mixed_voices,
+        1,
+        &root,
+        &work,
+        &segmenter,
+        &embedder,
     )
     .await?;
     println!();
@@ -592,13 +604,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let (false, false) = (true_scores.is_empty(), stranger_scores.is_empty()) {
         let (_, worst_stranger) = range(&stranger_scores);
         let (weakest_true, _) = range(&true_scores);
-        println!("the gap the bars live in                 {worst_stranger:.3} … {weakest_true:.3}");
+        println!(
+            "the gap the bars live in                 {worst_stranger:.3} … {weakest_true:.3}"
+        );
     }
     println!();
 
     // --- the plateau -------------------------------------------------------
-    println!("=== every TAU_LINK that gets all three fixtures right (MARGIN = {:.2}) ===",
-        people::MARGIN);
+    println!(
+        "=== every TAU_LINK that gets all three fixtures right (MARGIN = {:.2}) ===",
+        people::MARGIN
+    );
     let mut right: Vec<f32> = Vec::new();
     let mut step = 0usize;
     loop {
@@ -649,10 +665,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             floor = tau;
         }
     }
-    println!(
-        "{floor:.3}   (shipped {:.2})",
-        people::TAU_SUGGEST
-    );
+    println!("{floor:.3}   (shipped {:.2})", people::TAU_SUGGEST);
 
     // --- fingerprint-level scores, which is what `pre_assign` sees ---------
     println!();

@@ -132,7 +132,16 @@ async fn rows_of(db: &Db, meeting_id: &str) -> Result<Vec<Row>, Box<dyn std::err
     Ok(found
         .into_iter()
         .map(
-            |(id, cluster_key, display_name, speaking_ms, person_id, suggested_person_id, score, centroid)| Row {
+            |(
+                id,
+                cluster_key,
+                display_name,
+                speaking_ms,
+                person_id,
+                suggested_person_id,
+                score,
+                centroid,
+            )| Row {
                 id,
                 cluster_key,
                 display_name,
@@ -183,7 +192,10 @@ fn print_rows(label: &str, rows: &[Row], profiles: &[repo::PersonProfileRow]) {
                 format!("{}d", row.centroid.len())
             },
             row.person_id.as_deref().map(short).unwrap_or("—".into()),
-            row.suggested_person_id.as_deref().map(short).unwrap_or("—".into()),
+            row.suggested_person_id
+                .as_deref()
+                .map(short)
+                .unwrap_or("—".into()),
             row.suggestion_score
                 .map(|s| format!("{s:.3}"))
                 .unwrap_or_else(|| "—".to_string()),
@@ -560,7 +572,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!(
         "AUTO-LINKED: {:?} → {:?} ({:.1} s of speech), name copied onto the row",
-        hit.id, hit.display_name, hit.speaking_ms as f64 / 1_000.0
+        hit.id,
+        hit.display_name,
+        hit.speaking_ms as f64 / 1_000.0
     );
     for row in after.iter().filter(|r| r.person_id.is_none()) {
         assert!(

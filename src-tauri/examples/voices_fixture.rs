@@ -631,8 +631,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fixture size -> threshold -> score
     let mut table: Vec<(usize, Vec<(f32, Score)>)> = Vec::new();
     // fixture size -> what the automatic count made of it
-    let mut automatic: Vec<(usize, Score, Option<echo_lib::diarize::cluster::CountChoice>)> =
-        Vec::new();
+    let mut automatic: Vec<(
+        usize,
+        Score,
+        Option<echo_lib::diarize::cluster::CountChoice>,
+    )> = Vec::new();
 
     for &n in &sizes {
         if pool.len() < n {
@@ -783,7 +786,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             s.coverage,
             silhouette,
             runner.map_or_else(|| "-".to_string(), |(k, v)| format!("{k} at {v:.3}")),
-            runner.map_or_else(|| "-".to_string(), |(_, v)| format!("{:.3}", silhouette - v)),
+            runner.map_or_else(
+                || "-".to_string(),
+                |(_, v)| format!("{:.3}", silhouette - v)
+            ),
             chosen.map_or_else(|| "-".to_string(), |c| c.cut_clusters.to_string()),
             chosen.map_or_else(|| "-".to_string(), |c| c.folded.to_string()),
             match chosen.map(|c| c.refusal) {

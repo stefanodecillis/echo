@@ -159,12 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // One millisecond of budget is one stretch per window: the pass as
             // it was before packing.
             "--no-packing" => pack_ms = 1,
-            "--pack-ms" => {
-                pack_ms = args
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0)
-            }
+            "--pack-ms" => pack_ms = args.next().and_then(|n| n.parse().ok()).unwrap_or(0),
             other => positional.push(other.to_string()),
         }
     }
