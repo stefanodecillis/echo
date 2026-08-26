@@ -457,8 +457,16 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
     let pass = pass?;
 
     // Live partials are superseded now — except over stretches this pass could
-    // not read, where nothing superseded them and the guess is the only text
-    // those seconds have (see [`repo::delete_partial_segments_except`]).
+    // not read, where nothing superseded them (see
+    // [`repo::delete_partial_segments_except`]).
+    //
+    // Worth being exact about what this can spare, because a sentence below
+    // used to promise more than it can: a live guess reaches the screen as an
+    // announcement and reaches the database only once its words have settled,
+    // so nothing this app writes today leaves an unfinished row behind. The
+    // sweep is a guard against rows an older build could have left, never a
+    // source of text for a stretch that would not read — those seconds had no
+    // text of any kind, which is exactly why the pass was sent at them.
     let unread: Vec<(Channel, i64, i64)> = pass.unread_merged();
     if let Err(error) = repo::delete_partial_segments_except(&ctx.db, &meeting_id, &unread).await {
         tracing::debug!(%error, "could not clear live text");
@@ -490,7 +498,7 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
             meeting = %meeting_id,
             unread = pass.unread.len(),
             unread_ms,
-            "part of this recording would not read back; the live text over it was kept"
+            "part of this recording would not read back and has no words against it"
         );
         ctx.events.emit(UiEvent::Notice(notice));
     }
@@ -508,10 +516,20 @@ async fn catch_up(ctx: &JobContext) -> Result<(), JobFailure> {
 /// ends" — so when it cannot, the person hears it rather than finding a gap
 /// months later.
 ///
-/// The live text over the stretch is kept (`session::jobs::catch_up`), and the
-/// second sentence says so: it is the difference between "some of this is
-/// rough" and "some of this is gone", and the person reading the transcript can
-/// see which lines are which.
+/// It used to end "The live text from then is still here", and that was not
+/// true. The pass is sent at the stretches of the recording that have **no**
+/// text against them — that is how its work is planned — so a window it could
+/// not read is a window over seconds nothing had ever written down. Saying the
+/// rough text survived, on top of a transcript that reads there exactly like
+/// one where nobody spoke, is a false explanation for a real hole: the closing
+/// move of the 2026-08-21 incident, in a different place.
+///
+/// Persistent, for the reason the ending of a lost recording is (see
+/// `session::recovery::ending_notice`): nothing else on any screen marks those
+/// seconds. The transcript is silent there, the left-out card on the same tab
+/// is about a different decision entirely, and a pass finishes minutes after
+/// somebody has walked away from the meeting that queued it. A toast that
+/// fades in four seconds is a quieter kind of silence.
 fn unread_stretch_notice(meeting_id: &str, unread_ms: i64) -> Option<NoticePayload> {
     if unread_ms <= 0 {
         return None;
@@ -519,7 +537,7 @@ fn unread_stretch_notice(meeting_id: &str, unread_ms: i64) -> Option<NoticePaylo
     Some(NoticePayload {
         level: NoticeLevel::Warning,
         message: unread_stretch_message(unread_ms),
-        persistent: false,
+        persistent: true,
         meeting_id: Some(meeting_id.to_string()),
         // One meeting, one such message: reading it again replaces the sentence
         // rather than stacking a second copy of it.
@@ -535,6 +553,11 @@ fn unread_stretch_notice(meeting_id: &str, unread_ms: i64) -> Option<NoticePaylo
 /// minutes" answers that while "2 minutes 47 seconds" pretends to an accuracy
 /// this number does not have. Up rather than down, because rounding a shortfall
 /// down is the direction that flatters Echo.
+///
+/// The second sentence is the one useful thing left to say: the words are gone
+/// but the audio is not, so the meeting can be listened to, or read again from
+/// its own screen. It does not name the button that does the reading — that
+/// name lives with the button, and a copy of it here is a copy that can drift.
 fn unread_stretch_message(unread_ms: i64) -> String {
     // `div_ceil` on a signed integer is not settled in the compiler this builds
     // on, and rounding up is one line of arithmetic.
@@ -547,8 +570,8 @@ fn unread_stretch_message(unread_ms: i64) -> String {
         }
     };
     format!(
-        "Echo couldn't read {how_much} of this recording back. \
-         The live text from then is still here."
+        "Echo couldn't read {how_much} of this recording back, so that part of the \
+         transcript has no words in it. The recording itself is still here."
     )
 }
 
@@ -2652,11 +2675,20 @@ mod tests {
     ///
     /// The live text told the person "Echo will fill in the rest when the
     /// meeting ends". When a window would not read, that stretch is exactly the
-    /// rest — and the runner used to clear the guesses over it anyway and mark
-    /// the job done at 100%, so the seconds a person watched appear on screen
-    /// during the meeting were gone and nothing anywhere said so.
+    /// rest — and the runner used to mark the job done at 100% with nothing
+    /// anywhere saying otherwise.
+    ///
+    /// The sentence is held to what it may claim as much as to being said at
+    /// all. It used to end "The live text from then is still here", which is
+    /// not true of a stretch the pass was sent at *because* nothing had written
+    /// it down: those seconds have no words, and the transcript reads there
+    /// exactly like one where nobody spoke.
+    ///
+    /// The guess the fixture writes is the shape an older build could leave
+    /// behind, and the sweep still spares it: text that exists is never thrown
+    /// away over seconds nothing replaced.
     #[tokio::test]
-    async fn a_stretch_that_would_not_read_keeps_its_live_text_and_is_said_out_loud() {
+    async fn a_stretch_that_would_not_read_is_said_out_loud_without_a_false_comfort() {
         let db = crate::db::connect_in_memory().await.unwrap();
         let (meeting_id, job) = a_meeting_mid_catch_up(&db).await;
         let asr = Arc::new(super::super::mock::MockAsr::new());
@@ -2683,8 +2715,12 @@ mod tests {
             .expect("a hole in somebody's transcript is their business, not only the log's");
         assert_eq!(
             said.message,
-            "Echo couldn't read less than a minute of this recording back. \
-             The live text from then is still here."
+            "Echo couldn't read less than a minute of this recording back, so that part \
+             of the transcript has no words in it. The recording itself is still here."
+        );
+        assert!(
+            said.persistent,
+            "the only mark those seconds get anywhere faded on its own"
         );
         assert_eq!(said.meeting_id.as_deref(), Some(meeting_id.as_str()));
         assert_eq!(said.level, NoticeLevel::Warning);

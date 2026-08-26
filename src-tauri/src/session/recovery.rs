@@ -375,8 +375,22 @@ async fn discard_empty_meeting_inner(inner: &Arc<Inner>, meeting_id: &str, annou
     inner.cancel_jobs_for(meeting_id).await;
 
     let (dir, ran_for_ms) = match repo::get_meeting(&inner.db, meeting_id).await {
-        Ok(Some(meeting)) => (audio_dir_of(inner, &meeting), meeting.duration_ms),
-        _ => (inner.paths.meeting_dir(meeting_id), 0),
+        Ok(Some(meeting)) => (audio_dir_of(inner, &meeting), Some(meeting.duration_ms)),
+        // No row: there is no recording to have been long or short, and the
+        // folder is the only thing left to tidy.
+        Ok(None) => (inner.paths.meeting_dir(meeting_id), Some(0)),
+        Err(error) => {
+            // A read that failed is not a recording that ran for no time. Five
+            // connections, a fifteen-second wait for one and a ten-second wait
+            // on a locked database mean this read can fail while the writes a
+            // moment later succeed — and a stop happens exactly when the
+            // catch-up queue is being taken apart. Rounding the unknown down to
+            // zero is what told somebody their forty-five minutes were "too
+            // short to keep", which is the sentence this whole ending was
+            // rewritten to stop saying.
+            tracing::warn!(%error, meeting = %meeting_id, "could not tell how long that recording ran");
+            (inner.paths.meeting_dir(meeting_id), None)
+        }
     };
     match repo::delete_meeting(&inner.db, meeting_id).await {
         Ok(files) => {
@@ -401,7 +415,7 @@ async fn discard_empty_meeting_inner(inner: &Arc<Inner>, meeting_id: &str, annou
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    tracing::info!(meeting = %meeting_id, ran_for_ms, "nothing was recorded, so nothing was kept");
+    tracing::info!(meeting = %meeting_id, ?ran_for_ms, "nothing was recorded, so nothing was kept");
     inner.ports.events.emit(UiEvent::MeetingUpdated(
         crate::events::MeetingUpdatedPayload {
             meeting_id: meeting_id.to_string(),
@@ -445,8 +459,16 @@ const HEARD_NOTHING_AFTER_MS: i64 = 30_000;
 /// so there is no meeting left to open and look at afterwards — this sentence is
 /// the entire record of what happened, and a toast that fades in four seconds is
 /// only a quieter kind of silence (the rule this branch exists for).
-fn ending_notice(ran_for_ms: i64) -> NoticePayload {
-    if ran_for_ms >= HEARD_NOTHING_AFTER_MS {
+///
+/// `None` is "Echo could not find out how long it ran", and it takes the long
+/// ending. Of the two ways to be wrong about a recording nobody can measure,
+/// telling somebody their three quarters of an hour was too short to keep is
+/// the one that reads as Echo not knowing what it just did; telling somebody
+/// who really did mis-click to check their microphone costs them a sentence
+/// they can ignore. Unknown is not short, and guessing short is the guess that
+/// flatters Echo.
+fn ending_notice(ran_for_ms: Option<i64>) -> NoticePayload {
+    if ran_for_ms.unwrap_or(HEARD_NOTHING_AFTER_MS) >= HEARD_NOTHING_AFTER_MS {
         NoticePayload {
             level: NoticeLevel::Warning,
             message: "Echo couldn't hear anything for that whole recording, so there was nothing to keep. Check that Echo is allowed to use your microphone and to record this computer's audio.".into(),
@@ -509,12 +531,12 @@ mod tests {
 
     #[test]
     fn a_mis_click_and_a_lost_meeting_do_not_get_the_same_ending() {
-        let mis_click = ending_notice(1_500);
+        let mis_click = ending_notice(Some(1_500));
         assert_eq!(mis_click.tag.as_deref(), Some("nothingToKeep"));
         assert!(!mis_click.persistent, "a mis-click nagged");
         assert_eq!(mis_click.level, NoticeLevel::Info);
 
-        let lost = ending_notice(45 * 60_000);
+        let lost = ending_notice(Some(45 * 60_000));
         assert_eq!(lost.tag.as_deref(), Some("heardNothing"));
         assert!(lost.persistent, "the only record of it faded on its own");
         assert_eq!(lost.level, NoticeLevel::Warning);
@@ -530,15 +552,38 @@ mod tests {
         );
     }
 
+    /// A recording nobody could measure gets the honest ending, not the
+    /// flattering one.
+    ///
+    /// The length is read back from the database at the moment a stop is
+    /// tearing down everything else that holds a connection, so the read can
+    /// fail while the writes a moment later succeed. Collapsing that failure to
+    /// zero is how a forty-five-minute recording was told it was too short to
+    /// keep — the sentence the two endings were separated to stop saying.
+    #[test]
+    fn a_recording_of_unknown_length_is_never_called_too_short() {
+        let unknown = ending_notice(None);
+        assert_eq!(unknown.tag.as_deref(), Some("heardNothing"));
+        assert!(unknown.persistent);
+        assert_eq!(unknown.level, NoticeLevel::Warning);
+        assert!(
+            !unknown.message.contains("too short"),
+            "{} calls a recording nobody measured short",
+            unknown.message
+        );
+    }
+
     /// The boundary is a decision, so it is asserted rather than left to drift.
     #[test]
     fn the_honest_ending_starts_at_half_a_minute() {
         assert_eq!(
-            ending_notice(HEARD_NOTHING_AFTER_MS - 1).tag.as_deref(),
+            ending_notice(Some(HEARD_NOTHING_AFTER_MS - 1))
+                .tag
+                .as_deref(),
             Some("nothingToKeep")
         );
         assert_eq!(
-            ending_notice(HEARD_NOTHING_AFTER_MS).tag.as_deref(),
+            ending_notice(Some(HEARD_NOTHING_AFTER_MS)).tag.as_deref(),
             Some("heardNothing")
         );
         const {
@@ -553,7 +598,7 @@ mod tests {
     #[test]
     fn both_endings_are_said_in_the_app_s_own_voice() {
         for ran_for_ms in [0, 45 * 60_000] {
-            let message = ending_notice(ran_for_ms).message;
+            let message = ending_notice(Some(ran_for_ms)).message;
             assert!(!message.contains('!'), "{message} shouts");
             for jargon in ["buffer", "stream", "chunk", "OSStatus", "segment"] {
                 assert!(

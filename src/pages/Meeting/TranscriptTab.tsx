@@ -237,9 +237,14 @@ export function TranscriptTab({
       .then((moments) => {
         if (!cancelled) setLeftOut(moments);
       })
-      .catch(() => {
-        // A question that couldn't be asked is not an answer: nothing is said,
-        // rather than a failed read turning into a claim about the transcript.
+      .catch((err) => {
+        // A question that couldn't be asked is not an answer: nothing is said
+        // on screen, rather than a failed read turning into a claim about the
+        // transcript. But a card that never appears looks exactly like a
+        // meeting with nothing left out, and this read failing every time is
+        // the one way this feature breaks. So it says so to whoever is looking
+        // at the console — same standard as `useSetupJob` and `useEvent`.
+        console.warn("Echo: could not ask which moments were left out", err);
       });
     return () => {
       cancelled = true;
