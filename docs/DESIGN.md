@@ -88,7 +88,7 @@ audio_chunks(id, meeting_id, channel, seq, path, t_start_ms, t_end_ms, committed
 segments(id, meeting_id, t_start_ms, t_end_ms, channel, speaker_id, text,
          language, avg_confidence, revision, is_final, corrections)  -- corrections = words put right against "Words Echo should know", JSON, NULL when untouched
 suppressed_spans(id, meeting_id, channel, t_start_ms, t_end_ms, reason, decided_by,
-                 correlation, lag_ms, system_voice_ms, created_at, withdrawn_at)  -- seconds heard and deliberately left without text (speaker bleed); the catch-up planner subtracts the ones still standing, "listen again" withdraws them (the seconds are judged afresh) but keeps the measurement, whose median lag_ms the next reading inherits
+                 correlation, lag_ms, system_voice_ms, created_at, withdrawn_at)  -- seconds heard and deliberately left without text (speaker bleed); the catch-up planner subtracts the ones still standing, "listen again" withdraws them (the seconds are judged afresh) but keeps the measurement, whose median lag_ms the next reading inherits. The meeting screen reads them back (`asr::left_out`): a decision the finished transcript covers is nothing a person needs to hear about, but one that left those seconds with no words at all is named on the Transcript tab, with the times and a pointer at "Listen again" — never in the Live view, where the reading isn't finished, and never in an export, which is somebody else's document
 speakers(id, meeting_id, cluster_key, display_name, alias_of)  -- merge = alias, non-destructive
 markers(id, meeting_id, t_ms, kind, note)                       -- live "flag action item"
 summaries(id, meeting_id, template_id, template_snapshot, provider, model,

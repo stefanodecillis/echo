@@ -526,6 +526,20 @@ pub struct Segment {
     pub corrections: Vec<Correction>,
 }
 
+/// A stretch of a meeting that has no words in it because Echo heard it and
+/// decided not to write it down.
+///
+/// Not every such decision is one of these — nearly all of them are the far
+/// side written down once instead of twice, and those seconds have words.
+/// [`crate::asr::left_out`] is where that difference is argued, and this is
+/// only what survives it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeftOutMoment {
+    pub t_start_ms: i64,
+    pub t_end_ms: i64,
+}
+
 /// A segment as it is being written, before it lands in the database.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

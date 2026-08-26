@@ -30,6 +30,7 @@ import type {
   Job,
   JobProgressPayload,
   JobQuery,
+  LeftOutMoment,
   Marker,
   MarkerKind,
   Meeting,
@@ -173,6 +174,18 @@ export const deleteAllData = () => call<void>("delete_all_data");
 
 export const getTranscript = (query: TranscriptQuery) =>
   call<Segment[]>("get_transcript", { query });
+
+/**
+ * The moments of this meeting that have no words in them because Echo decided
+ * not to write them down.
+ *
+ * Empty for almost every meeting: the decision is nearly always the other
+ * people written down once instead of twice, and the core only returns the ones
+ * where nothing covered those seconds. Worth re-asking once a transcript pass
+ * finishes, since a pass changes what covers what.
+ */
+export const leftOutMoments = (meetingId: Id) =>
+  call<LeftOutMoment[]>("left_out_moments", { meetingId });
 
 /**
  * "Listen again": write this meeting's transcript again from its recording.

@@ -15,6 +15,9 @@
 //!   and is the one bar both the transcript screen and the recap ask.
 //! * [`phantom`] recognises the lines silence talked the decoder into, after
 //!   the fact, and drops them.
+//! * [`left_out`] works out which of the stretches Echo decided not to write
+//!   down left the transcript with no words at all, so the meeting screen can
+//!   say so.
 //!
 //! Lifecycle (mantra 1, as amended 2026-08-20): the engine loads the moment a
 //! meeting is detected or started and stays resident for the whole conversation
@@ -31,6 +34,7 @@ pub mod confidence;
 pub mod engine;
 pub mod glossary;
 pub mod language;
+pub mod left_out;
 pub mod models;
 pub mod phantom;
 pub mod reconcile;

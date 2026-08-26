@@ -650,6 +650,45 @@ pub async fn get_transcript(
     Ok(repo::get_segments(&state.db, &query).await?)
 }
 
+/// The stretches of this meeting that have no words in them because Echo heard
+/// them and decided not to write them down.
+///
+/// Echo removes the microphone's copy of what this computer played so the far
+/// side is written down once rather than twice, and the decisions are on record
+/// with what was measured behind each one. Almost always the far side's own
+/// words cover those same seconds and nothing is missing; occasionally they do
+/// not, and then the transcript reads exactly like one where nobody spoke.
+/// [`asr::left_out`] is the argument for which is which, and this is the read
+/// the meeting screen makes to say so.
+///
+/// Live guesses count as words, so this asks for them: text a person watched
+/// appear is text those seconds have. The limit is the ceiling
+/// [`repo::get_segments`] allows rather than its default, because a hole in the
+/// last ten minutes of a long meeting is exactly the one worth naming and the
+/// default would stop reading before it.
+#[tauri::command]
+pub async fn left_out_moments(
+    state: State<'_, AppState>,
+    meeting_id: Id,
+) -> CmdResult<Vec<LeftOutMoment>> {
+    check_id(&meeting_id)?;
+    let decided = repo::list_suppressed_spans(&state.db, &meeting_id).await?;
+    if decided.is_empty() {
+        return Ok(Vec::new());
+    }
+    let transcript = repo::get_segments(
+        &state.db,
+        &TranscriptQuery {
+            meeting_id: meeting_id.clone(),
+            include_partial: Some(true),
+            limit: Some(50_000),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(asr::left_out::moments_left_out(&decided, &transcript))
+}
+
 /// "No, it heard that right": put one line back the way the engine wrote it.
 ///
 /// The other half of a repair. Echo is allowed to change words in a transcript
@@ -1896,6 +1935,7 @@ macro_rules! echo_command_handler {
             $crate::commands::delete_meeting,
             $crate::commands::delete_all_data,
             $crate::commands::get_transcript,
+            $crate::commands::left_out_moments,
             $crate::commands::undo_corrections,
             $crate::commands::retranscribe_meeting,
             $crate::commands::search_transcripts,

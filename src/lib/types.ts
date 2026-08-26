@@ -230,6 +230,20 @@ export interface Correction {
   to: string;
 }
 
+/**
+ * A stretch of a meeting that has no words in it because Echo heard it and
+ * decided not to write it down.
+ *
+ * Nearly every such decision is the other people written down once instead of
+ * twice, and those seconds do have words; the core (`asr::left_out`) keeps only
+ * the ones that left the transcript silent, so a list of these is a list of
+ * places worth looking at.
+ */
+export interface LeftOutMoment {
+  tStartMs: number;
+  tEndMs: number;
+}
+
 /** One word in "Words Echo should know", and where it came from. */
 export interface VocabularyWord {
   word: string;

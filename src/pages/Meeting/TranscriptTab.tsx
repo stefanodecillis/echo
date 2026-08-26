@@ -15,6 +15,7 @@ import { cx } from "@/components/lib/cx";
 import {
   EVENTS,
   getTranscript,
+  leftOutMoments,
   listSpeakers,
   retranscribeMeeting,
   toUiError,
@@ -24,6 +25,7 @@ import {
   common,
   jobLine,
   labels,
+  leftOut as leftOutCopy,
   meeting as copy,
   notices,
   peopleCount as peopleCountCopy,
@@ -32,7 +34,7 @@ import {
 import { inProgressJob, isActive, jobSentence, lastFailure, presentJob } from "@/lib/jobs";
 import { useEvent } from "@/hooks/useEvent";
 import { useEchoStore } from "@/lib/store";
-import type { Id, MeetingDetail, Segment } from "@/lib/types";
+import type { Id, LeftOutMoment, MeetingDetail, Segment } from "@/lib/types";
 
 import { ExportMenu } from "./components/ExportMenu";
 import { IconButton } from "./components/IconButton";
@@ -53,6 +55,12 @@ import { buildTranscriptText } from "./lib/transcriptText";
 const TRANSCRIBE_JOB_KINDS = new Set(["transcribeCatchup", "diarize"]);
 
 const ROW_HEIGHT = 96;
+
+/** How many left-out moments are listed by time before the rest are counted
+ * instead. The count in the heading is always the whole truth; this list is a
+ * way into the transcript, and fifty timestamps in a row is a wall rather than
+ * a list. */
+const LEFT_OUT_TIMES_SHOWN = 12;
 
 export interface TranscriptTabProps {
   meetingId: Id;
@@ -114,6 +122,9 @@ export function TranscriptTab({
    * taking clicks while the core answers. One at a time is enough: the click
    * target is a word, and nobody double-clicks two of them. */
   const [undoingId, setUndoingId] = useState<Id>();
+  /** Moments Echo heard and decided not to write down that nothing else wrote
+   * down either. Empty for almost every meeting, and empty is silence. */
+  const [leftOut, setLeftOut] = useState<LeftOutMoment[]>([]);
   const listRef = useRef<VirtualListHandle>(null);
   const addToast = useEchoStore((s) => s.addToast);
 
@@ -189,14 +200,51 @@ export function TranscriptTab({
   // shaky.
   const sureness = useMemo(() => howSureThisMeetingIs(segments ?? []), [segments]);
 
+  /** Scroll to the first line at or after a moment on the meeting clock. What
+   * is on screen is the filtered list, so that is what the index has to count:
+   * jumping by position in the unfiltered transcript lands somewhere else
+   * entirely while a filter is typed. */
+  const scrollToMoment = (ms: number) => {
+    if (filtered.length === 0) return;
+    const index = filtered.findIndex((s) => s.tStartMs >= ms);
+    const target = index === -1 ? filtered.length - 1 : index;
+    listRef.current?.scrollToIndex(Math.max(0, target));
+  };
+
   useEffect(() => {
     if (jumpToMs === undefined || !segments || segments.length === 0) return;
-    const index = segments.findIndex((s) => s.tStartMs >= jumpToMs);
-    const target = index === -1 ? segments.length - 1 : index;
-    listRef.current?.scrollToIndex(Math.max(0, target));
+    scrollToMoment(jumpToMs);
     onJumpConsumed();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jumpToMs, segments]);
+
+  // Only asked once nothing is being recorded or read back. Both halves of the
+  // question move while a pass runs — decisions are still being made, and the
+  // words that cover them are still arriving — so an answer read mid-flight
+  // would name moments a minute before they were filled in. Coming out of a
+  // pass flips this back and asks again.
+  const transcriptSettled =
+    detail.meeting.status !== "recording" && !transcribeJob && !retranscribing;
+
+  useEffect(() => {
+    // Cleared first, always: a moment belongs to one meeting and one reading of
+    // it, so nothing from the last of either is left standing on screen while a
+    // fresh answer is on its way.
+    setLeftOut([]);
+    if (!transcriptSettled) return;
+    let cancelled = false;
+    leftOutMoments(meetingId)
+      .then((moments) => {
+        if (!cancelled) setLeftOut(moments);
+      })
+      .catch(() => {
+        // A question that couldn't be asked is not an answer: nothing is said,
+        // rather than a failed read turning into a claim about the transcript.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [meetingId, transcriptSettled]);
 
   const handleMerged = () => {
     listSpeakers(meetingId)
@@ -344,6 +392,52 @@ export function TranscriptTab({
           <span className="text-xs text-ink-faint">
             {transcribeFailure.error ?? notices.somethingWentWrong}
           </span>
+        </div>
+      )}
+
+      {/* Echo left these seconds out and nothing else wrote them down, so the
+          transcript reads there exactly like one where nobody spoke. Said
+          after the fact, on the meeting's own screen: never in the Live view,
+          where the reading isn't finished, and never in an export, which is
+          somebody else's document. Nothing at all when there are none. */}
+      {leftOut.length > 0 && (
+        <div className="flex flex-col gap-1.5 rounded-xl border border-hairline bg-surface-sunken p-4">
+          <span className="text-xs font-medium text-ink-soft">
+            {leftOutCopy.title(leftOut.length)}
+          </span>
+          <span className="text-xs text-ink-faint">
+            {leftOutCopy.explanation(leftOut.length)}
+          </span>
+          <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+            {leftOut.slice(0, LEFT_OUT_TIMES_SHOWN).map((moment) => {
+              const time = formatTimestamp(moment.tStartMs);
+              return (
+                <button
+                  key={moment.tStartMs}
+                  type="button"
+                  title={leftOutCopy.jumpLabel(time)}
+                  aria-label={leftOutCopy.jumpLabel(time)}
+                  onClick={() => scrollToMoment(moment.tStartMs)}
+                  className="rounded-full bg-surface px-2 py-0.5 text-xs tabular-nums text-ink-faint outline-none transition-colors hover:text-ink focus-visible:ring-2 focus-visible:ring-accent/40"
+                >
+                  {time}
+                </button>
+              );
+            })}
+            {leftOut.length > LEFT_OUT_TIMES_SHOWN && (
+              <span className="text-xs text-ink-ghost">
+                {leftOutCopy.andMore(leftOut.length - LEFT_OUT_TIMES_SHOWN)}
+              </span>
+            )}
+          </div>
+          {/* Only while there is still a recording to read: "Listen again" is
+              disabled without one, and a repair that cannot run is worse than
+              none offered. */}
+          {hasAudio && (
+            <span className="text-xs text-ink-faint">
+              {leftOutCopy.repair(copy.listenAgainButton)}
+            </span>
+          )}
         </div>
       )}
 

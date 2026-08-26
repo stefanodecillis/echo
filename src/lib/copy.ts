@@ -200,6 +200,46 @@ export const transcriptNote = {
   undone: "Put back the way Echo heard it.",
 } as const;
 
+/**
+ * The moments Echo heard and chose not to write down, said on the meeting's
+ * own screen (`src-tauri/src/asr/left_out.rs` decides which ones these are).
+ *
+ * Echo takes the microphone's copy of what this computer played out of the
+ * transcript so the other people are written down once instead of twice. That
+ * is right almost every time and nothing is missing — but it is measurably
+ * wrong sometimes, and when it is, the transcript reads exactly like one where
+ * nobody spoke. Only the moments that left no words at all reach this: a
+ * decision the transcript covers is not a person's problem, and saying "84
+ * stretches" about a perfectly good transcript would be noise nobody could act
+ * on.
+ *
+ * Zero-jargon, and specifically: not a word here names the machinery. What a
+ * person needs is what happened ("Echo took it for this computer's own sound"),
+ * when it happened, and what to do about it.
+ */
+export const leftOut = {
+  title: (count: number) =>
+    count === 1 ? "One moment has no words" : `${count} moments have no words`,
+  /** Says what Echo did and that nothing else covered those seconds — the two
+   * halves of why the transcript is silent there. */
+  explanation: (count: number) =>
+    count === 1
+      ? "Echo heard something through the microphone here and took it for this computer's own sound coming back, so it didn't write it down. Nothing else was written down at that moment either."
+      : "Echo heard something through the microphone at these times and took it for this computer's own sound coming back, so it didn't write them down. Nothing else was written down then either.",
+  /**
+   * The repair, naming the button that performs it so the two can never drift
+   * apart. Only shown while the recording still exists: without it there is
+   * nothing to read again, and offering a repair that can't run is worse than
+   * offering none.
+   */
+  repair: (buttonLabel: string) =>
+    `If somebody was speaking, “${buttonLabel}” reads the whole recording again and decides afresh.`,
+  jumpLabel: (time: string) => `Go to ${time} in the transcript`,
+  /** The list is a way in, not the record: the count above is the truth, and
+   * fifty times in a row is a wall rather than a list. */
+  andMore: (count: number) => `and ${count} more`,
+} as const;
+
 export const jobLine = {
   running: (label: string) => `${label}…`,
   waiting: (label: string) => `${label} — waiting its turn`,
