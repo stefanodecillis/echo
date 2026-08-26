@@ -38,21 +38,27 @@ pub mod keys {
     pub const GEMINI_MODEL: &str = "gemini_model";
     pub const DETECTION_SNOOZED_UNTIL: &str = "detection_snoozed_until";
     pub const MODEL_CATALOG_REVISION: &str = "model_catalog_revision";
-    /// File name of the speech weights that have been through a full load on
-    /// this machine. Written once a load finishes, and the record that the
+    /// The speech weights that have been through a full load on this machine,
+    /// and the build of Echo that loaded them: `file name @ build identity`,
+    /// written by [`crate::asr::models::mark_warmed`]. The record that the
     /// one-time setup those weights need here has been paid: on Apple silicon
     /// the first load of a model builds its encoder for this particular
     /// machine, which took sixteen minutes on 2026-08-24 — in the middle of a
     /// meeting, with nothing on screen to say so.
+    ///
+    /// The build is part of the value because the cache the OS keeps is keyed on
+    /// the binary: a rebuilt app with untouched weights compiled all over again
+    /// on 2026-08-26, and a marker naming only the model file called that warm
+    /// (see [`crate::asr::models::warm_up_needed`]).
     pub const SPEECH_WARMED_MODEL: &str = "speech_warmed_model";
-    /// File name of the speech weights Echo has *tried* to set up. Written
-    /// before the load starts, so a crash halfway through that compile cannot
-    /// turn into a quarter of an hour of it at every launch: the row that crash
-    /// interrupted is settled as failed rather than requeued
-    /// ([`crate::db::repo::requeue_orphaned_jobs`]), and this is what keeps
-    /// anything from queueing a fresh one. Taken back again when the attempt
-    /// turned out to have failed before the compile could have started (see
-    /// [`crate::asr::models::mark_warm_attempted`]).
+    /// The weights, and the build, Echo has *tried* to set up — same shape as
+    /// [`SPEECH_WARMED_MODEL`]. Written before the load starts, so a crash
+    /// halfway through that compile cannot turn into a quarter of an hour of it
+    /// at every launch: the row that crash interrupted is settled as failed
+    /// rather than requeued ([`crate::db::repo::requeue_orphaned_jobs`]), and
+    /// this is what keeps anything from queueing a fresh one. Taken back again
+    /// when the attempt turned out to have failed before the compile could have
+    /// started (see [`crate::asr::models::mark_warm_attempted`]).
     pub const SPEECH_WARM_ATTEMPTED: &str = "speech_warm_attempted";
     /// The words somebody typed into "Words Echo should know", as a JSON array
     /// of strings, newest last. See [`crate::settings::words_to_know`].

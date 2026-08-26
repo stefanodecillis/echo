@@ -329,6 +329,57 @@ impl EngineAsr {
             db,
         }
     }
+
+    /// Write down that the weights now loaded have been through their one-time
+    /// setup here, under this build of Echo.
+    ///
+    /// Whatever this machine had to build for these weights has been built and
+    /// cached by the OS by the time a load returns, so this is what the marker
+    /// records. It is keyed on the build as well as the file, because the cache
+    /// is (see [`crate::asr::models::warm_up_needed`]).
+    async fn remember_the_setup_is_paid(&self) {
+        let Some(file_name) = self
+            .worker
+            .configured()
+            .and_then(|config| config.model_path.file_name().map(|n| n.to_os_string()))
+        else {
+            return;
+        };
+        let file_name = file_name.to_string_lossy().into_owned();
+        if let Err(error) = crate::asr::models::mark_warmed(&self.db, &file_name).await {
+            // Nothing is broken by this: the worst it costs is doing the setup
+            // job again, which is fast now.
+            tracing::debug!(
+                %error,
+                model = %file_name,
+                "could not remember that these weights are ready on this machine"
+            );
+        }
+    }
+
+    /// Record a load that nobody asked to warm anything, and that turned out to
+    /// pay the one-time compile.
+    ///
+    /// The half of this that predicts a lost cache can only predict what it
+    /// knows about — a new binary. An OS update, a machine that evicted the
+    /// cache to reclaim disk, something nobody has thought of yet: those leave
+    /// the compile to be discovered, and the load that discovers it is the only
+    /// thing that knows. So a load that took long enough to have compiled
+    /// ([`crate::asr::engine::LIKELY_COMPILED_AT`]) writes the marker even
+    /// though it was a decode, or a catch-up pass, that happened to trigger it —
+    /// and the next launch knows this machine is warm instead of paying for it
+    /// twice.
+    ///
+    /// Costs one atomic read per call on the ordinary path.
+    async fn remember_an_unasked_compile(&self) {
+        if self.worker.take_compile_to_record() {
+            tracing::info!(
+                "the speech engine compiled itself for this machine while it was working; \
+                 remembering that so it is not done again"
+            );
+            self.remember_the_setup_is_paid().await;
+        }
+    }
 }
 
 impl AsrPort for EngineAsr {
@@ -341,35 +392,16 @@ impl AsrPort for EngineAsr {
             let backend = self.worker.load_now().await?;
             tracing::info!(?backend, "speech understanding is ready");
 
-            // The load is over, so whatever this machine had to build for these
-            // weights has been built and cached by the OS. This is the one place
-            // that can be recorded: every load anything asks for by name — a
+            // The load is over, and every load anything asks for by name — a
             // meeting starting, a download finishing, the setup job — comes
-            // through this method.
+            // through this method, so this is where it is written down.
             //
-            // Not quite every load, though: a decode that arrives with nothing
-            // loaded is served by `engine::ensure_loaded` on the engine thread,
-            // which never passes here, so the marker can stay unwritten after a
-            // load that really happened. That costs one redundant setup job,
-            // which finds the weights already in memory, returns in
-            // milliseconds and writes the marker — the repair, rather than a
-            // case to guard against.
-            if let Some(file_name) = self
-                .worker
-                .configured()
-                .and_then(|config| config.model_path.file_name().map(|n| n.to_os_string()))
-            {
-                let file_name = file_name.to_string_lossy().into_owned();
-                if let Err(error) = crate::asr::models::mark_warmed(&self.db, &file_name).await {
-                    // Nothing is broken by this: the worst it costs is doing the
-                    // setup job again, which is fast now.
-                    tracing::debug!(
-                        %error,
-                        model = %file_name,
-                        "could not remember that these weights are ready on this machine"
-                    );
-                }
-            }
+            // The flag is taken and dropped on the floor because this records
+            // the marker either way: whether this load compiled or found the
+            // cache already warm, the answer written is the same, and taking it
+            // saves the next decode a settings write that would say nothing new.
+            let _ = self.worker.take_compile_to_record();
+            self.remember_the_setup_is_paid().await;
             Ok(())
         })
     }
@@ -379,7 +411,15 @@ impl AsrPort for EngineAsr {
         job: TranscribeJob,
         on_partial: Option<PartialFn>,
     ) -> BoxFuture<'a, Result<Transcription, AsrError>> {
-        Box::pin(async move { self.worker.submit(job, on_partial).await })
+        Box::pin(async move {
+            // A decode that arrives with nothing loaded is served by the engine
+            // thread, which no pre-warm and no setup job hears about. Asked
+            // after the answer, not before, and whether or not it was an error:
+            // a load that compiled and then failed to decode still compiled.
+            let answer = self.worker.submit(job, on_partial).await;
+            self.remember_an_unasked_compile().await;
+            answer
+        })
     }
 
     fn transcribe_live<'a>(
@@ -388,7 +428,11 @@ impl AsrPort for EngineAsr {
         plan: crate::asr::engine::DecodePlan,
         on_partial: Option<PartialFn>,
     ) -> BoxFuture<'a, Result<Transcription, AsrError>> {
-        Box::pin(async move { self.worker.submit_with(job, plan, on_partial).await })
+        Box::pin(async move {
+            let answer = self.worker.submit_with(job, plan, on_partial).await;
+            self.remember_an_unasked_compile().await;
+            answer
+        })
     }
 
     fn hold_resident(&self, resident: bool) {
@@ -432,6 +476,8 @@ impl AsrPort for EngineAsr {
                 on_progress: control.on_progress,
                 ..Default::default()
             };
+            // Same reason as `transcribe`: this pass loads the engine itself
+            // when nothing else has, and that load can be the one that compiles.
             let report = crate::asr::catchup::run(
                 &self.worker,
                 db,
@@ -439,8 +485,9 @@ impl AsrPort for EngineAsr {
                 options,
                 &crate::asr::catchup::DiskAudio,
             )
-            .await?;
-            Ok(report.segments_written)
+            .await;
+            self.remember_an_unasked_compile().await;
+            Ok(report?.segments_written)
         })
     }
 
@@ -482,6 +529,8 @@ impl AsrPort for EngineAsr {
                 on_progress: control.on_progress,
                 ..Default::default()
             };
+            // Same reason as `transcribe`: this pass loads the engine itself
+            // when nothing else has, and that load can be the one that compiles.
             let report = crate::asr::catchup::run(
                 &self.worker,
                 db,
@@ -489,8 +538,9 @@ impl AsrPort for EngineAsr {
                 options,
                 &crate::asr::catchup::DiskAudio,
             )
-            .await?;
-            Ok(report.segments_written)
+            .await;
+            self.remember_an_unasked_compile().await;
+            Ok(report?.segments_written)
         })
     }
 
@@ -821,6 +871,64 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .push(event);
         }
+    }
+
+    /// The second half of the defence of 2026-08-26: a load that nobody asked to
+    /// warm anything, and that turned out to pay the one-time compile, is
+    /// written down anyway.
+    ///
+    /// Prediction only reaches what Echo can see coming — a new binary. An OS
+    /// update, a machine that evicted the cache, something nobody has thought of
+    /// yet: for those, the load that pays is the only thing that knows, and the
+    /// next launch has to inherit what it learnt.
+    #[tokio::test]
+    async fn a_compile_nobody_asked_for_is_written_down() {
+        let db = crate::db::connect_in_memory().await.expect("a database");
+        let asr = EngineAsr::new(db.clone());
+        asr.worker
+            .configure(crate::asr::engine::EngineConfig {
+                model_path: std::path::PathBuf::from("/nowhere/some-weights.bin"),
+                accelerator_path: None,
+                decode: crate::asr::catalog::default_preset().decode,
+                model_name: "test".to_string(),
+                model_revision: "test".to_string(),
+            })
+            .await;
+        asr.worker.pretend_a_load_compiled();
+
+        // An ordinary decode, and one that cannot even succeed: there are no
+        // weights at that path. Nothing here asked for a warm-up.
+        let answer = asr.transcribe(TranscribeJob::default(), None).await;
+        assert!(answer.is_err(), "there are no weights to decode with");
+
+        let marker = crate::db::repo::get_setting(&db, crate::settings::keys::SPEECH_WARMED_MODEL)
+            .await
+            .expect("the settings table")
+            .expect("the compile was written down");
+        assert!(
+            marker.starts_with("some-weights.bin@"),
+            "the marker names the weights and the build that loaded them: {marker}"
+        );
+        assert!(
+            !asr.worker.take_compile_to_record(),
+            "one load is written down once; the next decode has nothing to say"
+        );
+    }
+
+    /// A load that found the cache already warm is not a compile, and there is
+    /// nothing for a decode to write down about it.
+    #[tokio::test]
+    async fn an_ordinary_decode_writes_nothing() {
+        let db = crate::db::connect_in_memory().await.expect("a database");
+        let asr = EngineAsr::new(db.clone());
+        let answer = asr.transcribe(TranscribeJob::default(), None).await;
+        assert!(answer.is_err(), "nothing is configured to decode with");
+        assert_eq!(
+            crate::db::repo::get_setting(&db, crate::settings::keys::SPEECH_WARMED_MODEL)
+                .await
+                .expect("the settings table"),
+            None
+        );
     }
 
     /// Stands in for the tray arm on the day it took the meeting down: blows up

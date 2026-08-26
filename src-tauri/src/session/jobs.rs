@@ -2142,12 +2142,58 @@ mod tests {
         );
 
         // The one attempt is on the record, against these weights by name.
+        //
+        // Contract change of 2026-08-26: the marker names the build of Echo that
+        // made the attempt as well as the weights, because the compiled encoder
+        // is cached against the binary and a rebuilt app has to pay again. The
+        // weights are still the front of it; what follows the `@` is whichever
+        // build is running the test.
         assert_eq!(
-            repo::get_setting(&db, crate::settings::keys::SPEECH_WARM_ATTEMPTED)
-                .await
-                .unwrap()
-                .as_deref(),
+            attempt_marker(&db).await.as_deref().map(name_in_marker),
             Some("some-weights.bin")
+        );
+    }
+
+    /// What the settings table is holding as the one attempt, if anything.
+    async fn attempt_marker(db: &Db) -> Option<String> {
+        repo::get_setting(db, crate::settings::keys::SPEECH_WARM_ATTEMPTED)
+            .await
+            .expect("the settings table")
+    }
+
+    /// The weights half of a marker, which is all these tests are about; the
+    /// build half belongs to `asr::models`, which is where it is tested.
+    fn name_in_marker(marker: &str) -> &str {
+        marker.split('@').next().expect("a marker names weights")
+    }
+
+    /// The order the whole one-attempt policy rests on: the attempt is on the
+    /// record *before* the load begins, not after it comes back.
+    ///
+    /// The window this test looks into is the one a crash falls into. Anything
+    /// that takes the process down inside the compile — an out-of-memory, a
+    /// driver fault, somebody force-quitting an app that looks frozen — leaves
+    /// the marker standing, and that is what stops the next launch from starting
+    /// the same quarter of an hour again.
+    #[tokio::test]
+    async fn the_attempt_is_on_the_record_before_the_load_starts() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let job = a_setup_job_for(&db, "some-weights.bin").await;
+        let (mut ctx, _seen) = context_for(&db, job).await;
+        let asr = Arc::new(super::super::mock::MockAsr::new());
+        asr.prewarm_takes(Duration::from_millis(300));
+        ctx.asr = asr;
+
+        let while_it_loads = async {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            attempt_marker(&db).await
+        };
+        let (outcome, midway) = tokio::join!(prepare_engine(&ctx), while_it_loads);
+        outcome.expect("the setup finishes");
+        assert_eq!(
+            midway.as_deref().map(name_in_marker),
+            Some("some-weights.bin"),
+            "the load had not come back yet, and the attempt was already written"
         );
     }
 
@@ -2182,9 +2228,7 @@ mod tests {
             "a failed setup is a row that failed, not a silent nothing: {outcome:?}"
         );
         assert_eq!(
-            repo::get_setting(&db, crate::settings::keys::SPEECH_WARM_ATTEMPTED)
-                .await
-                .unwrap(),
+            attempt_marker(&db).await,
             None,
             "nothing expensive happened, so the next launch is free to try again"
         );
@@ -2205,10 +2249,7 @@ mod tests {
         let outcome = prepare_engine(&ctx).await;
         assert!(matches!(outcome, Err(JobFailure::Preempted)), "{outcome:?}");
         assert_eq!(
-            repo::get_setting(&db, crate::settings::keys::SPEECH_WARM_ATTEMPTED)
-                .await
-                .unwrap()
-                .as_deref(),
+            attempt_marker(&db).await.as_deref().map(name_in_marker),
             Some("some-weights.bin"),
             "the row comes back for the rest of it; it does not start over"
         );

@@ -1518,6 +1518,14 @@ struct Shared {
     /// language, and a policy still pinned to Danish in the worker's own memory
     /// would hand the repair pass the very answer it is running away from.
     policies: Mutex<HashMap<String, LanguagePolicy>>,
+    /// Raised by a load that looks like it paid the one-time encoder compile
+    /// ([`compiled_for_this_machine`]), and lowered by whoever writes that down.
+    ///
+    /// The engine thread cannot reach the database itself — it is a blocking
+    /// thread and the marker is async work — so this is how a compile nobody
+    /// asked for gets remembered: [`EngineWorker::take_compile_to_record`], read
+    /// by the port after anything that could have loaded.
+    compiled_unrecorded: AtomicBool,
 }
 
 /// Serialises jobs onto one loaded engine, loading on demand and unloading when
@@ -1597,6 +1605,32 @@ impl EngineWorker {
     /// Is something still holding the engine?
     pub fn is_resident(&self) -> bool {
         self.shared.resident.load(Ordering::SeqCst)
+    }
+
+    /// Take the record of a load that compiled the encoder for this machine.
+    ///
+    /// `true` at most once per such load, and to exactly one caller: taking it
+    /// clears it, and whoever took it owes the marker that says this machine is
+    /// warm ([`crate::asr::models::mark_warmed`]). One atomic read is what this
+    /// costs on the ordinary path, where nothing compiled and there is nothing
+    /// to write.
+    pub fn take_compile_to_record(&self) -> bool {
+        self.shared
+            .compiled_unrecorded
+            .swap(false, Ordering::SeqCst)
+    }
+
+    /// Raise that flag as a real load would.
+    ///
+    /// Only a test calls this. The compile it stands for takes a quarter of an
+    /// hour on a machine that has never seen these weights and is impossible on
+    /// one that has, so what can be tested is what happens *after* it — that the
+    /// port picks the load up and writes it down.
+    #[cfg(test)]
+    pub fn pretend_a_load_compiled(&self) {
+        self.shared
+            .compiled_unrecorded
+            .store(true, Ordering::SeqCst);
     }
 
     /// Choose what to load. Changing the weights releases whatever is loaded, so
@@ -2068,7 +2102,18 @@ fn ensure_loaded<'a>(
     }
     if engine.is_none() {
         let loaded = Engine::load(wanted, shared.abort.clone())?;
-        *shared.backend.lock().expect("backend report poisoned") = loaded.backend();
+        let backend = loaded.backend();
+        if backend.compiled_for_this_machine {
+            // Every load reaches here, including the one served straight off a
+            // decode that arrived with nothing loaded — the path that no
+            // pre-warm and no setup job knows about. If this load paid the
+            // compile, then whatever had emptied the cache has now been paid
+            // for, and that is worth writing down wherever the compile
+            // happened. Someone else takes it from here; the engine thread has
+            // no database.
+            shared.compiled_unrecorded.store(true, Ordering::SeqCst);
+        }
+        *shared.backend.lock().expect("backend report poisoned") = backend;
         *engine = Some(loaded);
         shared.loaded.store(true, Ordering::SeqCst);
     }
