@@ -185,8 +185,10 @@ microphone, a permission dialog to click, and 4.3 GB of weights.
   now records. Note that Hugging Face's ETag on these is *not* the SHA-256, so a
   hash has to come from the download rather than from a HEAD.
   Range + If-Range resume was confirmed separately against the same CDN.
-- Click-to-play in the transcript, live speaker clustering (deliberately out of
-  scope for v1), and installer signing/notarization are not done.
+- Click-to-play in the transcript and live speaker clustering are deliberately
+  out of scope for v1. Releases are code-signed and update-signed, but **not
+  notarized by Apple** — see Installing below for what that means on first
+  launch.
 
 CI compiles and tests on both platforms. It cannot check audio capture,
 permission prompts or tray behaviour, because a headless runner has no microphone
@@ -204,16 +206,76 @@ and no keys.
 Recording captures everything your computer plays, not only the meeting window.
 Echo says so rather than implying otherwise.
 
-## Local build signing
+## Installing
 
-`tauri.conf.json` signs release bundles with the "Echo Local Signing" certificate — a
-self-signed code-signing certificate in the login keychain of the machine that builds.
-It exists so macOS permission grants (microphone, screen recording) survive rebuilds:
-ad-hoc signatures are re-keyed on every build and macOS forgets the grants. On a new
-machine, either create such a certificate (Keychain Access → Certificate Assistant →
-Create a Certificate → type "Code Signing", name it "Echo Local Signing") or change
-`bundle.macOS.signingIdentity` to `"-"` and accept re-prompting during development.
-Proper Developer ID signing + notarization replaces this for distribution.
+Releases are on the [releases page](https://github.com/stefanodecillis/echo/releases).
+
+**macOS.** Download the `.dmg`, drag Echo to Applications. The first launch says
+Apple cannot verify Echo, because Echo is not notarized — notarization needs a paid
+Apple Developer account. Right-click Echo and choose **Open**, once, and macOS
+remembers. Nothing about that warning is specific to Echo; it is what every
+unnotarized app does.
+
+**Linux.** The AppImage keeps itself up to date. The `.deb` does not — download a
+newer one when you want it.
+
+## Keeping itself up to date
+
+Echo asks GitHub every half hour whether there is a newer release. If there is, it
+downloads and installs it quietly and then offers a restart, in the corner and in
+the tray menu. Nothing restarts on its own.
+
+It never does this while a meeting is being recorded, or while a meeting that has
+finished still has its transcript or recap outstanding — those get the machine
+first, and the check simply comes back later. Restarting mid-work is safe anyway:
+parked work is requeued at launch with its progress intact.
+
+Restarting after an update means Echo gets ready to understand speech again, which
+takes a few minutes: the compiled speech model is keyed to the app that asked for
+it, so a new app means a new compile. Recording still works throughout — audio goes
+to disk from the first second and the words fill in afterwards.
+
+Every update carries an ed25519 signature, and Echo refuses any bundle that does
+not verify against the public key compiled into it. Being able to serve the release
+endpoint is not enough to hand Echo new code.
+
+## Signing
+
+Two certificates, doing two different jobs. Neither is an Apple Developer ID.
+
+**"Echo Local Signing"** — self-signed, in the login keychain of the machine that
+builds, named in `bundle.macOS.signingIdentity`. It exists so macOS permission
+grants (microphone, screen recording) survive rebuilds: ad-hoc signatures are
+re-keyed on every build and macOS forgets the grants. On a new machine either
+create one (Keychain Access → Certificate Assistant → Create a Certificate → type
+"Code Signing") or set the identity to `"-"` and accept re-prompting.
+
+**"Echo Release Signing"** — self-signed too, but it lives in a password manager
+and in this repository's secrets, and CI signs every release with it. It has to
+never change: macOS keys those same permission grants to the signing identity, so
+a new certificate means every user grants microphone and screen recording again.
+
+What self-signing does **not** do is satisfy Gatekeeper. That needs notarization,
+which needs the paid account. The release workflow is ready for it — Tauri
+notarizes when `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID` are set and skips
+with a warning when they are not, so switching it on is three secrets and no code.
+
+## Cutting a release
+
+```sh
+node scripts/version.mjs 0.2.0     # writes all three files that carry the version
+git commit -am "chore: 0.2.0" && git tag v0.2.0 && git push --follow-tags
+```
+
+The tag builds both platforms and opens a **draft** release. Check the artifacts,
+then publish — publishing is what makes `latest.json` live, and every installed
+copy is polling it.
+
+The version lives in `package.json`, `src-tauri/Cargo.toml` and
+`src-tauri/tauri.conf.json`, and the updater compares releases against only the
+last of those. `scripts/version.mjs` writes all three and CI refuses a tag that
+disagrees with them, because that particular mistake makes every installed copy
+download the same release every half hour forever.
 
 ## License
 

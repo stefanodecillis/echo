@@ -25,6 +25,7 @@ pub struct AppState {
     pub paths: paths::AppPaths,
     pub session: session::SessionManager,
     pub detect: detect::Watcher,
+    pub updates: crate::update::Watcher,
 }
 
 // ---------------------------------------------------------------------------
@@ -1905,6 +1906,35 @@ pub async fn get_panel_state(app: AppHandle) -> CmdResult<Option<crate::events::
         .and_then(|panel| panel.showing()))
 }
 
+/// What Echo knows about a newer version of itself.
+///
+/// Asked for on mount as well as listened for: the answer can be settled before
+/// any window exists, and a screen that only listens would be blind to it for
+/// the rest of the session.
+#[tauri::command]
+pub async fn get_update_state(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::events::UpdateStatePayload> {
+    Ok(state.updates.state())
+}
+
+/// Quit and come straight back on the version that was downloaded.
+///
+/// Refuses while a meeting is being recorded, and says so in the same words as
+/// every other thing that will not interrupt a recording. Work belonging to a
+/// meeting that has already finished is *not* a reason to refuse: parking it and
+/// picking it up again is exactly what a restart does to it anyway, and launch
+/// recovery puts it back in the queue with its progress intact.
+#[tauri::command]
+pub async fn restart_for_update(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    let capture = state.session.status().await.state;
+    if crate::session::engine_is_needed_by_capture(capture) {
+        return Err(session::SessionError::AlreadyRecording.into());
+    }
+    crate::restart_for_update(&app);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn quit_app(app: AppHandle) -> CmdResult<()> {
     // Same path as the tray: close a live recording, park the queue, free the
@@ -2013,6 +2043,9 @@ macro_rules! echo_command_handler {
             $crate::commands::get_onboarding_state,
             $crate::commands::complete_onboarding,
             $crate::commands::get_system_capabilities,
+            // keeping Echo current
+            $crate::commands::get_update_state,
+            $crate::commands::restart_for_update,
             // window
             $crate::commands::show_main_window,
             $crate::commands::quit_app,

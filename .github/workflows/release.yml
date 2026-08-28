@@ -1,0 +1,219 @@
+# Cutting a release.
+#
+# Pushing a `v*` tag builds Echo for macOS and Linux, signs it, and publishes a
+# draft GitHub release with the bundles and the `latest.json` that installed
+# copies read.
+#
+# TWO SIGNATURES, DOING DIFFERENT JOBS
+#
+#   * The **ed25519 update signature** (`TAURI_SIGNING_PRIVATE_KEY`) is what
+#     makes auto-update safe. Echo carries the matching public key compiled in
+#     and refuses any bundle that does not verify against it, so serving the
+#     endpoint is not enough to ship code to anybody. Without this secret the
+#     build still succeeds — and produces updates no released Echo will accept.
+#
+#   * The **Apple code signature** (`APPLE_*`) is a self-signed certificate, and
+#     it is not about Gatekeeper: an unnotarized app still warns on first launch.
+#     It is about macOS keying microphone and screen-recording permission to the
+#     signing identity. Same identity every release means a person grants those
+#     once. Change the certificate and everybody grants them again, so that
+#     `.p12` is the most irreplaceable thing in this pipeline.
+#
+# NOTARIZATION, WHEN IT IS WANTED
+# Nothing here needs changing. Tauri notarizes when `APPLE_ID`, `APPLE_PASSWORD`
+# and `APPLE_TEAM_ID` are present in the environment and skips with a warning
+# when they are not. Add those three secrets and pass them through below.
+#
+# The release is left as a **draft** on purpose: `latest.json` is what every
+# installed copy is polling, so publishing is the irreversible half and belongs
+# to a person who has checked the artifacts.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist)"
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  version-gate:
+    name: One version, everywhere
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # The check that matters most before anything is published. A tag that
+      # disagrees with tauri.conf.json ships a release every installed copy
+      # downloads, installs, fails to recognise as itself, and downloads again —
+      # every half hour, forever.
+      #
+      # The tag arrives through the environment rather than being interpolated
+      # into the command. Only somebody with push access can name it, so this is
+      # not the shape of a real attack — but a tag is still a string a person
+      # typed, and a shell is still a shell.
+      - name: The tag and the three files must agree
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: node scripts/version.mjs --check "$TAG"
+
+  release:
+    name: ${{ matrix.name }}
+    needs: version-gate
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Apple Silicon)
+            os: macos-14
+            target: aarch64-apple-darwin
+          - name: Linux (x86_64)
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # Same list as ci.yml, including the Vulkan shader compiler whisper needs
+      # on Linux. Kept verbatim rather than shared: a release build that fails on
+      # a missing library is worth more than the deduplication.
+      - name: Install Linux system libraries
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config libssl-dev libglib2.0-dev libgtk-3-dev \
+            librsvg2-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev libayatana-appindicator3-dev libxdo-dev \
+            libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev cmake
+          sudo apt-get install --no-install-recommends -y libvulkan-dev glslc \
+            || sudo apt-get install --no-install-recommends -y libvulkan-dev glslang-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: release-${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # The certificate goes into a keychain of its own, which dies with the
+      # runner. `-T /usr/bin/codesign` plus the partition list is what stops
+      # codesign pausing to ask for permission nobody is there to give.
+      #
+      # A self-signed certificate has no chain to anything the system believes
+      # in, so it reports `CSSMERR_TP_NOT_TRUSTED` and
+      # `security find-identity -v` counts zero valid identities. That was
+      # rehearsed locally on 2026-08-28 and **codesign signs with it anyway** —
+      # the `-v` filter is stricter than the signing path. So the trust step
+      # below is allowed to fail, and the check that decides this step's fate
+      # looks for the identity without `-v`.
+      - name: Trust the release certificate (macOS)
+        if: matrix.os == 'macos-14'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            echo "::error::APPLE_CERTIFICATE is not set. A release signed with a"
+            echo "::error::different identity makes every user grant microphone and"
+            echo "::error::screen-recording permission again."
+            exit 1
+          fi
+          KEYCHAIN="$RUNNER_TEMP/echo-release.keychain-db"
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # Search list, not default keychain: codesign only looks at what is on
+          # the list, and the login keychain may not exist on a runner.
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain
+
+          # Belt and braces, and deliberately non-fatal: this only turns
+          # "identity found, not trusted" into "valid identity", which nothing in
+          # the signing path requires. The runner is destroyed afterwards, so a
+          # self-signed root in its System keychain costs nothing.
+          openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -clcerts -nokeys \
+            -passin pass:"$APPLE_CERTIFICATE_PASSWORD" \
+            -out "$RUNNER_TEMP/cert.pem" 2>/dev/null || true
+          sudo security add-trusted-cert -d -r trustRoot \
+            -k /Library/Keychains/System.keychain "$RUNNER_TEMP/cert.pem" || \
+            echo "note: could not mark the certificate trusted; codesign does not need it"
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/cert.pem"
+
+          # Without `-v`, because an untrusted self-signed certificate is exactly
+          # what this is and `-v` would report none. What must be true is that
+          # codesign can find it by name.
+          security find-identity -p codesigning "$KEYCHAIN"
+          if ! security find-identity -p codesigning "$KEYCHAIN" \
+               | grep -q "$APPLE_SIGNING_IDENTITY"; then
+            echo "::error::'$APPLE_SIGNING_IDENTITY' is not in the keychain. The"
+            echo "::error::certificate and APPLE_SIGNING_IDENTITY must name the same thing."
+            exit 1
+          fi
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Refuses any bundle it did not sign. Without it, updates are unsigned
+          # and every released Echo rejects them.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Overrides bundle.macOS.signingIdentity in tauri.conf.json, which
+          # names a certificate that only exists on one laptop.
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # Notarization happens if and only if these three are set. Unset today.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: Echo __VERSION__
+          releaseBody: |
+            Echo __VERSION__.
+
+            macOS: download the `.dmg`, drag Echo to Applications. The first
+            launch shows a warning because Echo is not notarized by Apple —
+            right-click Echo and choose Open, once. Updates after that install
+            themselves.
+
+            Linux: the AppImage updates itself. The `.deb` does not; download a
+            newer one when you want it.
+          # A draft, because latest.json is live the moment it is published and
+          # every installed copy is polling for it.
+          releaseDraft: true
+          prerelease: false
+          # The .app.tar.gz + .sig pair and the latest.json that points at them.
+          includeUpdaterJson: true
+          args: --target ${{ matrix.target }}

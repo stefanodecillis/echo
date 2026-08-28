@@ -78,6 +78,7 @@ import type {
   TranscriptRevisedPayload,
   TrayActionPayload,
   TrayStatePayload,
+  UpdateStatePayload,
   UiError,
   VocabularyWord,
 } from "./types";
@@ -600,6 +601,28 @@ export const showMainWindow = () => call<void>("show_main_window");
 export const quitApp = () => call<void>("quit_app");
 
 // ---------------------------------------------------------------------------
+// Keeping Echo current
+// ---------------------------------------------------------------------------
+
+/**
+ * What Echo knows about a newer version of itself.
+ *
+ * Asked for on mount as well as listened for: an update can be found and
+ * installed before any window exists, and a screen that only listened would be
+ * blind to it for the rest of the session.
+ */
+export const getUpdateState = () => call<UpdateStatePayload>("get_update_state");
+
+/**
+ * Quit and come straight back on the version already downloaded.
+ *
+ * Refuses while a meeting is being recorded — the error carries the same
+ * sentence as everything else that will not interrupt a recording. Nothing comes
+ * back on success, because on success this process is gone.
+ */
+export const restartForUpdate = () => call<void>("restart_for_update");
+
+// ---------------------------------------------------------------------------
 // The floating panel
 // ---------------------------------------------------------------------------
 
@@ -651,6 +674,7 @@ export const EVENTS = {
   recoveryAvailable: "echo://recovery-available",
   /** Only ever delivered to the floating panel window. */
   panelState: "echo://panel-state",
+  updateState: "echo://update-state",
 } as const;
 
 export type EventName = (typeof EVENTS)[keyof typeof EVENTS];
@@ -677,6 +701,7 @@ export interface EventPayloads {
   [EVENTS.navigate]: NavigatePayload;
   [EVENTS.recoveryAvailable]: RecoveryAvailablePayload;
   [EVENTS.panelState]: PanelStatePayload;
+  [EVENTS.updateState]: UpdateStatePayload;
 }
 
 /**

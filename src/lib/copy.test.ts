@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { jobLine, labels, leftOut, meeting, nav, workChip } from "./copy";
+import { jobLine, labels, leftOut, meeting, nav, update, workChip } from "./copy";
 
 /**
  * The sentence Echo says about moments it left out of a transcript.
@@ -130,5 +130,51 @@ describe("what a meeting row says about unfinished work", () => {
     // Two treatments of the same state in one screen have to use one sentence.
     expect(labels.meetingStatus.interrupted).toBe("Didn't finish");
     expect(meeting.infoWorkingTitle).toBe(nav.workingLabel);
+  });
+});
+
+/**
+ * What Echo says when a newer version of itself is waiting.
+ *
+ * A pill somebody reads once and acts on, so it has to be true, plain, and
+ * silent about machinery — where the version came from, what it is called, and
+ * how big it was are all none of the reader's business.
+ */
+describe("what Echo says about a new version", () => {
+  it("says what is waiting and what pressing it costs", () => {
+    expect(update.readyTitle).toContain("new version");
+    expect(update.readyAction.toLowerCase()).toContain("restart");
+    // The honest half: restarting means paying for the speech setup again,
+    // because the compiled model is keyed to the app that asked for it. A person
+    // who is told beforehand can pick their moment.
+    expect(update.readySetupHint.toLowerCase()).toContain("getting ready");
+  });
+
+  it("promises to wait rather than offering something it will refuse", () => {
+    expect(update.waitingForMeeting.toLowerCase()).toContain("meeting");
+    expect(update.waitingForMeeting.toLowerCase()).not.toContain("click");
+  });
+
+  it("names no machinery and no numbers", () => {
+    const everything = Object.values(update);
+    for (const said of everything) {
+      expect(said.trim().length).toBeGreaterThan(0);
+      // No version strings, no sizes, no percentages.
+      expect(said).not.toMatch(/\d/);
+    }
+    const joined = everything.join(" ").toLowerCase();
+    for (const jargon of [
+      "github",
+      "download",
+      "bundle",
+      "signature",
+      "artifact",
+      "binary",
+      "install",
+      "updater",
+      "release",
+    ]) {
+      expect(joined).not.toContain(jargon);
+    }
   });
 });

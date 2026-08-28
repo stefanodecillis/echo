@@ -33,7 +33,7 @@ Windows. Calendar integration. Chat-with-meetings (schema leaves room). Team dep
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Shell | Tauri 2.x | Tray, single-instance, notifications, updater plugins |
+| Shell | Tauri 2.x | Tray, single-instance, notifications, updater plugins (all in use as of 2026-08-28) |
 | Frontend | React 18 + TS + Vite + Tailwind | Sana-style minimal UI |
 | ASR | whisper-rs (whisper.cpp) in-process | **Per-OS builds with backends compiled in**: macOS binary = `metal`+`coreml` features; Linux binary = `vulkan` feature. Runtime = GPU *init* attempt with CPU fallback (`n_threads` clamped, conservative default). CoreML needs a matching `*-encoder.mlmodelc` per model — catalogued and downloaded alongside the GGML file, and paired to *its own* GGML file so an older model still serving a meeting loads its own encoder; accelerates encoder only. |
 | VAD | Silero VAD via `ort` | CPU (tiny). On Linux, all ONNX work is CPU-bound (no Vulkan EP in ort) — accepted, stated in Advanced settings. |
@@ -46,7 +46,7 @@ Windows. Calendar integration. Chat-with-meetings (schema leaves room). Team dep
 | Secrets | `keyring` → Keychain / Secret Service | Off UI thread; distinct handling for absent/locked/cancelled; **never** plaintext fallback; recording works without stored credentials |
 | HTTP | `reqwest` | Downloads: SHA-256 verify, length check, Range+ETag resume, temp file + fsync + atomic rename, disk-space preflight, stale-partial cleanup |
 
-Distribution: macOS aarch64 `.dmg` (Developer ID signing + notarization + hardened runtime + usage-description plist entries; permission testing on the notarized build); Linux x86_64 `.AppImage` + `.deb` built on oldest supported base (declares WebKitGTK/AppIndicator deps). CI compiles both + runs unit/fixture tests; audio/permission/tray behavior verified on a manual hardware matrix (headless CI cannot).
+Distribution: macOS aarch64 `.dmg`, Linux x86_64 `.AppImage` + `.deb` built on oldest supported base (declares WebKitGTK/AppIndicator deps). CI compiles both + runs unit/fixture tests; audio/permission/tray behavior verified on a manual hardware matrix (headless CI cannot). **Amendment (2026-08-28, implemented):** signing is hardened runtime + usage-description plists + a *self-signed* "Echo Release Signing" certificate held in CI, not a Developer ID — the fee is not paid, so first launch shows Gatekeeper's unverified-developer warning and the README tells people to right-click → Open once. The certificate is chosen once and never changed, because macOS keys the microphone and screen-recording grants to the signing identity. Notarization is a switch, not a rewrite: Tauri does it when `APPLE_ID`/`APPLE_PASSWORD`/`APPLE_TEAM_ID` are set. Updates are secured separately and properly, by an ed25519 signature Echo verifies against a public key compiled into it; a `v*` tag builds a draft release with `latest.json`, and the version-in-three-files gate exists because a tag that disagrees with `tauri.conf.json` makes every installed copy re-download the same release forever.
 
 ## 3. Architecture
 

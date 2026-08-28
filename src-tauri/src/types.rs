@@ -1523,6 +1523,28 @@ pub enum TrayState {
     Processing,
 }
 
+/// How far along Echo is with fetching a newer version of itself.
+///
+/// Only `Ready` reaches a person. The rest exist so a screen that asks outright
+/// gets a truthful answer, and so the log can tell "nothing to do" apart from
+/// "could not ask" — which look identical from the outside and mean very
+/// different things.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UpdateState {
+    /// Nothing to do: this is the newest Echo there is.
+    #[default]
+    Idle,
+    Checking,
+    Downloading,
+    /// A new version is on disk. All that is left is a restart, and that is the
+    /// person's to ask for.
+    Ready,
+    /// The last attempt did not work. Deliberately not shown to anybody: the app
+    /// they have works, and the next attempt is half an hour away.
+    Failed,
+}
+
 /// What the person picked in the tray menu, forwarded to the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

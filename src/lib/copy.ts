@@ -310,6 +310,28 @@ export const workChip = {
   deferred: "Paused until the recording ends",
 } as const;
 
+/**
+ * The corner pill when a newer Echo is sitting on disk waiting to be run.
+ *
+ * Says what is true and what it costs, and nothing about how it got there: no
+ * release numbers, no download, no mention of where it came from. Somebody who
+ * wants that detail is not reading a pill.
+ *
+ * The second line is the honest part. Restarting means Echo has to get ready to
+ * understand speech all over again on this computer — the compiled model is
+ * keyed to the app that asked for it — and that can take a while. Saying so is
+ * the difference between a person choosing their moment and a person wondering
+ * why Echo went quiet right after they updated it.
+ */
+export const update = {
+  readyTitle: "A new version of Echo is ready",
+  readyAction: "Restart to use it",
+  readySetupHint: "Echo will spend a few minutes getting ready afterwards",
+  /** While a meeting is being recorded. Restarting then is refused outright, so
+   * this says what will happen instead of offering something that will not. */
+  waitingForMeeting: "Echo will update when your meeting is done",
+} as const;
+
 /** Words used across more than one screen: dialogs, toasts, generic buttons. */
 export const common = {
   close: "Close",
