@@ -256,9 +256,11 @@ never change: macOS keys those same permission grants to the signing identity, s
 a new certificate means every user grants microphone and screen recording again.
 
 What self-signing does **not** do is satisfy Gatekeeper. That needs notarization,
-which needs the paid account. The release workflow is ready for it — Tauri
-notarizes when `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID` are set and skips
-with a warning when they are not, so switching it on is three secrets and no code.
+which needs the paid account. Switching it on is three secrets and no code:
+add `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID` and the release workflow
+notarizes. It checks that all three have values first — an unset GitHub secret
+interpolates to an empty string, and Tauri reads a variable that exists but is
+empty as "notarize this", then fails on it after the build.
 
 ## Cutting a release
 
