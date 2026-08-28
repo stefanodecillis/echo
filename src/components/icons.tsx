@@ -152,6 +152,29 @@ export function DownloadIcon(props: IconProps) {
 /** A trash can, for the hover-only delete affordance on a meeting row. Same
  * stroke weight as the rest of the set (1.6) so it doesn't read as timid next
  * to Search/Close/Plus. */
+export function UpdateReadyIcon(props: IconProps) {
+  // An arrow that has arrived rather than one still moving: it points up, out of
+  // a filled base. `DownloadIcon` is the one that means "bytes on their way";
+  // this one means "here, waiting".
+  return (
+    <svg {...base(props)}>
+      <path
+        d="M10 13V4M6.5 7.5 10 4l3.5 3.5"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M4 15.5h12"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
 export function TrashIcon(props: IconProps) {
   return (
     <svg {...base(props)}>

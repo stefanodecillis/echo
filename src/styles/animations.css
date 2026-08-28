@@ -34,3 +34,36 @@
 .animate-toast-in {
   animation: echo-toast-in 0.16s ease-out;
 }
+
+/**
+ * Still working on the last meeting: one arc travelling round, unhurried.
+ *
+ * Deliberately the tray's processing motif (docs/DESIGN.md §4 — "an arc
+ * travelling round the mark, so 'still working on the last meeting' is never
+ * mistaken for 'still listening'"), so the menu bar and the meeting list say the
+ * same thing the same way. Deliberately not the recording dot's pulse, and
+ * deliberately not a colour: `live` is recording-or-error and nothing else, so
+ * there is no second hue to spend on the difference and the motion has to carry
+ * it on its own.
+ *
+ * Slower than Tailwind's `animate-spin`, because half a dozen of these in a list
+ * at a second each is a busy screen and none of it is urgent.
+ */
+@keyframes echo-working-arc {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-working-arc {
+  animation: echo-working-arc 1.6s linear infinite;
+}
+
+/* Somebody who asked for less motion gets the ring standing still — which is
+   why this is a ring with a gap in it and not a fading dot: the shape says
+   "going round" without moving. Same posture as styles/panel.css. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-working-arc {
+    animation: none;
+  }
+}

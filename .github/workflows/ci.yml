@@ -122,6 +122,17 @@ jobs:
             libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev cmake \
             libvulkan-dev glslc || true
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Echo's version lives in three files that nothing keeps in step, and the
+      # updater compares releases against only one of them. Drift means every
+      # installed copy downloads the same release forever — see
+      # scripts/version.mjs.
+      - name: One version, in all three places
+        run: node scripts/version.mjs --check
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -150,12 +161,19 @@ jobs:
       # A screen naming a job kind is unavoidable — `inProgressJob` is asked
       # which kinds it is about — and the label beside it comes from
       # `labels.jobKind`, which this check still reads.
+      #
+      # Tests are excluded for the same reason as the contract files: a test that
+      # asserts Echo never says "diarization" has to be able to write the word
+      # down. Nothing in a `.test.ts` is rendered, and the alternative — spelling
+      # the word in pieces to slip past a grep — is the kind of cleverness that
+      # costs the next reader more than the check is worth.
       - name: No jargon in user-facing strings
         run: |
           set -uo pipefail
           hits=$(grep -rnoiE '"[^"]*(whisper|onnx|diariz|screencapturekit|pipewire|ggml|coreml|silero|pyannote)[^"]*"' \
                    src --include='*.tsx' --include='*.ts' \
                    | grep -vE 'src/lib/(copy|types|ipc)\.ts' \
+                   | grep -vE '\.test\.tsx?:' \
                    | grep -vE ':"diarize"$' || true)
           if [ -n "$hits" ]; then
             echo "$hits"

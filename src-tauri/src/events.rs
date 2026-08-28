@@ -67,6 +67,8 @@ pub const NAVIGATE: &str = "echo://navigate";
 pub const RECOVERY_AVAILABLE: &str = "echo://recovery-available";
 /// What the floating panel should be showing. Sent to the `panel` window only.
 pub const PANEL_STATE: &str = "echo://panel-state";
+/// Echo found, fetched, or failed to fetch a newer version of itself.
+pub const UPDATE_STATE: &str = "echo://update-state";
 
 /// Every event name, for tests that assert the TS mirror is complete.
 pub const ALL: &[&str] = &[
@@ -90,6 +92,7 @@ pub const ALL: &[&str] = &[
     NAVIGATE,
     RECOVERY_AVAILABLE,
     PANEL_STATE,
+    UPDATE_STATE,
 ];
 
 // ---------------------------------------------------------------------------
@@ -443,5 +446,34 @@ mod tests {
         })
         .unwrap();
         assert!(!anonymous.contains("appName"), "{anonymous}");
+    }
+}
+
+/// `UPDATE_STATE`
+///
+/// Carries the whole answer rather than a delta, so a window that opens in the
+/// middle of it draws the same thing as one that was already there — the rule
+/// the job event had to learn (see `migrations/0009_job_stage.sql`).
+///
+/// `notes` is whatever the release said about itself. Nothing renders it yet;
+/// it travels because throwing it away here would mean a second round trip the
+/// day something does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateStatePayload {
+    pub state: crate::types::UpdateState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+impl UpdateStatePayload {
+    /// A state with nothing else worth saying about it.
+    pub fn of(state: crate::types::UpdateState) -> Self {
+        Self {
+            state,
+            ..Default::default()
+        }
     }
 }

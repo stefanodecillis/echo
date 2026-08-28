@@ -2,7 +2,7 @@
  * The one piece of client state that more than one screen needs at once.
  *
  * Everything else — a form draft, a tab selection, a search query — belongs in
- * the component that owns it. This store exists for the three things that
+ * the component that owns it. This store exists for the four things that
  * genuinely cross component boundaries:
  *
  *  - `captureState`: so the sidebar's live indicator and the Live screen and
@@ -15,11 +15,15 @@
  *  - `toasts`: the banners the app raises, whether they came from the backend
  *    `notice` event (wired up in `App.tsx`) or from a screen reacting to its
  *    own action (e.g. "Copied.").
+ *  - `activeJobsByMeeting` / `failedJobsByMeeting`: which meetings still have
+ *    background work outstanding, so a row in any list, the rail's dot and the
+ *    corner pill all agree without each of them asking the core on its own.
+ *    Kept fresh by the `useActiveJobs` hook (`src/hooks/useActiveJobs.ts`).
  */
 
 import { create } from "zustand";
 
-import type { CaptureStatus, Id, NoticeLevel } from "./types";
+import type { CaptureStatus, Id, Job, NoticeLevel } from "./types";
 
 export interface Toast {
   id: string;
@@ -51,6 +55,38 @@ export interface EchoStore {
   activeMeetingId: Id | null;
   setActiveMeetingId: (id: Id | null) => void;
 
+  /**
+   * Every unfinished job in the app, grouped by the meeting it belongs to.
+   *
+   * `undefined` until the first read lands, which is not the same as "no work" —
+   * and the difference is the whole reason it is nullable. A row that cannot
+   * tell "nothing is happening" from "nobody has asked yet" would claim one of
+   * them on first paint, and it would be wrong roughly as often as it was right.
+   *
+   * Jobs with no `meetingId` are deliberately absent: the one-time download and
+   * getting the engine ready belong to the corner pill, not to a meeting.
+   */
+  activeJobsByMeeting: Record<Id, Job[]> | undefined;
+  /**
+   * The failed rows each meeting still carries.
+   *
+   * Separate from the map above because a failure is not work: it is the reason
+   * there is none. It is also only ever a partial history — enough to explain a
+   * meeting that has stopped without finishing, never enough to be asked "what
+   * has ever gone wrong here".
+   */
+  failedJobsByMeeting: Record<Id, Job[]> | undefined;
+  /**
+   * Replaces either map, or both.
+   *
+   * Whole-map replacement rather than a per-job setter on purpose: the read it
+   * is fed from (`listJobs({ activeOnly: true })`) is the authoritative set of
+   * unfinished work, and anything the client is holding that the core did not
+   * name is a job that ended without saying so. Merging would keep that ghost
+   * on screen for the rest of the session.
+   */
+  setJobWork: (next: { active?: Record<Id, Job[]>; failed?: Record<Id, Job[]> }) => void;
+
   toasts: Toast[];
   /** Returns the toast's id, e.g. so a caller can dismiss it early. */
   addToast: (toast: Omit<Toast, "id"> & { id?: string }) => string;
@@ -64,6 +100,14 @@ export const useEchoStore = create<EchoStore>((set, get) => ({
 
   activeMeetingId: null,
   setActiveMeetingId: (id) => set({ activeMeetingId: id }),
+
+  activeJobsByMeeting: undefined,
+  failedJobsByMeeting: undefined,
+  setJobWork: (next) =>
+    set({
+      ...(next.active !== undefined ? { activeJobsByMeeting: next.active } : {}),
+      ...(next.failed !== undefined ? { failedJobsByMeeting: next.failed } : {}),
+    }),
 
   toasts: [],
   addToast: (toast) => {

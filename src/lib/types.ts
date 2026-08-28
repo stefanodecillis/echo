@@ -726,6 +726,24 @@ export interface OnboardingState {
  *  and Echo is still finishing it off. */
 export type TrayState = "idle" | "detected" | "recording" | "processing";
 
+/**
+ * How far along Echo is with fetching a newer version of itself.
+ *
+ * Only `ready` is ever shown to anybody. The rest exist so a screen that asks
+ * outright gets a truthful answer, and so "there is nothing to do" can be told
+ * apart from "Echo could not ask" — which look the same from outside and mean
+ * very different things.
+ */
+export type UpdateState = "idle" | "checking" | "downloading" | "ready" | "failed";
+
+export interface UpdateStatePayload {
+  state: UpdateState;
+  /** The version waiting, once there is one. */
+  version?: string;
+  /** Whatever the release said about itself. Nothing renders it yet. */
+  notes?: string;
+}
+
 export type TrayAction = "start" | "stop" | "open" | "pauseDetection" | "quit";
 
 // ---------------------------------------------------------------------------

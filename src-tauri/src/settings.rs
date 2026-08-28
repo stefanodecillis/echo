@@ -60,6 +60,16 @@ pub mod keys {
     /// when the attempt turned out to have failed before the compile could have
     /// started (see [`crate::asr::models::mark_warm_attempted`]).
     pub const SPEECH_WARM_ATTEMPTED: &str = "speech_warm_attempted";
+    /// When Echo last managed to ask whether there is a newer version, RFC 3339.
+    ///
+    /// Only so that restarting the app repeatedly does not mean asking
+    /// repeatedly. Note what is deliberately *not* stored beside it: whether an
+    /// update is waiting. That answer belongs to the run it was found in — once
+    /// Echo has been restarted it either took effect, in which case there is
+    /// nothing to wait for, or it never will, in which case the next check finds
+    /// it again. Persisting it could only produce a pill offering a restart that
+    /// has already happened.
+    pub const UPDATE_LAST_CHECKED_AT: &str = "update_last_checked_at";
     /// The words somebody typed into "Words Echo should know", as a JSON array
     /// of strings, newest last. See [`crate::settings::words_to_know`].
     pub const VOCABULARY_TYPED: &str = "vocabulary_typed";

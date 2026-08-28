@@ -29,6 +29,7 @@ pub mod session;
 pub mod settings;
 pub mod summarize;
 pub mod types;
+pub mod update;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -49,6 +50,7 @@ mod tray_ids {
     pub const OPEN: &str = "open";
     pub const SNOOZE: &str = "snooze";
     pub const QUIT: &str = "quit";
+    pub const RESTART_FOR_UPDATE: &str = "restart_for_update";
 }
 
 /// Four tray icons: waiting, a meeting seems to be happening, recording, and
@@ -241,12 +243,85 @@ pub fn quit(app: &AppHandle) {
         animation.stop();
     }
     if let Some(state) = app.try_state::<AppState>() {
+        state.updates.stop();
         tauri::async_runtime::block_on(state.session.shutdown());
     }
+    fold_the_log_back_in(app);
     app.exit(0);
 }
 
-fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+/// Ask SQLite to fold the write-ahead log back into the database file.
+///
+/// On the way out, and on the way out only. Otherwise the WAL is the next
+/// process's problem to recover, and a restart means the next process starts a
+/// beat sooner than it needs to. A failure here changes nothing a person sees —
+/// SQLite recovers it on open — so it is a log line, not an obstacle to leaving.
+fn fold_the_log_back_in(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    if let Err(error) = tauri::async_runtime::block_on(db::pool::checkpoint(&state.db)) {
+        tracing::debug!(%error, "could not tidy the database on the way out");
+    }
+}
+
+/// Put "Restart to update Echo" in the tray menu, or take it out again.
+///
+/// Hopped onto the main thread, like every other menu-bar change in this file:
+/// AppKit insists on it, and `schedule_tray_state` records what happens when
+/// something on this path panics instead — one panic on 2026-08-24 stopped every
+/// event for the rest of a 35-minute meeting. So nothing here is allowed to fail
+/// loudly; the worst case is a menu that is one line out of date.
+pub fn show_restart_menu_item(app: &AppHandle, visible: bool) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(tray) = handle.tray_by_id("echo-tray") else {
+            return;
+        };
+        match tray_menu(&handle, visible) {
+            Ok(menu) => {
+                if let Err(error) = tray.set_menu(Some(menu)) {
+                    tracing::debug!(%error, "could not change the tray menu");
+                }
+            }
+            Err(error) => tracing::debug!(%error, "could not rebuild the tray menu"),
+        }
+    });
+}
+
+/// The way out that comes back: everything [`quit`] does, and then Tauri brings
+/// Echo up again on the version that was just installed.
+///
+/// `request_restart` rather than `restart`, and the difference is not cosmetic.
+/// `restart` called on the main thread skips `ExitRequested` and `Exit`
+/// altogether, which is where `tauri-plugin-single-instance` unlinks its socket.
+/// Skip that and the replacement process connects to a listener the dying one
+/// still holds, decides Echo is already running, and exits — leaving no Echo at
+/// all and nothing in the log to explain it. `request_restart` fires both events
+/// first. It also uses an exit code that deliberately ignores `prevent_close`, so
+/// the guard in [`on_run_event`] cannot block a restart we asked for ourselves.
+pub fn restart_for_update(app: &AppHandle) {
+    if let Some(flags) = app.try_state::<UiFlags>() {
+        flags.quitting.store(true, Ordering::SeqCst);
+    }
+    if let Some(animation) = app.try_state::<panel::TrayAnimation>() {
+        animation.stop();
+    }
+    if let Some(state) = app.try_state::<AppState>() {
+        state.updates.stop();
+        tauri::async_runtime::block_on(state.session.shutdown());
+    }
+    fold_the_log_back_in(app);
+    tracing::info!("restarting to finish an update");
+    app.request_restart();
+}
+
+/// The tray menu, with or without the line about an update.
+///
+/// Rebuilt rather than shown and hidden, because a Tauri menu item cannot be
+/// hidden after it is made — and an item that is always there but greyed out
+/// would be a permanent fifth line about something that is almost never true.
+fn tray_menu(app: &AppHandle, with_restart: bool) -> tauri::Result<Menu<tauri::Wry>> {
     // Wording, not commands: "Start recording", not "Start".
     let start = MenuItem::with_id(app, tray_ids::START, "Start recording", true, None::<&str>)?;
     let stop = MenuItem::with_id(app, tray_ids::STOP, "Stop recording", true, None::<&str>)?;
@@ -261,10 +336,30 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, tray_ids::QUIT, "Quit Echo", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
 
-    let menu = Menu::with_items(
+    if !with_restart {
+        return Menu::with_items(
+            app,
+            &[&start, &stop, &separator, &open, &snooze, &separator, &quit],
+        );
+    }
+    // Above Quit, and next to it: the two lines that end this run of Echo.
+    let restart = MenuItem::with_id(
         app,
-        &[&start, &stop, &separator, &open, &snooze, &separator, &quit],
+        tray_ids::RESTART_FOR_UPDATE,
+        "Restart to update Echo",
+        true,
+        None::<&str>,
     )?;
+    Menu::with_items(
+        app,
+        &[
+            &start, &stop, &separator, &open, &snooze, &separator, &restart, &quit,
+        ],
+    )
+}
+
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    let menu = tray_menu(app, false)?;
 
     TrayIconBuilder::with_id("echo-tray")
         .icon(Image::from_bytes(TRAY_ICON_IDLE)?)
@@ -273,6 +368,10 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {
+            if event.id().as_ref() == tray_ids::RESTART_FOR_UPDATE {
+                crate::restart_for_update(app);
+                return;
+            }
             let action = match event.id().as_ref() {
                 tray_ids::START => Some(TrayAction::Start),
                 tray_ids::STOP => Some(TrayAction::Stop),
@@ -494,6 +593,7 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(AppState {
         session: session::SessionManager::new(db.clone(), app_paths.clone()),
         detect: detect::Watcher::new(loaded.detection_enabled),
+        updates: update::Watcher::new(),
         db,
         paths: app_paths,
     });
@@ -536,6 +636,10 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             if let Err(error) = state.session.start_job_runner().await {
                 tracing::warn!(%error, "background work is not being picked up");
             }
+            // Looking for a newer Echo. Waits out the busiest part of launch
+            // first, and never runs while a meeting is happening or has work
+            // outstanding (`update::may_disturb`).
+            state.updates.start(handle.clone()).await;
             // Does Echo have the speech model it wants? This is the launch that
             // notices a new release wants different weights: it queues the
             // download (the job runner above is already draining), keeps
@@ -633,6 +737,35 @@ fn apply_launch_at_login(app: &AppHandle, wanted: bool) {
 /// no state is a dead end. `has_visible_windows` is the system's own answer, so
 /// a click while the window is already up does nothing.
 fn on_run_event(app: &AppHandle, event: &tauri::RunEvent) {
+    // Every way out lands here, including the two that used to skip the tidying
+    // up entirely: Cmd-Q on the system menu, and closing the last window when
+    // close-to-tray is off. Both went straight to exit without closing a
+    // recording, parking the queue or giving the engine's memory back — the work
+    // `quit` exists to do. `quit` and `restart_for_update` set `quitting` first,
+    // so this does not do it twice for them.
+    //
+    // Nothing here prevents the exit. Refusing to quit is not Echo's decision to
+    // make, and the restart path uses an exit code that ignores `prevent_close`
+    // anyway.
+    if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+        let Some(flags) = app.try_state::<UiFlags>() else {
+            return;
+        };
+        if flags.quitting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tracing::info!("closing down");
+        if let Some(animation) = app.try_state::<panel::TrayAnimation>() {
+            animation.stop();
+        }
+        if let Some(state) = app.try_state::<AppState>() {
+            state.updates.stop();
+            tauri::async_runtime::block_on(state.session.shutdown());
+        }
+        fold_the_log_back_in(app);
+        return;
+    }
+
     #[cfg(target_os = "macos")]
     if let tauri::RunEvent::Reopen {
         has_visible_windows,
@@ -671,6 +804,11 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        // Updates verify their own ed25519 signature against the public key in
+        // `tauri.conf.json` before anything is unpacked. That, not Apple's
+        // signature, is what stops somebody who can serve the endpoint from
+        // shipping code to everybody.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             // The file log belongs to `logging`; this only carries messages
             // from the UI to the terminal during development.

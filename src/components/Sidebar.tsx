@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 
+import { useHasOutstandingWork } from "../hooks/useActiveJobs";
 import { useCaptureState } from "../hooks/useCaptureState";
 import { nav } from "../lib/copy";
 import { formatElapsed } from "./lib/format";
@@ -21,10 +22,18 @@ import { SidebarNavItem } from "./SidebarNavItem";
  * itself: the Home screen owns the actual Start button and its confirmation
  * flow (title prompt, device picker), this just gets the person there with
  * the intent already expressed, the same way a notification click does.
+ *
+ * A dot appears on Meetings while Echo still has work outstanding on any of
+ * them. It is the one indicator that still says something while a recording has
+ * every outstanding job parked and nothing is running — which is exactly when
+ * the corner pill, being a sentence about something happening, has nothing to
+ * say. Wordless on purpose: a number here would be a queue depth, and
+ * `lib/copy.ts` rules those out.
  */
 export function Sidebar() {
   const capture = useCaptureState();
   const isLive = capture.state === "recording" || capture.state === "paused";
+  const outstanding = useHasOutstandingWork();
 
   return (
     <nav
@@ -47,7 +56,22 @@ export function Sidebar() {
       </Link>
 
       <SidebarNavItem to="/" end label={nav.home} icon={<HomeIcon className="h-full w-full" />} />
-      <SidebarNavItem to="/search" label={nav.meetings} icon={<MeetingsIcon className="h-full w-full" />} />
+      <SidebarNavItem
+        to="/search"
+        label={nav.meetings}
+        icon={<MeetingsIcon className="h-full w-full" />}
+        badge={
+          outstanding ? (
+            <span className="flex items-center">
+              {/* `ink-soft`, never `live` — red on the rail reads as "recording",
+                  and this is the opposite: the meeting is over and Echo is still
+                  tidying up after it. */}
+              <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-ink-soft" />
+              <span className="sr-only">{nav.workingLabel}</span>
+            </span>
+          ) : undefined
+        }
+      />
 
       <div className="flex-1" />
 
