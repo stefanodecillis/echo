@@ -183,6 +183,38 @@ jobs:
             exit 1
           fi
 
+      # Notarization is opt-in by the presence of three credentials, and that
+      # presence has to be real. Declaring `APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}`
+      # against a secret that does not exist sets the variable to the empty
+      # string, which Tauri reads as "notarize this" and then rejects with
+      # "Team ID must be at least 3 characters" — after a seven-minute build and
+      # after signing succeeded. That is what happened on the first release
+      # attempt of v0.2.0. An empty variable is not an absent one, so the
+      # variables are only exported when there is something in them.
+      #
+      # Adding the three secrets is therefore still the whole of turning
+      # notarization on. Nothing here changes.
+      - name: Notarize only if there are credentials for it (macOS)
+        if: matrix.os == 'macos-14'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+            {
+              echo "APPLE_ID=$APPLE_ID"
+              echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+            } >> "$GITHUB_ENV"
+            echo "Notarization: on."
+          else
+            echo "Notarization: off — no Apple credentials are set."
+            echo "The app is still signed, so permission grants survive updates;"
+            echo "first launch shows Gatekeeper's unverified-developer warning."
+          fi
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -193,10 +225,6 @@ jobs:
           # Overrides bundle.macOS.signingIdentity in tauri.conf.json, which
           # names a certificate that only exists on one laptop.
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # Notarization happens if and only if these three are set. Unset today.
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: ${{ inputs.tag || github.ref_name }}
           releaseName: Echo __VERSION__
