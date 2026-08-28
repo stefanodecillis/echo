@@ -146,6 +146,30 @@ export const labels = {
     failed: "Didn't finish",
     cancelled: "Cancelled",
   },
+  /**
+   * A meeting's own state, for the one place it has to fit in a few words: a row
+   * in a list, where there is no room for a sentence and sometimes no job to
+   * name.
+   *
+   * `processing` is the careful one. It means Echo has not finished with this
+   * meeting, which is not the same as something happening this second: the work
+   * can be parked for a recording, and it can have stopped without finishing, in
+   * which case the meeting stays here for good (`settle_meeting` in
+   * src-tauri/src/session/jobs.rs only ever runs for work that finished). So it
+   * says what is true of the meeting and claims no activity at all. The
+   * sentences about activity are `jobLine`'s, and they are only ever said about
+   * a job that is really running.
+   */
+  meetingStatus: {
+    created: "Not started",
+    recording: "Recording",
+    processing: "Not finished yet",
+    complete: "Done",
+    /** Word for word what Home's recovery card calls this above the list
+     * (`home.recoveringTitle`), so a row and the card agree. */
+    interrupted: "Didn't finish",
+    failed: "Something went wrong",
+  },
   permissionState: {
     unknown: "Not checked yet",
     granted: "Allowed",
@@ -266,6 +290,26 @@ export const jobLine = {
   deferred: (label: string) => `${label} — paused until the recording ends`,
 } as const;
 
+/**
+ * The chip on a meeting row.
+ *
+ * Two of the four states a row can be in are covered by `jobLine` above and
+ * borrow it: running work names itself, because which of the four passes is
+ * happening is the whole thing somebody wants to know at a glance, and work that
+ * stopped names itself too, because *what* did not finish is what tells a person
+ * which part of the meeting is missing.
+ *
+ * The two here name nothing, and say the same sentences as `jobLine.waiting` and
+ * `jobLine.deferred` with the job's name taken off the front. Deliberately not
+ * reusing those: nothing is happening in either state, so the name would be the
+ * only moving part of a still sentence, and a row is a few words wide. A number
+ * of any kind is out of the question here — see the rule at the top of this file.
+ */
+export const workChip = {
+  waiting: "Waiting its turn",
+  deferred: "Paused until the recording ends",
+} as const;
+
 /** Words used across more than one screen: dialogs, toasts, generic buttons. */
 export const common = {
   close: "Close",
@@ -307,6 +351,10 @@ export const nav = {
   privacyNote: "Everything stays on this computer.",
   liveLabel: "Recording",
   livePausedLabel: "Paused",
+  /** Read aloud for the rail's dot and the corner pill's ring, both of which are
+   * shapes with no words of their own. Matches `meeting.infoWorkingTitle`, which
+   * is the same idea on the Meeting page. */
+  workingLabel: "Still working",
 } as Record<string, string>;
 
 /** Home: the status hero, the recent list, empty states. */

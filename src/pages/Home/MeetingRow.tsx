@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 
-import { Button, Card, Chip, Modal, TrashIcon } from "../../components";
-import { useCommand } from "../../hooks";
+import { Button, Card, Chip, Modal, TrashIcon, WorkChip } from "../../components";
+import { useCommand, useMeetingWork } from "../../hooks";
 import { common, home, languageLabel } from "../../lib/copy";
 import { deleteMeeting } from "../../lib/ipc";
 import type { Id, MeetingSummary } from "../../lib/types";
@@ -19,9 +19,17 @@ export interface MeetingRowProps {
  * a quiet delete affordance that only shows up on hover. Shared by Home's
  * Recent meetings and the full Meetings page (`/search`) so both read as the
  * same list, because they are — both come from `listMeetings`.
+ *
+ * It also says whether Echo has finished with the meeting: which one is being
+ * worked on right now, which is waiting its turn, and which stopped without
+ * finishing. That answer comes from `useMeetingWork`, which reads a map kept
+ * fresh for the whole app — not from the list, which knows nothing about it. So
+ * neither list's own reload cycle has anything to do with it, and neither list
+ * hook had to change.
  */
 export function MeetingRow({ meeting, onDeleted }: MeetingRowProps) {
   const language = languageLabel(meeting.language);
+  const work = useMeetingWork(meeting);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const deleteCmd = useCommand(deleteMeeting);
 
@@ -46,9 +54,15 @@ export function MeetingRow({ meeting, onDeleted }: MeetingRowProps) {
               {formatRelativeDate(meeting.startedAt)}
             </span>
           </div>
-          <div className="flex items-center gap-2 text-xs text-ink-faint">
-            <span>{formatDuration(meeting.durationMs)}</span>
-            {language && <Chip>{language}</Chip>}
+          {/* The status is what yields on a narrow window: `min-w-0` here plus
+              `truncate` inside the chip, against `shrink-0` on the two facts that
+              are always worth their space. Nothing is absolutely positioned, so
+              the card's `pr-11` gutter still belongs entirely to the delete
+              button below. */}
+          <div className="flex min-w-0 items-center gap-2 text-xs text-ink-faint">
+            <span className="shrink-0">{formatDuration(meeting.durationMs)}</span>
+            {language && <Chip className="shrink-0">{language}</Chip>}
+            <WorkChip work={work} />
           </div>
           {meeting.snippet && <p className="truncate text-sm text-ink-soft">{meeting.snippet}</p>}
         </Card>

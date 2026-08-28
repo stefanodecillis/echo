@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Route, Routes, useLocation, useNavigate } from "react-router-dom";
 
-import { SetupProgress } from "./components/SetupProgress";
 import { Sidebar } from "./components/Sidebar";
+import { StatusCorner } from "./components/StatusCorner";
 import { ToastViewport } from "./components/Toast";
+import { useActiveJobs } from "./hooks/useActiveJobs";
 import { useEvent } from "./hooks/useEvent";
 import { EVENTS, getOnboardingState, snoozeDetection, stopRecording } from "./lib/ipc";
 import { useEchoStore } from "./lib/store";
@@ -47,6 +48,11 @@ export default function App() {
   const navigate = useNavigate();
   const location = useLocation();
   const addToast = useEchoStore((s) => s.addToast);
+
+  // Mounted here and nowhere else: this is the only thing in the app that writes
+  // the outstanding-work maps, and every row, the rail's dot and the corner pill
+  // read them. One subscriber, one poll, however many rows are on screen.
+  useActiveJobs();
 
   // First launch goes to the setup wizard, exactly once per app start. null
   // means "still asking", so nothing flashes before the answer arrives. If the
@@ -141,7 +147,7 @@ export default function App() {
           </Routes>
         </div>
       </main>
-      <SetupProgress />
+      <StatusCorner />
       <ToastViewport />
     </div>
   );
